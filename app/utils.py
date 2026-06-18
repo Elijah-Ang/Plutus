@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -66,3 +66,106 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(v) for v in value]
     return value
+
+
+def format_sgt(dt_val: datetime | str) -> str:
+    if isinstance(dt_val, str):
+        dt_val = datetime.fromisoformat(dt_val.replace("Z", "+00:00"))
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=UTC)
+    sgt_tz = timezone(timedelta(hours=8))
+    dt_sgt = dt_val.astimezone(sgt_tz)
+    date_part = dt_sgt.strftime("%b %d, %Y")
+    hour = dt_sgt.hour % 12
+    if hour == 0:
+        hour = 12
+    minute = dt_sgt.strftime("%M")
+    ampm = dt_sgt.strftime("%p")
+    return f"{date_part}, {hour}:{minute} {ampm} SGT"
+
+
+def format_expiry(expiry_dt: datetime | str, now: datetime | None = None) -> str:
+    if isinstance(expiry_dt, str):
+        expiry_dt = datetime.fromisoformat(expiry_dt.replace("Z", "+00:00"))
+    if expiry_dt.tzinfo is None:
+        expiry_dt = expiry_dt.replace(tzinfo=UTC)
+    
+    now = now or datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+        
+    diff = expiry_dt - now
+    diff_minutes = round(diff.total_seconds() / 60)
+    
+    sgt_str = format_sgt(expiry_dt)
+    if 0 < diff_minutes <= 120:
+        return f"{sgt_str} (about {diff_minutes} minutes)"
+    return sgt_str
+
+
+def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is_fake_test: bool = False) -> str:
+    symbol = proposal.get("symbol", "").upper()
+    side = proposal.get("side", "").capitalize()
+    notional = proposal.get("notional")
+    qty = proposal.get("qty")
+    expiry = proposal.get("expires_at", "")
+    expiry_fmt = format_expiry(expiry)
+    
+    if symbol == "TEST" or is_fake_test:
+        return (
+            f"🧪 Fake paper test proposal\n\n"
+            f"This is only testing the Telegram approval flow.\n"
+            f"No Alpaca order will be placed for this fake TEST symbol.\n\n"
+            f"Reply yes to approve the test, or no to reject it.\n"
+            f"Expires: {expiry_fmt}"
+        )
+        
+    mode = config.get("mode", "paper")
+    live_enabled = config.get("live_enabled", False)
+    
+    if mode == "live" and live_enabled:
+        mode_str = "Live trading"
+        mode_notice = "WARNING: This is a LIVE trade using real money."
+    else:
+        mode_str = "Paper trading only"
+        mode_notice = "This uses fake Alpaca Paper money, not real money."
+        
+    if side.lower() == "buy":
+        amount_str = f"${notional:.0f}" if notional is not None else "N/A"
+        return (
+            f"📄 Paper trade proposal\n\n"
+            f"Mode: {mode_str}\n"
+            f"Action: Buy {symbol}\n"
+            f"Amount: {amount_str}\n"
+            f"{mode_notice}\n\n"
+            f"Reply yes to approve, or no to reject.\n"
+            f"Expires: {expiry_fmt}"
+        )
+    else:
+        qty_str = f"{qty} shares" if qty is not None else (f"${notional:.0f}" if notional is not None else "N/A")
+        return (
+            f"📄 Paper sell proposal\n\n"
+            f"Mode: {mode_str}\n"
+            f"Action: Sell {symbol}\n"
+            f"Quantity: {qty_str}\n"
+            f"Purpose: Close or reduce the existing paper position.\n\n"
+            f"Reply yes to approve, or no to reject.\n"
+            f"Expires: {expiry_fmt}"
+        )
+
+
+def translate_reason(reason: str) -> str:
+    if "message is not an unambiguous approval or rejection" in reason:
+        return "I did not take any action because I could not tell whether you meant yes or no. Please reply yes to approve or no to reject."
+    if "identify proposal when pending count is not one" in reason:
+        return "I did not take any action because there is more than one pending proposal. Please reply with the proposal ID and yes/no, for example: yes 5e165d49."
+    if "exactly one matching pending proposal is required" in reason:
+        return "I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol."
+    if "proposal expired" in reason:
+        return "I did not take any action because this proposal has already expired."
+    if "unauthorized sender" in reason:
+        return "I ignored this message because it was not sent by the authorized Telegram user."
+    if "unauthorized" in reason:
+        return "I ignored this message because it was not sent by the authorized Telegram user."
+    return f"No action taken: {reason}."
+

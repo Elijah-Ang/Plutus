@@ -13,8 +13,7 @@ from .market_data import normalize_bars
 from .power import get_power_status
 from .risk_engine import RiskCheck, RiskEngine
 from .strategy_rule_based import evaluate_symbol
-from .telegram_bot import TelegramBot
-from .utils import PROJECT_ROOT, iso_now, json_dumps
+from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -68,6 +67,12 @@ class TradingService:
                 self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
                 self.telegram.send_message(response, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                 continue
+            
+            # Live safety check before processing approvals
+            if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
+                self.telegram.send_message("Blocked for safety: live trading is disabled.")
+                continue
+
             pending = self.storage.active_proposals()
             parsed = parse_approval(text, sender, self.telegram.allowed_user_id or "", pending)
             approval_id = str(uuid.uuid4())
@@ -76,15 +81,16 @@ class TradingService:
                 (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "accepted" if parsed.accepted else "rejected", iso_now()),
             )
             if not parsed.accepted or not parsed.proposal_id:
-                self.telegram.send_message(f"No action taken: {parsed.reason}")
+                msg = translate_reason(parsed.reason)
+                self.telegram.send_message(msg)
                 continue
             if parsed.action == "reject":
                 self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (parsed.proposal_id,))
-                self.telegram.send_message(f"Proposal {parsed.proposal_id} rejected. No order placed.")
+                self.telegram.send_message(f"Rejected. No order was placed for proposal {parsed.proposal_id[:8]}.")
                 continue
             row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
             if not self.storage.consume_approval(parsed.proposal_id, approval_id):
-                self.telegram.send_message("Approval was already used or proposal is no longer pending. No order placed.")
+                self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                 continue
             proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
             context = self._portfolio_context(proposal, approval_valid=True)
@@ -93,11 +99,22 @@ class TradingService:
                 "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal["symbol"], proposal["side"], proposal["notional"], result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
             )
-            self.telegram.send_message(f"Proposal {parsed.proposal_id}: order status {result.status}." + ("" if result.submitted else " No retry will occur."))
+            
+            # User-friendly order status response
+            if result.status.lower() in {"filled", "filled_fully", "orderstatus.filled"}:
+                self.telegram.send_message(f"Filled. The paper order for {proposal['symbol']} was completed successfully.")
+            elif result.submitted:
+                self.telegram.send_message(f"Approved. A paper order was submitted for {proposal['symbol']}. Current status: pending.")
+            else:
+                self.telegram.send_message(f"Approved, but submission failed or was blocked: {result.reason}")
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
     def scan(self) -> None:
+        if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
+            self.telegram.send_message("Blocked for safety: live trading is disabled.")
+            return
+
         positions = self.broker.get_positions()
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
@@ -132,7 +149,10 @@ class TradingService:
             self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
             review = self.ai.review(proposal)
             self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
-            self.telegram.send_message(f"Proposal {proposal_id}\n{review['telegram_message']}\nExpires: {expiry.isoformat()}")
+            
+            # Natural language proposal message
+            message_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config)
+            self.telegram.send_message(message_text)
 
     def run_cycle(self) -> None:
         self.process_telegram()

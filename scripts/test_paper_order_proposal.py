@@ -8,7 +8,7 @@ from app.telegram_bot import TelegramBot
 from app.broker_alpaca import AlpacaBroker
 from app.risk_engine import RiskEngine
 from app.power import get_power_status
-from app.utils import PROJECT_ROOT, load_config
+from app.utils import PROJECT_ROOT, load_config, format_proposal_message
 
 def main():
     load_dotenv(PROJECT_ROOT / ".env")
@@ -144,12 +144,8 @@ def main():
     # 4. Send message to Telegram
     try:
         bot = TelegramBot()
-        bot.send_message(
-            f"Proposal {proposal_id}\n"
-            f"PAPER EXECUTION TEST — fake money only\n"
-            f"{symbol} BUY 1.0\n"
-            f"Expires: {expiry.isoformat()}"
-        )
+        msg_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, config)
+        bot.send_message(msg_text)
         print("Real-symbol paper proposal sent to Telegram successfully.")
         print(f"Proposal ID: {proposal_id}")
     except Exception as e:

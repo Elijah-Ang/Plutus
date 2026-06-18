@@ -23,3 +23,7 @@ cd /Users/elijahang/Documents/Trading/TradingAgent
 ```
 
 The first run will safely fail preflight until local credentials are configured. Do not install launchd until the manual run and tests are satisfactory. See [SETUP.md](docs/SETUP.md), [SAFETY_RULES.md](docs/SAFETY_RULES.md), and [OPERATIONS_MANUAL.md](docs/OPERATIONS_MANUAL.md).
+
+## Developer safeguard checklist
+Whenever making meaningful changes to configs, scripts, or core application modules, you must update the master [docs/SYSTEM_OVERVIEW.md](file:///Users/elijahang/Desktop/TradingAgent/docs/SYSTEM_OVERVIEW.md) to reflect the new state. A unit test enforces the existence and structure of this document.
+

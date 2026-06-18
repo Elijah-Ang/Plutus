@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from dotenv import load_dotenv
 from app.storage import Storage
 from app.telegram_bot import TelegramBot
-from app.utils import PROJECT_ROOT, load_config
+from app.utils import PROJECT_ROOT, load_config, format_proposal_message
 
 def main():
     load_dotenv(PROJECT_ROOT / ".env")
@@ -76,11 +76,8 @@ def main():
     # Send message to Telegram
     try:
         bot = TelegramBot()
-        bot.send_message(
-            f"Proposal {proposal_id}\n"
-            f"FAKE PAPER TEST PROPOSAL — no real/live order will be placed unless explicitly approved through the test flow.\n"
-            f"Expires: {expiry.isoformat()}"
-        )
+        msg_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, config, is_fake_test=True)
+        bot.send_message(msg_text)
         print("Fake proposal sent to Telegram successfully.")
         print(f"Proposal ID: {proposal_id}")
     except Exception as e:
