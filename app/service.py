@@ -52,7 +52,12 @@ class TradingService:
         }
 
     def process_telegram(self) -> None:
-        for update in self.telegram.get_updates(timeout=0):
+        updates = self.telegram.get_updates(timeout=0)
+        if not updates:
+            return
+        max_id = 0
+        for update in updates:
+            max_id = max(max_id, update.get("update_id", 0))
             message = update.get("message") or {}
             text = str(message.get("text", "")).strip()
             sender = str((message.get("from") or {}).get("id", ""))
@@ -89,6 +94,8 @@ class TradingService:
                 (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal["symbol"], proposal["side"], proposal["notional"], result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
             )
             self.telegram.send_message(f"Proposal {parsed.proposal_id}: order status {result.status}." + ("" if result.submitted else " No retry will occur."))
+        if max_id > 0:
+            self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
     def scan(self) -> None:
         positions = self.broker.get_positions()
