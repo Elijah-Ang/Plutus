@@ -96,6 +96,18 @@ def test_master_overview_documentation_exists_and_has_required_sections():
     
     content = overview_path.read_text(encoding="utf-8")
     
+    # Assert no local links exist
+    assert "file:///Users/" not in content, "SYSTEM_OVERVIEW.md contains local absolute file links"
+    
+    # Assert update rule exists
+    assert "Update Rule:" in content, "SYSTEM_OVERVIEW.md is missing the update rule notice"
+    
+    # Assert stale-state warning exists
+    assert "Stale-State Warning:" in content, "SYSTEM_OVERVIEW.md is missing the stale-state warning"
+    
+    # Assert Mermaid sections exist
+    assert "```mermaid" in content, "SYSTEM_OVERVIEW.md is missing Mermaid codeblocks"
+    
     required_sections = [
         "Project Purpose",
         "Current Safety Status",
@@ -124,3 +136,4 @@ def test_master_overview_documentation_exists_and_has_required_sections():
     
     for section in required_sections:
         assert section in content, f"SYSTEM_OVERVIEW.md is missing section: {section}"
+

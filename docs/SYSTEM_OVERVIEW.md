@@ -22,7 +22,10 @@ Before committing changes, ask:
 ---
 
 ## 1. Project Purpose
-TradingAgent is an autonomous (but user-gated) trading assistant that scans a watchlist of symbols, evaluates technical rules, generates trade proposals, conducts AI-assisted risk and caution reviews, requests user approval via Telegram, and executes approved paper trades through the Alpaca Paper Trading API.
+TradingAgent is a supervised, user-gated paper trading assistant that scans a watchlist of symbols, evaluates technical rules, generates trade proposals, conducts AI-assisted risk and caution reviews, and requests user approval via Telegram. It is capable of executing approved paper trades through the Alpaca Paper Trading API but cannot place orders autonomously.
+- The bot can scan and propose but **cannot execute any trades without manual Telegram approval** from the authorized user.
+- The AI layer is strictly read-only and **cannot execute orders** or access credentials.
+- **Live trading is completely disabled** at the config, database, and broker API levels.
 
 ## 2. Current Safety Status
 The system is strictly configured for **Paper Trading Only** (`mode: paper`, `live_enabled: false`).
@@ -49,27 +52,39 @@ The project follows a modular design with clear separation between:
 - `tests/`: Project unit and integration tests.
 
 ## 5. Main Config Files
-- [config.yaml](file:///Users/elijahang/Desktop/TradingAgent/config/config.yaml): Sets the bot's modes, watchlist, intervals, and AI model parameters.
-- [risk_limits.yaml](file:///Users/elijahang/Desktop/TradingAgent/config/risk_limits.yaml): Sets paper and live boundaries (max notional, open positions, daily trades, and global safety toggles).
-- [strategies.yaml](file:///Users/elijahang/Desktop/TradingAgent/config/strategies.yaml): Strategy thresholds (maximum volatility, drawdown stop).
+- [config.yaml](../config/config.yaml): Sets the bot's modes, watchlist, intervals, and AI model parameters.
+- [risk_limits.yaml](../config/risk_limits.yaml): Sets paper and live boundaries (max notional, open positions, daily trades, and global safety toggles).
+- [strategies.yaml](../config/strategies.yaml): Strategy thresholds (maximum volatility, drawdown stop).
 
 ## 6. Main App Modules
-- [main.py](file:///Users/elijahang/Desktop/TradingAgent/app/main.py): Entry point executing single bounded cycles.
-- [service.py](file:///Users/elijahang/Desktop/TradingAgent/app/service.py): Runs the cycle flow (polled Telegram parser -> strategy scanner -> proposal -> AI review).
-- [approval_parser.py](file:///Users/elijahang/Desktop/TradingAgent/app/approval_parser.py): Parses Telegram approvals and rejections (supports prefix matching, side, and symbol disambiguation).
-- [risk_engine.py](file:///Users/elijahang/Desktop/TradingAgent/app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
-- [broker_alpaca.py](file:///Users/elijahang/Desktop/TradingAgent/app/broker_alpaca.py): Integrates the Alpaca API and blocks live endpoint submissions.
-- [execution.py](file:///Users/elijahang/Desktop/TradingAgent/app/execution.py): Handler final revalidation and broker submission.
-- [storage.py](file:///Users/elijahang/Desktop/TradingAgent/app/storage.py): Manages database transactions, initialization, and approvals usage.
-- [telegram_bot.py](file:///Users/elijahang/Desktop/TradingAgent/app/telegram_bot.py): Wrapper around the Telegram Bot API.
-- [utils.py](file:///Users/elijahang/Desktop/TradingAgent/app/utils.py): Utility tools including timezone conversion to SGT and message templates.
+- [main.py](../app/main.py): Entry point executing single bounded cycles.
+- [service.py](../app/service.py): Runs the cycle flow (polled Telegram parser -> strategy scanner -> proposal -> AI review).
+- [approval_parser.py](../app/approval_parser.py): Parses Telegram approvals and rejections (supports prefix matching, side, and symbol disambiguation).
+- [risk_engine.py](../app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
+- [broker_alpaca.py](../app/broker_alpaca.py): Integrates the Alpaca API and blocks live endpoint submissions.
+- [execution.py](../app/execution.py): Handler final revalidation and broker submission.
+- [storage.py](../app/storage.py): Manages database transactions, initialization, and approvals usage.
+- [telegram_bot.py](../app/telegram_bot.py): Wrapper around the Telegram Bot API.
+- [utils.py](../app/utils.py): Utility tools including timezone conversion to SGT and message templates.
 
 ## 7. Scripts and What They Do
-- `run_once.sh`: Runs a single cycle of Telegram checking and watchlist scanning.
-- `export_excel.sh`: Generates the openpyxl summary workbook.
-- `test_fake_paper_proposal.sh`: Creates a fake pending proposal for symbol `TEST` to verify the parser.
-- `test_paper_order_proposal.sh`: Creates a real-symbol `SPY` paper proposal.
-- `store_secret_keychain.sh`: Helper to store API keys in the macOS Keychain.
+The `scripts/` directory contains operational shell and Python scripts used for testing and execution:
+- `setup_venv.sh`: Installs Python virtual environment, updates pip, and installs requirements. **[Safe/Read-only]**
+- `run_once.sh`: Runs a single bounded scan and polling cycle. **[Execution-capable]**
+- `export_excel.sh`: Generates the openpyxl summary report workbook. **[Safe/Read-only]**
+- `test_openai_summary.sh`: Manually tests the OpenAI connection and summary generation. **[Safe/Read-only]**
+- `test_alpaca_paper_connection.sh`: Verifies read-only connectivity and prints Alpaca account metrics. **[Safe/Read-only]**
+- `test_fake_paper_proposal.sh`: Creates a fake pending proposal for symbol `TEST` to verify the Telegram parser. **[Proposal-only]**
+- `test_paper_order_proposal.sh`: Generates a real-symbol `SPY` or `QQQ` paper proposal. **[Proposal-only]**
+- `test_paper_sell_proposal.sh`: (Future) Will generate a real-symbol paper exit proposal. **[Proposal-only]**
+- `store_secret_keychain.sh`: Stores API keys securely in the macOS Keychain. **[Safe/Read-only]**
+- `install_launchd.sh`: Installs the launchd plist file for recurring automation. **[Scheduling-related]**
+- `uninstall_launchd.sh`: Uninstalls the launchd plist file. **[Scheduling-related]**
+- `rotate_logs.sh`: Truncates and backs up application logs. **[Safe/Read-only]**
+- `backup_db.sh`: Creates a copy of the SQLite database file. **[Safe/Read-only]**
+- `start_agent.sh` / `stop_agent.sh`: Utility scripts to load or unload the scheduled jobs. **[Scheduling-related]**
+- `telegram_get_updates.py`: Small Python utility to print raw Telegram JSON updates. **[Safe/Read-only]**
+- `telegram_test.py`: Simple verification script to send a basic Telegram message. **[Safe/Read-only]**
 
 ## 8. Telegram Approval Flow
 Every trade proposal is written to SQLite with `status='pending'` and messaged to the authorized user via Telegram.
@@ -94,20 +109,47 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini`.
 - **Expiry Gates**: Blocks execution if the proposal has expired.
 
 ## 12. Database / SQLite Tables
-Stored at `data/trading_agent.db`:
-- `runs`: History of cycles run.
-- `signals`: Raw indicator signals generated by strategy.
+Stored at `data/trading_agent.db`. The schema contains the following tables:
+- `runs`: History of cycles run with configuration mode.
+- `preflight_checks`: Preflight health validation results.
+- `market_snapshots`: Saved price snapshots from the broker.
+- `indicators`: Intermediate indicator calculations.
+- `signals`: Raw indicators signals generated by strategy (`ENTRY` or `EXIT`).
+- `ml_predictions`: Predictive model evaluations.
+- `risk_checks`: Logs of safety checks passed or failed.
+- `ai_reviews`: Summaries and caution assessments from OpenAI.
 - `trade_proposals`: Pending, approved, rejected, or expired proposals.
-- `ai_reviews`: Summaries and caution assessments.
-- `approvals`: Consumer records of Telegram replies.
+- `approvals`: Consumer records of Telegram replies (uniquely constraints prevent double-approvals).
 - `orders`: Records of submitted broker orders.
-- `preflight_checks` & `risk_checks`: Logs of safety checks passed/failed.
+- `fills`: Historical fill data from broker executions.
+- `positions`: Tracked positions from the broker.
+- `cash_snapshots`: Cash balance audits.
+- `cashout_reviews`: Suggestions history.
+- `cashout_suggestions`: Generated suggestions.
+- `errors`: Logged runtime errors.
+- `audit_events`: System audit log.
+- `strategy_versions`: Tracked rules-based and ML versions.
+- `model_versions`: ML metadata records.
+- `config_snapshots`: Redacted config maps.
+- `daily_summaries`: Daily equity audits.
 
 ## 13. Excel Reporting Flow
-Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. Sheets include:
-- Summary Dashboard (aggregate counts of approvals, rejections, active positions).
-- Trades/Orders/Fills (historical trade execution lists).
-- Risk Checks / Approvals / Audit Logs.
+Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
+- **Summary Dashboard**: Derived from database records (calculated metrics).
+- **Daily PnL**: Directly database-backed (`daily_summaries`).
+- **Trades**: Directly database-backed (`orders`).
+- **Orders**: Directly database-backed (`orders`).
+- **Fills**: Directly database-backed (`fills`).
+- **Positions**: Directly database-backed (`positions`).
+- **Signals**: Directly database-backed (`signals`).
+- **Risk Checks**: Directly database-backed (`risk_checks`).
+- **AI Reviews**: Directly database-backed (`ai_reviews`).
+- **Approvals**: Directly database-backed (`approvals`).
+- **Cash Management**: Directly database-backed (`cashout_suggestions`).
+- **ML Shadow Metrics**: Directly database-backed (`model_versions`). Currently empty/placeholder as ML is shadow-only.
+- **Errors**: Directly database-backed (`errors`).
+- **Audit Events**: Directly database-backed (`audit_events`).
+- **Config Snapshot**: Directly database-backed (`config_snapshots`).
 
 ## 14. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).
@@ -121,6 +163,10 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 `Blocked for safety: live trading is disabled.`
 
 ## 17. Current Known State
+> [!WARNING]
+> **Stale-State Warning:** This section reflects the last verified manual checkpoint. It must be updated after every paper execution, sell/exit test, launchd setup, risk limit change, or live-trading gate change.
+
+- **Checkpoint Date**: June 18, 2026
 - **Mode**: paper
 - **Live Enabled**: false
 - **Default AI Model**: `gpt-5.4-mini`
@@ -129,14 +175,16 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Daily Trade Count**: 1
 
 ## 18. Recent Milestones Completed
-- Verified Telegram credentials and keychain storage.
-- Verified gpt-5.4-mini connection and review generation.
-- Verified Alpaca paper-only dry-run cycle.
-- Tested and verified mock `TEST` proposal rejection flow.
-- Tested and verified real-symbol `SPY` proposal rejection flow.
-- Verified double-spending and late-approval blocks.
-- Executed the first real-symbol `SPY` paper buy order successfully.
-- Fixed Telegram polling update offset bug.
+- **Initial safe scaffold**: Basic project setup and configuration framework.
+- **Telegram setup**: Bot token stored, chat IDs verified, and approval testing implemented.
+- **OpenAI setup**: API credentials stored in Keychain and model configuration parsed.
+- **Default model changed to `gpt-5.4-mini`**: Updated configs and code modules to default to the mini reasoning model.
+- **Alpaca Paper connectivity checks**: Confirmed paper broker credentials and fetched read-only balance.
+- **Single dry-run verification**: Executed dry cycle with SPY and QQQ generating HOLD signals.
+- **Fake paper proposal approval/rejection test**: Verified rejection gates and parsed responses using a mock `TEST` proposal.
+- **Controlled Alpaca Paper BUY execution test**: Successfully approved and executed a $1 paper order for `SPY`.
+- **Telegram polling offset bug fix**: Resolved unacknowledged updates by updating the Telegram offset parameter in `service.py`.
+- **Telegram message cleanup and system overview creation**: Overhauled bot wording, implemented Singapore Time formatting, and built the system overview document.
 
 ## 19. How to Update This Document
 Whenever you edit code structure, config parameters, database tables, or broker/safety logic:
@@ -216,3 +264,4 @@ flowchart TD
 
 ## 23. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
+- **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
