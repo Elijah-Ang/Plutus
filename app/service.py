@@ -13,6 +13,7 @@ from .market_data import normalize_bars
 from .power import get_power_status
 from .risk_engine import RiskCheck, RiskEngine
 from .strategy_rule_based import evaluate_symbol
+from .telegram_bot import TelegramBot
 from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason
 
 
@@ -96,8 +97,8 @@ class TradingService:
             context = self._portfolio_context(proposal, approval_valid=True)
             result = Executor(self.broker, self._risk_engine(parsed.proposal_id, "final")).execute(proposal, context)
             self.storage.execute(
-                "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal["symbol"], proposal["side"], proposal["notional"], result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
+                "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal["symbol"], proposal["side"], proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
             )
             
             # User-friendly order status response

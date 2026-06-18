@@ -32,8 +32,13 @@ class Executor:
         if not decision.passed:
             return ExecutionResult(False, "blocked", client_order_id, reason="; ".join(decision.reasons))
         try:
+            order_args = {}
+            if candidate.get("qty") is not None:
+                order_args["qty"] = float(candidate["qty"])
+            else:
+                order_args["notional"] = float(candidate["notional"])
             response = self.broker.submit_order(
-                candidate["symbol"], candidate["side"], {"notional": float(candidate["notional"])},
+                candidate["symbol"], candidate["side"], order_args,
                 candidate.get("order_type", "market"), candidate.get("limit_price"), client_order_id,
             )
             return ExecutionResult(True, str(getattr(response, "status", "submitted")), client_order_id, response)

@@ -76,7 +76,7 @@ The `scripts/` directory contains operational shell and Python scripts used for 
 - `test_alpaca_paper_connection.sh`: Verifies read-only connectivity and prints Alpaca account metrics. **[Safe/Read-only]**
 - `test_fake_paper_proposal.sh`: Creates a fake pending proposal for symbol `TEST` to verify the Telegram parser. **[Proposal-only]**
 - `test_paper_order_proposal.sh`: Generates a real-symbol `SPY` or `QQQ` paper proposal. **[Proposal-only]**
-- `test_paper_sell_proposal.sh`: (Future) Will generate a real-symbol paper exit proposal. **[Proposal-only]**
+- `test_paper_sell_proposal.sh`: Generates a real-symbol `SPY` paper exit proposal. **[Proposal-only]**
 - `store_secret_keychain.sh`: Stores API keys securely in the macOS Keychain. **[Safe/Read-only]**
 - `install_launchd.sh`: Installs the launchd plist file for recurring automation. **[Scheduling-related]**
 - `uninstall_launchd.sh`: Uninstalls the launchd plist file. **[Scheduling-related]**
@@ -166,13 +166,13 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 > [!WARNING]
 > **Stale-State Warning:** This section reflects the last verified manual checkpoint. It must be updated after every paper execution, sell/exit test, launchd setup, risk limit change, or live-trading gate change.
 
-- **Checkpoint Date**: June 18, 2026
+- **Checkpoint Date**: June 19, 2026
 - **Mode**: paper
 - **Live Enabled**: false
 - **Default AI Model**: `gpt-5.4-mini`
-- **Active Position**: 1 position in `SPY` (qty: `0.001325081` shares)
+- **Active Position**: 0 positions (the SPY position has been closed)
 - **Active Orders**: 0
-- **Daily Trade Count**: 1
+- **Daily Trade Count**: 2
 
 ## 18. Recent Milestones Completed
 - **Initial safe scaffold**: Basic project setup and configuration framework.
@@ -183,8 +183,8 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Single dry-run verification**: Executed dry cycle with SPY and QQQ generating HOLD signals.
 - **Fake paper proposal approval/rejection test**: Verified rejection gates and parsed responses using a mock `TEST` proposal.
 - **Controlled Alpaca Paper BUY execution test**: Successfully approved and executed a $1 paper order for `SPY`.
-- **Telegram polling offset bug fix**: Resolved unacknowledged updates by updating the Telegram offset parameter in `service.py`.
 - **Telegram message cleanup and system overview creation**: Overhauled bot wording, implemented Singapore Time formatting, and built the system overview document.
+- **Controlled Alpaca Paper SELL execution test**: Successfully approved and executed a paper sell order to close the SPY position.
 
 ## 19. How to Update This Document
 Whenever you edit code structure, config parameters, database tables, or broker/safety logic:
@@ -265,3 +265,4 @@ flowchart TD
 ## 23. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
+- **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
