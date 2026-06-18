@@ -1,0 +1,55 @@
+mode: paper
+live_enabled: false
+explicit_live_confirmation: false
+broker: alpaca
+scan_interval_minutes: 10
+require_power: true
+require_market_open: true
+watchlist: [SPY, QQQ]
+approved_strategy_versions: [rule_based_v1]
+telegram:
+  approval_enabled: true
+  proposal_expiry_minutes: 10
+  allow_plain_yes_only_when_single_pending_proposal: true
+ai:
+  enabled: true
+  provider: openai
+  model: gpt-5-mini
+  reasoning_effort_default: low
+  reasoning_effort_risk_review: medium
+  max_summary_words: 180
+  mask_account_values: true
+  allow_deterministic_only_live: false
+ml_shadow_enabled: false
+risk:
+  max_trade_notional_paper: 5
+  max_trade_notional_live: 5
+  max_trades_per_day: 1
+  max_open_positions: 1
+  allow_margin: false
+  allow_shorting: false
+  allow_options: false
+  allow_crypto: false
+  allow_fractional: true
+  signal_expiry_minutes: 10
+  stop_if_daily_loss_exceeds: 5
+  stop_if_weekly_loss_exceeds: 10
+  require_final_revalidation: true
+  allowed_order_types: [market, limit]
+  max_price_age_seconds: 120
+  min_historical_bars: 50
+  max_price_gap_pct: 15
+cash_management:
+  enabled: true
+  mode: recommend_only
+  profit_lock_rate: 0.30
+  cash_reserve_rate: 0.20
+  reinvest_rate: 0.50
+  minimum_withdrawal: 10
+  require_realized_settled_profit: true
+  allow_api_withdrawal: false
+storage:
+  sqlite_path: data/trading_agent.db
+  export_dir: data/exports
+  backup_dir: data/backups
+  active_db_must_be_local: true
