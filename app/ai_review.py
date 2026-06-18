@@ -38,8 +38,13 @@ class AIReviewer:
     def __init__(self, config: dict[str, Any], client: Any | None = None) -> None:
         self.config = config
         self.client = client
+        self.calls_made = 0
 
     def review(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        max_calls = self.config.get("max_calls_per_run", 5)
+        if self.calls_made >= max_calls:
+            return deterministic_review(proposal, f"AI review blocked: exceeded call limit of {max_calls}")
+        self.calls_made += 1
         safe = redact(proposal)
         try:
             if self.client is None:
@@ -54,7 +59,7 @@ class AIReviewer:
                 "(low/medium/high), should_block_for_reasoning_only (boolean), reasoning_notes. Data: " + json.dumps(safe, default=str)
             )
             response = self.client.responses.create(
-                model=self.config.get("model", "gpt-5-mini"),
+                model=self.config.get("model", "gpt-5.4-mini"),
                 reasoning={"effort": self.config.get("reasoning_effort_default", "low")},
                 input=prompt,
             )
