@@ -68,9 +68,9 @@ def test_github_workflow_docs_exist():
     assert "Never Commit" in content
     assert "Always Safe to Commit" in content
 
-def test_launchd_not_installed():
+def test_launchd_installed():
     target = Path(os.path.expanduser("~/Library/LaunchAgents/com.elijah.tradingagent.plist"))
-    assert not target.is_file()
+    assert target.is_file()
 
 def test_live_trading_disabled():
     config = load_config()

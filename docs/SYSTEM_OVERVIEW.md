@@ -159,7 +159,19 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - Verified via `pytest`.
 
 ## 15. Launchd / Scheduling Status
-**Currently not installed/loaded.** The agent must be run manually or triggered for single cycles.
+**Installed and loaded.**
+- **Label**: `com.elijah.tradingagent`
+- **Schedule**: Every 5 minutes (`StartInterval`: 300 seconds)
+- **Command Run**: `/Users/elijahang/Desktop/TradingAgent/scripts/start_agent.sh`
+- **Working Directory**: `/Users/elijahang/Desktop/TradingAgent`
+- **Stdout Log**: `logs/runtime/launchd.out`
+- **Stderr Log**: `logs/errors/launchd.err`
+- **How to Check Status**: Run `launchctl list | grep tradingagent`
+- **How to Stop/Disable Agent**: Run `./scripts/stop_agent.sh` (or `touch config/KILL_SWITCH`)
+- **How to Uninstall**: Run `./scripts/uninstall_launchd.sh`
+- **How to Run Manually**: Run `./scripts/run_once.sh`
+- **Behavior**: Scheduled runs are observation and scoring-first. GPT and Telegram calls are throttled and not triggered every 5 minutes by default. A Telegram approval response is strictly required before order execution, and live trading remains disabled.
+- **macOS TCC Note**: Because the project is located in `~/Desktop`, launchd requires `/bin/zsh` to be granted **Full Disk Access** in *System Settings > Privacy & Security > Full Disk Access* to read the shell script.
 
 ## 16. Live Trading Gates
 Live trading is disabled. If a live proposal is attempted, it is caught and blocked by the safety gate:
@@ -266,8 +278,24 @@ flowchart TD
     check_risk -- Yes --> submit[Submit Alpaca Paper Order]
 ```
 
-## 23. Change Log
+## 24. Power-Management Plan
+To ensure the bot executes reliably every 5 minutes during trading hours:
+1. **Mac State**: The Mac must remain awake during the trading window when plugged into AC power. Display sleep and screen saver are allowed, but full system sleep must be avoided.
+2. **Safest Option (caffeinate)**: The safest and most robust option is using the built-in macOS CLI tool `caffeinate`. The user can run:
+   `caffeinate -dim -t 23400 &`
+   to prevent idle/system sleep for 6.5 hours (the US market session duration) without permanently changing system-level settings.
+3. **Alternative (pmset)**: Alternatively, the system energy preferences can be configured via:
+   `sudo pmset -c sleep 0` (only when plugged into AC power).
+4. **Preflight Gates**:
+   - If AC power is disconnected, the preflight checks fail, and the execution is aborted cleanly.
+   - If internet connectivity is lost, the internet preflight check fails, and execution aborts.
+5. **Missed Intervals**:
+   - launchd `StartInterval` triggers does not replay missed runs in a burst after waking up. It will only run the next scheduled cycle.
+   - The run lock `logs/runtime/agent.lockdir` ensures overlapping runs never occur.
+
+## 25. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
 - **2026-06-19**: Implemented GitHub workflow remote setup, safe commit push helper, deterministic Trade Decision Score (0-100), market memory DB logging, and GPT call throttling.
+- **2026-06-19**: Installed and loaded the 5-minute launchd scheduled agent, verified preflight gates, and documented the power-management plan.
