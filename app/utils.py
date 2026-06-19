@@ -132,23 +132,41 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         
     if side.lower() == "buy":
         amount_str = f"${notional:.0f}" if notional is not None else "N/A"
+        score_val = proposal.get("score")
+        scoring_str = ""
+        if score_val is not None:
+            scoring_str = (
+                f"Recommendation score: {score_val:.0f}/100\n"
+                f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
+                f"Why: {proposal.get('reason', '')}\n\n"
+            )
         return (
             f"📄 Paper trade proposal\n\n"
             f"Mode: {mode_str}\n"
             f"Action: Buy {symbol}\n"
             f"Amount: {amount_str}\n"
             f"{mode_notice}\n\n"
+            f"{scoring_str}"
             f"Reply yes to approve, or no to reject.\n"
             f"Expires: {expiry_fmt}"
         )
     else:
         qty_str = f"{qty} shares" if qty is not None else (f"${notional:.0f}" if notional is not None else "N/A")
+        score_val = proposal.get("score")
+        scoring_str = ""
+        if score_val is not None:
+            scoring_str = (
+                f"Recommendation score: {score_val:.0f}/100\n"
+                f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
+                f"Why: {proposal.get('reason', '')}\n\n"
+            )
         return (
             f"📄 Paper sell proposal\n\n"
             f"Mode: {mode_str}\n"
             f"Action: Sell {symbol}\n"
             f"Quantity: {qty_str}\n"
             f"Purpose: Close or reduce the existing paper position.\n\n"
+            f"{scoring_str}"
             f"Reply yes to approve, or no to reject.\n"
             f"Expires: {expiry_fmt}"
         )

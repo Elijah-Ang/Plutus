@@ -20,6 +20,11 @@ ai:
   max_summary_words: 180
   mask_account_values: true
   allow_deterministic_only_live: false
+  ai_review_on_every_run: false
+  ai_review_min_score: 65
+  ai_review_min_interval_minutes: 30
+  ai_daily_call_limit: 10
+  ai_max_calls_per_run: 2
 ml_shadow_enabled: false
 risk:
   max_trade_notional_paper: 5

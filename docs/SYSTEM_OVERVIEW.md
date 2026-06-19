@@ -77,6 +77,7 @@ The `scripts/` directory contains operational shell and Python scripts used for 
 - `test_fake_paper_proposal.sh`: Creates a fake pending proposal for symbol `TEST` to verify the Telegram parser. **[Proposal-only]**
 - `test_paper_order_proposal.sh`: Generates a real-symbol `SPY` or `QQQ` paper proposal. **[Proposal-only]**
 - `test_paper_sell_proposal.sh`: Generates a real-symbol `SPY` paper exit proposal. **[Proposal-only]**
+- `safe_commit_push.sh`: Safe helper to run pytest, scan secrets, verify doc presence, and commit staged clean files to GitHub. **[Safe/Read-only]**
 - `store_secret_keychain.sh`: Stores API keys securely in the macOS Keychain. **[Safe/Read-only]**
 - `install_launchd.sh`: Installs the launchd plist file for recurring automation. **[Scheduling-related]**
 - `uninstall_launchd.sh`: Uninstalls the launchd plist file. **[Scheduling-related]**
@@ -132,6 +133,7 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `model_versions`: ML metadata records.
 - `config_snapshots`: Redacted config maps.
 - `daily_summaries`: Daily equity audits.
+- `market_memory`: Logs of 5-minute observation price telemetry, indicators, and recommendation scores.
 
 ## 13. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
@@ -150,6 +152,7 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Errors**: Directly database-backed (`errors`).
 - **Audit Events**: Directly database-backed (`audit_events`).
 - **Config Snapshot**: Directly database-backed (`config_snapshots`).
+- **Market Memory**: Telemetry comparison logs (`market_memory`).
 
 ## 14. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).
@@ -185,6 +188,7 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Controlled Alpaca Paper BUY execution test**: Successfully approved and executed a $1 paper order for `SPY`.
 - **Telegram message cleanup and system overview creation**: Overhauled bot wording, implemented Singapore Time formatting, and built the system overview document.
 - **Controlled Alpaca Paper SELL execution test**: Successfully approved and executed a paper sell order to close the SPY position.
+- **GitHub remote integration & 5-minute scoring**: Configured remote repository, added secret scanning pre-commit hooks, and designed lightweight 5-minute observation telemetry.
 
 ## 19. How to Update This Document
 Whenever you edit code structure, config parameters, database tables, or broker/safety logic:
@@ -266,3 +270,4 @@ flowchart TD
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
+- **2026-06-19**: Implemented GitHub workflow remote setup, safe commit push helper, deterministic Trade Decision Score (0-100), market memory DB logging, and GPT call throttling.
