@@ -373,3 +373,33 @@ def test_live_auto_execution_hard_blocked(temp_storage):
     }
     # Must remain false because mode is live
     assert service._should_auto_execute(proposal) is False
+
+def test_us_market_holiday_handling_juneteenth(temp_storage):
+    config = load_config()
+    broker = MockBroker()
+    broker.open = False # closed for holiday (e.g. Juneteenth)
+    
+    # Verify preflight block
+    from app.preflight import run_preflight
+    res = run_preflight(config, temp_storage, broker, lock_held=True)
+    assert res.passed is False
+    assert any(c.name == "market_open" and not c.passed for c in res.checks)
+    
+    # Verify scan cycle logic with closed market
+    service = TradingService(config, temp_storage, broker, "test_holiday_run_id")
+    service.telegram = MockTelegramBot()
+    
+    service.scan()
+    
+    # Verify no trade proposals were created
+    proposals = temp_storage.fetch_all("SELECT * FROM trade_proposals")
+    assert len(proposals) == 0
+    
+    # Verify no signals passed score filters
+    memory_rows = temp_storage.fetch_all("SELECT * FROM market_memory")
+    for row in memory_rows:
+        assert row["proposal_allowed"] == 0
+        assert row["gpt_called"] == 0
+        assert row["signal"] == "HOLD"
+        assert row["classification"] == "Weak / watch only"
+

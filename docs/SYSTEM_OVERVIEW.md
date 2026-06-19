@@ -295,6 +295,11 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
 
 ## 26. Market Coverage & Data Provider Policy
 - **US Equities/ETFs**: The system uses **Alpaca** as the broker and data source. Alpaca is configured for US-listed symbols only and is limited to Paper trading mode.
+- **Market Hours & Holidays**:
+  - The system queries the broker's real-time clock API to check if the market is open.
+  - On weekends and US market holidays (such as Juneteenth, Independence Day, Thanksgiving, Christmas, etc.), the broker reports the market is closed, causing the preflight `market_open` gate to fail.
+  - When the preflight gate fails, the execution cycle aborts cleanly and logs the run status as `blocked` with detail `market_open`.
+  - No database proposals are generated, no GPT calls are made, no Telegram messages are sent, and no orders can be executed during market closed hours or holidays.
 - **Singapore (SGX) & Hong Kong (HKEX)**:
   - SGX and HKEX observation profiles (e.g., `sgx_observation`, `hkex_observation`) are strictly placeholders/disabled.
   - Integration with SGX or HKEX requires a separate, dedicated market data provider or broker API to be explicitly configured.
