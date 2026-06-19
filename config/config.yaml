@@ -5,11 +5,64 @@ broker: alpaca
 scan_interval_minutes: 10
 require_power: true
 require_market_open: true
-watchlist: [SPY, QQQ]
+watchlist: [SPY, QQQ, DIA, IWM]
 approved_strategy_versions: [rule_based_v1]
+
+# Market Profiles
+market_profiles:
+  us_equities:
+    name: "US Equities Night Market"
+    status: active
+    timezone: "America/New_York"
+    session_hours: "09:30-16:00"
+    execution_enabled: true
+    proposals_enabled: true
+    broker: alpaca
+    watchlist: [SPY, QQQ, DIA, IWM]
+    observation_watchlist: [XLK, XLF, XLV, XLE, XLY]
+  sgx_observation:
+    name: "SGX Singapore Market"
+    status: observation_only
+    timezone: "Asia/Singapore"
+    session_hours: "09:00-17:00"
+    execution_enabled: false
+    proposals_enabled: false
+    broker: none
+    watchlist: [ES3.SI]
+  hkex_observation:
+    name: "HKEX Hong Kong Market"
+    status: observation_only
+    timezone: "Asia/Hong_Kong"
+    session_hours: "09:30-16:00"
+    execution_enabled: false
+    proposals_enabled: false
+    broker: none
+    watchlist: [2800.HK]
+
+# Dynamic Proposal Expiry Config
+proposal_expiry_default_minutes: 15
+proposal_expiry_min_minutes: 5
+proposal_expiry_max_minutes: 20
+proposal_expiry_high_volatility_minutes: 5
+proposal_expiry_low_volatility_minutes: 20
+proposal_expiry_notify_on_expiry: true
+proposal_expiry_high_volatility_threshold: 0.20
+proposal_expiry_low_volatility_threshold: 0.12
+
+# Auto-Execution Design (strictly paper-only, disabled by default)
+auto_execution_enabled: false
+auto_execution_mode: manual_only
+paper_auto_min_asset_score: 90
+paper_auto_min_trade_score: 90
+paper_auto_max_notional: 1
+paper_auto_max_trades_per_day: 1
+paper_auto_require_no_open_orders: true
+paper_auto_require_final_revalidation: true
+paper_auto_notify_after_execution: true
+
 telegram:
   approval_enabled: true
-  proposal_expiry_minutes: 10
+  proposal_expiry_minutes: 15
   allow_plain_yes_only_when_single_pending_proposal: true
 ai:
   enabled: true

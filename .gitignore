@@ -28,3 +28,5 @@ config/KILL_SWITCH
 .DS_Store
 *.xlsx
 *.csv
+.Rhistory
+*.Rhistory

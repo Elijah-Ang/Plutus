@@ -12,7 +12,7 @@ from .storage import Storage
 from .utils import PROJECT_ROOT
 
 SHEETS: list[tuple[str, str | None]] = [
-    ("Summary Dashboard", None), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
+    ("Summary Dashboard", None), ("Proposals", "trade_proposals"), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
     ("Orders", "orders"), ("Fills", "fills"), ("Positions", "positions"), ("Signals", "signals"),
     ("Risk Checks", "risk_checks"), ("AI Reviews", "ai_reviews"), ("Approvals", "approvals"),
     ("Cash Management", "cashout_suggestions"), ("ML Shadow Metrics", "model_versions"),
@@ -50,6 +50,15 @@ def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Pa
     positions = storage.fetch_all("SELECT * FROM positions ORDER BY created_at DESC")
     runs = storage.fetch_all("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1")
     errors = storage.fetch_all("SELECT * FROM errors ORDER BY created_at DESC LIMIT 1")
+    profiles = config.get("market_profiles", {})
+    active_profile_key = "default"
+    active_profile = {}
+    for k, v in profiles.items():
+        if v.get("status") == "active":
+            active_profile_key = k
+            active_profile = v
+            break
+
     metrics = [
         ("Mode", config.get("mode", "paper")), ("Report date", date.today().isoformat()),
         ("Starting capital", "See broker statement"), ("Current equity", "See latest cash snapshot"),
@@ -64,6 +73,13 @@ def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Pa
         ("Weekly loss limit status", "See Risk Checks"), ("Last bot run", runs[0]["started_at"] if runs else "Never"),
         ("Last error", errors[0]["message"] if errors else "None"), ("System health status", "Review latest preflight checks"),
         ("Suggested cash-out amount", "Recommendation only; see Cash Management"),
+        ("Active Market Profile", active_profile_key),
+        ("Execution Enabled", "yes" if active_profile.get("execution_enabled") else "no"),
+        ("Default Proposal Expiry (minutes)", config.get("proposal_expiry_default_minutes", 15)),
+        ("Auto-execution Mode Status", config.get("auto_execution_mode", "manual_only")),
+        ("Auto-execution Enabled", str(config.get("auto_execution_enabled", False))),
+        ("Asset Universe Status (Tradeable)", ", ".join(active_profile.get("watchlist", [])) if active_profile else ""),
+        ("Asset Universe Status (Observation)", ", ".join(active_profile.get("observation_watchlist", [])) if active_profile else ""),
     ]
     summary.append(["TradingAgent Summary Dashboard"])
     summary["A1"].font = Font(bold=True, size=16)

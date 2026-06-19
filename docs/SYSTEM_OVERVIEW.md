@@ -293,6 +293,19 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
    - launchd `StartInterval` triggers does not replay missed runs in a burst after waking up. It will only run the next scheduled cycle.
    - The run lock `logs/runtime/agent.lockdir` ensures overlapping runs never occur.
 
+## 26. Market Coverage & Data Provider Policy
+- **US Equities/ETFs**: The system uses **Alpaca** as the broker and data source. Alpaca is configured for US-listed symbols only and is limited to Paper trading mode.
+- **Singapore (SGX) & Hong Kong (HKEX)**:
+  - SGX and HKEX observation profiles (e.g., `sgx_observation`, `hkex_observation`) are strictly placeholders/disabled.
+  - Integration with SGX or HKEX requires a separate, dedicated market data provider or broker API to be explicitly configured.
+  - Alpaca **cannot** be assigned as a data provider or broker for SGX or HKEX, and any configuration trying to do so is blocked.
+  - If a profile is active but has no data provider or broker (e.g., `broker: none` or missing), the system logs a `data_source_missing` warning and skips scanning for safety.
+  - Daytime market observation for SGX/HKEX is a future extension to be developed once a proper data provider has been selected and configured.
+- **Anti-Hallucination Guardrails**:
+  - The system **never** creates fake SGX/HKEX market data, does not scrape random web pages, and does not add uncontrolled news/data scraping.
+  - The system must not hallucinate, mock, or infer live market data. If real, structured data is not available from an approved API, the symbol/profile is skipped.
+  - Profiles for SGX/HKEX are configured as `observation_only` or `disabled` with `execution_enabled: false` and `proposals_enabled: false` to ensure no proposals are created or executed.
+
 ## 25. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.

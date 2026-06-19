@@ -64,7 +64,7 @@ class RiskEngine:
         check("valid_price", isinstance(price, (int, float)) and price > 0, "latest price must be positive")
         price_at = _dt(proposal.get("price_at"))
         age = (now - price_at).total_seconds() if price_at else float("inf")
-        check("fresh_price", 0 <= age <= self.risk.get("max_price_age_seconds", 120), "price timestamp must be fresh")
+        check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "price timestamp must be fresh")
         check("historical_data", int(proposal.get("historical_bars", 0)) >= self.risk.get("min_historical_bars", 50), "sufficient history required")
         check("volume", proposal.get("volume") is not None and proposal.get("volume", 0) >= 0, "volume must be present")
         check("price_gap", abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious price gap blocked")
@@ -80,7 +80,61 @@ class RiskEngine:
         check("duplicate_position", not (is_entry and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
         check("margin", not context.get("uses_margin", False) or self.risk.get("allow_margin", False), "margin use must be disabled")
         check("shorting", str(proposal.get("side", "")).lower() != "sell" or not is_entry or self.risk.get("allow_shorting", False), "short entries are disabled")
-        check("asset_class", proposal.get("asset_class", "equity") == "equity", "only equities are allowed")
+        # Profile universe checks
+        profiles = self.config.get("market_profiles", {})
+        symbol = proposal.get("symbol", "").upper()
+        
+        if not profiles:
+            # Fallback for configuration snapshots / testing that do not define profiles
+            watchlist = self.config.get("watchlist", ["SPY", "QQQ"])
+            check("approved_universe", symbol in watchlist, f"symbol {symbol} not in watchlist")
+            check("asset_class", proposal.get("asset_class", "equity") == "equity", "only equities are allowed")
+            check("options_blocked", proposal.get("asset_class") != "option", "options are blocked")
+            check("crypto_blocked", proposal.get("asset_class") != "crypto" and not symbol.endswith("USD"), "crypto is blocked")
+            check("forex_futures_blocked", proposal.get("asset_class") not in {"forex", "future"}, "forex and futures are blocked")
+            leveraged_inverse = {"TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "UDOW", "TNA"}
+            check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
+        else:
+            # Find which profile matches the symbol
+            symbol_profile = None
+            symbol_profile_key = None
+            for p_key, p_val in profiles.items():
+                if symbol in p_val.get("watchlist", []) or symbol in p_val.get("observation_watchlist", []):
+                    symbol_profile = p_val
+                    symbol_profile_key = p_key
+                    break
+                    
+            if symbol_profile:
+                # Check if active profile
+                is_active_profile = symbol_profile.get("status") == "active"
+                check("active_profile", is_active_profile, f"profile {symbol_profile_key} is not active")
+                
+                # Check watchlist
+                check("approved_universe", symbol in symbol_profile.get("watchlist", []), f"symbol {symbol} not in active watchlist")
+                
+                # Check execution
+                check("profile_execution_enabled", symbol_profile.get("execution_enabled", False) is True, f"execution disabled for profile {symbol_profile_key}")
+                
+                # Check proposals
+                check("profile_proposals_enabled", symbol_profile.get("proposals_enabled", False) is True, f"proposals disabled for profile {symbol_profile_key}")
+                
+                # Check broker
+                check("profile_broker_alpaca", symbol_profile.get("broker") == "alpaca", f"broker must be alpaca for execution")
+                
+                # Alpaca cannot be SGX/HKEX broker/data provider
+                is_sgx_or_hkex = symbol.endswith(".SI") or symbol.endswith(".HK")
+                if is_sgx_or_hkex:
+                    check("sgx_hkex_no_alpaca", symbol_profile.get("broker") != "alpaca", "Alpaca cannot be assigned as SGX/HKEX broker/data provider")
+                
+                # Blocked asset class checks
+                check("asset_class", proposal.get("asset_class", "equity") == "equity", "only equities are allowed")
+                check("options_blocked", proposal.get("asset_class") != "option", "options are blocked")
+                check("crypto_blocked", proposal.get("asset_class") != "crypto" and not symbol.endswith("USD"), "crypto is blocked")
+                check("forex_futures_blocked", proposal.get("asset_class") not in {"forex", "future"}, "forex and futures are blocked")
+                leveraged_inverse = {"TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "UDOW", "TNA"}
+                check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
+            else:
+                check("approved_universe", False, f"no matching market profile found for symbol {symbol}")
         check("daily_loss", float(context.get("daily_loss", 0)) < self.risk.get("stop_if_daily_loss_exceeds", 5), "daily loss limit")
         check("weekly_loss", float(context.get("weekly_loss", 0)) < self.risk.get("stop_if_weekly_loss_exceeds", 10), "weekly loss limit")
 

@@ -109,14 +109,33 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     notional = proposal.get("notional")
     qty = proposal.get("qty")
     expiry = proposal.get("expires_at", "")
-    expiry_fmt = format_expiry(expiry)
     
+    expiry_minutes = proposal.get("expiry_minutes", 15)
+    volatility_class = proposal.get("volatility_class", "normal")
+    expiry_fmt = format_sgt(expiry)
+
+    if volatility_class == "high":
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes because the market is moving quickly."
+    elif volatility_class == "low":
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes because conditions are relatively stable."
+    else:
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes"
+
+    score_val = proposal.get("score", 50)
+    if score_val >= 80:
+        urgency_note = "High priority/confidence signal."
+    elif score_val >= 65:
+        urgency_note = "Moderate confidence signal."
+    else:
+        urgency_note = "Lower urgency, watch-only signal."
+
     if symbol == "TEST" or is_fake_test:
         return (
             f"🧪 Fake paper test proposal\n\n"
             f"This is only testing the Telegram approval flow.\n"
             f"No Alpaca order will be placed for this fake TEST symbol.\n\n"
             f"Reply yes to approve the test, or no to reject it.\n"
+            f"Time to decide: {expiry_minutes} minutes\n"
             f"Expires: {expiry_fmt}"
         )
         
@@ -132,11 +151,11 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         
     if side.lower() == "buy":
         amount_str = f"${notional:.0f}" if notional is not None else "N/A"
-        score_val = proposal.get("score")
         scoring_str = ""
         if score_val is not None:
             scoring_str = (
                 f"Recommendation score: {score_val:.0f}/100\n"
+                f"Urgency guidance: {urgency_note}\n"
                 f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
                 f"Why: {proposal.get('reason', '')}\n\n"
             )
@@ -148,15 +167,16 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"{mode_notice}\n\n"
             f"{scoring_str}"
             f"Reply yes to approve, or no to reject.\n"
+            f"{time_to_decide}\n"
             f"Expires: {expiry_fmt}"
         )
     else:
         qty_str = f"{qty} shares" if qty is not None else (f"${notional:.0f}" if notional is not None else "N/A")
-        score_val = proposal.get("score")
         scoring_str = ""
         if score_val is not None:
             scoring_str = (
                 f"Recommendation score: {score_val:.0f}/100\n"
+                f"Urgency guidance: {urgency_note}\n"
                 f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
                 f"Why: {proposal.get('reason', '')}\n\n"
             )
@@ -168,6 +188,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"Purpose: Close or reduce the existing paper position.\n\n"
             f"{scoring_str}"
             f"Reply yes to approve, or no to reject.\n"
+            f"{time_to_decide}\n"
             f"Expires: {expiry_fmt}"
         )
 
