@@ -161,17 +161,17 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 ## 15. Launchd / Scheduling Status
 **Installed and loaded.**
 - **Label**: `com.elijah.tradingagent`
-- **Schedule**: Every 5 minutes (`StartInterval`: 300 seconds)
-- **Command Run**: `/Users/elijahang/Desktop/TradingAgent/scripts/start_agent.sh`
-- **Working Directory**: `/Users/elijahang/Desktop/TradingAgent`
+- **Schedule**: Every 10 minutes (`StartInterval`: 600 seconds)
+- **Command Run**: `/Users/elijahang/Projects/TradingAgent/scripts/run_once.sh`
+- **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
 - **Stdout Log**: `logs/runtime/launchd.out`
 - **Stderr Log**: `logs/errors/launchd.err`
 - **How to Check Status**: Run `launchctl list | grep tradingagent`
 - **How to Stop/Disable Agent**: Run `./scripts/stop_agent.sh` (or `touch config/KILL_SWITCH`)
 - **How to Uninstall**: Run `./scripts/uninstall_launchd.sh`
 - **How to Run Manually**: Run `./scripts/run_once.sh`
-- **Behavior**: Scheduled runs are observation and scoring-first. GPT and Telegram calls are throttled and not triggered every 5 minutes by default. A Telegram approval response is strictly required before order execution, and live trading remains disabled.
-- **macOS TCC Note**: Because the project is located in `~/Desktop`, launchd requires `/bin/zsh` to be granted **Full Disk Access** in *System Settings > Privacy & Security > Full Disk Access* to read the shell script.
+- **Behavior**: Scheduled runs are observation and scoring-first. GPT and Telegram calls are throttled and not triggered every 10 minutes by default. A Telegram approval response is strictly required before order execution, and live trading remains disabled.
+- **macOS Sandbox Note**: The project has been relocated to `/Users/elijahang/Projects/TradingAgent` to completely bypass the macOS TCC/Sandbox restrictions on `~/Desktop`, ensuring launchd runs execute successfully without requiring system-wide Full Disk Access configurations.
 
 ## 16. Live Trading Gates
 Live trading is disabled. If a live proposal is attempted, it is caught and blocked by the safety gate:
