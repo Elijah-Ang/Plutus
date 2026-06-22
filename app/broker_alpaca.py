@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .broker_interface import BrokerInterface
+from .capabilities import require_live_trading_support
 from .utils import get_secret
 
 
@@ -13,8 +14,9 @@ class AlpacaBroker(BrokerInterface):
         self.config = config
         self.mode = config.get("mode", "paper")
         if self.mode != "paper":
-            if config.get("live_enabled") is not True or config.get("explicit_live_confirmation") is not True:
-                raise PermissionError("Live broker initialization requires both live_enabled and explicit confirmation")
+            # This build has no live capability. Fail before reading any key so
+            # live credentials cannot be selected through configuration alone.
+            require_live_trading_support()
         key = api_key or get_secret("ALPACA_API_KEY")
         secret = secret_key or get_secret("ALPACA_SECRET_KEY")
         if not key or not secret:
@@ -50,8 +52,8 @@ class AlpacaBroker(BrokerInterface):
         return self.data.get_stock_bars(request).df
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
-        if self.mode != "paper" and not (self.config.get("live_enabled") is True and self.config.get("explicit_live_confirmation") is True):
-            raise PermissionError("Live order blocked by safety gates")
+        if self.mode != "paper":
+            require_live_trading_support()
         if symbol.upper() == "TEST":
             return type("MockOrder", (), {"status": "submitted", "id": f"mock-order-{client_order_id}"})()
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -66,8 +68,35 @@ class AlpacaBroker(BrokerInterface):
     def get_order(self, order_id: str) -> Any:
         return self.trading.get_order_by_id(order_id)
 
+    def get_order_by_client_order_id(self, client_order_id: str) -> Any:
+        return self.trading.get_order_by_client_id(client_order_id)
+
+    def get_clock(self) -> Any:
+        return self.trading.get_clock()
+
+    def get_loss_metrics(self) -> dict[str, float | None]:
+        """Return positive loss amounts from authoritative Alpaca data."""
+        account = self.get_account()
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
+        daily_loss = max(0.0, last_equity - equity)
+
+        weekly_loss: float | None = None
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+            history = self.trading.get_portfolio_history(
+                GetPortfolioHistoryRequest(period="1W", timeframe="1D", extended_hours=False)
+            )
+            equities = [float(value) for value in (getattr(history, "equity", None) or []) if value is not None and float(value) > 0]
+            if len(equities) >= 2:
+                weekly_loss = max(0.0, equities[0] - equities[-1])
+        except Exception:
+            weekly_loss = None
+        return {"daily_loss": daily_loss, "weekly_loss": weekly_loss}
+
     def is_market_open(self) -> bool:
-        return bool(self.trading.get_clock().is_open)
+        return bool(self.get_clock().is_open)
 
 
 AlpacaPaperBroker = AlpacaBroker

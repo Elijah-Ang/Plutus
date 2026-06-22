@@ -14,6 +14,8 @@ This document outlines the rules and best practices for contributing to the Plut
 - `.venv/` (Python virtual environments)
 - `__pycache__/`, `*.py[cod]` (Python compilation files)
 - `config/KILL_SWITCH` (local safety switch file)
+- Raw Telegram update/dump files and local diagnostic payloads
+- Model files (`.joblib`, `.pkl`) and package/cache artifacts
 
 ### Always Safe to Commit
 - Core source files under `app/` (e.g. `app/main.py`, `app/service.py`)
@@ -29,7 +31,9 @@ Before committing or pushing code:
 1. **Check Status**: Run `git status` to ensure only safe files are staged.
 2. **Review Diff**: Run `git diff --cached` to verify that no API keys or personal identifiers are written into code.
 3. **Run Tests**: Verify all tests pass by running `.venv/bin/pytest`.
-4. **Run Secret Scan**: Use `scripts/safe_commit_push.sh` to automatically check staged files for high-entropy strings and secret key prefixes (like `sk-` or Alpaca tokens).
+4. **Run Secret Scan**: Use `scripts/safe_commit_push.sh` to check staged files for supported secret-value patterns and forbidden runtime paths. This is defense in depth, not a substitute for reviewing `git diff --cached` or a maintained secret scanner.
+
+The helper scans staged blobs only. It does not certify Git history, unstaged files, or arbitrary unknown secret formats. For sensitive releases, also use a maintained scanner such as Gitleaks and review the staged diff manually.
 
 ## 3. Handling Suspected Secret Exposure
 

@@ -30,3 +30,6 @@ config/KILL_SWITCH
 *.csv
 .Rhistory
 *.Rhistory
+*telegram*update*.json
+raw_telegram*
+data/telegram_updates/

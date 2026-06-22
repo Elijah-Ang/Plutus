@@ -29,9 +29,10 @@ TradingAgent is a supervised, user-gated paper trading assistant that scans a wa
 
 ## 2. Current Safety Status
 The system is strictly configured for **Paper Trading Only** (`mode: paper`, `live_enabled: false`).
-- All live trading functions are hard-blocked by code-level permission checks.
+- Live trading is disabled by current configuration (`mode: paper`, `live_enabled: false`, `explicit_live_confirmation: false`) and rejected by a non-configurable capability gate in this build.
+- The current build now also has non-configurable code capability gates: live trading and auto-execution are both unsupported even if YAML is changed.
 - A local **Kill Switch** mechanism allows immediate pause of all scanner evaluations and execution flows.
-- Every order execution requires a double-validation step (first when proposed, and a final revalidation immediately before execution).
+- Every order execution requires manual Telegram approval plus a double-validation step. Final validation refreshes broker/account loss and margin state, internet, Telegram, broker, database, power, and market state; unknown values block execution.
 
 ## 3. High-Level Architecture
 The project follows a modular design with clear separation between:
@@ -46,7 +47,7 @@ The project follows a modular design with clear separation between:
 - `config/`: Configurations, strategies, and risk limit files.
 - `data/`: Databases, exports (Excel), backups, and cache.
 - `docs/`: System documentation.
-- `launchd/`: Templates for future OS-level scheduling.
+- `launchd/`: Source template for the currently installed 10-minute LaunchAgent.
 - `logs/`: Runtime logs, audit events, and error logs.
 - `scripts/`: Operational scripts and manual test runners.
 - `tests/`: Project unit and integration tests.
@@ -61,15 +62,18 @@ The project follows a modular design with clear separation between:
 - [service.py](../app/service.py): Runs the cycle flow (polled Telegram parser -> strategy scanner -> proposal -> AI review).
 - [approval_parser.py](../app/approval_parser.py): Parses Telegram approvals and rejections (supports prefix matching, side, and symbol disambiguation).
 - [risk_engine.py](../app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
-- [broker_alpaca.py](../app/broker_alpaca.py): Integrates the Alpaca API and blocks live endpoint submissions.
+- [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
+- [reconciliation.py](../app/reconciliation.py): Read-only broker reconciliation that updates local order/fill/account/position records without submitting or retrying orders.
+- [capabilities.py](../app/capabilities.py): Non-configurable hard gates keeping live trading and auto-execution unsupported.
+- [run_lock.py](../app/run_lock.py): Inspects PID/timestamp lock metadata and identifies only safely recoverable stale locks.
 - [storage.py](../app/storage.py): Manages database transactions, initialization, and approvals usage.
 - [telegram_bot.py](../app/telegram_bot.py): Wrapper around the Telegram Bot API.
 - [utils.py](../app/utils.py): Utility tools including timezone conversion to SGT and message templates.
 
 ## 7. Scripts and What They Do
 The `scripts/` directory contains operational shell and Python scripts used for testing and execution:
-- `setup_venv.sh`: Installs Python virtual environment, updates pip, and installs requirements. **[Safe/Read-only]**
+- `setup_venv.sh`: Creates/updates the Python virtual environment and installs requirements. **[Local-state modifying]**
 - `run_once.sh`: Runs a single bounded scan and polling cycle. **[Execution-capable]**
 - `export_excel.sh`: Generates the openpyxl summary report workbook. **[Safe/Read-only]**
 - `test_openai_summary.sh`: Manually tests the OpenAI connection and summary generation. **[Safe/Read-only]**
@@ -77,12 +81,12 @@ The `scripts/` directory contains operational shell and Python scripts used for 
 - `test_fake_paper_proposal.sh`: Creates a fake pending proposal for symbol `TEST` to verify the Telegram parser. **[Proposal-only]**
 - `test_paper_order_proposal.sh`: Generates a real-symbol `SPY` or `QQQ` paper proposal. **[Proposal-only]**
 - `test_paper_sell_proposal.sh`: Generates a real-symbol `SPY` paper exit proposal. **[Proposal-only]**
-- `safe_commit_push.sh`: Safe helper to run pytest, scan secrets, verify doc presence, and commit staged clean files to GitHub. **[Safe/Read-only]**
+- `safe_commit_push.sh`: Helper to run pytest, perform a limited staged-file secret scan, verify doc presence, then commit and push. **[Git-state modifying]**
 - `store_secret_keychain.sh`: Stores API keys securely in the macOS Keychain. **[Safe/Read-only]**
 - `install_launchd.sh`: Installs the launchd plist file for recurring automation. **[Scheduling-related]**
 - `uninstall_launchd.sh`: Uninstalls the launchd plist file. **[Scheduling-related]**
-- `rotate_logs.sh`: Truncates and backs up application logs. **[Safe/Read-only]**
-- `backup_db.sh`: Creates a copy of the SQLite database file. **[Safe/Read-only]**
+- `rotate_logs.sh`: Deletes/archives logs according to retention rules. **[Local-state modifying]**
+- `backup_db.sh`: Creates and retains local SQLite/archive copies. **[Local-state modifying]**
 - `start_agent.sh` / `stop_agent.sh`: Utility scripts to load or unload the scheduled jobs. **[Scheduling-related]**
 - `telegram_get_updates.py`: Small Python utility to print raw Telegram JSON updates. **[Safe/Read-only]**
 - `telegram_test.py`: Simple verification script to send a basic Telegram message. **[Safe/Read-only]**
@@ -137,7 +141,8 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
 - **Position Gates**: Enforces `max_open_positions` (default 1) and `max_trades_per_day` (default 1).
 - **Drawdown Gates**: Stops trading if daily/weekly loss limits are breached.
 - **Expiry Gates**: Blocks execution if the proposal has expired.
-- **Live Trading & Auto-Execution**: Strictly disabled. No orders can be placed without manual Telegram approval. No reply = no order.
+- **Live Trading & Auto-Execution**: Both are unsupported by code-level capability constants as well as disabled in configuration. YAML and Telegram cannot enable them. Normal operation requires Telegram approval and no reply means no order.
+- **Authoritative Final Context**: Daily/weekly losses come from Alpaca account/portfolio history, margin use comes from current account values, and broker/internet/Telegram/database health is checked rather than assumed. Missing loss or margin state blocks risk approval.
 
 ## 12. Database / SQLite Tables
 Stored at `data/trading_agent.db`. The schema contains the following tables:
@@ -163,11 +168,12 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `model_versions`: ML metadata records.
 - `config_snapshots`: Redacted config maps.
 - `daily_summaries`: Daily equity audits.
-- `market_memory`: Logs of 5-minute observation price telemetry, indicators, and recommendation scores.
+- `market_memory`: Logs of scheduled observation telemetry (currently a 10-minute target interval), indicators, and recommendation scores.
 - `telegram_digests`: History of 30-minute Telegram informational digests.
 
 ## 13. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
+- Telegram raw text and sender IDs are redacted by default. JSON payloads are recursively redacted and scanned for supported secret-value patterns before cells are written.
 - **Summary Dashboard**: Derived from database records (calculated metrics).
 - **Daily PnL**: Directly database-backed (`daily_summaries`).
 - **Trades**: Directly database-backed (`orders`).
@@ -202,6 +208,8 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **How to Uninstall**: Run `./scripts/uninstall_launchd.sh`
 - **How to Run Manually**: Run `./scripts/run_once.sh`
 - **Behavior**: Scheduled runs are observation and scoring-first. GPT and Telegram calls are throttled and not triggered every 10 minutes by default. A Telegram approval response is strictly required before order execution, and live trading remains disabled.
+- **Reconciliation**: Each passing cycle reads existing Alpaca order/account/position state and reconciles SQLite before scanning. Reconciliation has no submission or retry operation.
+- **Lock Recovery**: `run_once.sh` records PID and epoch time. Active/recent locks are preserved; only a dead owner older than the grace period is atomically recovered and audited.
 - **macOS Sandbox Note**: The project has been relocated to `/Users/elijahang/Projects/TradingAgent` to completely bypass the macOS TCC/Sandbox restrictions on `~/Desktop`, ensuring launchd runs execute successfully without requiring system-wide Full Disk Access configurations.
 
 ## 16. Live Trading Gates
@@ -212,13 +220,13 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 > [!WARNING]
 > **Stale-State Warning:** This section reflects the last verified manual checkpoint. It must be updated after every paper execution, sell/exit test, launchd setup, risk limit change, or live-trading gate change.
 
-- **Checkpoint Date**: June 19, 2026
+- **Checkpoint Date**: June 22, 2026
 - **Mode**: paper
 - **Live Enabled**: false
 - **Default AI Model**: `gpt-5.4-mini`
 - **Active Position**: 0 positions (the SPY position has been closed)
 - **Active Orders**: 0
-- **Daily Trade Count**: 2
+- **Daily Trade Count**: 0 local order rows for June 22; Alpaca reports two older filled paper orders
 
 ## 18. Recent Milestones Completed
 - **Initial safe scaffold**: Basic project setup and configuration framework.
@@ -231,7 +239,7 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Controlled Alpaca Paper BUY execution test**: Successfully approved and executed a $1 paper order for `SPY`.
 - **Telegram message cleanup and system overview creation**: Overhauled bot wording, implemented Singapore Time formatting, and built the system overview document.
 - **Controlled Alpaca Paper SELL execution test**: Successfully approved and executed a paper sell order to close the SPY position.
-- **GitHub remote integration & 5-minute scoring**: Configured remote repository, added secret scanning pre-commit hooks, and designed lightweight 5-minute observation telemetry.
+- **GitHub remote integration & scheduled scoring**: Configured the remote repository, added a limited staged-file secret-scan helper, and designed lightweight 10-minute observation telemetry.
 
 ## 19. How to Update This Document
 Whenever you edit code structure, config parameters, database tables, or broker/safety logic:
@@ -310,7 +318,7 @@ flowchart TD
 ```
 
 ## 24. Power-Management Plan
-To ensure the bot executes reliably every 5 minutes during trading hours:
+To support the bot's current 10-minute schedule during trading hours:
 1. **Mac State**: The Mac must remain awake during the trading window when plugged into AC power. Display sleep and screen saver are allowed, but full system sleep must be avoided.
 2. **Safest Option (caffeinate)**: The safest and most robust option is using the built-in macOS CLI tool `caffeinate`. The user can run:
    `caffeinate -dim -t 23400 &`
@@ -354,6 +362,8 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
 - **2026-06-19**: Implemented GitHub workflow remote setup, safe commit push helper, deterministic Trade Decision Score (0-100), market memory DB logging, and GPT call throttling.
-- **2026-06-19**: Installed and loaded the 5-minute launchd scheduled agent, verified preflight gates, and documented the power-management plan.
+- **2026-06-19**: Installed and loaded the launchd scheduled agent, later set to 10 minutes, verified preflight gates, and documented the power-management plan.
 - **2026-06-22**: Upgraded Telegram proposals with rule-based and GPT confidence reviews, implemented dynamic proposal expiry times (5-20 min limits), added one-shot expiry notifications, extended SQLite market_memory columns for reporting, and added validation tests.
 - **2026-06-22**: Implemented a 30-minute Telegram informational market digest feature with database logging, throttling constraints, Excel reporting, and validation tests.
+- **2026-06-22**: Audited the active system and corrected stale documentation concerning scheduling, script side effects, live/auto-execution guarantees, and current paper-account state.
+- **2026-06-22**: Repaired authoritative final-risk context, hard-disabled live/auto capabilities, added read-only order/fill reconciliation, safe stale-lock recovery, report/Telegram redaction, and functional near-close clock handling.

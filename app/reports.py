@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Font, PatternFill
 
 from .storage import Storage
-from .utils import PROJECT_ROOT
+from .utils import PROJECT_ROOT, json_dumps, redact
 
 SHEETS: list[tuple[str, str | None]] = [
     ("Summary Dashboard", None), ("Proposals", "trade_proposals"), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
@@ -22,7 +24,32 @@ SHEETS: list[tuple[str, str | None]] = [
 ]
 
 
-def _write_rows(sheet: Any, rows: list[dict[str, Any]]) -> None:
+SECRET_VALUE_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"[0-9]{6,}:[A-Za-z0-9_-]{20,}"),
+    re.compile(r"PK[A-Z0-9]{15,}"),
+)
+
+
+def redact_report_value(table: str, header: str, value: Any, include_raw_telegram: bool = False) -> Any:
+    if table == "approvals" and header == "raw_message" and not include_raw_telegram:
+        return "[REDACTED TELEGRAM TEXT]"
+    if table == "approvals" and header == "sender_id":
+        return "[REDACTED ID]"
+    if value is None:
+        return None
+    if header in {"payload", "values_json", "config_json", "detail", "risks"} and isinstance(value, str):
+        try:
+            value = json_dumps(redact(json.loads(value)))
+        except (ValueError, TypeError):
+            value = redact(value)
+    if isinstance(value, str):
+        for pattern in SECRET_VALUE_PATTERNS:
+            value = pattern.sub("[REDACTED SECRET]", value)
+    return value
+
+
+def _write_rows(sheet: Any, rows: list[dict[str, Any]], table: str, include_raw_telegram: bool = False) -> None:
     if not rows:
         sheet.append(["No records"])
         return
@@ -32,14 +59,14 @@ def _write_rows(sheet: Any, rows: list[dict[str, Any]]) -> None:
         cell.font = Font(bold=True)
         cell.fill = PatternFill("solid", fgColor="D9EAF7")
     for row in rows:
-        sheet.append([row.get(header) for header in headers])
+        sheet.append([redact_report_value(table, header, row.get(header), include_raw_telegram) for header in headers])
     sheet.freeze_panes = "A2"
     for column in sheet.columns:
         width = min(50, max(len(str(cell.value or "")) for cell in column) + 2)
         sheet.column_dimensions[column[0].column_letter].width = width
 
 
-def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Path | None = None) -> Path:
+def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Path | None = None, include_raw_telegram: bool = False) -> Path:
     output = Path(output_path or PROJECT_ROOT / "data" / "exports" / f"trading_agent_report_{date.today().isoformat()}.xlsx")
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
@@ -92,7 +119,7 @@ def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Pa
     summary.column_dimensions["B"].width = 48
     for name, table in SHEETS[1:]:
         sheet = workbook.create_sheet(name)
-        _write_rows(sheet, storage.fetch_all(f'SELECT * FROM "{table}"'))
+        _write_rows(sheet, storage.fetch_all(f'SELECT * FROM "{table}"'), str(table), include_raw_telegram)
         sheet.conditional_formatting.add("A2:Z10000", CellIsRule(operator="lessThan", formula=["0"], fill=PatternFill("solid", fgColor="F4CCCC")))
     workbook.save(output)
     return output

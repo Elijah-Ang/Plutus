@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .ai_review import AIReviewer, deterministic_review
+from .capabilities import AUTO_EXECUTION_SUPPORTED
 
 logger = logging.getLogger("trading_agent")
 
 from .approval_parser import parse_approval
 from .execution import Executor
+from .internet import internet_available
 from .market_data import normalize_bars
 from .power import get_power_status
 from .risk_engine import RiskCheck, RiskEngine
+from .reconciliation import BrokerReconciler
 from .strategy_rule_based import evaluate_symbol
 from .telegram_bot import TelegramBot
 from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason, format_sgt
@@ -33,26 +37,97 @@ class TradingService:
         telegram = TelegramBot()
         self.telegram = telegram
         self.ai = AIReviewer(config.get("ai", {}))
+        self._context_cache: tuple[float, dict[str, Any]] | None = None
+        self._auto_block_audited = False
 
     def _risk_engine(self, proposal_id: str, stage: str) -> RiskEngine:
         return RiskEngine(self.config, lambda c: self.storage.record_check(self.run_id, c.name, c.passed, c.reason, proposal_id, stage))
 
+    def _authoritative_runtime_state(self, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if not force and self._context_cache and now - self._context_cache[0] <= 15:
+            return self._context_cache[1]
+
+        telegram_health = getattr(self.telegram, "is_available", None)
+        state: dict[str, Any] = {
+            "internet_available": internet_available(),
+            "database_writable": self.storage.writable(),
+            "telegram_available": bool(telegram_health(force=force)) if callable(telegram_health) else False,
+            "broker_available": False,
+            "market_open": False,
+            "account": None,
+            "positions": [],
+            "orders": [],
+            "daily_loss": None,
+            "weekly_loss": None,
+            "uses_margin": None,
+        }
+        try:
+            account = self.broker.get_account()
+            positions = self.broker.get_positions()
+            orders = self.broker.get_open_orders()
+            get_clock = getattr(self.broker, "get_clock", None)
+            clock = get_clock() if callable(get_clock) else None
+            market_open = bool(clock.is_open) if clock is not None else bool(self.broker.is_market_open())
+            state.update(
+                account=account,
+                positions=positions,
+                orders=orders,
+                broker_available=True,
+                market_open=market_open,
+            )
+
+            try:
+                losses = self.broker.get_loss_metrics()
+                state["daily_loss"] = losses.get("daily_loss")
+                state["weekly_loss"] = losses.get("weekly_loss")
+            except Exception:
+                # Daily equity comparison is still authoritative when present.
+                equity = _value(account, "equity")
+                last_equity = _value(account, "last_equity")
+                if equity is not None and last_equity is not None:
+                    state["daily_loss"] = max(0.0, float(last_equity) - float(equity))
+
+            cash = _value(account, "cash")
+            equity = _value(account, "equity")
+            long_value = _value(account, "long_market_value")
+            short_value = _value(account, "short_market_value")
+            if all(value is not None for value in (cash, equity, long_value, short_value)):
+                state["uses_margin"] = (
+                    float(cash) < 0
+                    or float(short_value) < 0
+                    or float(long_value) > float(equity) + 0.01
+                )
+        except Exception:
+            # Unknown broker/account state stays unknown and blocks risk checks.
+            pass
+
+        self._context_cache = (now, state)
+        return state
+
     def _portfolio_context(self, proposal: dict[str, Any], approval_valid: bool = False) -> dict[str, Any]:
-        positions = self.broker.get_positions()
-        orders = self.broker.get_open_orders()
-        account = self.broker.get_account()
+        state = self._authoritative_runtime_state(force=approval_valid)
+        positions = state["positions"]
+        orders = state["orders"]
+        account = state["account"]
         symbol = proposal["symbol"]
         today_orders = self.storage.fetch_all("SELECT id FROM orders WHERE substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
         return {
             "power_connected": get_power_status().connected is True,
-            "internet_available": True, "database_writable": self.storage.writable(), "broker_available": True,
-            "telegram_available": True, "market_open": self.broker.is_market_open(),
+            "internet_available": state["internet_available"],
+            "database_writable": state["database_writable"],
+            "broker_available": state["broker_available"],
+            "telegram_available": state["telegram_available"],
+            "market_open": state["market_open"],
             "kill_switch": (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
             "open_positions": len(positions), "trades_today": len(today_orders),
             "duplicate_order": any(str(_value(o, "symbol", "")).upper() == symbol for o in orders),
             "same_symbol_position": any(str(_value(p, "symbol", "")).upper() == symbol for p in positions),
-            "uses_margin": False, "daily_loss": 0, "weekly_loss": 0,
-            "buying_power": float(_value(account, "buying_power", 0) or 0), "approval_valid": approval_valid,
+            "uses_margin": state["uses_margin"],
+            "daily_loss": state["daily_loss"],
+            "weekly_loss": state["weekly_loss"],
+            "buying_power": float(_value(account, "buying_power", 0) or 0) if account is not None else 0.0,
+            "approval_valid": approval_valid,
         }
 
     def process_telegram(self) -> None:
@@ -116,38 +191,13 @@ class TradingService:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
     def _should_auto_execute(self, proposal: dict[str, Any]) -> bool:
-        auto_enabled = self.config.get("auto_execution_enabled", False)
-        auto_mode = self.config.get("auto_execution_mode", "manual_only")
-        
-        if not auto_enabled or auto_mode != "paper_high_confidence_only":
-            return False
-            
-        # Hard safety: Mode MUST be paper, live auto-execution is strictly forbidden
-        if self.config.get("mode") == "live" or self.config.get("live_enabled", False):
-            return False
-            
-        score = proposal.get("score", 0)
-        min_asset = self.config.get("paper_auto_min_asset_score", 90)
-        min_trade = self.config.get("paper_auto_min_trade_score", 90)
-        if score < min_asset or score < min_trade:
-            return False
-            
-        notional = proposal.get("notional", 0)
-        max_notional = self.config.get("paper_auto_max_notional", 1)
-        if notional > max_notional:
-            return False
-            
-        context = self._portfolio_context(proposal)
-        trades_today = context.get("trades_today", 0)
-        max_trades = self.config.get("paper_auto_max_trades_per_day", 1)
-        if trades_today >= max_trades:
-            return False
-            
-        if self.config.get("paper_auto_require_no_open_orders", True):
-            if self.broker.get_open_orders():
-                return False
-                
-        return True
+        # Quarantined: YAML cannot enable this unsupported capability.
+        requested = self.config.get("auto_execution_enabled", False) or self.config.get("auto_execution_mode") != "manual_only"
+        if requested and not self._auto_block_audited:
+            self.storage.audit(self.run_id, "auto_execution_blocked", {"reason": "unsupported capability"})
+            self._auto_block_audited = True
+        assert AUTO_EXECUTION_SUPPORTED is False
+        return False
 
     def notify_expired_proposals(self) -> None:
         # Find all expired proposals that haven't been notified yet
@@ -311,7 +361,8 @@ class TradingService:
                 if time_until_close < expiry_minutes:
                     expiry_minutes = max(5, int(time_until_close))
         except Exception:
-            pass
+            # Unknown close time must shorten, never extend, a proposal window.
+            expiry_minutes = min(expiry_minutes, 5)
 
         # Hard boundaries
         return max(5, min(20, expiry_minutes))
@@ -575,18 +626,14 @@ class TradingService:
                     proposal_id = str(uuid.uuid4())
                     proposal = {"id": proposal_id, "run_id": self.run_id, "signal_id": signal_id, "symbol": symbol, "side": signal.side, "action": "entry" if signal.action == "ENTRY" else "exit", "notional": float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5)), "latest_price": price, "price_at": str(price_at), "historical_bars": len(bars), "volume": volume, "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0, "created_at": now.isoformat(), "expires_at": expiry.isoformat(), "strategy_version": signal.strategy_version, "reason": signal.reason, "order_type": "market", "asset_class": "equity", "indicators": signal.indicators, "score": score, "classification": classification, "system_confidence": system_confidence, "expiry_minutes": expiry_minutes, "volatility_class": volatility_class, "asset_score": asset_score, "asset_classification": asset_classification, "symbol_rank": rank, "total_active_symbols": len(active_watchlist), "price_change_pct": price_change_pct, "session_change_pct": session_change_pct, "gpt_called": gpt_called}
                     
-                    if self._should_auto_execute(proposal):
-                        proposal_generated = True
-                        no_action_reason = "auto-executed"
-                        any_generated = True
+                    self._should_auto_execute(proposal)  # audits and blocks any accidental enablement
+                    decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                    if not decision.passed:
+                        no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                     else:
-                        decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
-                        if not decision.passed:
-                            no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
-                        else:
-                            proposal_generated = True
-                            no_action_reason = "proposal generated"
-                            any_generated = True
+                        proposal_generated = True
+                        no_action_reason = "proposal generated"
+                        any_generated = True
 
                 if proposal_allowed:
                     review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
@@ -612,20 +659,11 @@ class TradingService:
                         self.storage.audit(self.run_id, "proposal_blocked", {"symbol": symbol, "reasons": decision.reasons})
                     continue
                 
-                if no_action_reason == "auto-executed":
-                    approval_id = str(uuid.uuid4())
-                    self.storage.execute("INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (approval_id, self.run_id, proposal_id, "system_auto", "AUTO_EXECUTE", "approve", 1, "accepted", iso_now()))
-                    self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "approved", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
-                    self.storage.consume_approval(proposal_id, approval_id)
-                    context = self._portfolio_context(proposal, approval_valid=True)
-                    if self.config.get("paper_auto_require_final_revalidation", True): context["final_revalidation"] = True
-                    result = Executor(self.broker, self._risk_engine(proposal_id, "final")).execute(proposal, context)
-                    self.storage.execute("INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, symbol, signal.side, proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()))
-                    self.telegram.send_message(f"⚡ [AUTO-EXECUTED] A high-confidence paper order was automatically submitted for {symbol}." if result.submitted else f"⚡ [AUTO-EXECUTION BLOCKED] Auto-execution attempted for {symbol} but failed/blocked: {result.reason}")
-                else:
-                    self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
-                    self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
-                    self.telegram.send_message(f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config))
+                # Manual approval is the only supported path. Auto-execution
+                # cannot synthesize an approval or approved proposal state.
+                self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
+                self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
+                self.telegram.send_message(f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config))
 
             if profile_results:
                 best_watch_res = profile_results[0]
@@ -728,12 +766,8 @@ class TradingService:
             session_change = ((p_latest / p_session_start) - 1.0) * 100.0 if p_session_start > 0 else 0.0
             
             has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
-            was_auto = any(r.get("no_action_reason") == "auto-executed" for r in s_rows)
-            
             status_str = "Watch"
-            if was_auto:
-                status_str = "Auto-executed"
-            elif has_prop:
+            if has_prop:
                 status_str = "Proposal generated, pending approval"
             elif latest_row.get("signal") in {"ENTRY", "EXIT"}:
                 status_str = "Watch, no proposal"
@@ -824,11 +858,12 @@ class TradingService:
         self.storage.audit(self.run_id, "digest_processed", {"status": status, "window_start": window_start_iso, "window_end": now.isoformat()})
 
     def run_cycle(self) -> None:
+        BrokerReconciler(self.broker, self.storage, self.run_id).reconcile()
+        # Reconciliation has refreshed account/position state; force the next
+        # proposal/final context to retrieve an authoritative fresh snapshot.
+        self._context_cache = None
         self.notify_expired_proposals()
         self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
         self.check_and_send_digest()
-
-
-

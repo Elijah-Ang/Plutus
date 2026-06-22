@@ -62,6 +62,7 @@ class Storage:
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({columns})')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON trade_proposals(status, expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_proposal ON risk_checks(proposal_id)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id)")
             
             # Migration check for existing databases
             cursor = conn.execute("PRAGMA table_info(trade_proposals)")

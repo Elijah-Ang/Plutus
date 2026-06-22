@@ -43,8 +43,8 @@ def run_preflight(config: dict[str, Any], storage: Any, broker: Any | None = Non
     add("config", config.get("mode") in {"paper", "live"}, "configuration loaded and mode valid")
     add("database", storage.writable(), "SQLite database must be writable")
     add("run_lock", lock_held, "starter must hold the run lock")
-    mode_ok = config.get("mode") == "paper" or (config.get("live_enabled") is True and config.get("explicit_live_confirmation") is True)
-    add("mode", mode_ok, "paper mode or all explicit live gates required")
+    mode_ok = config.get("mode") == "paper" and config.get("live_enabled") is not True
+    add("mode", mode_ok, "this build supports paper mode only")
     if broker is None:
         add("broker", False, "broker not initialized")
         market_open = False

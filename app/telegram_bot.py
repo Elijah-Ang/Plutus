@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import requests
@@ -17,6 +18,8 @@ class TelegramBot:
         if not self.token:
             raise RuntimeError("Telegram token is not configured")
         self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self._health_checked_at = 0.0
+        self._health_ok = False
 
     def _request(self, method: str, payload: dict[str, Any] | None = None) -> Any:
         response = requests.post(f"{self.base_url}/{method}", json=payload or {}, timeout=self.timeout)
@@ -40,6 +43,17 @@ class TelegramBot:
         if offset is not None:
             payload["offset"] = offset
         return self._request("getUpdates", payload)
+
+    def is_available(self, force: bool = False, cache_seconds: float = 30.0) -> bool:
+        now = time.monotonic()
+        if not force and self._health_checked_at and now - self._health_checked_at <= cache_seconds:
+            return self._health_ok
+        try:
+            self._health_ok = bool(self._request("getMe")) and bool(self.chat_id) and bool(self.allowed_user_id)
+        except Exception:
+            self._health_ok = False
+        self._health_checked_at = now
+        return self._health_ok
 
     def is_authorized(self, sender_id: Any) -> bool:
         return bool(self.allowed_user_id) and str(sender_id) == str(self.allowed_user_id)
@@ -70,3 +84,18 @@ class TelegramBot:
             "/help": "/status /pause /resume /killswitch /report /cashout /pending /help",
         }
         return messages.get(command, "Unknown command. Use /help.")
+
+
+def redact_telegram_update(update: dict[str, Any], include_raw: bool = False) -> dict[str, Any]:
+    """Return a diagnostic-safe update; raw user data requires explicit opt-in."""
+    if include_raw:
+        return update
+    message = update.get("message") or update.get("edited_message") or {}
+    return {
+        "update_id": update.get("update_id"),
+        "message_present": bool(message),
+        "text_present": bool(message.get("text")),
+        "sender_id": "[REDACTED]" if message.get("from") else None,
+        "chat_id": "[REDACTED]" if message.get("chat") else None,
+        "text": "[REDACTED]" if message.get("text") else None,
+    }

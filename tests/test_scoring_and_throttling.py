@@ -1,7 +1,7 @@
 import os
 import uuid
 import json
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from pathlib import Path
 import pytest
 import pandas as pd
@@ -28,6 +28,10 @@ class MockBroker:
     def is_market_open(self):
         return self.open
 
+    def get_clock(self):
+        now = datetime.now(UTC)
+        return type("Clock", (), {"is_open": self.open, "timestamp": now, "next_close": now + timedelta(hours=6)})()
+
     def get_latest_price(self, symbol):
         return type("T", (), {"price": self.price, "timestamp": datetime.now(UTC)})()
 
@@ -41,7 +45,13 @@ class MockBroker:
         return df
 
     def get_account(self):
-        return type("A", (), {"buying_power": 1000000.0})()
+        return type("A", (), {
+            "buying_power": 1000000.0, "equity": 100000.0, "last_equity": 100000.0,
+            "cash": 100000.0, "long_market_value": 0.0, "short_market_value": 0.0,
+        })()
+
+    def get_loss_metrics(self):
+        return {"daily_loss": 0.0, "weekly_loss": 0.0}
 
 class MockTelegramBot:
     def __init__(self):
@@ -53,6 +63,9 @@ class MockTelegramBot:
 
     def is_authorized(self, sender):
         return sender == self.allowed_user_id
+
+    def is_available(self, force=False):
+        return True
 
 @pytest.fixture
 def temp_storage(tmp_path):

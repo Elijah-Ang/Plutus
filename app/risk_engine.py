@@ -51,7 +51,7 @@ class RiskEngine:
             if self.recorder:
                 self.recorder(item)
 
-        check("mode_gate", mode == "paper" or (self.config.get("live_enabled") is True and self.config.get("explicit_live_confirmation") is True), "paper mode or all explicit live gates required")
+        check("mode_gate", mode == "paper" and self.config.get("live_enabled") is not True, "this build supports paper mode only")
         check("kill_switch", not context.get("kill_switch", False), "kill switch must be off")
         check("power", context.get("power_connected") is True, "AC power must be confirmed")
         check("internet", context.get("internet_available") is True, "internet must be available")
@@ -78,7 +78,9 @@ class RiskEngine:
         check("notional", isinstance(notional, (int, float)) and 0 < notional <= limit, "notional must be positive and within limit")
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
         check("duplicate_position", not (is_entry and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
-        check("margin", not context.get("uses_margin", False) or self.risk.get("allow_margin", False), "margin use must be disabled")
+        uses_margin = context.get("uses_margin")
+        check("margin_state_known", isinstance(uses_margin, bool), "margin-use state must be authoritative")
+        check("margin", uses_margin is False or self.risk.get("allow_margin", False), "margin use must be disabled")
         check("shorting", str(proposal.get("side", "")).lower() != "sell" or not is_entry or self.risk.get("allow_shorting", False), "short entries are disabled")
         # Profile universe checks
         profiles = self.config.get("market_profiles", {})
@@ -135,8 +137,12 @@ class RiskEngine:
                 check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
             else:
                 check("approved_universe", False, f"no matching market profile found for symbol {symbol}")
-        check("daily_loss", float(context.get("daily_loss", 0)) < self.risk.get("stop_if_daily_loss_exceeds", 5), "daily loss limit")
-        check("weekly_loss", float(context.get("weekly_loss", 0)) < self.risk.get("stop_if_weekly_loss_exceeds", 10), "weekly loss limit")
+        daily_loss = context.get("daily_loss")
+        weekly_loss = context.get("weekly_loss")
+        check("daily_loss_known", isinstance(daily_loss, (int, float)), "daily loss must come from an authoritative source")
+        check("weekly_loss_known", isinstance(weekly_loss, (int, float)), "weekly loss must come from an authoritative source")
+        check("daily_loss", isinstance(daily_loss, (int, float)) and float(daily_loss) < self.risk.get("stop_if_daily_loss_exceeds", 5), "daily loss limit")
+        check("weekly_loss", isinstance(weekly_loss, (int, float)) and float(weekly_loss) < self.risk.get("stop_if_weekly_loss_exceeds", 10), "weekly loss limit")
 
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))

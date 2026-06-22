@@ -1,6 +1,9 @@
 mode: paper
 live_enabled: false
 explicit_live_confirmation: false
+capabilities:
+  live_trading_supported: false
+  auto_execution_supported: false
 broker: alpaca
 scan_interval_minutes: 10
 require_power: true
@@ -122,4 +125,3 @@ digest:
   telegram_digest_use_gpt: false
   telegram_digest_min_cycles_required: 2
   telegram_digest_send_when_market_closed: false
-

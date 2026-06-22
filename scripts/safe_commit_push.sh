@@ -25,22 +25,28 @@ if [ ! -f "$ROOT/docs/SYSTEM_OVERVIEW.md" ]; then
 fi
 
 echo "=== Step 3: Checking for staged sensitive/ignored files ==="
-# Get staged file list
-STAGED_FILES=$(git diff --cached --name-only)
-
-if [ -z "$STAGED_FILES" ]; then
+if git diff --cached --quiet; then
     echo "ERROR: No files are staged for commit. Use git add first." >&2
     exit 1
 fi
 
-# Block forbidden extensions or paths
-for f in $STAGED_FILES; do
-    # Check if the file is .env, .db, .xlsx, .csv, .log, or in logs/ or backups/
-    if [[ "$f" == *".env"* ]] || [[ "$f" == *".db"* ]] || [[ "$f" == *".xlsx"* ]] || [[ "$f" == *".csv"* ]] || [[ "$f" == *".log"* ]] || [[ "$f" == "logs/"* ]] || [[ "$f" == "data/backups/"* ]]; then
-        echo "ERROR: Staged forbidden file detected: $f. Aborting commit." >&2
-        exit 1
-    fi
-done
+"$ROOT/.venv/bin/python" - <<'PY'
+import subprocess, sys
+
+blocked_prefixes = ("logs/", "data/", ".venv/", ".pytest_cache/", "__pycache__/", "trading_agent.egg-info/")
+blocked_suffixes = (".env", ".db", ".db-wal", ".db-shm", ".xlsx", ".xls", ".csv", ".log", ".joblib", ".pkl", ".pyc")
+staged = subprocess.check_output(["git", "diff", "--cached", "--name-only", "-z"]).decode().split("\0")
+bad = []
+for path in filter(None, staged):
+    lower = path.lower()
+    if path == ".env" or path.startswith(blocked_prefixes) or lower.endswith(blocked_suffixes) or "telegram" in lower and "update" in lower and lower.endswith(".json"):
+        # Tracked .gitkeep files are never expected in an ordinary change; fail closed.
+        bad.append(path)
+if bad:
+    for path in bad:
+        print(f"ERROR: Staged forbidden runtime/sensitive file: {path}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 echo "=== Step 4: Scanning staged files for secrets ==="
 # Run a Python script inline to check for secret patterns in staged files
@@ -48,14 +54,16 @@ echo "=== Step 4: Scanning staged files for secrets ==="
 import sys, subprocess, re
 
 SENSITIVE_PATTERNS = [
-    re.compile(r'sk-[a-zA-Z0-9]{32,48}'),
-    re.compile(r'ALPACA_SECRET_KEY\s*=\s*[\'\"][a-zA-Z0-9]{32,48}[\'\"]'),
-    re.compile(r'TELEGRAM_BOT_TOKEN\s*=\s*[\'\"][0-9]+:[a-zA-Z0-9_-]{35}[\'\"]'),
+    re.compile(r'sk-[a-zA-Z0-9_-]{20,}'),
+    re.compile(r'[0-9]{6,}:[a-zA-Z0-9_-]{20,}'),
+    re.compile(r'PK[A-Z0-9]{15,}'),
+    re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+    re.compile(r'(?:ALPACA_SECRET_KEY|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN)\s*[=:]\s*[\'\"]?(?!replace_with_|\[REDACTED)[^\s\'\"]{12,}', re.I),
 ]
 
-staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z']).decode().split('\0')
 has_secret = False
-for f in staged:
+for f in filter(None, staged):
     try:
         content = subprocess.check_output(['git', 'show', f':{f}'], text=True, stderr=subprocess.DEVNULL)
     except Exception:
