@@ -31,7 +31,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
     "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
-    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT",
+    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT",
 }
 
 
@@ -72,6 +72,32 @@ class Storage:
             cols = [row["name"] for row in cursor.fetchall()]
             if "market_profile" not in cols:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN market_profile TEXT")
+            if "asset_score" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN asset_score REAL")
+            if "asset_classification" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN asset_classification TEXT")
+            if "symbol_rank" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN symbol_rank INTEGER")
+            if "proposal_generated" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN proposal_generated INTEGER")
+            if "no_action_reason" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN no_action_reason TEXT")
+            if "asset_selection_score" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN asset_selection_score REAL")
+            if "trade_decision_score" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN trade_decision_score REAL")
+            if "system_confidence" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN system_confidence TEXT")
+            if "gpt_confidence" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN gpt_confidence TEXT")
+            if "gpt_caution" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN gpt_caution TEXT")
+            if "expiry_minutes" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN expiry_minutes INTEGER")
+            if "expires_at_sgt" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN expires_at_sgt TEXT")
+            if "main_risk" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN main_risk TEXT")
 
     def writable(self) -> bool:
         try:

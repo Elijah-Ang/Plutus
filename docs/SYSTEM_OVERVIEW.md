@@ -99,15 +99,45 @@ The broker is initialized in paper mode using keys fetched securely from the mac
 - Supports market and limit order types, and fractional share order sizes.
 
 ## 10. OpenAI / AI Review Flow
-The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini`.
-- The AI layer evaluates risk and returns caution parameters.
-- The AI has **no access to broker APIs or execution tools**; it is solely an analysis layer.
+The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or the configured reasoning model).
+- **No Authority**: The AI review layer has **no access to broker APIs or execution tools**; it is strictly an analysis layer and cannot place or execute orders.
+- **Rule-Based Precedence**: GPT cannot create or override the rule-based trade decision score from scratch, and it cannot override risk engine gates or bypass Telegram user approvals.
+- **Structured Fields**: When called, the AI review returns structured fields:
+  - `gpt_confidence`: High / Medium / Low
+  - `gpt_caution`: Low / Medium / High
+  - `main_risk`: A short warning sentence
+  - `supports_system_score`: yes/no
+  - `reason`: Explanation of the critique
+- **Throttled State**: If GPT is not called (due to scoring thresholds or daily call throttle limits), the Telegram proposal displays: `GPT review: Not called because score/signal did not meet review threshold.`
 
 ## 11. Risk Engine and Safety Gates
+- **Scoring Systems**:
+  - **Asset Selection Score** (0–100): Ranks approved watchlist symbols compared with observation universe symbols based on liquidity, trend, volatility, and data quality. It is used for prioritization and does not trigger orders by itself.
+  - **Trade Decision Score** (0–100): Deterministic score measuring setup strength. Derived from the following 100-point weighting:
+    - Strategy signal strength: 25
+    - Asset selection/rank: 15
+    - Recent 10-minute movement: 10
+    - Session trend: 10
+    - Volatility sanity: 15
+    - Risk safety: 15
+    - Data quality/freshness: 10
+  - **Confidence Labels**:
+    - 90–100: "Very strong paper setup" (System confidence: "Very strong")
+    - 80–89: "Strong paper setup" (System confidence: "Strong")
+    - 65–79: "Moderate paper setup" (System confidence: "Moderate")
+    - 50–64: "Weak setup, watch only" (System confidence: "Weak")
+    - Below 50: "No action suggested" (System confidence: "No action suggested")
+- **Dynamic Expiry Rules**:
+  - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
+  - Base values: Normal buy/sell is 15 minutes, exits/sells are 10 minutes. High volatility limits base to 5 minutes, and low volatility extends base to 20 minutes.
+  - Modifiers: Weak setups subtract 2 minutes, very strong setups add 2 minutes. Stale price data subtracts 3 minutes.
+  - Close proximity: If market close is near, the duration is truncated to close time (min 5).
+  - Expiry notifications: If no yes/no reply is received before SGT expiry time, the proposal is marked as expired, a single natural language Telegram expiry notification is sent, and any execution attempt is blocked. Approved/rejected proposals do not send expiry notifications.
 - **Hardware/Env Gates**: Blocks trading if AC power is disconnected, internet is down, or database/broker is unreachable.
 - **Position Gates**: Enforces `max_open_positions` (default 1) and `max_trades_per_day` (default 1).
 - **Drawdown Gates**: Stops trading if daily/weekly loss limits are breached.
 - **Expiry Gates**: Blocks execution if the proposal has expired.
+- **Live Trading & Auto-Execution**: Strictly disabled. No orders can be placed without manual Telegram approval. No reply = no order.
 
 ## 12. Database / SQLite Tables
 Stored at `data/trading_agent.db`. The schema contains the following tables:
@@ -317,3 +347,4 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
 - **2026-06-19**: Implemented GitHub workflow remote setup, safe commit push helper, deterministic Trade Decision Score (0-100), market memory DB logging, and GPT call throttling.
 - **2026-06-19**: Installed and loaded the 5-minute launchd scheduled agent, verified preflight gates, and documented the power-management plan.
+- **2026-06-22**: Upgraded Telegram proposals with rule-based and GPT confidence reviews, implemented dynamic proposal expiry times (5-20 min limits), added one-shot expiry notifications, extended SQLite market_memory columns for reporting, and added validation tests.

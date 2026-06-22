@@ -111,23 +111,17 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     expiry = proposal.get("expires_at", "")
     
     expiry_minutes = proposal.get("expiry_minutes", 15)
-    volatility_class = proposal.get("volatility_class", "normal")
     expiry_fmt = format_sgt(expiry)
 
-    if volatility_class == "high":
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes because the market is moving quickly."
-    elif volatility_class == "low":
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes because conditions are relatively stable."
+    # 1. Mode/Header
+    mode = config.get("mode", "paper")
+    live_enabled = config.get("live_enabled", False)
+    if mode == "live" and live_enabled:
+        mode_str = "Live trading"
+        mode_notice = "WARNING: This is a LIVE trade using real money."
     else:
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes"
-
-    score_val = proposal.get("score", 50)
-    if score_val >= 80:
-        urgency_note = "High priority/confidence signal."
-    elif score_val >= 65:
-        urgency_note = "Moderate confidence signal."
-    else:
-        urgency_note = "Lower urgency, watch-only signal."
+        mode_str = "Paper trading only"
+        mode_notice = "This uses fake Alpaca Paper money, not real money."
 
     if symbol == "TEST" or is_fake_test:
         return (
@@ -138,59 +132,124 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"Time to decide: {expiry_minutes} minutes\n"
             f"Expires: {expiry_fmt}"
         )
-        
-    mode = config.get("mode", "paper")
-    live_enabled = config.get("live_enabled", False)
-    
-    if mode == "live" and live_enabled:
-        mode_str = "Live trading"
-        mode_notice = "WARNING: This is a LIVE trade using real money."
-    else:
-        mode_str = "Paper trading only"
-        mode_notice = "This uses fake Alpaca Paper money, not real money."
-        
+
+    # 2. Action / Amount
     if side.lower() == "buy":
-        amount_str = f"${notional:.0f}" if notional is not None else "N/A"
-        scoring_str = ""
-        if score_val is not None:
-            scoring_str = (
-                f"Recommendation score: {score_val:.0f}/100\n"
-                f"Urgency guidance: {urgency_note}\n"
-                f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
-                f"Why: {proposal.get('reason', '')}\n\n"
-            )
-        return (
-            f"📄 Paper trade proposal\n\n"
-            f"Mode: {mode_str}\n"
-            f"Action: Buy {symbol}\n"
-            f"Amount: {amount_str}\n"
-            f"{mode_notice}\n\n"
-            f"{scoring_str}"
-            f"Reply yes to approve, or no to reject.\n"
-            f"{time_to_decide}\n"
-            f"Expires: {expiry_fmt}"
-        )
+        action_header = f"📄 Paper trade proposal\n\n"
+        action_detail = f"Action: Buy {symbol}\n"
+        amount_detail = f"Amount: ${notional:.0f}" if notional is not None else "Amount: N/A"
     else:
-        qty_str = f"{qty} shares" if qty is not None else (f"${notional:.0f}" if notional is not None else "N/A")
-        scoring_str = ""
-        if score_val is not None:
-            scoring_str = (
-                f"Recommendation score: {score_val:.0f}/100\n"
-                f"Urgency guidance: {urgency_note}\n"
-                f"Suggestion: {proposal.get('classification', 'Watch only')}\n"
-                f"Why: {proposal.get('reason', '')}\n\n"
-            )
-        return (
-            f"📄 Paper sell proposal\n\n"
-            f"Mode: {mode_str}\n"
-            f"Action: Sell {symbol}\n"
-            f"Quantity: {qty_str}\n"
-            f"Purpose: Close or reduce the existing paper position.\n\n"
-            f"{scoring_str}"
-            f"Reply yes to approve, or no to reject.\n"
-            f"{time_to_decide}\n"
-            f"Expires: {expiry_fmt}"
+        action_header = f"📄 Paper sell proposal\n\n"
+        action_detail = f"Action: Sell {symbol}\n"
+        amount_detail = f"Quantity: {qty} shares" if qty is not None else (f"Amount: ${notional:.0f}" if notional is not None else "Amount: N/A")
+        amount_detail += "\nPurpose: Close or reduce the existing paper position."
+
+    # 3. Scores & Confidence
+    asset_score = proposal.get("asset_score")
+    asset_classification = proposal.get("asset_classification", "Watch only")
+    score_val = proposal.get("score")
+    trade_classification = proposal.get("classification", "No action suggested")
+    
+    # Map score to system confidence
+    system_confidence = "No action suggested"
+    if score_val is not None:
+        if score_val >= 90: system_confidence = "Very strong"
+        elif score_val >= 80: system_confidence = "Strong"
+        elif score_val >= 65: system_confidence = "Moderate"
+        elif score_val >= 50: system_confidence = "Weak"
+        
+    scores_str = ""
+    if score_val is not None and asset_score is not None:
+        scores_str = (
+            f"Asset score: {asset_score:.0f}/100 — {asset_classification}\n"
+            f"Trade score: {score_val:.0f}/100 — {trade_classification}\n"
+            f"System confidence: {system_confidence}\n\n"
         )
+    elif score_val is not None:
+        if score_val >= 80:
+            urgency_note = "High priority/confidence signal."
+        elif score_val >= 65:
+            urgency_note = "Moderate confidence signal."
+        else:
+            urgency_note = "Lower urgency, watch-only signal."
+        scores_str = (
+            f"Recommendation score: {score_val:.0f}/100\n"
+            f"Urgency guidance: {urgency_note}\n"
+            f"Suggestion: {trade_classification}\n"
+            f"Why: {proposal.get('reason', '')}\n\n"
+        )
+
+    # 4. Rank
+    rank = proposal.get("symbol_rank")
+    total_active = proposal.get("total_active_symbols")
+    rank_str = ""
+    if rank is not None and total_active is not None:
+        rank_str = f"Rank: #{rank} of {total_active} active ETFs\n\n"
+
+    # 5. Price changes
+    price_change_pct = proposal.get("price_change_pct", 0.0)
+    session_change_pct = proposal.get("session_change_pct", 0.0)
+    changes_str = (
+        f"Since last check: {price_change_pct:+.2f}%\n"
+        f"Since market open: {session_change_pct:+.2f}%\n\n"
+    )
+
+    # 6. GPT Review
+    gpt_str = ""
+    review = proposal.get("review")
+    if review:
+        gpt_conf = review.get("gpt_confidence", "Not called")
+        gpt_caution = review.get("gpt_caution", "Low")
+        main_risk = review.get("main_risk", "")
+        if gpt_conf != "Not called" and "Deterministic fallback" not in review.get("reasoning_notes", ""):
+            gpt_str = (
+                f"GPT review: {gpt_conf} confidence\n"
+                f"Main caution: {main_risk or 'None'}\n\n"
+            )
+        else:
+            gpt_str = "GPT review: Not called because score/signal did not meet review threshold.\n\n"
+    else:
+        gpt_str = "GPT review: Not called because score/signal did not meet review threshold.\n\n"
+
+    # 7. Reason
+    reason_str = ""
+    if asset_score is not None:
+        reason_str = f"Why: {proposal.get('reason', '')}\n\n"
+
+    # 8. Time to decide and expiry
+    volatility_class = proposal.get("volatility_class", "normal")
+    if volatility_class == "high":
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes because the market is moving quickly."
+    elif volatility_class == "low":
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes because conditions are relatively stable."
+    else:
+        time_to_decide = f"Time to decide: {expiry_minutes} minutes"
+
+    expiry_info = (
+        f"{time_to_decide}\n"
+        f"Expires: {expiry_fmt}\n\n"
+    )
+
+    # 9. Instructions
+    instructions = (
+        f"Reply yes to approve, or no to reject.\n"
+        f"No reply = proposal expires and no order is placed."
+    )
+
+    return (
+        f"{action_header}"
+        f"Mode: {mode_str}\n"
+        f"{action_detail}"
+        f"{amount_detail}\n\n"
+        f"{scores_str}"
+        f"{rank_str}"
+        f"{changes_str}"
+        f"{gpt_str}"
+        f"{reason_str}"
+        f"{expiry_info}"
+        f"{instructions}"
+    )
+
 
 
 def translate_reason(reason: str) -> str:

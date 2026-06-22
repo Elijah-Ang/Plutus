@@ -401,5 +401,5 @@ def test_us_market_holiday_handling_juneteenth(temp_storage):
         assert row["proposal_allowed"] == 0
         assert row["gpt_called"] == 0
         assert row["signal"] == "HOLD"
-        assert row["classification"] == "Weak / watch only"
+        assert row["classification"] == "Weak setup, watch only"
 

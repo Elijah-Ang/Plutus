@@ -99,7 +99,13 @@ def test_deterministic_scoring_logic(temp_storage):
     assert len(rows) > 0
     for r in rows:
         assert 0.0 <= r["score"] <= 100.0
-        assert r["classification"] in {"Strong paper candidate", "Moderate paper candidate", "Weak / watch only", "Do not approve / wait"}
+        assert r["classification"] in {
+            "Very strong paper setup",
+            "Strong paper setup",
+            "Moderate paper setup",
+            "Weak setup, watch only",
+            "No action suggested"
+        }
 
 def test_telegram_proposal_includes_score():
     proposal = {

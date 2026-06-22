@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .ai_review import AIReviewer, deterministic_review
+
+logger = logging.getLogger("trading_agent")
+
 from .approval_parser import parse_approval
 from .execution import Executor
 from .market_data import normalize_bars
@@ -157,9 +161,10 @@ class TradingService:
             expires_fmt = format_sgt(expires_at)
             
             msg = (
-                f"⏳ Proposal expired\n"
-                f"The {symbol} paper proposal expired at {expires_fmt}.\n"
-                f"No order was placed."
+                f"⏳ Proposal expired\n\n"
+                f"The {symbol} paper trade proposal expired at {expires_fmt}.\n"
+                f"No order was placed.\n"
+                f"Reason: no yes/no reply before expiry."
             )
             self.telegram.send_message(msg)
             
@@ -172,6 +177,145 @@ class TradingService:
                 "proposal_expiry_notified",
                 {"proposal_id": proposal_id, "symbol": symbol, "expires_at": expires_at}
             )
+
+    def _calculate_asset_selection_score(self, symbol: str, bars: Any, price_at: Any, signal: Any, now: Any, spy_ret_20d: float | None = None) -> float:
+        import pandas as pd
+        # 1. Liquidity/spread quality (max 20)
+        score_liq = 10.0
+        if isinstance(bars, pd.DataFrame) and not bars.empty and "volume" in bars.columns:
+            avg_vol = float(bars["volume"].tail(20).mean())
+            if avg_vol >= 1000000:
+                score_liq = 20.0
+            elif avg_vol >= 500000:
+                score_liq = 15.0
+            elif avg_vol >= 100000:
+                score_liq = 10.0
+            else:
+                score_liq = 5.0
+                
+        # 2. Trend strength (max 20)
+        score_trend = 10.0
+        if isinstance(bars, pd.DataFrame) and not bars.empty and len(bars) >= 50 and "close" in bars.columns:
+            close = float(bars["close"].iloc[-1])
+            ma_50 = float(bars["close"].tail(50).mean())
+            ma_200 = float(bars["close"].tail(200).mean()) if len(bars) >= 200 else None
+            if ma_200 is not None:
+                if close > ma_50 and ma_50 > ma_200:
+                    score_trend = 20.0
+                elif close > ma_50:
+                    score_trend = 15.0
+                elif close > ma_200:
+                    score_trend = 10.0
+                else:
+                    score_trend = 5.0
+            else:
+                score_trend = 15.0 if close > ma_50 else 5.0
+                
+        # 3. Volatility sanity (max 20)
+        score_vol = 10.0
+        vol_20 = signal.indicators.get("volatility_20")
+        if vol_20 is not None and isinstance(vol_20, (int, float)) and vol_20 > 0:
+            if 0.05 <= vol_20 <= 0.35:
+                score_vol = 20.0
+            elif 0.02 <= vol_20 <= 0.50:
+                score_vol = 12.0
+            else:
+                score_vol = 5.0
+                
+        # 4. Relative strength vs SPY (max 15)
+        score_rel = 10.0
+        if isinstance(bars, pd.DataFrame) and not bars.empty and len(bars) >= 20 and "close" in bars.columns:
+            ret_20d = float(bars["close"].iloc[-1] / bars["close"].iloc[-20]) - 1.0
+            if spy_ret_20d is not None:
+                if ret_20d > spy_ret_20d:
+                    score_rel = 15.0
+                elif ret_20d == spy_ret_20d:
+                    score_rel = 10.0
+                else:
+                    score_rel = 5.0
+                    
+        # 5. Signal confirmation (max 15)
+        score_sig = 5.0
+        if signal.action in {"ENTRY", "EXIT"}:
+            score_sig = 15.0
+        elif signal.side in {"buy", "sell"}:
+            score_sig = 10.0
+            
+        # 6. Data quality/confidence (max 10)
+        age = (now - price_at).total_seconds() if price_at else float("inf")
+        fresh_price = -5 <= age <= 120
+        enough_bars = isinstance(bars, pd.DataFrame) and len(bars) >= 50
+        if fresh_price and enough_bars:
+            score_data = 10.0
+        elif fresh_price:
+            score_data = 5.0
+        else:
+            score_data = 2.0
+            
+        total = score_liq + score_trend + score_vol + score_rel + score_sig + score_data
+        return float(round(total, 2))
+
+    def _classify_asset_score(self, score: float) -> str:
+        if score >= 80:
+            return "Strong approved-universe candidate"
+        if score >= 65:
+            return "Moderate approved-universe candidate"
+        if score >= 50:
+            return "Watch only"
+        return "Do not prioritize"
+
+    def _classify_trade_score(self, score: float) -> str:
+        if score >= 90:
+            return "Very strong paper setup"
+        if score >= 80:
+            return "Strong paper setup"
+        if score >= 65:
+            return "Moderate paper setup"
+        if score >= 50:
+            return "Weak setup, watch only"
+        return "No action suggested"
+
+    def _calculate_expiry_minutes(self, symbol: str, signal: Any, vol_20: float | None, score: float, price_at: datetime, now: datetime) -> int:
+        default_exp = self.config.get("proposal_expiry_default_minutes", 15)
+        high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
+        low_vol_thresh = self.config.get("proposal_expiry_low_volatility_threshold", 0.12)
+        
+        is_exit = signal.action == "EXIT" or signal.side == "sell"
+        
+        # Base expiry depending on Volatility and Action type
+        if vol_20 is None or not isinstance(vol_20, (int, float)) or vol_20 <= 0:
+            expiry_minutes = 10 if is_exit else default_exp
+        elif vol_20 >= high_vol_thresh:
+            expiry_minutes = 5
+        elif vol_20 <= low_vol_thresh:
+            expiry_minutes = 10 if is_exit else 20
+        else:
+            expiry_minutes = 10 if is_exit else default_exp
+
+        # Dependency on setup confidence
+        if score < 65:  # Weak setup
+            expiry_minutes -= 2
+        elif score >= 90:  # Very strong setup
+            expiry_minutes += 2
+
+        # Dependency on data freshness
+        age = (now - price_at).total_seconds() if price_at else float("inf")
+        if age > 60:
+            expiry_minutes -= 3
+
+        # Dependency on market session state (if close is within 20 mins)
+        try:
+            clock = self.broker.get_clock()
+            if clock and clock.is_open:
+                time_until_close = (clock.next_close - clock.timestamp).total_seconds() / 60
+                if time_until_close < expiry_minutes:
+                    expiry_minutes = max(5, int(time_until_close))
+        except Exception:
+            pass
+
+        # Hard boundaries
+        return max(5, min(20, expiry_minutes))
+
 
     def scan(self) -> None:
         if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
@@ -219,8 +363,18 @@ class TradingService:
             obs_watchlist = profile.get("observation_watchlist", [])
             proposals_enabled = profile.get("proposals_enabled", False)
             
-            # Scan active and observation watchlists
             all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist))
+            
+            spy_ret_20d = None
+            if "SPY" in all_symbols or any(p.get("watchlist") and "SPY" in p.get("watchlist") for p in profiles.values()):
+                try:
+                    spy_bars = normalize_bars(self.broker.get_historical_bars("SPY", "1Day", 50), "SPY")
+                    if not spy_bars.empty and len(spy_bars) >= 20:
+                        spy_ret_20d = float(spy_bars["close"].iloc[-1] / spy_bars["close"].iloc[-20]) - 1.0
+                except Exception:
+                    pass
+            
+            profile_results = []
             
             for symbol in all_symbols:
                 try:
@@ -234,7 +388,6 @@ class TradingService:
                 bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
                 volume = float(bars.iloc[-1]["volume"]) if not bars.empty else 0.0
                 
-                # Write market snapshot
                 self.storage.execute(
                     "INSERT INTO market_snapshots(run_id,symbol,price,price_at,volume,payload,created_at) VALUES(?,?,?,?,?,?,?)",
                     (self.run_id, symbol, price, price_at.isoformat() if hasattr(price_at, "isoformat") else str(price_at), volume, json_dumps({"price": price, "volume": volume}), now.isoformat())
@@ -245,226 +398,258 @@ class TradingService:
                 signal = evaluate_symbol(symbol, bars, has_position, has_order, market_open, strategy_config["maximum_volatility_20d"], strategy_config["stop_drawdown_pct"])
                 signal_id = str(uuid.uuid4())
                 
-                # Calculate dynamic expiry duration based on volatility_20
                 vol_20 = signal.indicators.get("volatility_20")
+                asset_score = self._calculate_asset_selection_score(symbol, bars, price_at, signal, now, spy_ret_20d)
+                asset_classification = self._classify_asset_score(asset_score)
                 
-                default_exp = self.config.get("proposal_expiry_default_minutes", 15)
-                min_exp = self.config.get("proposal_expiry_min_minutes", 5)
-                max_exp = self.config.get("proposal_expiry_max_minutes", 20)
-                high_vol_exp = self.config.get("proposal_expiry_high_volatility_minutes", 5)
-                low_vol_exp = self.config.get("proposal_expiry_low_volatility_minutes", 20)
-                high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
-                low_vol_thresh = self.config.get("proposal_expiry_low_volatility_threshold", 0.12)
-                
-                if vol_20 is None or not isinstance(vol_20, (int, float)) or vol_20 <= 0:
-                    expiry_minutes = default_exp
-                    volatility_class = "normal"
-                elif vol_20 >= high_vol_thresh:
-                    expiry_minutes = high_vol_exp
-                    volatility_class = "high"
-                elif vol_20 <= low_vol_thresh:
-                    expiry_minutes = low_vol_exp
-                    volatility_class = "low"
-                else:
-                    expiry_minutes = default_exp
-                    volatility_class = "normal"
-                    
-                expiry_minutes = max(min_exp, min(max_exp, expiry_minutes))
-                expiry = now + timedelta(minutes=expiry_minutes)
-                
-                self.storage.execute("INSERT INTO signals(id,run_id,symbol,side,action,strategy_version,reason,confidence,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (signal_id, self.run_id, symbol, signal.side, signal.action, signal.strategy_version, signal.reason, signal.confidence, now.isoformat(), expiry.isoformat(), json_dumps(signal.indicators)))
-                
-                # Write indicators
-                self.storage.execute(
-                    "INSERT INTO indicators(run_id,symbol,values_json,created_at) VALUES(?,?,?,?)",
-                    (self.run_id, symbol, json_dumps(signal.indicators), now.isoformat())
-                )
-                
-                # Fetch previous snapshot & session start
-                prev_row = self.storage.fetch_all(
-                    "SELECT price, score, signal FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
-                    (symbol,)
-                )
+                prev_row = self.storage.fetch_all("SELECT price, score, signal FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (symbol,))
                 prev_price = float(prev_row[0]["price"]) if prev_row else price
-                
-                session_row = self.storage.fetch_all(
-                    "SELECT price FROM market_memory WHERE symbol=? AND created_at>=? ORDER BY created_at ASC LIMIT 1",
-                    (symbol, today_start)
-                )
+                session_row = self.storage.fetch_all("SELECT price FROM market_memory WHERE symbol=? AND created_at>=? ORDER BY created_at ASC LIMIT 1", (symbol, today_start))
                 session_start_price = float(session_row[0]["price"]) if session_row else price
-                
                 price_change = price - prev_price
                 price_change_pct = (price / prev_price - 1) * 100 if prev_price > 0 else 0.0
                 session_change = price - session_start_price
+                session_change_pct = (price / session_start_price - 1) * 100 if session_start_price > 0 else 0.0
                 
-                # Compute score
-                # 1. Rule signal strength (30)
-                score_rule = 30.0 if signal.action in {"ENTRY", "EXIT"} else 0.0
-
-                # 2. Short-term 5-minute change (15)
-                score_5m = 7.5
+                # Part B scoring weighting:
+                # 1. Strategy signal strength (max 25)
+                score_rule = 25.0 if signal.action in {"ENTRY", "EXIT"} else 0.0
+                
+                # 2. Asset selection/rank (max 15)
+                score_asset = 15.0 if asset_score >= 80 else (12.0 if asset_score >= 65 else (8.0 if asset_score >= 50 else 3.0))
+                
+                # 3. Recent 10-minute movement (max 10)
+                score_5m = 5.0
                 if prev_row:
                     if signal.side == "buy":
-                        score_5m = 15.0 if price > prev_price else (7.5 if price == prev_price else 0.0)
+                        score_5m = 10.0 if price > prev_price else (5.0 if price == prev_price else 0.0)
                     elif signal.side == "sell":
-                        score_5m = 15.0 if price < prev_price else (7.5 if price == prev_price else 0.0)
+                        score_5m = 10.0 if price < prev_price else (5.0 if price == prev_price else 0.0)
                     else:
-                        score_5m = 7.5 if price == prev_price else (15.0 if price > prev_price else 0.0)
-
-                # 3. Session/day trend (15)
-                score_session = 7.5
+                        score_5m = 5.0 if price == prev_price else (10.0 if price > prev_price else 0.0)
+                
+                # 4. Session trend (max 10)
+                score_session = 5.0
                 if session_row:
                     if signal.side == "buy":
-                        score_session = 15.0 if price > session_start_price else (7.5 if price == session_start_price else 0.0)
+                        score_session = 10.0 if price > session_start_price else (5.0 if price == session_start_price else 0.0)
                     elif signal.side == "sell":
-                        score_session = 15.0 if price < session_start_price else (7.5 if price == session_start_price else 0.0)
+                        score_session = 10.0 if price < session_start_price else (5.0 if price == session_start_price else 0.0)
                     else:
-                        score_session = 7.5 if price == session_start_price else (15.0 if price > session_start_price else 0.0)
-
-                # 4. Volatility/risk (15)
+                        score_session = 5.0 if price == session_start_price else (10.0 if price > session_start_price else 0.0)
+                
+                # 5. Volatility sanity (max 15)
                 max_vol = strategy_config.get("maximum_volatility_20d", 0.05)
                 score_vol = 15.0 if (vol_20 is not None and vol_20 <= max_vol) else 0.0
-
-                # 5. Portfolio safety (15)
+                
+                # 6. Risk safety (max 15)
                 port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
                 safety_ok = True
-                if port_context.get("duplicate_order"):
-                    safety_ok = False
-                if port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
+                if port_context.get("duplicate_order") or port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
                     safety_ok = False
                 if signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
                     safety_ok = False
                 score_safety = 15.0 if safety_ok else 0.0
-
-                # 6. Data quality / confidence (10)
+                
+                # 7. Data quality/freshness (max 10)
                 age = (now - price_at).total_seconds() if price_at else float("inf")
                 fresh_price = -5 <= age <= self.config["risk"].get("max_price_age_seconds", 120)
                 enough_bars = len(bars) >= self.config["risk"].get("min_historical_bars", 50)
-                score_data = 10.0 if (fresh_price and enough_bars) else 0.0
-
-                score = float(round(score_rule + score_5m + score_session + score_vol + score_safety + score_data, 2))
+                score_data = 10.0 if (fresh_price and enough_bars) else (5.0 if fresh_price else 0.0)
                 
-                # Classification
-                if score >= 80:
-                    classification = "Strong paper candidate"
+                # Calculate final trade decision score
+                score = float(round(score_rule + score_asset + score_5m + score_session + score_vol + score_safety + score_data, 2))
+                classification = self._classify_trade_score(score)
+                
+                # System confidence
+                system_confidence = "No action suggested"
+                if score >= 90:
+                    system_confidence = "Very strong"
+                elif score >= 80:
+                    system_confidence = "Strong"
                 elif score >= 65:
-                    classification = "Moderate paper candidate"
+                    system_confidence = "Moderate"
                 elif score >= 50:
-                    classification = "Weak / watch only"
+                    system_confidence = "Weak"
+                
+                # Dynamic expiry
+                expiry_minutes = self._calculate_expiry_minutes(symbol, signal, vol_20, score, price_at, now)
+                
+                high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
+                low_vol_thresh = self.config.get("proposal_expiry_low_volatility_threshold", 0.12)
+                if vol_20 is None or not isinstance(vol_20, (int, float)) or vol_20 <= 0:
+                    volatility_class = "normal"
+                elif vol_20 >= high_vol_thresh:
+                    volatility_class = "high"
+                elif vol_20 <= low_vol_thresh:
+                    volatility_class = "low"
                 else:
-                    classification = "Do not approve / wait"
-                    
+                    volatility_class = "normal"
+                
+                expiry = now + timedelta(minutes=expiry_minutes)
+                
+                self.storage.execute("INSERT INTO signals(id,run_id,symbol,side,action,strategy_version,reason,confidence,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (signal_id, self.run_id, symbol, signal.side, signal.action, signal.strategy_version, signal.reason, signal.confidence, now.isoformat(), expiry.isoformat(), json_dumps(signal.indicators)))
+                self.storage.execute("INSERT INTO indicators(run_id,symbol,values_json,created_at) VALUES(?,?,?,?)", (self.run_id, symbol, json_dumps(signal.indicators), now.isoformat()))
+                
+                profile_results.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "price_at": price_at,
+                    "bars": bars,
+                    "volume": volume,
+                    "has_position": has_position,
+                    "has_order": has_order,
+                    "signal": signal,
+                    "signal_id": signal_id,
+                    "vol_20": vol_20,
+                    "expiry_minutes": expiry_minutes,
+                    "volatility_class": volatility_class,
+                    "expiry": expiry,
+                    "prev_price": prev_price,
+                    "price_change": price_change,
+                    "price_change_pct": price_change_pct,
+                    "session_start_price": session_start_price,
+                    "session_change": session_change,
+                    "session_change_pct": session_change_pct,
+                    "score": score,
+                    "classification": classification,
+                    "system_confidence": system_confidence,
+                    "asset_score": asset_score,
+                    "asset_classification": asset_classification,
+                })
+
+            profile_results.sort(key=lambda x: x["asset_score"], reverse=True)
+            any_generated = False
+            
+            for idx, res in enumerate(profile_results):
+                rank = idx + 1
+                symbol = res["symbol"]
+                price = res["price"]
+                price_at = res["price_at"]
+                bars = res["bars"]
+                volume = res["volume"]
+                signal = res["signal"]
+                signal_id = res["signal_id"]
+                vol_20 = res["vol_20"]
+                expiry_minutes = res["expiry_minutes"]
+                volatility_class = res["volatility_class"]
+                expiry = res["expiry"]
+                prev_price = res["prev_price"]
+                price_change = res["price_change"]
+                price_change_pct = res["price_change_pct"]
+                session_start_price = res["session_start_price"]
+                session_change = res["session_change"]
+                session_change_pct = res["session_change_pct"]
+                score = res["score"]
+                classification = res["classification"]
+                system_confidence = res["system_confidence"]
+                asset_score = res["asset_score"]
+                asset_classification = res["asset_classification"]
+                
                 ai_config = self.config.get("ai", {})
-                is_active_symbol = symbol in active_watchlist
-                proposal_allowed = (
-                    is_active_symbol and 
-                    proposals_enabled and 
-                    signal.action in {"ENTRY", "EXIT"} and 
-                    score >= ai_config.get("ai_review_min_score", 65)
-                )
-                
+                proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
                 gpt_called = False
-                if proposal_allowed:
-                    # Count calls today
-                    calls_today = len(self.storage.fetch_all(
-                        "SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)
-                    ))
-                    # Count calls in current run
-                    calls_current_run = self.ai.calls_made
-                    
-                    # Check interval since last GPT call
-                    last_call = self.storage.fetch_all(
-                        "SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1",
-                        (symbol,)
-                    )
-                    if last_call:
-                        last_call_time = datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
-                        time_since = (now - last_call_time).total_seconds() / 60
-                    else:
-                        time_since = float("inf")
-                    
-                    # Throttling logic
-                    max_calls_run = ai_config.get("ai_max_calls_per_run", 2)
-                    daily_limit = ai_config.get("ai_daily_call_limit", 10)
-                    min_interval = ai_config.get("ai_review_min_interval_minutes", 30)
-                    
-                    if (ai_config.get("ai_review_on_every_run", False) or
-                        (calls_today < daily_limit and calls_current_run < max_calls_run and time_since >= min_interval)):
-                        gpt_called = True
-                
-                # Log to market_memory
-                self.storage.execute(
-                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct,
-                        session_start_price, session_change, vol_20 or 0.0, signal.action, score,
-                        classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat()
-                    )
-                )
+                proposal_generated = False
+                no_action_reason = ""
+                proposal_id = None
+                decision = None
+                proposal = None
+                review = None
                 
                 if not proposal_allowed:
-                    continue
-                    
-                proposal_id = str(uuid.uuid4())
-                proposal = {
-                    "id": proposal_id, "run_id": self.run_id, "signal_id": signal_id, "symbol": symbol,
-                    "side": signal.side, "action": "entry" if signal.action == "ENTRY" else "exit", "notional": float(self.config["risk"]["max_trade_notional_paper"]),
-                    "latest_price": price, "price_at": str(price_at), "historical_bars": len(bars),
-                    "volume": volume, "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,
-                    "created_at": now.isoformat(), "expires_at": expiry.isoformat(), "strategy_version": signal.strategy_version,
-                    "reason": signal.reason, "order_type": "market", "asset_class": "equity", "indicators": signal.indicators,
-                    "score": score, "classification": classification,
-                    "expiry_minutes": expiry_minutes, "volatility_class": volatility_class,
-                }
-                
-                if self._should_auto_execute(proposal):
-                    # Auto-execution mode (paper only, disabled by default)
-                    approval_id = str(uuid.uuid4())
-                    self.storage.execute(
-                        "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (approval_id, self.run_id, proposal_id, "system_auto", "AUTO_EXECUTE", "approve", 1, "accepted", iso_now()),
-                    )
-                    self.storage.execute(
-                        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "approved", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal))
-                    )
-                    self.storage.consume_approval(proposal_id, approval_id)
-                    
-                    context = self._portfolio_context(proposal, approval_valid=True)
-                    if self.config.get("paper_auto_require_final_revalidation", True):
-                        context["final_revalidation"] = True
-                    
-                    result = Executor(self.broker, self._risk_engine(proposal_id, "final")).execute(proposal, context)
-                    self.storage.execute(
-                        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (str(uuid.uuid4()), self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, symbol, signal.side, proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
-                    )
-                    if result.submitted:
-                        self.telegram.send_message(f"⚡ [AUTO-EXECUTED] A high-confidence paper order was automatically submitted for {symbol}.")
+                    if symbol not in active_watchlist:
+                        no_action_reason = "symbol not in active watchlist"
+                    elif not proposals_enabled:
+                        no_action_reason = "proposals disabled for profile"
+                    elif signal.action not in {"ENTRY", "EXIT"}:
+                        no_action_reason = f"no entry/exit signal ({signal.reason})"
                     else:
-                        self.telegram.send_message(f"⚡ [AUTO-EXECUTION BLOCKED] Auto-execution attempted for {symbol} but failed/blocked: {result.reason}")
+                        no_action_reason = f"trade score below threshold ({score} < {ai_config.get('ai_review_min_score', 65)})"
                 else:
-                    # Regular manual approval flow
-                    decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
-                    if not decision.passed:
-                        self.storage.audit(self.run_id, "proposal_blocked", {"symbol": symbol, "reasons": decision.reasons})
-                        continue
-                    self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
+                    calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
+                    last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
+                    time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
+                    if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
+                        gpt_called = True
                     
-                    if gpt_called:
-                        review = self.ai.review(proposal)
+                    proposal_id = str(uuid.uuid4())
+                    proposal = {"id": proposal_id, "run_id": self.run_id, "signal_id": signal_id, "symbol": symbol, "side": signal.side, "action": "entry" if signal.action == "ENTRY" else "exit", "notional": float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5)), "latest_price": price, "price_at": str(price_at), "historical_bars": len(bars), "volume": volume, "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0, "created_at": now.isoformat(), "expires_at": expiry.isoformat(), "strategy_version": signal.strategy_version, "reason": signal.reason, "order_type": "market", "asset_class": "equity", "indicators": signal.indicators, "score": score, "classification": classification, "system_confidence": system_confidence, "expiry_minutes": expiry_minutes, "volatility_class": volatility_class, "asset_score": asset_score, "asset_classification": asset_classification, "symbol_rank": rank, "total_active_symbols": len(active_watchlist), "price_change_pct": price_change_pct, "session_change_pct": session_change_pct, "gpt_called": gpt_called}
+                    
+                    if self._should_auto_execute(proposal):
+                        proposal_generated = True
+                        no_action_reason = "auto-executed"
+                        any_generated = True
                     else:
-                        review = deterministic_review(proposal, warning="AI review throttled to avoid spam")
-                        
+                        decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                        if not decision.passed:
+                            no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                        else:
+                            proposal_generated = True
+                            no_action_reason = "proposal generated"
+                            any_generated = True
+
+                if proposal_allowed:
+                    review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
+                    proposal["review"] = review
+
+                g_conf = review.get("gpt_confidence", "Not called") if (gpt_called and review) else "Not called"
+                g_caut = review.get("gpt_caution", "Low") if (gpt_called and review) else "N/A"
+                m_risk = review.get("main_risk", "No AI risk evaluation was performed.") if (gpt_called and review) else "N/A"
+                exp_sgt = format_sgt(expiry)
+
+                self.storage.execute(
+                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, rank, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk)
+                )
+                
+                logger.info(
+                    "Symbol: %s | Profile: %s | Asset Score: %.2f (%s) | Trade Score: %.2f (%s) | Rank: #%d | Prev Change: %.2f%% | Session Change: %.2f | Proposal Allowed: %s | GPT Called: %s | Proposal Generated: %s | No-Action Reason: %s",
+                    symbol, profile_key, asset_score, asset_classification, score, classification, rank, price_change_pct, session_change, proposal_allowed, gpt_called, proposal_generated, no_action_reason or "N/A"
+                )
+                
+                if not proposal_generated:
+                    if proposal_allowed and decision and not decision.passed:
+                        self.storage.audit(self.run_id, "proposal_blocked", {"symbol": symbol, "reasons": decision.reasons})
+                    continue
+                
+                if no_action_reason == "auto-executed":
+                    approval_id = str(uuid.uuid4())
+                    self.storage.execute("INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (approval_id, self.run_id, proposal_id, "system_auto", "AUTO_EXECUTE", "approve", 1, "accepted", iso_now()))
+                    self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "approved", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
+                    self.storage.consume_approval(proposal_id, approval_id)
+                    context = self._portfolio_context(proposal, approval_valid=True)
+                    if self.config.get("paper_auto_require_final_revalidation", True): context["final_revalidation"] = True
+                    result = Executor(self.broker, self._risk_engine(proposal_id, "final")).execute(proposal, context)
+                    self.storage.execute("INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, symbol, signal.side, proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()))
+                    self.telegram.send_message(f"⚡ [AUTO-EXECUTED] A high-confidence paper order was automatically submitted for {symbol}." if result.submitted else f"⚡ [AUTO-EXECUTION BLOCKED] Auto-execution attempted for {symbol} but failed/blocked: {result.reason}")
+                else:
+                    self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
                     self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
-                    
-                    # Natural language proposal message
-                    message_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config)
-                    self.telegram.send_message(message_text)
+                    self.telegram.send_message(f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config))
+
+            if profile_results:
+                best_watch_res = profile_results[0]
+                active_results = [r for r in profile_results if r["symbol"] in active_watchlist]
+                best_trade_res = max(active_results, key=lambda x: x["score"]) if active_results else (max(profile_results, key=lambda x: x["score"]) if profile_results else None)
+                
+                logger.info("=== Profile '%s' Scan Summary ===", profile_key)
+                logger.info("Best symbol to watch: %s (Asset Score: %.2f)", best_watch_res["symbol"], best_watch_res["asset_score"])
+                if best_trade_res:
+                    logger.info("Best symbol for trade consideration: %s (Trade Score: %.2f)", best_trade_res["symbol"], best_trade_res["score"])
+                else:
+                    logger.info("Best symbol for trade consideration: None")
+                
+                if any_generated:
+                    logger.info("Why no proposal was generated: N/A (Proposal was generated)")
+                else:
+                    reasons_summary = ", ".join(f"{r['symbol']}: {r.get('no_action_reason') or 'N/A'}" for r in profile_results)
+                    logger.info("Why no proposal was generated: %s", reasons_summary)
 
     def run_cycle(self) -> None:
         self.notify_expired_proposals()
         self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
+
+
+
