@@ -645,11 +645,190 @@ class TradingService:
                     reasons_summary = ", ".join(f"{r['symbol']}: {r.get('no_action_reason') or 'N/A'}" for r in profile_results)
                     logger.info("Why no proposal was generated: %s", reasons_summary)
 
+    def check_and_send_digest(self) -> None:
+        digest_config = self.config.get("digest", {})
+        if not digest_config.get("telegram_digest_enabled", True):
+            return
+
+        now = datetime.now(UTC)
+        interval_minutes = digest_config.get("telegram_digest_interval_minutes", 30)
+
+        try:
+            market_open = self.broker.is_market_open()
+        except Exception:
+            market_open = False
+
+        if not market_open and not digest_config.get("telegram_digest_send_when_market_closed", False):
+            return
+
+        # 1. Throttling
+        last_sent = self.storage.fetch_all(
+            "SELECT sent_at FROM telegram_digests WHERE status='sent' ORDER BY sent_at DESC LIMIT 1"
+        )
+        if last_sent:
+            last_sent_dt = datetime.fromisoformat(last_sent[0]["sent_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
+            elapsed_mins = (now - last_sent_dt).total_seconds() / 60
+            if elapsed_mins < (interval_minutes - 2):
+                return
+
+        # 2. Minimum cycles
+        window_start = now - timedelta(minutes=interval_minutes)
+        window_start_iso = window_start.isoformat()
+        
+        cycles = self.storage.fetch_all(
+            "SELECT COUNT(DISTINCT run_id) as cnt FROM market_memory WHERE created_at >= ?",
+            (window_start_iso,)
+        )
+        cycle_count = cycles[0]["cnt"] if cycles else 0
+        min_cycles = digest_config.get("telegram_digest_min_cycles_required", 2)
+        if cycle_count < min_cycles:
+            return
+
+        # 3. Retrieve rows
+        include_obs = digest_config.get("telegram_digest_include_observation_symbols", True)
+        profiles = self.config.get("market_profiles", {})
+        active_watchlist = []
+        obs_watchlist = []
+        for p in profiles.values():
+            if p.get("status") == "active":
+                active_watchlist.extend(p.get("watchlist", []))
+                obs_watchlist.extend(p.get("observation_watchlist", []))
+                
+        allowed_symbols = set(active_watchlist)
+        if include_obs:
+            allowed_symbols.update(obs_watchlist)
+
+        rows = self.storage.fetch_all(
+            "SELECT * FROM market_memory WHERE created_at >= ? ORDER BY created_at ASC",
+            (window_start_iso,)
+        )
+        if not rows:
+            return
+
+        import collections
+        symbol_rows = collections.defaultdict(list)
+        for row in rows:
+            sym = row["symbol"]
+            if allowed_symbols and sym not in allowed_symbols:
+                continue
+            symbol_rows[sym].append(row)
+
+        if not symbol_rows:
+            return
+
+        symbols_list = []
+        for sym, s_rows in symbol_rows.items():
+            first_row = s_rows[0]
+            latest_row = s_rows[-1]
+            p_first = first_row["price"]
+            p_latest = latest_row["price"]
+            change_30m = ((p_latest / p_first) - 1.0) * 100.0 if p_first > 0 else 0.0
+            
+            p_session_start = latest_row.get("session_start_price") or p_latest
+            session_change = ((p_latest / p_session_start) - 1.0) * 100.0 if p_session_start > 0 else 0.0
+            
+            has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
+            was_auto = any(r.get("no_action_reason") == "auto-executed" for r in s_rows)
+            
+            status_str = "Watch"
+            if was_auto:
+                status_str = "Auto-executed"
+            elif has_prop:
+                status_str = "Proposal generated, pending approval"
+            elif latest_row.get("signal") in {"ENTRY", "EXIT"}:
+                status_str = "Watch, no proposal"
+                
+            symbols_list.append({
+                "symbol": sym,
+                "trade_score": latest_row["score"],
+                "trade_classification": latest_row["classification"],
+                "asset_score": latest_row.get("asset_score"),
+                "price_change_30m": change_30m,
+                "session_change": session_change,
+                "status": status_str
+            })
+
+        symbols_list.sort(key=lambda x: x["trade_score"] if x["trade_score"] is not None else -1, reverse=True)
+
+        strongest = symbols_list[0]
+        weakest = min(symbols_list, key=lambda x: x["trade_score"] if x["trade_score"] is not None else 1000)
+
+        max_syms = digest_config.get("telegram_digest_max_symbols", 6)
+        top_watched = symbols_list[:max_syms]
+
+        proposals = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE created_at >= ?",
+            (window_start_iso,)
+        )
+        prop_cnt = proposals[0]["cnt"] if proposals else 0
+        
+        orders = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM orders WHERE created_at >= ?",
+            (window_start_iso,)
+        )
+        order_cnt = orders[0]["cnt"] if orders else 0
+        
+        gpt_calls = sum(bool(r.get("gpt_called")) for r in rows)
+        
+        expired = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE status='expired' AND expires_at >= ? AND expires_at <= ?",
+            (window_start_iso, now.isoformat())
+        )
+        expired_cnt = expired[0]["cnt"] if expired else 0
+
+        if prop_cnt > 0:
+            pending_rows = self.storage.fetch_all(
+                "SELECT symbol, side FROM trade_proposals WHERE created_at >= ? AND status='pending'",
+                (window_start_iso,)
+            )
+            if pending_rows:
+                syms_p = ", ".join(f"{r['side'].upper()} {r['symbol']}" for r in pending_rows)
+                summary_str = f"{strongest['symbol']} is strongest, pending proposal for {syms_p}."
+            else:
+                summary_str = f"Setup triggered action for {strongest['symbol']} during the window."
+        else:
+            summary_str = f"{strongest['symbol']} is strongest, but no setup crossed the proposal threshold."
+
+        digest_data = {
+            "market_open_status": "Open" if market_open else "Closed",
+            "window_start": window_start,
+            "window_end": now,
+            "symbols_list": top_watched,
+            "weakest_symbol": weakest["symbol"],
+            "weakest_score": weakest["trade_score"],
+            "weakest_classification": weakest["trade_classification"],
+            "actions": {
+                "proposals": prop_cnt,
+                "orders": order_cnt,
+                "gpt_calls": gpt_calls,
+                "expired": expired_cnt
+            },
+            "summary": summary_str
+        }
+
+        from .utils import format_digest_message
+        message_text = format_digest_message(digest_data, self.config)
+        
+        try:
+            self.telegram.send_message(message_text)
+            status = "sent"
+        except Exception as e:
+            status = "error"
+            self.storage.record_check(self.run_id, "digest_send", False, str(e), stage="digest")
+            
+        symbols_str = ", ".join(x["symbol"] for x in top_watched)
+        self.storage.execute(
+            "INSERT INTO telegram_digests(run_id,window_start,window_end,sent_at,symbols,summary_text,status) VALUES(?,?,?,?,?,?,?)",
+            (self.run_id, window_start_iso, now.isoformat(), now.isoformat(), symbols_str, summary_str, status)
+        )
+        self.storage.audit(self.run_id, "digest_processed", {"status": status, "window_start": window_start_iso, "window_end": now.isoformat()})
+
     def run_cycle(self) -> None:
         self.notify_expired_proposals()
         self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
+        self.check_and_send_digest()
 
 
 

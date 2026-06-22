@@ -17,6 +17,7 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Risk Checks", "risk_checks"), ("AI Reviews", "ai_reviews"), ("Approvals", "approvals"),
     ("Cash Management", "cashout_suggestions"), ("ML Shadow Metrics", "model_versions"),
     ("Market Memory", "market_memory"),
+    ("Telegram Digests", "telegram_digests"),
     ("Errors", "errors"), ("Audit Events", "audit_events"), ("Config Snapshot", "config_snapshots"),
 ]
 

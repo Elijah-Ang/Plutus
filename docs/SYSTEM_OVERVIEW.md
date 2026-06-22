@@ -164,6 +164,7 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `config_snapshots`: Redacted config maps.
 - `daily_summaries`: Daily equity audits.
 - `market_memory`: Logs of 5-minute observation price telemetry, indicators, and recommendation scores.
+- `telegram_digests`: History of 30-minute Telegram informational digests.
 
 ## 13. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
@@ -341,6 +342,13 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
   - The system must not hallucinate, mock, or infer live market data. If real, structured data is not available from an approved API, the symbol/profile is skipped.
   - Profiles for SGX/HKEX are configured as `observation_only` or `disabled` with `execution_enabled: false` and `proposals_enabled: false` to ensure no proposals are created or executed.
 
+## 27. Telegram Market Digest
+- **Purpose**: Sends a 30-minute informational digest to the user during active US regular trading hours (9:30 PM to 4:00 AM SGT, or based on the broker's clock is_open API) summarizing recent telemetry.
+- **Informational Only**: Unlike trade proposal messages, the digest is strictly informational. It does not ask for user approval, does not create trade proposals in the database, and does not place or execute broker orders.
+- **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
+- **Throttling Constraints**: Computes data from the last 30 minutes, requiring a minimum of 2 successful cycles logged in `market_memory`. It checks `telegram_digests` history to ensure it is sent at most once per 30 minutes.
+- **GPT Usage**: GPT is not used for digests by default (`telegram_digest_use_gpt: false`). It relies entirely on rules-based, logged sqlite data to construct summaries.
+
 ## 25. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
@@ -348,3 +356,4 @@ To ensure the bot executes reliably every 5 minutes during trading hours:
 - **2026-06-19**: Implemented GitHub workflow remote setup, safe commit push helper, deterministic Trade Decision Score (0-100), market memory DB logging, and GPT call throttling.
 - **2026-06-19**: Installed and loaded the 5-minute launchd scheduled agent, verified preflight gates, and documented the power-management plan.
 - **2026-06-22**: Upgraded Telegram proposals with rule-based and GPT confidence reviews, implemented dynamic proposal expiry times (5-20 min limits), added one-shot expiry notifications, extended SQLite market_memory columns for reporting, and added validation tests.
+- **2026-06-22**: Implemented a 30-minute Telegram informational market digest feature with database logging, throttling constraints, Excel reporting, and validation tests.

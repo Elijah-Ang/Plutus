@@ -297,3 +297,80 @@ def translate_reason(reason: str) -> str:
         return "I ignored this message because it was not sent by the authorized Telegram user."
     return f"No action taken: {reason}."
 
+
+def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -> str:
+    mode = config.get("mode", "paper")
+    live_enabled = config.get("live_enabled", False)
+    if mode == "live" and live_enabled:
+        mode_str = "Live trading"
+    else:
+        mode_str = "Paper trading only"
+
+    def parse_dt(val: Any) -> datetime:
+        if isinstance(val, str):
+            val = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=UTC)
+        return val
+
+    def format_time_only(dt: datetime) -> str:
+        sgt_tz = timezone(timedelta(hours=8))
+        dt_sgt = dt.astimezone(sgt_tz)
+        hour = dt_sgt.hour % 12
+        if hour == 0:
+            hour = 12
+        minute = dt_sgt.strftime("%M")
+        ampm = dt_sgt.strftime("%p")
+        return f"{hour}:{minute} {ampm}"
+        
+    w_start = format_time_only(parse_dt(digest_data["window_start"]))
+    w_end = format_time_only(parse_dt(digest_data["window_end"]))
+    
+    msg_parts = [
+        f"📊 30-min market digest\n",
+        f"US market: {digest_data['market_open_status']}",
+        f"Window: {w_start}–{w_end} SGT",
+        f"Mode: {mode_str}\n",
+        "Top watched:"
+    ]
+    
+    for idx, sym_data in enumerate(digest_data["symbols_list"]):
+        rank = idx + 1
+        score_val = sym_data["trade_score"]
+        score_str = f"{score_val:.1f}" if isinstance(score_val, (int, float)) else "N/A"
+        class_str = sym_data["trade_classification"]
+        
+        change_30m = sym_data["price_change_30m"]
+        change_30m_str = f"{change_30m:+.2f}%" if isinstance(change_30m, (int, float)) else "0.00%"
+        
+        session_change = sym_data["session_change"]
+        session_change_str = f"{session_change:+.2f}%" if isinstance(session_change, (int, float)) else "0.00%"
+        
+        msg_parts.append(
+            f"{rank}. {sym_data['symbol']} — Trade score {score_str}, {class_str}\n"
+            f"   30-min: {change_30m_str} | Session: {session_change_str}\n"
+            f"   Status: {sym_data['status']}"
+        )
+        
+    weakest_score = digest_data.get("weakest_score")
+    weakest_score_str = f"{weakest_score:.1f}" if isinstance(weakest_score, (int, float)) else "N/A"
+    msg_parts.append(
+        f"\nWeakest: {digest_data['weakest_symbol']} — {weakest_score_str}, {digest_data.get('weakest_classification', 'No action suggested')}\n"
+    )
+    
+    actions = digest_data.get("actions", {})
+    msg_parts.append(
+        f"Past 30 min actions:\n"
+        f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
+    )
+    
+    msg_parts.append(f"Summary: {digest_data.get('summary', '')}\n")
+    
+    if actions.get('proposals', 0) > 0:
+        msg_parts.append("No action needed unless approving the active proposal above.")
+    else:
+        msg_parts.append("No action needed.")
+        
+    return "\n".join(msg_parts)
+
+

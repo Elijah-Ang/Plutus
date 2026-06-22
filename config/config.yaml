@@ -111,3 +111,15 @@ storage:
   export_dir: data/exports
   backup_dir: data/backups
   active_db_must_be_local: true
+
+# 30-Minute Telegram Market Digest Config
+digest:
+  telegram_digest_enabled: true
+  telegram_digest_interval_minutes: 30
+  telegram_digest_market_hours_only: true
+  telegram_digest_include_observation_symbols: true
+  telegram_digest_max_symbols: 6
+  telegram_digest_use_gpt: false
+  telegram_digest_min_cycles_required: 2
+  telegram_digest_send_when_market_closed: false
+
