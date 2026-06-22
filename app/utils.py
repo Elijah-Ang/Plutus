@@ -153,10 +153,10 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     # Map score to system confidence
     system_confidence = "No action suggested"
     if score_val is not None:
-        if score_val >= 90: system_confidence = "Very strong"
-        elif score_val >= 80: system_confidence = "Strong"
-        elif score_val >= 65: system_confidence = "Moderate"
-        elif score_val >= 50: system_confidence = "Weak"
+        if score_val >= 90: system_confidence = "Very strong paper setup"
+        elif score_val >= 80: system_confidence = "Strong paper setup"
+        elif score_val >= 65: system_confidence = "Moderate paper setup"
+        elif score_val >= 50: system_confidence = "Weak setup, watch only"
         
     scores_str = ""
     if score_val is not None and asset_score is not None:
@@ -197,24 +197,54 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     # 6. GPT Review
     gpt_str = ""
     review = proposal.get("review")
+    gpt_called = proposal.get("gpt_called", True)
+    
     if review:
         gpt_conf = review.get("gpt_confidence", "Not called")
         gpt_caution = review.get("gpt_caution", "Low")
         main_risk = review.get("main_risk", "")
-        if gpt_conf != "Not called" and "Deterministic fallback" not in review.get("reasoning_notes", ""):
+        if gpt_called and gpt_conf != "Not called" and "Deterministic fallback" not in review.get("reasoning_notes", ""):
             gpt_str = (
                 f"GPT review: {gpt_conf} confidence\n"
                 f"Main caution: {main_risk or 'None'}\n\n"
             )
         else:
-            gpt_str = "GPT review: Not called because score/signal did not meet review threshold.\n\n"
+            if score_val is not None and score_val < 65:
+                gpt_str = "GPT review: Not called. The setup was not strong enough to need AI review.\n\n"
+            else:
+                gpt_str = "GPT review: Not called. AI review was skipped due to throttling/safety limits.\n\n"
     else:
-        gpt_str = "GPT review: Not called because score/signal did not meet review threshold.\n\n"
+        if score_val is not None and score_val < 65:
+            gpt_str = "GPT review: Not called. The setup was not strong enough to need AI review.\n\n"
+        else:
+            gpt_str = "GPT review: Not called. AI review was skipped due to throttling/safety limits.\n\n"
 
     # 7. Reason
     reason_str = ""
     if asset_score is not None:
-        reason_str = f"Why: {proposal.get('reason', '')}\n\n"
+        raw_reason = proposal.get("reason", "")
+        if raw_reason.startswith("Test") or symbol == "TEST" or is_fake_test:
+            reason_str = f"Why: {raw_reason}\n\n"
+        else:
+            reasons_why = []
+            if rank is not None and total_active is not None:
+                reasons_why.append(f"ETF is ranked #{rank} of {total_active} active candidates")
+            if raw_reason:
+                reasons_why.append(f"primary strategy signal indicates '{raw_reason}'")
+            volatility_class = proposal.get("volatility_class", "normal")
+            if volatility_class:
+                reasons_why.append(f"volatility condition is {volatility_class}")
+            if price_change_pct != 0.0:
+                reasons_why.append(f"recent price change is {price_change_pct:+.2f}% since last check")
+            if session_change_pct != 0.0:
+                reasons_why.append(f"session trend is {session_change_pct:+.2f}% since market open")
+            
+            if reasons_why:
+                why_text = "; ".join(reasons_why)
+                why_text = why_text[0].upper() + why_text[1:] + "."
+                reason_str = f"Why: {why_text}\n\n"
+            else:
+                reason_str = f"Why: {raw_reason}\n\n"
 
     # 8. Time to decide and expiry
     volatility_class = proposal.get("volatility_class", "normal")
