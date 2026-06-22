@@ -31,7 +31,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
     "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
-    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT",
+    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL",
     "telegram_digests": "id INTEGER PRIMARY KEY, run_id TEXT, window_start TEXT, window_end TEXT, sent_at TEXT, symbols TEXT, summary_text TEXT, status TEXT",
 }
 
@@ -100,6 +100,18 @@ class Storage:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN expires_at_sgt TEXT")
             if "main_risk" not in cols:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN main_risk TEXT")
+            if "volatility_regime" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_regime TEXT")
+            if "volatility_score_contribution" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_score_contribution REAL")
+            if "volatility_gate_result" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_gate_result TEXT")
+            if "dedupe_status" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN dedupe_status TEXT")
+            if "dedupe_reason" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN dedupe_reason TEXT")
+            if "paper_size_adjustment" not in cols:
+                conn.execute("ALTER TABLE market_memory ADD COLUMN paper_size_adjustment REAL")
 
     def writable(self) -> bool:
         try:

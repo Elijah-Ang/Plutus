@@ -122,7 +122,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     - Asset selection/rank: 15
     - Recent 10-minute movement: 10
     - Session trend: 10
-    - Volatility sanity: 15
+    - Volatility sanity: 15 (graded across volatility regimes)
     - Risk safety: 15
     - Data quality/freshness: 10
   - **Confidence Labels**:
@@ -131,6 +131,21 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     - 65–79: "Moderate paper setup" (System confidence: "Moderate")
     - 50–64: "Weak setup, watch only" (System confidence: "Weak")
     - Below 50: "No action suggested" (System confidence: "No action suggested")
+- **Volatility Regimes & Limits**:
+  - ENTRY requires annualized realized volatility <= 45% (removing the previous conservative 5% binary hard veto).
+  - Volatility sanity component (max 15 points) is graded across 5 regimes:
+    - **0%–8%**: Too quiet; eligible for entry but receives a weak score (8/15)
+    - **8%–25%**: Normal ETF volatility regime; receives full score (15/15)
+    - **25%–35%**: Elevated volatility; receives reduced score (10/15), and paper notional size is automatically reduced by 50% for caution
+    - **35%–45%**: High volatility; receives watch-only score (5/15) and blocks new entries (watch-only)
+    - **Above 45% or missing/invalid**: Extreme volatility/missing data; receives 0/15 points and hard blocks new entries
+  - Position-reducing exits and risk controls are exempt from volatility restrictions.
+- **State-Based Proposal Deduplication**:
+  - To prevent alert spam, new proposals are blocked if an active pending proposal for the same symbol + side exists, or if a similar proposal was generated within the last 60 minutes.
+  - The 60-minute cooldown is bypassed only if:
+    - It is a position-reducing exit (and a real position exists), or
+    - The Trade Decision Score improves by $\ge 10$ points compared to the last proposal.
+  - Deduplication actions are tracked in the database and audit events, and do not bypass approvals.
 - **Dynamic Expiry Rules**:
   - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
   - Base values: Normal buy/sell is 15 minutes, exits/sells are 10 minutes. High volatility limits base to 5 minutes, and low volatility extends base to 20 minutes.
@@ -367,3 +382,4 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-22**: Implemented a 30-minute Telegram informational market digest feature with database logging, throttling constraints, Excel reporting, and validation tests.
 - **2026-06-22**: Audited the active system and corrected stale documentation concerning scheduling, script side effects, live/auto-execution guarantees, and current paper-account state.
 - **2026-06-22**: Repaired authoritative final-risk context, hard-disabled live/auto capabilities, added read-only order/fill reconciliation, safe stale-lock recovery, report/Telegram redaction, and functional near-close clock handling.
+- **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.

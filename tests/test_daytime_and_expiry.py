@@ -261,6 +261,8 @@ def test_dynamic_expiry_volatility_rules(temp_storage):
         import app.service
         app.service.evaluate_symbol = mock_evaluate
         try:
+            temp_storage.execute("DELETE FROM trade_proposals")
+            temp_storage.execute("DELETE FROM market_memory")
             service.scan()
         except Exception as e:
             import traceback
@@ -401,5 +403,5 @@ def test_us_market_holiday_handling_juneteenth(temp_storage):
         assert row["proposal_allowed"] == 0
         assert row["gpt_called"] == 0
         assert row["signal"] == "HOLD"
-        assert row["classification"] == "Weak setup, watch only"
+        assert row["classification"] == "No action suggested"
 

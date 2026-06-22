@@ -29,19 +29,41 @@ def evaluate_symbol(symbol: str, bars: pd.DataFrame, has_position: bool = False,
     indicators = {k: (None if pd.isna(v) else float(v)) for k, v in row.items()}
     above_50 = row["close"] > row["ma_50"]
     above_200 = pd.isna(row["ma_200"]) or row["close"] > row["ma_200"]
-    volatility_ok = pd.notna(row["volatility_20"]) and row["volatility_20"] <= maximum_volatility_20d
+    
+    vol_20 = indicators.get("volatility_20")
+    
+    # Volatility checks
+    if vol_20 is None:
+        volatility_ok = False
+        vol_reason = "missing volatility data; fail-safe HOLD"
+    elif vol_20 > 0.45:
+        volatility_ok = False
+        vol_reason = "extreme volatility; blocked"
+    elif vol_20 > 0.35:
+        volatility_ok = False
+        vol_reason = "high volatility; watch only"
+    elif vol_20 >= 0.25:
+        volatility_ok = True
+        vol_reason = "volatility elevated; reduced confidence"
+    else:
+        volatility_ok = True
+        vol_reason = "volatility normal"
+
     if has_position and (not above_50 or position_drawdown_pct <= -abs(stop_drawdown_pct)):
         return Signal("EXIT", "sell", symbol, "close below 50-day MA or stop drawdown reached", 0.8, indicators)
+        
     if not has_position and not has_open_order and market_open and above_50 and above_200 and volatility_ok:
-        return Signal("ENTRY", "buy", symbol, "trend filters passed and volatility within limit", 0.7, indicators)
+        return Signal("ENTRY", "buy", symbol, f"trend filters passed and {vol_reason}", 0.7, indicators)
+
     reasons = []
     if not market_open: reasons.append("market closed")
     if has_position: reasons.append("position already exists")
     if has_open_order: reasons.append("open order already exists")
     if not above_50: reasons.append("below 50-day MA")
     if not above_200: reasons.append("below 200-day MA")
-    if not volatility_ok: reasons.append("volatility unavailable or too high")
-    return Signal("HOLD", None, symbol, "; ".join(reasons) or "no entry or exit", 0.0, indicators)
+    reasons.append(vol_reason)
+    
+    return Signal("HOLD", None, symbol, "; ".join(reasons), 0.0, indicators)
 
 
 class RuleBasedStrategy:

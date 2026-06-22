@@ -490,8 +490,36 @@ class TradingService:
                         score_session = 5.0 if price == session_start_price else (10.0 if price > session_start_price else 0.0)
                 
                 # 5. Volatility sanity (max 15)
-                max_vol = strategy_config.get("maximum_volatility_20d", 0.05)
-                score_vol = 15.0 if (vol_20 is not None and vol_20 <= max_vol) else 0.0
+                volatility_regime = "unknown"
+                volatility_gate_result = "fail-safe HOLD"
+                if vol_20 is None:
+                    score_vol = 0.0
+                    volatility_regime = "missing"
+                    volatility_gate_result = "fail-safe HOLD"
+                elif vol_20 > 0.45:
+                    score_vol = 0.0
+                    volatility_regime = "extreme"
+                    volatility_gate_result = "blocked"
+                elif vol_20 > 0.35:
+                    score_vol = 5.0
+                    volatility_regime = "high"
+                    volatility_gate_result = "watch only"
+                elif vol_20 >= 0.25:
+                    score_vol = 10.0
+                    volatility_regime = "elevated"
+                    volatility_gate_result = "eligible"
+                elif vol_20 >= 0.08:
+                    score_vol = 15.0
+                    volatility_regime = "normal"
+                    volatility_gate_result = "eligible"
+                elif vol_20 >= 0.0:
+                    score_vol = 8.0
+                    volatility_regime = "too quiet"
+                    volatility_gate_result = "eligible"
+                else:
+                    score_vol = 0.0
+                    volatility_regime = "unknown"
+                    volatility_gate_result = "fail-safe HOLD"
                 
                 # 6. Risk safety (max 15)
                 port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
@@ -567,6 +595,9 @@ class TradingService:
                     "system_confidence": system_confidence,
                     "asset_score": asset_score,
                     "asset_classification": asset_classification,
+                    "score_vol": score_vol,
+                    "volatility_regime": volatility_regime,
+                    "volatility_gate_result": volatility_gate_result,
                 })
 
             profile_results.sort(key=lambda x: x["asset_score"], reverse=True)
@@ -596,7 +627,12 @@ class TradingService:
                 system_confidence = res["system_confidence"]
                 asset_score = res["asset_score"]
                 asset_classification = res["asset_classification"]
+                has_position = res["has_position"]
                 
+                score_vol = res.get("score_vol", 0.0)
+                volatility_regime = res.get("volatility_regime", "unknown")
+                volatility_gate_result = res.get("volatility_gate_result", "fail-safe HOLD")
+
                 ai_config = self.config.get("ai", {})
                 proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
                 gpt_called = False
@@ -606,6 +642,10 @@ class TradingService:
                 decision = None
                 proposal = None
                 review = None
+                
+                dedupe_status = "skipped"
+                dedupe_reason = "not eligible for proposal"
+                paper_size_adjustment = 1.0
                 
                 if not proposal_allowed:
                     if symbol not in active_watchlist:
@@ -617,23 +657,115 @@ class TradingService:
                     else:
                         no_action_reason = f"trade score below threshold ({score} < {ai_config.get('ai_review_min_score', 65)})"
                 else:
-                    calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
-                    last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
-                    time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
-                    if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
-                        gpt_called = True
+                    # State-based proposal deduplication
+                    dedupe_status = "allowed"
+                    dedupe_reason = "passed deduplication check"
                     
-                    proposal_id = str(uuid.uuid4())
-                    proposal = {"id": proposal_id, "run_id": self.run_id, "signal_id": signal_id, "symbol": symbol, "side": signal.side, "action": "entry" if signal.action == "ENTRY" else "exit", "notional": float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5)), "latest_price": price, "price_at": str(price_at), "historical_bars": len(bars), "volume": volume, "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0, "created_at": now.isoformat(), "expires_at": expiry.isoformat(), "strategy_version": signal.strategy_version, "reason": signal.reason, "order_type": "market", "asset_class": "equity", "indicators": signal.indicators, "score": score, "classification": classification, "system_confidence": system_confidence, "expiry_minutes": expiry_minutes, "volatility_class": volatility_class, "asset_score": asset_score, "asset_classification": asset_classification, "symbol_rank": rank, "total_active_symbols": len(active_watchlist), "price_change_pct": price_change_pct, "session_change_pct": session_change_pct, "gpt_called": gpt_called}
-                    
-                    self._should_auto_execute(proposal)  # audits and blocks any accidental enablement
-                    decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
-                    if not decision.passed:
-                        no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                    # Check 1: Pending similar proposal
+                    pending_proposals = self.storage.fetch_all(
+                        "SELECT * FROM trade_proposals WHERE symbol=? AND side=? AND status='pending'",
+                        (symbol, signal.side)
+                    )
+                    if pending_proposals:
+                        dedupe_status = "suppressed"
+                        dedupe_reason = "active/pending similar proposal exists"
                     else:
-                        proposal_generated = True
-                        no_action_reason = "proposal generated"
-                        any_generated = True
+                        # Check 2: Cooldown within 60 minutes
+                        last_prop_rows = self.storage.fetch_all(
+                            "SELECT * FROM trade_proposals WHERE symbol=? AND side=? ORDER BY created_at DESC LIMIT 1",
+                            (symbol, signal.side)
+                        )
+                        if last_prop_rows:
+                            last_prop = last_prop_rows[0]
+                            last_created_at = datetime.fromisoformat(last_prop["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
+                            elapsed_mins = (now - last_created_at).total_seconds() / 60
+                            
+                            try:
+                                payload_dict = json.loads(last_prop["payload"])
+                                last_score = float(payload_dict.get("score", 0))
+                            except Exception:
+                                last_score = 0.0
+                                
+                            is_exit = (signal.action == "EXIT" or signal.side == "sell")
+                            if elapsed_mins < 60:
+                                if is_exit and has_position:
+                                    dedupe_status = "allowed"
+                                    dedupe_reason = f"exit/reduce-risk action allowed (elapsed: {elapsed_mins:.1f}m)"
+                                elif score >= last_score + 10:
+                                    dedupe_status = "allowed"
+                                    dedupe_reason = f"meaningful score improvement (score: {score:.1f} vs previous: {last_score:.1f}, elapsed: {elapsed_mins:.1f}m)"
+                                else:
+                                    dedupe_status = "suppressed"
+                                    dedupe_reason = f"duplicate proposal cooldown (elapsed: {elapsed_mins:.1f}m, score delta: {score - last_score:.1f})"
+                    
+                    if dedupe_status == "suppressed":
+                        proposal_allowed = False
+                        no_action_reason = f"suppressed by dedupe: {dedupe_reason}"
+                        self.storage.audit(self.run_id, "proposal_deduplicated", {
+                            "symbol": symbol, "side": signal.side, "status": "suppressed", "reason": dedupe_reason
+                        })
+                    else:
+                        calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
+                        last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
+                        time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
+                        if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
+                            gpt_called = True
+                        
+                        proposal_id = str(uuid.uuid4())
+                        
+                        # Size adjustment calculation
+                        base_notional = float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5))
+                        notional = base_notional
+                        notional_adjustment_note = ""
+                        if signal.action == "ENTRY" and signal.side == "buy":
+                            if vol_20 is not None and 0.25 <= vol_20 <= 0.35:
+                                notional = base_notional * 0.5
+                                paper_size_adjustment = 0.5
+                                notional_adjustment_note = " (reduced by 50% due to elevated volatility)"
+                                
+                        proposal = {
+                            "id": proposal_id,
+                            "run_id": self.run_id,
+                            "signal_id": signal_id,
+                            "symbol": symbol,
+                            "side": signal.side,
+                            "action": "entry" if signal.action == "ENTRY" else "exit",
+                            "notional": notional,
+                            "notional_adjustment_note": notional_adjustment_note,
+                            "latest_price": price,
+                            "price_at": str(price_at),
+                            "historical_bars": len(bars),
+                            "volume": volume,
+                            "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,
+                            "created_at": now.isoformat(),
+                            "expires_at": expiry.isoformat(),
+                            "strategy_version": signal.strategy_version,
+                            "reason": signal.reason,
+                            "order_type": "market",
+                            "asset_class": "equity",
+                            "indicators": signal.indicators,
+                            "score": score,
+                            "classification": classification,
+                            "system_confidence": system_confidence,
+                            "expiry_minutes": expiry_minutes,
+                            "volatility_class": volatility_class,
+                            "asset_score": asset_score,
+                            "asset_classification": asset_classification,
+                            "symbol_rank": rank,
+                            "total_active_symbols": len(active_watchlist),
+                            "price_change_pct": price_change_pct,
+                            "session_change_pct": session_change_pct,
+                            "gpt_called": gpt_called
+                        }
+                        
+                        self._should_auto_execute(proposal)
+                        decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                        if not decision.passed:
+                            no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                        else:
+                            proposal_generated = True
+                            no_action_reason = "proposal generated"
+                            any_generated = True
 
                 if proposal_allowed:
                     review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
@@ -645,8 +777,8 @@ class TradingService:
                 exp_sgt = format_sgt(expiry)
 
                 self.storage.execute(
-                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, rank, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk)
+                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, rank, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment)
                 )
                 
                 logger.info(

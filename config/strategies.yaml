@@ -1,6 +1,6 @@
 rule_based_v1:
   enabled: true
-  maximum_volatility_20d: 0.05
+  maximum_volatility_20d: 0.45
   require_ma_200_when_available: true
   stop_drawdown_pct: 0.08
 ml_shadow:

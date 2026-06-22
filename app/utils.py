@@ -134,14 +134,15 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         )
 
     # 2. Action / Amount
+    notional_adjustment_note = proposal.get("notional_adjustment_note", "")
     if side.lower() == "buy":
         action_header = f"📄 Paper trade proposal\n\n"
         action_detail = f"Action: Buy {symbol}\n"
-        amount_detail = f"Amount: ${notional:.0f}" if notional is not None else "Amount: N/A"
+        amount_detail = f"Amount: ${notional:.0f}{notional_adjustment_note}" if notional is not None else "Amount: N/A"
     else:
         action_header = f"📄 Paper sell proposal\n\n"
         action_detail = f"Action: Sell {symbol}\n"
-        amount_detail = f"Quantity: {qty} shares" if qty is not None else (f"Amount: ${notional:.0f}" if notional is not None else "Amount: N/A")
+        amount_detail = f"Quantity: {qty} shares" if qty is not None else (f"Amount: ${notional:.0f}{notional_adjustment_note}" if notional is not None else "Amount: N/A")
         amount_detail += "\nPurpose: Close or reduce the existing paper position."
 
     # 3. Scores & Confidence
@@ -189,9 +190,30 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     # 5. Price changes
     price_change_pct = proposal.get("price_change_pct", 0.0)
     session_change_pct = proposal.get("session_change_pct", 0.0)
+    
+    vol_20 = proposal.get("volatility")
+    if vol_20 is None:
+        vol_20 = proposal.get("indicators", {}).get("volatility_20")
+        
+    vol_regime_str = ""
+    if vol_20 is not None and isinstance(vol_20, (int, float)):
+        vol_pct = vol_20 * 100
+        if vol_20 > 0.45:
+            regime = "extreme; blocked"
+        elif vol_20 > 0.35:
+            regime = "high; watch only"
+        elif vol_20 >= 0.25:
+            regime = "elevated; smaller paper size / extra caution"
+        elif vol_20 >= 0.08:
+            regime = "normal ETF regime"
+        else:
+            regime = "too quiet"
+        vol_regime_str = f"Volatility: {vol_pct:.1f}% annualized — {regime}\n"
+        
     changes_str = (
         f"Since last check: {price_change_pct:+.2f}%\n"
-        f"Since market open: {session_change_pct:+.2f}%\n\n"
+        f"Since market open: {session_change_pct:+.2f}%\n"
+        f"{vol_regime_str}\n"
     )
 
     # 6. GPT Review
