@@ -17,8 +17,8 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "ml_predictions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, model_version TEXT, prediction TEXT, probability REAL, payload TEXT, created_at TEXT",
     "risk_checks": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, stage TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT",
     "ai_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, summary TEXT, risks TEXT, caution_level TEXT, payload TEXT, created_at TEXT",
-    "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT",
-    "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
+    "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT",
+    "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
     "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, created_at TEXT, updated_at TEXT",
     "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT",
     "positions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, qty REAL, market_value REAL, unrealized_pl REAL, payload TEXT, created_at TEXT",
@@ -71,6 +71,18 @@ class Storage:
                 conn.execute("ALTER TABLE trade_proposals ADD COLUMN expiry_notified INTEGER DEFAULT 0")
             if "telegram_message_id" not in cols:
                 conn.execute("ALTER TABLE trade_proposals ADD COLUMN telegram_message_id TEXT")
+            if "proposal_market_rank" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN proposal_market_rank INTEGER")
+            if "proposal_eligible_rank" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN proposal_eligible_rank INTEGER")
+            if "selection_reason" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN selection_reason TEXT")
+            if "ai_review_status" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN ai_review_status TEXT")
+            if "ai_confidence" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN ai_confidence TEXT")
+            if "ai_caution" not in cols:
+                conn.execute("ALTER TABLE trade_proposals ADD COLUMN ai_caution TEXT")
                 
             cursor = conn.execute("PRAGMA table_info(approvals)")
             cols = [row["name"] for row in cursor.fetchall()]
@@ -80,6 +92,28 @@ class Storage:
                 conn.execute("ALTER TABLE approvals ADD COLUMN proposal_targeting_method TEXT")
             if "acknowledgement_status" not in cols:
                 conn.execute("ALTER TABLE approvals ADD COLUMN acknowledgement_status TEXT")
+            if "approval_received_at" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN approval_received_at TEXT")
+            if "acknowledgement_sent_at" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN acknowledgement_sent_at TEXT")
+            if "acknowledgement_delay_seconds" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN acknowledgement_delay_seconds REAL")
+            if "final_revalidation_started_at" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN final_revalidation_started_at TEXT")
+            if "final_revalidation_completed_at" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN final_revalidation_completed_at TEXT")
+            if "price_refreshed_at" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN price_refreshed_at TEXT")
+            if "refreshed_price" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN refreshed_price REAL")
+            if "refreshed_price_age_seconds" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN refreshed_price_age_seconds REAL")
+            if "price_move_bps_since_proposal" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN price_move_bps_since_proposal REAL")
+            if "final_order_decision" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN final_order_decision TEXT")
+            if "final_block_reason" not in cols:
+                conn.execute("ALTER TABLE approvals ADD COLUMN final_block_reason TEXT")
                 
             cursor = conn.execute("PRAGMA table_info(market_memory)")
             cols = [row["name"] for row in cursor.fetchall()]

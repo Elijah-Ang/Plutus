@@ -166,9 +166,16 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     
     rank = proposal.get("symbol_rank")
     total_active = proposal.get("total_active_symbols")
+    eligible_rank = proposal.get("proposal_eligible_rank")
+    selection_reason = proposal.get("selection_reason")
+    
     rank_line = ""
     if rank is not None and total_active is not None:
-        rank_line = f"Rank: #{rank} of {total_active} active ETFs\n"
+        rank_line = f"Rank: #{rank} of {total_active} active ETFs (Market rank)\n"
+        if eligible_rank is not None:
+            rank_line += f"Proposal rank: #{eligible_rank} currently eligible candidate\n"
+        if selection_reason:
+            rank_line += f"Selection reason: {selection_reason}\n"
         
     scores_section = f"{confidence_line}{score_line}{rank_line}\n"
 
@@ -227,13 +234,27 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     review = proposal.get("review")
     gpt_called = proposal.get("gpt_called", True)
     
-    main_risk_str = ""
-    if review and review.get("main_risk"):
-        main_risk_str = f"Main risk:\n{review.get('main_risk')}\n\n"
-    elif not gpt_called and side.lower() == "buy":
-        main_risk_str = (
-            f"Main risk:\nRule-based only. AI review was not available. Treat with extra caution.\n\n"
-        )
+    ai_review_section = ""
+    if side.lower() == "buy":
+        if gpt_called and review:
+            ai_confidence = review.get("gpt_confidence", "Not called")
+            ai_caution = review.get("gpt_caution", "Low")
+            main_risk = review.get("main_risk", "No AI risk evaluation was performed.")
+            ai_review_section = (
+                f"AI review: Completed\n"
+                f"AI confidence: {ai_confidence}\n"
+                f"AI caution: {ai_caution}\n"
+                f"Main risk:\n{main_risk}\n\n"
+            )
+        else:
+            ai_review_section = (
+                f"AI review: Not available\n"
+                f"Rule-based only. AI review was not available. Treat with extra caution.\n\n"
+            )
+    else:
+        # Sell proposals
+        if review and review.get("main_risk"):
+            ai_review_section = f"Main risk:\n{review.get('main_risk')}\n\n"
 
     # Decision time
     decision_time_str = f"Decision time: {expiry_minutes} minutes\n"
@@ -255,7 +276,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         f"{scores_section}"
         f"{why_section}"
         f"{movement_section}"
-        f"{main_risk_str}"
+        f"{ai_review_section}"
         f"{decision_time_str}"
         f"{expires_str}"
         f"{instructions}"
@@ -267,11 +288,13 @@ def translate_reason(reason: str) -> str:
     if "message is not an unambiguous approval or rejection" in reason:
         return "I did not take any action because I could not tell whether you meant yes or no. Please reply yes to approve or no to reject."
     if "identify proposal when pending count is not one" in reason:
-        return "I did not take any action because there is more than one pending proposal. Please reply with the proposal ID and yes/no, for example: yes 5e165d49."
+        return "I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID."
+    if "ambiguous plain action with multiple pending proposals" in reason:
+        return "I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID."
     if "exactly one matching pending proposal is required" in reason:
         return "I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol."
     if "proposal expired" in reason:
-        return "I did not take any action because this proposal has already expired."
+        return "⏳ This proposal has already expired. No order was placed."
     if "unauthorized sender" in reason:
         return "I ignored this message because it was not sent by the authorized Telegram user."
     if "unauthorized" in reason:

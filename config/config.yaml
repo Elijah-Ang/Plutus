@@ -67,6 +67,14 @@ telegram:
   approval_enabled: true
   proposal_expiry_minutes: 15
   allow_plain_yes_only_when_single_pending_proposal: true
+  telegram_approval_listener_enabled: true
+  telegram_approval_poll_interval_seconds: 30
+  telegram_approval_listener_mode: approval_only
+  market_scan_processes_telegram_updates: false
+  approval_price_refresh_required: true
+  approval_max_price_age_seconds: 60
+  approval_max_price_move_bps: 25
+
 ai:
   enabled: true
   provider: openai
