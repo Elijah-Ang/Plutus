@@ -34,10 +34,10 @@ def test_proposal_message_template():
     message = format_proposal_message(proposal, config)
     
     # Verify required structural content
-    assert "Paper trading only" in message
+    assert "Paper only" in message
     assert "Buy SPY" in message
     assert "$1" in message
-    assert "Reply yes to approve, or no to reject." in message
+    assert "Reply to this message with:" in message
     assert "Jun 19, 2026" in message
     assert "2:06 AM" in message
     assert "SGT" in message

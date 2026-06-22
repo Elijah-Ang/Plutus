@@ -132,9 +132,9 @@ def test_telegram_proposal_includes_score():
     }
     config = load_config()
     msg = format_proposal_message(proposal, config)
-    assert "Recommendation score: 75/100" in msg
-    assert "Suggestion: Moderate paper candidate" in msg
-    assert "Why: Test trend score" in msg
+    assert "Trade score: 75/100" in msg
+    assert "Confidence: Moderate" in msg
+    assert "Why this appeared:\nThe longer-term trend passed the bot’s filters" in msg
 
 def test_gpt_call_throttling(temp_storage):
     config = load_config()

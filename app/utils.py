@@ -117,11 +117,9 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     mode = config.get("mode", "paper")
     live_enabled = config.get("live_enabled", False)
     if mode == "live" and live_enabled:
-        mode_str = "Live trading"
-        mode_notice = "WARNING: This is a LIVE trade using real money."
+        mode_notice = "Live trading"
     else:
-        mode_str = "Paper trading only"
-        mode_notice = "This uses fake Alpaca Paper money, not real money."
+        mode_notice = "Paper only"
 
     if symbol == "TEST" or is_fake_test:
         return (
@@ -133,61 +131,68 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"Expires: {expiry_fmt}"
         )
 
-    # 2. Action / Amount
+    # Header / Action & Amount
     notional_adjustment_note = proposal.get("notional_adjustment_note", "")
     if side.lower() == "buy":
-        action_header = f"📄 Paper trade proposal\n\n"
-        action_detail = f"Action: Buy {symbol}\n"
-        amount_detail = f"Amount: ${notional:.0f}{notional_adjustment_note}" if notional is not None else "Amount: N/A"
+        header = "📄 Paper trade proposal\n\n"
+        action_line = f"Buy {symbol} — {mode_notice}\n"
+        amount_line = f"Amount: ${notional:.0f}{notional_adjustment_note}\n\n"
     else:
-        action_header = f"📄 Paper sell proposal\n\n"
-        action_detail = f"Action: Sell {symbol}\n"
-        amount_detail = f"Quantity: {qty} shares" if qty is not None else (f"Amount: ${notional:.0f}{notional_adjustment_note}" if notional is not None else "Amount: N/A")
-        amount_detail += "\nPurpose: Close or reduce the existing paper position."
+        header = "📄 Paper sell proposal\n\n"
+        action_line = f"Sell {symbol} — {mode_notice}\n"
+        if qty is not None:
+            amount_line = f"Quantity: {qty} shares\n\n"
+        elif notional is not None:
+            amount_line = f"Amount: ${notional:.0f}{notional_adjustment_note}\n\n"
+        else:
+            amount_line = "Amount: N/A\n\n"
 
-    # 3. Scores & Confidence
-    asset_score = proposal.get("asset_score")
-    asset_classification = proposal.get("asset_classification", "Watch only")
+    # Confidence and Scores
     score_val = proposal.get("score")
-    trade_classification = proposal.get("classification", "No action suggested")
     
-    # Map score to system confidence
     system_confidence = "No action suggested"
     if score_val is not None:
-        if score_val >= 90: system_confidence = "Very strong paper setup"
-        elif score_val >= 80: system_confidence = "Strong paper setup"
-        elif score_val >= 65: system_confidence = "Moderate paper setup"
-        elif score_val >= 50: system_confidence = "Weak setup, watch only"
-        
-    scores_str = ""
-    if score_val is not None and asset_score is not None:
-        scores_str = (
-            f"Asset score: {asset_score:.0f}/100 — {asset_classification}\n"
-            f"Trade score: {score_val:.0f}/100 — {trade_classification}\n"
-            f"System confidence: {system_confidence}\n\n"
-        )
-    elif score_val is not None:
-        if score_val >= 80:
-            urgency_note = "High priority/confidence signal."
+        if score_val >= 90:
+            system_confidence = "Very strong"
+        elif score_val >= 80:
+            system_confidence = "Strong"
         elif score_val >= 65:
-            urgency_note = "Moderate confidence signal."
-        else:
-            urgency_note = "Lower urgency, watch-only signal."
-        scores_str = (
-            f"Recommendation score: {score_val:.0f}/100\n"
-            f"Urgency guidance: {urgency_note}\n"
-            f"Suggestion: {trade_classification}\n"
-            f"Why: {proposal.get('reason', '')}\n\n"
-        )
-
-    # 4. Rank
+            system_confidence = "Moderate"
+        elif score_val >= 50:
+            system_confidence = "Weak"
+            
+    confidence_line = f"Confidence: {system_confidence}\n"
+    score_line = f"Trade score: {score_val:.0f}/100\n" if score_val is not None else ""
+    
     rank = proposal.get("symbol_rank")
     total_active = proposal.get("total_active_symbols")
-    rank_str = ""
+    rank_line = ""
     if rank is not None and total_active is not None:
-        rank_str = f"Rank: #{rank} of {total_active} active ETFs\n\n"
+        rank_line = f"Rank: #{rank} of {total_active} active ETFs\n"
+        
+    scores_section = f"{confidence_line}{score_line}{rank_line}\n"
 
-    # 5. Price changes
+    # Why this appeared
+    raw_reason = proposal.get("reason", "")
+    why_text = ""
+    if side.lower() == "buy":
+        if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
+            why_text = "The longer-term trend passed the bot’s filters, and volatility is normal for this ETF."
+        elif "volatility elevated" in raw_reason or "volatility_elevated" in raw_reason or "elevated" in raw_reason.lower():
+            why_text = "The longer-term trend passed the bot’s filters, and volatility is elevated for this ETF."
+        else:
+            why_text = f"The longer-term trend passed the bot’s filters, and volatility is normal for this ETF."
+    else:
+        if "close below 50-day MA" in raw_reason or "below 50-day MA" in raw_reason:
+            why_text = "The price closed below the 50-day moving average, signaling an exit to protect capital."
+        elif "stop drawdown" in raw_reason:
+            why_text = "The position hit the trailing stop drawdown threshold."
+        else:
+            why_text = f"Exit condition met: {raw_reason}."
+            
+    why_section = f"Why this appeared:\n{why_text}\n\n"
+
+    # Current movement
     price_change_pct = proposal.get("price_change_pct", 0.0)
     session_change_pct = proposal.get("session_change_pct", 0.0)
     
@@ -198,107 +203,61 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     vol_regime_str = ""
     if vol_20 is not None and isinstance(vol_20, (int, float)):
         vol_pct = vol_20 * 100
-        if vol_20 > 0.45:
-            regime = "extreme; blocked"
-        elif vol_20 > 0.35:
-            regime = "high; watch only"
-        elif vol_20 >= 0.25:
-            regime = "elevated; smaller paper size / extra caution"
-        elif vol_20 >= 0.08:
-            regime = "normal ETF regime"
+        volatility_class = proposal.get("volatility_class", "normal")
+        if volatility_class == "extreme" or vol_20 > 0.45:
+            regime = "extreme ETF regime"
+        elif volatility_class == "high" or vol_20 > 0.35:
+            regime = "high ETF regime"
+        elif volatility_class == "elevated" or vol_20 >= 0.25:
+            regime = "elevated ETF regime"
+        elif volatility_class == "low" or vol_20 < 0.08:
+            regime = "quiet ETF regime"
         else:
-            regime = "too quiet"
+            regime = "normal ETF regime"
         vol_regime_str = f"Volatility: {vol_pct:.1f}% annualized — {regime}\n"
-        
-    changes_str = (
+
+    movement_section = (
+        f"Current movement:\n"
         f"Since last check: {price_change_pct:+.2f}%\n"
         f"Since market open: {session_change_pct:+.2f}%\n"
         f"{vol_regime_str}\n"
     )
 
-    # 6. GPT Review
-    gpt_str = ""
+    # Main risk / GPT review / caution
     review = proposal.get("review")
     gpt_called = proposal.get("gpt_called", True)
     
-    if review:
-        gpt_conf = review.get("gpt_confidence", "Not called")
-        gpt_caution = review.get("gpt_caution", "Low")
-        main_risk = review.get("main_risk", "")
-        if gpt_called and gpt_conf != "Not called" and "Deterministic fallback" not in review.get("reasoning_notes", ""):
-            gpt_str = (
-                f"GPT review: {gpt_conf} confidence\n"
-                f"Main caution: {main_risk or 'None'}\n\n"
-            )
-        else:
-            if score_val is not None and score_val < 65:
-                gpt_str = "GPT review: Not called. The setup was not strong enough to need AI review.\n\n"
-            else:
-                gpt_str = "GPT review: Not called. AI review was skipped due to throttling/safety limits.\n\n"
-    else:
-        if score_val is not None and score_val < 65:
-            gpt_str = "GPT review: Not called. The setup was not strong enough to need AI review.\n\n"
-        else:
-            gpt_str = "GPT review: Not called. AI review was skipped due to throttling/safety limits.\n\n"
+    main_risk_str = ""
+    if review and review.get("main_risk"):
+        main_risk_str = f"Main risk:\n{review.get('main_risk')}\n\n"
+    elif not gpt_called and side.lower() == "buy":
+        main_risk_str = (
+            f"Main risk:\nRule-based only. AI review was not available. Treat with extra caution.\n\n"
+        )
 
-    # 7. Reason
-    reason_str = ""
-    if asset_score is not None:
-        raw_reason = proposal.get("reason", "")
-        if raw_reason.startswith("Test") or symbol == "TEST" or is_fake_test:
-            reason_str = f"Why: {raw_reason}\n\n"
-        else:
-            reasons_why = []
-            if rank is not None and total_active is not None:
-                reasons_why.append(f"ETF is ranked #{rank} of {total_active} active candidates")
-            if raw_reason:
-                reasons_why.append(f"primary strategy signal indicates '{raw_reason}'")
-            volatility_class = proposal.get("volatility_class", "normal")
-            if volatility_class:
-                reasons_why.append(f"volatility condition is {volatility_class}")
-            if price_change_pct != 0.0:
-                reasons_why.append(f"recent price change is {price_change_pct:+.2f}% since last check")
-            if session_change_pct != 0.0:
-                reasons_why.append(f"session trend is {session_change_pct:+.2f}% since market open")
-            
-            if reasons_why:
-                why_text = "; ".join(reasons_why)
-                why_text = why_text[0].upper() + why_text[1:] + "."
-                reason_str = f"Why: {why_text}\n\n"
-            else:
-                reason_str = f"Why: {raw_reason}\n\n"
-
-    # 8. Time to decide and expiry
-    volatility_class = proposal.get("volatility_class", "normal")
-    if volatility_class == "high":
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes because the market is moving quickly."
-    elif volatility_class == "low":
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes because conditions are relatively stable."
-    else:
-        time_to_decide = f"Time to decide: {expiry_minutes} minutes"
-
-    expiry_info = (
-        f"{time_to_decide}\n"
-        f"Expires: {expiry_fmt}\n\n"
-    )
-
-    # 9. Instructions
+    # Decision time
+    decision_time_str = f"Decision time: {expiry_minutes} minutes\n"
+    expires_str = f"Expires: {expiry_fmt}\n\n"
+    
+    # Instructions
+    side_lowercase = side.lower()
     instructions = (
-        f"Reply yes to approve, or no to reject.\n"
-        f"No reply = proposal expires and no order is placed."
+        f"Reply to this message with:\n"
+        f"yes = approve this {symbol} paper {side_lowercase}\n"
+        f"no = reject this {symbol} paper {side_lowercase}\n\n"
+        f"No reply = expires and no order is placed."
     )
 
     return (
-        f"{action_header}"
-        f"Mode: {mode_str}\n"
-        f"{action_detail}"
-        f"{amount_detail}\n\n"
-        f"{scores_str}"
-        f"{rank_str}"
-        f"{changes_str}"
-        f"{gpt_str}"
-        f"{reason_str}"
-        f"{expiry_info}"
+        f"{header}"
+        f"{action_line}"
+        f"{amount_line}"
+        f"{scores_section}"
+        f"{why_section}"
+        f"{movement_section}"
+        f"{main_risk_str}"
+        f"{decision_time_str}"
+        f"{expires_str}"
         f"{instructions}"
     )
 

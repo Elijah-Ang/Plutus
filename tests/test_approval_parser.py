@@ -39,13 +39,13 @@ def test_mismatched_symbol_rejected():
 def test_rejection_rejected_with_multiple_pending():
     result = parse_approval("no", 7, 7, [pending(), pending(id="def")])
     assert not result.accepted
-    assert result.reason == "identify proposal when pending count is not one"
+    assert result.reason == "ambiguous plain action with multiple pending proposals"
 
 
 def test_rejection_rejected_with_no_pending():
     result = parse_approval("no", 7, 7, [])
     assert not result.accepted
-    assert result.reason == "identify proposal when pending count is not one"
+    assert result.reason == "exactly one matching pending proposal is required"
 
 
 def test_approval_rejected_with_no_pending():

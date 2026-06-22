@@ -153,19 +153,16 @@ def test_telegram_proposal_message_content():
     config = {"mode": "paper"}
     msg = format_proposal_message(proposal, config)
 
-    assert "Mode: Paper trading only" in msg
-    assert "Action: Buy QQQ" in msg
+    assert "Buy QQQ — Paper only" in msg
     assert "Amount: $1" in msg
-    assert "Asset score: 74/100 — Moderate watch candidate" in msg
-    assert "Trade score: 68/100 — Moderate paper setup" in msg
-    assert "System confidence: Moderate" in msg
+    assert "Confidence: Moderate" in msg
+    assert "Trade score: 68/100" in msg
     assert "Rank: #1 of 4 active ETFs" in msg
     assert "Since last check: +0.18%" in msg
     assert "Since market open: +0.72%" in msg
-    assert "GPT review: Medium confidence" in msg
-    assert "Main caution: Volatility is still slightly elevated." in msg
-    assert "Time to decide: 15 minutes" in msg
-    assert "Reply yes to approve, or no to reject." in msg
+    assert "Main risk:\nVolatility is still slightly elevated." in msg
+    assert "Decision time: 15 minutes" in msg
+    assert "yes = approve this QQQ paper buy" in msg
 
 def test_expiry_notification_natural_language(temp_storage):
     config = {"mode": "paper"}

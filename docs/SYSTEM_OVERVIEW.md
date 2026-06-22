@@ -92,10 +92,37 @@ The `scripts/` directory contains operational shell and Python scripts used for 
 - `telegram_test.py`: Simple verification script to send a basic Telegram message. **[Safe/Read-only]**
 
 ## 8. Telegram Approval Flow
-Every trade proposal is written to SQLite with `status='pending'` and messaged to the authorized user via Telegram.
-1. The user replies `yes` or `no` (and optionally includes symbol/ID if multiple are pending).
-2. The bot parses the response, matches the candidate proposal (supporting prefix ID matching like `yes 5e165d49`), and processes approval or rejection.
-3. If approved, the approval token is consumed (marked in DB to prevent duplicate double-spending) and final revalidation is executed.
+Every trade proposal is written to SQLite with `status='pending'`, assigned a Telegram `message_id` once transmitted, and messaged to the authorized user.
+
+- **Reply-To Proposal Targeting**: 
+  - The system stores each proposal's `proposal_id`, `symbol`, `side/action`, `telegram_message_id`, `expires_at`, and `status`.
+  - When the authorized user replies directly to a proposal message:
+    - The bot reads `reply_to_message.message_id` and matches it to the stored proposal.
+    - If the reply text is `yes`, it approves that specific proposal.
+    - If the reply text is `no`, it rejects that specific proposal.
+    - No symbol or proposal ID is required when reply-to targeting is used.
+
+- **Plain Yes/No Ambiguity Resolution**:
+  - If the user sends a plain `yes` or `no` without replying to a specific message:
+    - If exactly one pending proposal exists, the system processes it.
+    - If multiple pending proposals exist, the system does not guess. It replies with a clarification message:
+      `I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID, such as "yes SPY" or "no DIA".`
+
+- **Instant Acknowledgement Messages**:
+  - When the user sends a response, the bot immediately acknowledges it:
+    - **Approval Received**: `✅ Received: YES for [symbol] paper [side] proposal. I will now run the final safety check. No order will be placed unless the final check passes.`
+    - **Paper Order Submitted**: `✅ Paper order submitted: Buy [symbol] for $[amount]. Mode: paper only.` (or equivalent for sell).
+    - **Blocked by Safety Check**: `⚠️ Approved, but no order was placed. Reason: [clear reason].`
+    - **Rejection**: `❌ Received: NO for [symbol] paper [side] proposal. Proposal rejected. No order will be placed.`
+    - **Expired**: `⏳ This proposal has already expired. No order was placed.`
+    - **Ambiguous**: `I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.`
+
+- **Proposal Conflict Handling after Approval**:
+  - If a BUY proposal is approved and successfully submitted as an order:
+    - The system automatically marks all other pending BUY proposals as `superseded`.
+    - It sends a single notification message: `Other pending BUY proposals were cancelled because one paper position/trade is already active.`
+    - Superseded proposals are blocked from execution. Exits are never superseded by this logic.
+    - If approved, the approval token is consumed to prevent double-spending, and final validation is run.
 
 ## 9. Alpaca Paper Broker Flow
 The broker is initialized in paper mode using keys fetched securely from the macOS Keychain.
@@ -146,6 +173,26 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     - It is a position-reducing exit (and a real position exists), or
     - The Trade Decision Score improves by $\ge 10$ points compared to the last proposal.
   - Deduplication actions are tracked in the database and audit events, and do not bypass approvals.
+- **Simultaneous BUY Limits & Candidate Ranking**:
+  - The system enforces configuration constraints to limit BUY proposals:
+    - `max_new_buy_proposals_per_cycle`: Limits how many new BUY proposals can be sent in a single scan cycle (default: 1).
+    - `max_pending_buy_proposals`: Limits the total number of simultaneous pending BUY proposals (default: 1).
+    - `allow_multiple_exit_proposals`: Allows exit/reduce-risk proposals to bypass these limits (default: true).
+  - If multiple BUY candidates qualify, they are sorted and ranked. Only the best candidate is proposed; others are suppressed and logged as `suppressed_by_candidate_limit`.
+  - The sorting and tie-breaking order is:
+    1. Higher Trade Decision Score
+    2. Higher Asset Selection Score
+    3. Better symbol watchlist rank
+    4. Lower volatility regime (Normal -> Too Quiet -> Elevated -> High -> Extreme)
+    5. Stronger price movement (Price Change %)
+    6. Stronger session movement (Session Change %)
+    7. Stable deterministic symbol order (alphabetical fallback)
+- **GPT-Required Gating for BUY Proposals**:
+  - By default, `require_gpt_review_for_buy_proposals` is set to `true` for BUY proposals (exits/sells can bypass).
+  - If score $\ge 65$ but GPT review is unavailable/throttled:
+    - The proposal is deferred and logged in Market Memory as `deferred_ai_review_unavailable`. No pending proposal or Telegram message is created, and no order can be placed.
+  - If rules explicitly allow rule-only proposals (`require_gpt_review_for_buy_proposals: false`), the proposal clearly contains the caution warning:
+    `Rule-based only. AI review was not available. Treat with extra caution.`
 - **Dynamic Expiry Rules**:
   - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
   - Base values: Normal buy/sell is 15 minutes, exits/sells are 10 minutes. High volatility limits base to 5 minutes, and low volatility extends base to 20 minutes.
@@ -383,3 +430,4 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-22**: Audited the active system and corrected stale documentation concerning scheduling, script side effects, live/auto-execution guarantees, and current paper-account state.
 - **2026-06-22**: Repaired authoritative final-risk context, hard-disabled live/auto capabilities, added read-only order/fill reconciliation, safe stale-lock recovery, report/Telegram redaction, and functional near-close clock handling.
 - **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.
+- **2026-06-23**: Implemented Telegram reply-to proposal targeting, ambiguity resolution, instant acknowledgements, simultaneous BUY limits with 6-tier tie-breaking, and GPT review requirement/deferral logic.

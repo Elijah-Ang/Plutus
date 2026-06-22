@@ -234,6 +234,7 @@ def test_expired_proposal_cannot_execute():
 
 def test_dynamic_expiry_volatility_rules(temp_storage):
     config = load_config()
+    config["risk"]["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()
@@ -319,22 +320,21 @@ def test_telegram_proposal_formats_expiry_and_volatility():
     
     # Normal Volatility Msg
     msg = format_proposal_message(proposal, config)
-    assert "Time to decide: 15 minutes" in msg
+    assert "Decision time: 15 minutes" in msg
     assert f"Expires: {expiry_sgt}" in msg
-    assert "Urgency guidance: High priority/confidence signal." in msg
     
     # High Volatility Msg
     proposal["expiry_minutes"] = 5
     proposal["volatility_class"] = "high"
     msg_high = format_proposal_message(proposal, config)
-    assert "Time to decide: 5 minutes because the market is moving quickly." in msg_high
+    assert "Decision time: 5 minutes" in msg_high
     assert f"Expires: {expiry_sgt}" in msg_high
     
     # Low Volatility Msg
     proposal["expiry_minutes"] = 20
     proposal["volatility_class"] = "low"
     msg_low = format_proposal_message(proposal, config)
-    assert "Time to decide: 20 minutes because conditions are relatively stable." in msg_low
+    assert "Decision time: 20 minutes" in msg_low
     assert f"Expires: {expiry_sgt}" in msg_low
 
 def test_auto_execution_disabled_by_default(temp_storage):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -153,40 +154,149 @@ class TradingService:
                 self.telegram.send_message("Blocked for safety: live trading is disabled.")
                 continue
 
+            reply_to = message.get("reply_to_message") or {}
+            reply_to_message_id = reply_to.get("message_id")
+            
+            # Determine targeting method
+            targeting_method = None
+            if reply_to_message_id is not None:
+                targeting_method = "reply_to"
+            else:
+                normalized = " ".join(text.lower().strip().split())
+                reject_words = r"(?:no|reject|rejected)(?: thanks)?"
+                approve_words = r"(?:yes|approve|approved)(?: please)?"
+                is_plain_reject = bool(re.fullmatch(reject_words, normalized))
+                is_plain_approve = bool(re.fullmatch(approve_words, normalized))
+                if is_plain_approve or is_plain_reject:
+                    targeting_method = "single_pending"
+                else:
+                    reject_match = re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized)
+                    approve_match = re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized)
+                    match_obj = approve_match or reject_match
+                    if match_obj:
+                        side, symbol, proposal_id = match_obj.groups()
+                        if proposal_id:
+                            targeting_method = "proposal_id"
+                        elif symbol:
+                            targeting_method = "symbol"
+                        else:
+                            targeting_method = "single_pending"
+                            
             pending = self.storage.active_proposals()
-            parsed = parse_approval(text, sender, self.telegram.allowed_user_id or "", pending)
-            approval_id = str(uuid.uuid4())
-            self.storage.execute(
-                "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "accepted" if parsed.accepted else "rejected", iso_now()),
+            
+            # Check reply-to targeting validations (wrong/expired/handled proposals)
+            if reply_to_message_id is not None:
+                proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE telegram_message_id=?", (str(reply_to_message_id),))
+                if not proposal_rows:
+                    self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
+                    continue
+                    
+                proposal_row = proposal_rows[0]
+                prop_status = proposal_row.get("status")
+                prop_symbol = proposal_row.get("symbol", "")
+                prop_side = proposal_row.get("side", "").upper()
+                
+                # Check text matches yes/no action
+                normalized = " ".join(text.lower().strip().split())
+                reject_words = r"(?:no|reject|rejected)(?: thanks)?"
+                approve_words = r"(?:yes|approve|approved)(?: please)?"
+                is_approve = bool(re.fullmatch(approve_words, normalized)) or bool(re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized))
+                is_reject = bool(re.fullmatch(reject_words, normalized)) or bool(re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized))
+                
+                if not is_approve and not is_reject:
+                    self.telegram.send_message("I did not take any action because I could not tell whether you meant yes or no. Please reply yes to approve or no to reject.")
+                    continue
+                    
+                if prop_status == "expired":
+                    self.telegram.send_message("⏳ This proposal has already expired. No order was placed.")
+                    continue
+                elif prop_status in ("approved", "rejected", "superseded"):
+                    self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
+                    continue
+            
+            # Check plain yes/no ambiguity
+            normalized = " ".join(text.lower().strip().split())
+            reject_words = r"(?:no|reject|rejected)(?: thanks)?"
+            approve_words = r"(?:yes|approve|approved)(?: please)?"
+            is_plain_reject = bool(re.fullmatch(reject_words, normalized))
+            is_plain_approve = bool(re.fullmatch(approve_words, normalized))
+            
+            if reply_to_message_id is None and (is_plain_approve or is_plain_reject):
+                if len(pending) > 1:
+                    self.telegram.send_message("I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID, such as \"yes SPY\" or \"no DIA\".")
+                    continue
+                elif len(pending) == 0:
+                    self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
+                    continue
+
+            parsed = parse_approval(
+                text,
+                sender,
+                self.telegram.allowed_user_id or "",
+                pending,
+                reply_to_message_id=reply_to_message_id
             )
+            
+            # If not authorized, ignore
+            if parsed.reason == "unauthorized sender":
+                continue
+                
+            approval_id = str(uuid.uuid4())
+            ack_status = "rejected" if parsed.action == "reject" else "received"
+            
+            self.storage.execute(
+                "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "accepted" if parsed.accepted else "rejected", iso_now(), str(reply_to_message_id) if reply_to_message_id is not None else None, targeting_method, ack_status),
+            )
+            
             if not parsed.accepted or not parsed.proposal_id:
                 msg = translate_reason(parsed.reason)
                 self.telegram.send_message(msg)
                 continue
+                
+            row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
+            prop_symbol = row.get("symbol", "")
+            prop_side = row.get("side", "").lower()
+            
             if parsed.action == "reject":
                 self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (parsed.proposal_id,))
-                self.telegram.send_message(f"Rejected. No order was placed for proposal {parsed.proposal_id[:8]}.")
+                self.telegram.send_message(f"❌ Received: NO for {prop_symbol} paper {prop_side} proposal. Proposal rejected. No order will be placed.")
                 continue
-            row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
+                
+            # Send immediate acknowledgement message for YES
+            self.telegram.send_message(f"✅ Received: YES for {prop_symbol} paper {prop_side} proposal. I will now run the final safety check. No order will be placed unless the final check passes.")
+            
             if not self.storage.consume_approval(parsed.proposal_id, approval_id):
                 self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                 continue
+                
             proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
             context = self._portfolio_context(proposal, approval_valid=True)
             result = Executor(self.broker, self._risk_engine(parsed.proposal_id, "final")).execute(proposal, context)
+            
             self.storage.execute(
                 "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal["symbol"], proposal["side"], proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
             )
             
-            # User-friendly order status response
-            if result.status.lower() in {"filled", "filled_fully", "orderstatus.filled"}:
-                self.telegram.send_message(f"Filled. The paper order for {proposal['symbol']} was completed successfully.")
-            elif result.submitted:
-                self.telegram.send_message(f"Approved. A paper order was submitted for {proposal['symbol']}. Current status: pending.")
+            if result.submitted:
+                self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
+                notional_val = proposal.get("notional", 5)
+                qty_val = proposal.get("qty")
+                if prop_side == "buy":
+                    self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${notional_val:.0f}. Mode: paper only.")
+                else:
+                    qty_str = f"{qty_val} shares" if qty_val is not None else f"${notional_val:.0f}"
+                    self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {qty_str}. Mode: paper only.")
+                    
+                if prop_side == "buy":
+                    other_buys = self.storage.fetch_all("SELECT id FROM trade_proposals WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
+                    if other_buys:
+                        self.storage.execute("UPDATE trade_proposals SET status='superseded' WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
+                        self.telegram.send_message("Other pending BUY proposals were cancelled because one paper position/trade is already active.")
             else:
-                self.telegram.send_message(f"Approved, but submission failed or was blocked: {result.reason}")
+                self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
+                self.telegram.send_message(f"⚠️ Approved, but no order was placed. Reason: {result.reason}.")
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
@@ -600,11 +710,96 @@ class TradingService:
                     "volatility_gate_result": volatility_gate_result,
                 })
 
-            profile_results.sort(key=lambda x: x["asset_score"], reverse=True)
+            # Populate symbol rank and total active symbols first
+            for idx, res in enumerate(profile_results):
+                res["symbol_rank"] = idx + 1
+                res["total_active_symbols"] = len(active_watchlist)
+
+            risk_cfg = self.config.get("risk", {})
+            max_new_buy_per_cycle = risk_cfg.get("max_new_buy_proposals_per_cycle", 1)
+            max_pending_buy = risk_cfg.get("max_pending_buy_proposals", 1)
+            
+            # Determine which BUY candidates are eligible before we process/filter them
+            buy_candidates = []
+            for res in profile_results:
+                symbol = res["symbol"]
+                signal = res["signal"]
+                score = res["score"]
+                
+                # Check deduplication first to see if it would be allowed
+                tmp_dedupe_status = "allowed"
+                pending_proposals = self.storage.fetch_all(
+                    "SELECT * FROM trade_proposals WHERE symbol=? AND side=? AND status='pending'",
+                    (symbol, signal.side)
+                )
+                if pending_proposals:
+                    tmp_dedupe_status = "suppressed"
+                else:
+                    last_prop_rows = self.storage.fetch_all(
+                        "SELECT * FROM trade_proposals WHERE symbol=? AND side=? ORDER BY created_at DESC LIMIT 1",
+                        (symbol, signal.side)
+                    )
+                    if last_prop_rows:
+                        last_prop = last_prop_rows[0]
+                        last_created_at = datetime.fromisoformat(last_prop["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
+                        elapsed_mins = (now - last_created_at).total_seconds() / 60
+                        try:
+                            payload_dict = json.loads(last_prop["payload"])
+                            last_score = float(payload_dict.get("score", 0))
+                        except Exception:
+                            last_score = 0.0
+                            
+                        is_exit = (signal.action == "EXIT" or signal.side == "sell")
+                        if elapsed_mins < 60:
+                            if is_exit and res["has_position"]:
+                                pass
+                            elif score >= last_score + 10:
+                                pass
+                            else:
+                                tmp_dedupe_status = "suppressed"
+                                
+                ai_config = self.config.get("ai", {})
+                is_eligible_buy = (
+                    symbol in active_watchlist 
+                    and proposals_enabled 
+                    and signal.action == "ENTRY" 
+                    and signal.side == "buy" 
+                    and score >= ai_config.get("ai_review_min_score", 65)
+                    and tmp_dedupe_status == "allowed"
+                )
+                if is_eligible_buy:
+                    buy_candidates.append(res)
+            
+            def get_vol_regime_rank(regime):
+                order = ["normal", "too quiet", "elevated", "high", "extreme"]
+                try:
+                    return order.index(regime)
+                except ValueError:
+                    return len(order)
+                    
+            def buy_sort_key(candidate):
+                return (
+                    -candidate["score"],
+                    -candidate["asset_score"],
+                    candidate["symbol_rank"],
+                    get_vol_regime_rank(candidate["volatility_regime"]),
+                    -candidate["price_change_pct"],
+                    -candidate["session_change_pct"],
+                    candidate["symbol"]
+                )
+                
+            buy_candidates.sort(key=buy_sort_key)
+            
+            pending_in_db = self.storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='buy' AND status='pending'")[0]["cnt"]
+            allowed_new_buys = max(0, min(max_new_buy_per_cycle, max_pending_buy - pending_in_db))
+            
+            allowed_buy_symbols = {c["symbol"] for c in buy_candidates[:allowed_new_buys]}
+            suppressed_buy_symbols = {c["symbol"] for c in buy_candidates[allowed_new_buys:]}
+
             any_generated = False
             
             for idx, res in enumerate(profile_results):
-                rank = idx + 1
+                rank = res["symbol_rank"]
                 symbol = res["symbol"]
                 price = res["price"]
                 price_at = res["price_at"]
@@ -634,6 +829,8 @@ class TradingService:
                 volatility_gate_result = res.get("volatility_gate_result", "fail-safe HOLD")
 
                 ai_config = self.config.get("ai", {})
+                is_buy = (signal.action == "ENTRY" and signal.side == "buy")
+                
                 proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
                 gpt_called = False
                 proposal_generated = False
@@ -646,9 +843,14 @@ class TradingService:
                 dedupe_status = "skipped"
                 dedupe_reason = "not eligible for proposal"
                 paper_size_adjustment = 1.0
+                candidate_suppression_reason = None
+                deferred_ai_review_reason = None
                 
                 if not proposal_allowed:
-                    if symbol not in active_watchlist:
+                    if is_buy and symbol in suppressed_buy_symbols:
+                        no_action_reason = "suppressed due to simultaneous candidate limits"
+                        candidate_suppression_reason = "suppressed_by_candidate_limit"
+                    elif symbol not in active_watchlist:
                         no_action_reason = "symbol not in active watchlist"
                     elif not proposals_enabled:
                         no_action_reason = "proposals disabled for profile"
@@ -705,71 +907,110 @@ class TradingService:
                             "symbol": symbol, "side": signal.side, "status": "suppressed", "reason": dedupe_reason
                         })
                     else:
-                        calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
-                        last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
-                        time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
-                        if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
-                            gpt_called = True
-                        
-                        proposal_id = str(uuid.uuid4())
-                        
-                        # Size adjustment calculation
-                        base_notional = float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5))
-                        notional = base_notional
-                        notional_adjustment_note = ""
-                        if signal.action == "ENTRY" and signal.side == "buy":
-                            if vol_20 is not None and 0.25 <= vol_20 <= 0.35:
-                                notional = base_notional * 0.5
-                                paper_size_adjustment = 0.5
-                                notional_adjustment_note = " (reduced by 50% due to elevated volatility)"
-                                
-                        proposal = {
-                            "id": proposal_id,
-                            "run_id": self.run_id,
-                            "signal_id": signal_id,
-                            "symbol": symbol,
-                            "side": signal.side,
-                            "action": "entry" if signal.action == "ENTRY" else "exit",
-                            "notional": notional,
-                            "notional_adjustment_note": notional_adjustment_note,
-                            "latest_price": price,
-                            "price_at": str(price_at),
-                            "historical_bars": len(bars),
-                            "volume": volume,
-                            "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,
-                            "created_at": now.isoformat(),
-                            "expires_at": expiry.isoformat(),
-                            "strategy_version": signal.strategy_version,
-                            "reason": signal.reason,
-                            "order_type": "market",
-                            "asset_class": "equity",
-                            "indicators": signal.indicators,
-                            "score": score,
-                            "classification": classification,
-                            "system_confidence": system_confidence,
-                            "expiry_minutes": expiry_minutes,
-                            "volatility_class": volatility_class,
-                            "asset_score": asset_score,
-                            "asset_classification": asset_classification,
-                            "symbol_rank": rank,
-                            "total_active_symbols": len(active_watchlist),
-                            "price_change_pct": price_change_pct,
-                            "session_change_pct": session_change_pct,
-                            "gpt_called": gpt_called
-                        }
-                        
-                        self._should_auto_execute(proposal)
-                        decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
-                        if not decision.passed:
-                            no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                        # Check candidate limit suppression
+                        if is_buy and symbol in suppressed_buy_symbols:
+                            proposal_allowed = False
+                            dedupe_status = "suppressed"
+                            dedupe_reason = "suppressed due to simultaneous candidate limits"
+                            no_action_reason = "suppressed due to simultaneous candidate limits"
+                            candidate_suppression_reason = "suppressed_by_candidate_limit"
+                            self.storage.audit(self.run_id, "proposal_suppressed", {
+                                "symbol": symbol, "reason": "suppressed_by_candidate_limit", "score": score
+                            })
                         else:
-                            proposal_generated = True
-                            no_action_reason = "proposal generated"
-                            any_generated = True
+                            calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
+                            last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
+                            time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
+                            if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
+                                gpt_called = True
+                            
+                            proposal_id = str(uuid.uuid4())
+                            
+                            # Size adjustment calculation
+                            base_notional = float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5))
+                            notional = base_notional
+                            notional_adjustment_note = ""
+                            if signal.action == "ENTRY" and signal.side == "buy":
+                                if vol_20 is not None and 0.25 <= vol_20 <= 0.35:
+                                    notional = base_notional * 0.5
+                                    paper_size_adjustment = 0.5
+                                    notional_adjustment_note = " (reduced by 50% due to elevated volatility)"
+                                    
+                            proposal = {
+                                "id": proposal_id,
+                                "run_id": self.run_id,
+                                "signal_id": signal_id,
+                                "symbol": symbol,
+                                "side": signal.side,
+                                "action": "entry" if signal.action == "ENTRY" else "exit",
+                                "notional": notional,
+                                "notional_adjustment_note": notional_adjustment_note,
+                                "latest_price": price,
+                                "price_at": str(price_at),
+                                "historical_bars": len(bars),
+                                "volume": volume,
+                                "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,
+                                "created_at": now.isoformat(),
+                                "expires_at": expiry.isoformat(),
+                                "strategy_version": signal.strategy_version,
+                                "reason": signal.reason,
+                                "order_type": "market",
+                                "asset_class": "equity",
+                                "indicators": signal.indicators,
+                                "score": score,
+                                "classification": classification,
+                                "system_confidence": system_confidence,
+                                "expiry_minutes": expiry_minutes,
+                                "volatility_class": volatility_class,
+                                "asset_score": asset_score,
+                                "asset_classification": asset_classification,
+                                "symbol_rank": rank,
+                                "total_active_symbols": len(active_watchlist),
+                                "price_change_pct": price_change_pct,
+                                "session_change_pct": session_change_pct,
+                                "gpt_called": gpt_called
+                            }
+                            
+                            self._should_auto_execute(proposal)
+                            decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                            if not decision.passed:
+                                no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                                proposal_allowed = False
+                            else:
+                                require_gpt = self.config.get("risk", {}).get("require_gpt_review_for_buy_proposals", True)
+                                
+                                try:
+                                    if gpt_called:
+                                        review = self.ai.review(proposal)
+                                        if "Deterministic fallback" in review.get("reasoning_notes", ""):
+                                            gpt_called = False
+                                    else:
+                                        review = deterministic_review(proposal, warning="AI review throttled to avoid spam")
+                                except Exception as e:
+                                    logger.error("GPT review failed: %s", e)
+                                    gpt_called = False
+                                    review = deterministic_review(proposal, warning="AI review failed: " + str(e))
+                                    
+                                proposal["gpt_called"] = gpt_called
+                                proposal["review"] = review
+                                
+                                if is_buy and require_gpt and not gpt_called:
+                                    proposal_generated = False
+                                    proposal_allowed = False
+                                    no_action_reason = "deferred due to AI review throttling/unavailability"
+                                    deferred_ai_review_reason = "deferred_ai_review_unavailable"
+                                    self.storage.audit(self.run_id, "proposal_deferred", {
+                                        "symbol": symbol, "reason": "deferred_ai_review_unavailable", "score": score
+                                    })
+                                else:
+                                    proposal_generated = True
+                                    no_action_reason = "proposal generated"
+                                    any_generated = True
 
                 if proposal_allowed:
-                    review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
-                    proposal["review"] = review
+                    if review is None:
+                        review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
+                        proposal["review"] = review
 
                 g_conf = review.get("gpt_confidence", "Not called") if (gpt_called and review) else "Not called"
                 g_caut = review.get("gpt_caution", "Low") if (gpt_called and review) else "N/A"
@@ -777,8 +1018,8 @@ class TradingService:
                 exp_sgt = format_sgt(expiry)
 
                 self.storage.execute(
-                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, rank, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment)
+                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, rank, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason)
                 )
                 
                 logger.info(
@@ -795,7 +1036,10 @@ class TradingService:
                 # cannot synthesize an approval or approved proposal state.
                 self.storage.execute("INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, self.run_id, signal_id, symbol, signal.side, proposal["notional"], "pending", now.isoformat(), expiry.isoformat(), signal.strategy_version, json_dumps(proposal)))
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
-                self.telegram.send_message(f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, self.config))
+                
+                res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
+                if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                    self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
 
             if profile_results:
                 best_watch_res = profile_results[0]
@@ -954,6 +1198,15 @@ class TradingService:
                 summary_str = f"Setup triggered action for {strongest['symbol']} during the window."
         else:
             summary_str = f"{strongest['symbol']} is strongest, but no setup crossed the proposal threshold."
+
+        # Mention deferred candidates due to AI review unavailability
+        deferred_rows = self.storage.fetch_all(
+            "SELECT DISTINCT symbol FROM market_memory WHERE created_at >= ? AND deferred_ai_review_reason='deferred_ai_review_unavailable'",
+            (window_start_iso,)
+        )
+        if deferred_rows:
+            deferred_syms = ", ".join(r["symbol"] for r in deferred_rows)
+            summary_str += f" Candidates deferred due to AI review throttling: {deferred_syms}."
 
         digest_data = {
             "market_open_status": "Open" if market_open else "Closed",
