@@ -74,6 +74,7 @@ class MockTelegramBot:
         self.updates = []
         self.sent_messages = []
         self.chat_id = "12345"
+        self.allowed_user_id = "authorized_user_123"
 
     def get_updates(self, offset=None, timeout=0):
         return self.updates
@@ -153,9 +154,6 @@ def test_sleep_mode_toggle_and_expiry(temp_storage, base_config):
     assert len(audit_events) == 1
 
     # 2. Command older than 24h is ignored
-    # We mock time.time() to return:
-    # - now_ref on the first call (Phase 0 check, message is 10s old, not stale)
-    # - now_ref + 90000 on the second call (age check, message is 25 hours old)
     service.telegram.updates = [{
         "update_id": 2,
         "message": {
@@ -166,7 +164,7 @@ def test_sleep_mode_toggle_and_expiry(temp_storage, base_config):
             "chat": {"id": "12345"}
         }
     }]
-    with patch("time.time", side_effect=[now_ref, now_ref + 90000]):
+    with patch("time.time", return_value=now_ref + 90000):
         service.process_telegram()
     assert temp_storage.get_control_state("sleep_mode_active") is None
     audit_events = temp_storage.fetch_all("SELECT * FROM audit_events WHERE event_type='sleep_mode_command_ignored_old'")
@@ -515,3 +513,195 @@ def test_emergency_exit_missing_entry_price(temp_storage, base_config):
         # drawdown is -5% which does not match any hard triggers -> no emergency exit triggered!
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 0
+
+
+def test_telegram_command_routing_priority(temp_storage, base_config):
+    broker = MockBroker()
+    service = TradingService(base_config, temp_storage, broker, "test_run_id")
+    service.telegram = MockTelegramBot()
+
+    now_ref = 1729000000.0
+    service.listener_started_at = now_ref - 100.0
+
+    # helper to check state
+    def assert_sleep_active(expected):
+        val = temp_storage.get_control_state("sleep_mode_active")
+        if expected:
+            assert val is not None and int(val) == 1
+        else:
+            assert val is None or int(val) == 0
+
+    # 1. sleep command works when no pending proposals exist and market is closed
+    broker.open = False
+    temp_storage.execute("DELETE FROM trade_proposals")
+    temp_storage.execute("DELETE FROM approvals")
+    temp_storage.execute("DELETE FROM orders")
+    temp_storage.execute("DELETE FROM control_state")
+    service.telegram.sent_messages.clear()
+
+    service.telegram.updates = [{
+        "update_id": 10,
+        "message": {
+            "message_id": 201,
+            "date": int(now_ref - 10),
+            "text": "sleep",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert_sleep_active(True)
+    # verify acknowledgement sent
+    assert any("Sleep mode ON" in m[0] for m in service.telegram.sent_messages)
+    # verify no order, proposal or approval was created
+    assert len(temp_storage.fetch_all("SELECT * FROM approvals")) == 0
+    assert len(temp_storage.fetch_all("SELECT * FROM trade_proposals")) == 0
+    assert len(temp_storage.fetch_all("SELECT * FROM orders")) == 0
+
+    # 2. Already ON message is sent
+    service.telegram.sent_messages.clear()
+    service.telegram.updates = [{
+        "update_id": 11,
+        "message": {
+            "message_id": 202,
+            "date": int(now_ref - 5),
+            "text": "/sleep",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert_sleep_active(True)
+    assert any("Sleep mode is already ON" in m[0] for m in service.telegram.sent_messages)
+
+    # 3. awake command works when pending proposals exist
+    # Insert a pending proposal
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("prop1", "test_run_id", "QQQ", "buy", 5.0, "pending", (datetime.now(UTC) + timedelta(minutes=10)).isoformat(), datetime.now(UTC).isoformat())
+    )
+    service.telegram.sent_messages.clear()
+    service.telegram.updates = [{
+        "update_id": 12,
+        "message": {
+            "message_id": 203,
+            "date": int(now_ref - 2),
+            "text": "awake",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert_sleep_active(False)
+    assert any("Sleep mode OFF" in m[0] for m in service.telegram.sent_messages)
+    # verify proposal still exists and is not approved or rejected
+    props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE id='prop1'")
+    assert len(props) == 1
+    assert props[0]["status"] == "pending"
+
+    # 4. Already OFF message
+    service.telegram.sent_messages.clear()
+    service.telegram.updates = [{
+        "update_id": 13,
+        "message": {
+            "message_id": 204,
+            "date": int(now_ref - 1),
+            "text": "sleep mode off",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert_sleep_active(False)
+    assert any("Sleep mode is already OFF" in m[0] for m in service.telegram.sent_messages)
+
+    # 5. Robust command matching
+    robust_cases = [
+        ("Sleep", True),
+        ("sleep.", True),
+        ("I'm going to sleep", True),
+        ("im going to sleep", True),
+        ("I'm awake", False),
+        ("im awake", False),
+        ("/awake", False),
+    ]
+    for idx, (cmd, expect_on) in enumerate(robust_cases):
+        service.telegram.updates = [{
+            "update_id": 100 + idx,
+            "message": {
+                "message_id": 300 + idx,
+                "date": int(now_ref),
+                "text": cmd,
+                "from": {"id": "authorized_user_123"},
+                "chat": {"id": "12345"}
+            }
+        }]
+        with patch("time.time", return_value=now_ref):
+            service.process_telegram()
+        assert_sleep_active(expect_on)
+
+    # Reset sleep to OFF for next checks
+    temp_storage.set_control_state("sleep_mode_active", "0", "test", "test", "test", 1, 1, int(time.time()))
+
+    # 6. Unauthorized sleep command is ignored
+    service.telegram.updates = [{
+        "update_id": 50,
+        "message": {
+            "message_id": 501,
+            "date": int(now_ref),
+            "text": "sleep",
+            "from": {"id": "unauthorized_user"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert_sleep_active(False)
+
+    # 7. Unknown text with pending proposal gets yes/no clarification
+    service.telegram.sent_messages.clear()
+    service.telegram.updates = [{
+        "update_id": 60,
+        "message": {
+            "message_id": 601,
+            "date": int(now_ref),
+            "text": "hello there",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    assert any("could not tell whether you meant yes or no" in m[0] for m in service.telegram.sent_messages)
+
+    # 8. Plain yes/no still works
+    # Make sure only one pending proposal exists
+    temp_storage.execute("DELETE FROM trade_proposals")
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,expires_at,created_at,payload) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("prop_yesno", "test_run_id", "SPY", "buy", 5.0, "pending", (datetime.now(UTC) + timedelta(minutes=10)).isoformat(), datetime.now(UTC).isoformat(), '{"latest_price": 100.0}')
+    )
+    service.telegram.sent_messages.clear()
+    service.telegram.updates = [{
+        "update_id": 70,
+        "message": {
+            "message_id": 701,
+            "date": int(now_ref),
+            "text": "yes",
+            "from": {"id": "authorized_user_123"},
+            "chat": {"id": "12345"}
+        }
+    }]
+    broker.open = True
+    broker.price = 100.0
+    broker.price_time = datetime.now(UTC)
+    with patch("time.time", return_value=now_ref):
+        service.process_telegram()
+    # should record approval and run final revalidation/execution
+    approvals = temp_storage.fetch_all("SELECT * FROM approvals WHERE proposal_id='prop_yesno'")
+    assert len(approvals) == 1
+    assert approvals[0]["parsed_action"] == "approve"

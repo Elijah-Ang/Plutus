@@ -144,32 +144,16 @@ class TradingService:
             max_id = max(max_id, update.get("update_id", 0))
             message = update.get("message") or {}
             
-            # Phase 0: Protect against old queued Telegram approvals
-            message_date = message.get("date")
-            if message_date is not None:
-                is_stale = (message_date < self.listener_started_at) or (message_date < time.time() - 120)
-                if is_stale:
-                    self.storage.audit(self.run_id, "listener_bootstrap_update_ignored", {
-                        "message_id": message.get("message_id"),
-                        "message_date": message_date,
-                        "listener_started_at": self.listener_started_at,
-                        "text": message.get("text")
-                    })
-                    text_lower = str(message.get("text", "")).strip().lower()
-                    if text_lower in ("yes", "no") or any(w in text_lower for w in ("yes", "no", "approve", "reject")):
-                        self.telegram.send_message(
-                            "I ignored an old approval message from before the fast listener started. Please reply again to the current proposal if it is still pending.",
-                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
-                        )
-                    continue
-                    
             text = str(message.get("text", "")).strip()
             sender = str((message.get("from") or {}).get("id", ""))
             if not text:
                 continue
 
-            # Sleep / Wake Command Parsing
-            normalized_cmd = " ".join(text.lower().strip().split())
+            # 1. Sleep / Wake Command Parsing (Prioritized Control Commands)
+            cleaned = text.strip().lower()
+            cleaned = re.sub(r"[.!?,]+$", "", cleaned).strip()
+            normalized_cmd = " ".join(cleaned.split())
+
             is_sleep_on = normalized_cmd in (
                 "/sleep", "sleep", "sleep mode on", "i'm going to sleep", "im going to sleep", "going to sleep"
             )
@@ -203,7 +187,12 @@ class TradingService:
                 
                 if is_sleep_on:
                     was_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
-                    if not was_active:
+                    if was_active:
+                        self.telegram.send_message(
+                            "🌙 Sleep mode is already ON.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                    else:
                         self.storage.set_control_state("sleep_mode_active", "1", sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command", "sleep", sender, "telegram", text, update_id, message_id, message_date)
                         
@@ -220,7 +209,12 @@ class TradingService:
                         )
                 else:
                     was_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
-                    if was_active:
+                    if not was_active:
+                        self.telegram.send_message(
+                            "☀️ Sleep mode is already OFF.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                    else:
                         start_time_iso = self.storage.get_control_state("sleep_mode_started_at", iso_now())
                         self.storage.set_control_state("sleep_mode_active", "0", sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command", "awake", sender, "telegram", text, update_id, message_id, message_date)
@@ -239,11 +233,31 @@ class TradingService:
                         self.send_wake_summary(start_time_iso, end_time_iso)
                 continue
 
+            # 2. Telegram Bot Utility Commands
             if text.startswith("/"):
                 response = self.telegram.handle_command(text, sender)
                 self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
                 self.telegram.send_message(response, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                 continue
+
+            # 3. Phase 0: Protect against old queued Telegram approvals (Only for approvals/rejections)
+            message_date = message.get("date")
+            if message_date is not None:
+                is_stale = (message_date < self.listener_started_at) or (message_date < time.time() - 120)
+                if is_stale:
+                    self.storage.audit(self.run_id, "listener_bootstrap_update_ignored", {
+                        "message_id": message.get("message_id"),
+                        "message_date": message_date,
+                        "listener_started_at": self.listener_started_at,
+                        "text": message.get("text")
+                    })
+                    text_lower = str(message.get("text", "")).strip().lower()
+                    if text_lower in ("yes", "no") or any(w in text_lower for w in ("yes", "no", "approve", "reject")):
+                        self.telegram.send_message(
+                            "I ignored an old approval message from before the fast listener started. Please reply again to the current proposal if it is still pending.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                    continue
             
             # Live safety check before processing approvals
             if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
@@ -328,7 +342,7 @@ class TradingService:
             parsed = parse_approval(
                 text,
                 sender,
-                self.telegram.allowed_user_id or "",
+                getattr(self.telegram, "allowed_user_id", "") or "",
                 pending,
                 reply_to_message_id=reply_to_message_id
             )
