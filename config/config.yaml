@@ -137,3 +137,9 @@ digest:
   telegram_digest_use_gpt: false
   telegram_digest_min_cycles_required: 2
   telegram_digest_send_when_market_closed: false
+
+# Paper-only Emergency Auto-Exit Config
+emergency_exit:
+  enabled: true
+  max_wait_seconds_sleep: 15
+  max_wait_seconds_normal: 60

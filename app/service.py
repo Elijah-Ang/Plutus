@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
+import dataclasses
 import uuid
+import pandas as pd
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -164,6 +167,78 @@ class TradingService:
             sender = str((message.get("from") or {}).get("id", ""))
             if not text:
                 continue
+
+            # Sleep / Wake Command Parsing
+            normalized_cmd = " ".join(text.lower().strip().split())
+            is_sleep_on = normalized_cmd in (
+                "/sleep", "sleep", "sleep mode on", "i'm going to sleep", "im going to sleep", "going to sleep"
+            )
+            is_sleep_off = normalized_cmd in (
+                "/awake", "awake", "i'm awake", "im awake", "sleep mode off", "wake up"
+            )
+            
+            if is_sleep_on or is_sleep_off:
+                if not self.telegram.is_authorized(sender):
+                    self.storage.audit(self.run_id, "sleep_mode_command_ignored_unauthorized", {
+                        "sender_id": sender,
+                        "raw_command": text
+                    })
+                    continue
+                    
+                message_date = message.get("date")
+                if message_date is not None:
+                    if message_date < time.time() - 86400:
+                        self.storage.audit(self.run_id, "sleep_mode_command_ignored_old", {
+                            "message_date": message_date,
+                            "raw_command": text
+                        })
+                        self.telegram.send_message(
+                            "⚠️ Ignored old sleep/wake command from more than 24 hours ago. Please send it again.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                        continue
+                
+                update_id = update.get("update_id")
+                message_id = message.get("message_id")
+                
+                if is_sleep_on:
+                    was_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
+                    if not was_active:
+                        self.storage.set_control_state("sleep_mode_active", "1", sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command", "sleep", sender, "telegram", text, update_id, message_id, message_date)
+                        
+                        start_time_iso = datetime.fromtimestamp(message_date, UTC).isoformat() if message_date else iso_now()
+                        self.storage.set_control_state("sleep_mode_started_at", start_time_iso, sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command_sent_at", start_time_iso, sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command_processed_at", iso_now(), sender, "telegram", text, update_id, message_id, message_date)
+                        
+                        self.storage.audit(self.run_id, "sleep_mode_enabled", {"raw_command": text})
+                        
+                        self.telegram.send_message(
+                            "🌙 Sleep mode ON. I will keep scanning and logging, suppress normal BUY proposals, and only alert/act on serious paper-exit risk according to the configured emergency-exit rules. No live trading is enabled.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                else:
+                    was_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
+                    if was_active:
+                        start_time_iso = self.storage.get_control_state("sleep_mode_started_at", iso_now())
+                        self.storage.set_control_state("sleep_mode_active", "0", sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command", "awake", sender, "telegram", text, update_id, message_id, message_date)
+                        
+                        end_time_iso = iso_now()
+                        self.storage.set_control_state("sleep_mode_ended_at", end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command_sent_at", datetime.fromtimestamp(message_date, UTC).isoformat() if message_date else end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
+                        self.storage.set_control_state("sleep_mode_last_command_processed_at", end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
+                        
+                        self.storage.audit(self.run_id, "sleep_mode_disabled", {"raw_command": text})
+                        
+                        self.telegram.send_message(
+                            "☀️ Sleep mode OFF. Normal paper proposal alerts are enabled again. No orders were placed unless explicitly approved or emergency paper-exit rules were triggered.",
+                            str((message.get("chat") or {}).get("id", self.telegram.chat_id))
+                        )
+                        self.send_wake_summary(start_time_iso, end_time_iso)
+                continue
+
             if text.startswith("/"):
                 response = self.telegram.handle_command(text, sender)
                 self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
@@ -286,13 +361,42 @@ class TradingService:
             prop_side = row.get("side", "").lower()
             
             if parsed.action == "reject":
-                self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (parsed.proposal_id,))
-                self.telegram.send_message(f"❌ Received: NO for {prop_symbol} paper {prop_side} proposal. Proposal rejected. No order will be placed.")
+                if row.get("emergency_exit_triggered") == 1:
+                    self.storage.execute("UPDATE trade_proposals SET status='rejected', emergency_exit_final_decision='cancelled', emergency_exit_user_response='no' WHERE id=? AND status='pending'", (parsed.proposal_id,))
+                    self.telegram.send_message(f"❌ Received: NO for {prop_symbol} emergency paper sell proposal. Emergency exit cancelled.")
+                    self.storage.audit(self.run_id, "emergency_exit_cancelled_by_user", {"symbol": prop_symbol, "proposal_id": parsed.proposal_id})
+                else:
+                    self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (parsed.proposal_id,))
+                    self.telegram.send_message(f"❌ Received: NO for {prop_symbol} paper {prop_side} proposal. Proposal rejected. No order will be placed.")
                 ack_sent = iso_now()
                 delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
                 continue
                 
+            if row.get("emergency_exit_triggered") == 1:
+                self.telegram.send_message(f"✅ Received: YES for {prop_symbol} emergency paper sell proposal. I will now run the final safety check.")
+                ack_sent = iso_now()
+                delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
+                self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
+                
+                if not self.storage.consume_approval(parsed.proposal_id, approval_id):
+                    self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
+                    continue
+                
+                self.storage.audit(self.run_id, "emergency_exit_approved_by_user", {"symbol": prop_symbol, "proposal_id": parsed.proposal_id})
+                
+                proposal = {**json.loads(row.get("payload") or "{}"), **row}
+                success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
+                if success:
+                    self.storage.execute("UPDATE trade_proposals SET status='approved', emergency_exit_final_decision='submitted', emergency_exit_user_response='yes' WHERE id=?", (parsed.proposal_id,))
+                    self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {proposal.get('qty', 0)} shares. Mode: paper only.")
+                    self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": prop_symbol, "score": row.get("emergency_exit_score")})
+                else:
+                    self.storage.execute("UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=?, emergency_exit_user_response='yes' WHERE id=?", (err_reason, parsed.proposal_id))
+                    self.telegram.send_message(f"⚠️ Emergency exit was blocked. Reason: {err_reason}. No order was placed.")
+                    self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": prop_symbol, "reason": err_reason})
+                continue
+
             # Send immediate acknowledgement message for YES
             self.telegram.send_message(f"✅ Received: YES for {prop_symbol} paper {prop_side} proposal. I will now run the final safety check. No order will be placed unless the final check passes.")
             ack_sent = iso_now()
@@ -433,6 +537,34 @@ class TradingService:
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
+        # Check for timed out emergency exit proposals
+        now_str = iso_now()
+        timed_out = self.storage.fetch_all(
+            "SELECT * FROM trade_proposals WHERE status='pending' AND emergency_exit_triggered=1 AND emergency_exit_auto_execute_due_at <= ?",
+            (now_str,)
+        )
+        for row in timed_out:
+            proposal_id = row["id"]
+            symbol = row["symbol"]
+            qty = row["qty"]
+            total_score = row["emergency_exit_score"]
+            proposal = {**json.loads(row["payload"] or "{}"), **row}
+            
+            # Consume first to prevent race condition
+            self.storage.execute("UPDATE trade_proposals SET status='approved', emergency_exit_auto_execute_attempted_at=? WHERE id=?", (iso_now(), proposal_id))
+            
+            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_reached", {"symbol": symbol, "proposal_id": proposal_id})
+            
+            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
+            if success:
+                self.storage.execute("UPDATE trade_proposals SET emergency_exit_final_decision='submitted' WHERE id=?", (proposal_id,))
+                self.telegram.send_message(f"✅ Paper order submitted: Sell {symbol} for {qty} shares. Mode: paper only.")
+                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "score": total_score})
+            else:
+                self.storage.execute("UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=? WHERE id=?", (err_reason, proposal_id))
+                self.telegram.send_message(f"⚠️ Emergency exit was blocked. Reason: {err_reason}. No order was placed.")
+                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason})
+
     def _should_auto_execute(self, proposal: dict[str, Any]) -> bool:
         # Quarantined: YAML cannot enable this unsupported capability.
         requested = self.config.get("auto_execution_enabled", False) or self.config.get("auto_execution_mode") != "manual_only"
@@ -441,6 +573,359 @@ class TradingService:
             self._auto_block_audited = True
         assert AUTO_EXECUTION_SUPPORTED is False
         return False
+
+    def calculate_emergency_exit_risk_score(
+        self,
+        symbol: str,
+        position_drawdown_pct: float,
+        average_entry_price: float,
+        current_price: float,
+        indicators: dict[str, Any],
+        bars: Any
+    ) -> tuple[float, dict[str, Any], bool, str]:
+        if not average_entry_price or average_entry_price <= 0:
+            dd_val = -1.0
+            drawdown_points = 35
+            adverse_points = 15
+            adverse_move_atr = 0.0
+        else:
+            dd_val = position_drawdown_pct
+            if dd_val > -0.04:
+                drawdown_points = 0
+            elif dd_val > -0.06:
+                drawdown_points = 10
+            elif dd_val > -0.08:
+                drawdown_points = 20
+            elif dd_val > -0.10:
+                drawdown_points = 28
+            else:
+                drawdown_points = 35
+
+        from app.features import build_features
+        features_df = build_features(bars)
+        row = features_df.iloc[-1]
+        prev_row = features_df.iloc[-2] if len(features_df) >= 2 else None
+        
+        close_val = float(row["close"])
+        ma_50_val = float(row["ma_50"]) if "ma_50" in row and not pd.isna(row["ma_50"]) else None
+        ma_200_val = float(row["ma_200"]) if "ma_200" in row and not pd.isna(row["ma_200"]) else None
+        
+        ma_50_current = ma_50_val
+        ma_50_prev = float(prev_row["ma_50"]) if (prev_row is not None and "ma_50" in prev_row and not pd.isna(prev_row["ma_50"])) else None
+        ma_50_falling = (ma_50_current < ma_50_prev) if (ma_50_current is not None and ma_50_prev is not None) else False
+        
+        trend_points = 0
+        if ma_200_val is not None and close_val < ma_200_val:
+            trend_points = 20
+        elif ma_50_val is not None and close_val < ma_50_val:
+            if ma_50_falling:
+                trend_points = 16
+            else:
+                trend_points = 12
+
+        atr_value = None
+        if "high" in bars.columns and "low" in bars.columns and "close" in bars.columns:
+            high = bars["high"].astype(float)
+            low = bars["low"].astype(float)
+            close = bars["close"].astype(float)
+            close_prev = close.shift(1)
+            tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
+            atr_series = tr.rolling(20).mean()
+            if not atr_series.empty and not pd.isna(atr_series.iloc[-1]):
+                atr_value = float(atr_series.iloc[-1])
+        
+        is_atr_proxy = False
+        vol_20 = indicators.get("volatility_20")
+        if atr_value is None:
+            is_atr_proxy = True
+            if vol_20 is not None:
+                vol_daily = vol_20 / math.sqrt(252)
+                atr_value = current_price * vol_daily
+            else:
+                atr_value = 0.0
+
+        if average_entry_price and average_entry_price > 0:
+            adverse_move = average_entry_price - current_price
+            adverse_move_atr = adverse_move / atr_value if atr_value > 0 else 0.0
+            
+            if adverse_move_atr >= 1.50:
+                adverse_points = 15
+            elif adverse_move_atr >= 1.00:
+                adverse_points = 10
+            elif adverse_move_atr >= 0.75:
+                adverse_points = 5
+            else:
+                adverse_points = 0
+        else:
+            adverse_points = 15
+            adverse_move_atr = 0.0
+
+        vol_points = 0
+        if vol_20 is None:
+            vol_points = 0
+        elif vol_20 > 0.45:
+            vol_points = 10
+        elif vol_20 > 0.35:
+            vol_points = 7
+        elif vol_20 >= 0.25:
+            vol_points = 4
+        else:
+            vol_points = 0
+
+        minutes_to_close = None
+        if self.broker is not None:
+            try:
+                clock = self.broker.get_clock()
+                if clock and clock.is_open:
+                    minutes_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
+            except Exception:
+                pass
+        
+        if minutes_to_close is None or minutes_to_close > 90:
+            near_close_points = 0
+        elif 30 <= minutes_to_close <= 90:
+            near_close_points = 5
+        else:
+            near_close_points = 10
+
+        quality_points = 0
+        price_age = float("inf")
+        
+        # Get price_at from parameters
+        price_at_dt = None
+        for r in self.storage.fetch_all("SELECT price_at FROM market_snapshots WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (symbol,)):
+            try:
+                price_at_dt = datetime.fromisoformat(r["price_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
+            except Exception:
+                pass
+        if price_at_dt:
+            price_age = (datetime.now(UTC) - price_at_dt).total_seconds()
+        
+        if price_age <= 30:
+            quality_points += 5
+            
+        quality_points += 3
+        
+        open_orders = []
+        if self.broker is not None:
+            try:
+                open_orders = self.broker.get_open_orders()
+            except Exception:
+                pass
+        conflicting = any(str(_value(o, "symbol", "")).upper() == symbol.upper() and str(_value(o, "side", "")).lower() == "sell" for o in open_orders)
+        if not conflicting:
+            quality_points += 2
+            
+        total_score = drawdown_points + trend_points + adverse_points + vol_points + near_close_points + quality_points
+        
+        breakdown = {
+            "drawdown_points": drawdown_points,
+            "trend_points": trend_points,
+            "adverse_points": adverse_points,
+            "vol_points": vol_points,
+            "near_close_points": near_close_points,
+            "quality_points": quality_points,
+            "atr_value": atr_value,
+            "is_atr_proxy": is_atr_proxy,
+            "adverse_move_atr": adverse_move_atr,
+            "minutes_to_close": minutes_to_close,
+            "price_age_seconds": price_age
+        }
+        
+        hard_trigger_1 = (dd_val <= -0.08) and (ma_50_val is not None and close_val < ma_50_val)
+        hard_trigger_2 = (dd_val <= -0.10)
+        hard_trigger_3 = (ma_200_val is not None and close_val < ma_200_val) and (dd_val < 0)
+        hard_trigger_4 = (adverse_move_atr >= 1.50) and (dd_val <= -0.06)
+        
+        hard_trigger_matched = any([hard_trigger_1, hard_trigger_2, hard_trigger_3, hard_trigger_4])
+        hard_trigger_reason = ""
+        if hard_trigger_matched:
+            reasons = []
+            if hard_trigger_1: reasons.append("drawdown <= -8% and below MA50")
+            if hard_trigger_2: reasons.append("drawdown <= -10%")
+            if hard_trigger_3: reasons.append("below MA200 and position losing")
+            if hard_trigger_4: reasons.append("adverse move >= 1.5 ATR and drawdown <= -6%")
+            hard_trigger_reason = "; ".join(reasons)
+            
+        return float(total_score), breakdown, hard_trigger_matched, hard_trigger_reason
+
+    def get_gpt_exit_explanation(self, proposal: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.ai.review, proposal)
+            try:
+                review = future.result(timeout=timeout)
+                return {
+                    "status": "Completed",
+                    "confidence": review.get("gpt_confidence", "High"),
+                    "caution": review.get("gpt_caution", "Low"),
+                    "main_risk": review.get("main_risk", "N/A"),
+                    "telegram_message": review.get("telegram_message")
+                }
+            except Exception as e:
+                logger.warning("GPT exit review timed out or failed: %s", e)
+                return {
+                    "status": "Not available; using rule-based emergency exit reason",
+                    "confidence": "Not called",
+                    "caution": "Low",
+                    "main_risk": "N/A",
+                    "telegram_message": None
+                }
+
+    def revalidate_and_execute_emergency_exit(self, proposal: dict[str, Any]) -> tuple[bool, str]:
+        if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
+            return False, "not in paper mode / live enabled"
+        
+        emergency_cfg = self.config.get("emergency_exit", {})
+        if not emergency_cfg.get("enabled", True):
+            return False, "emergency exit disabled in configuration"
+            
+        if not self.storage.writable():
+            return False, "database is not writable"
+            
+        if (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+            return False, "kill switch active"
+            
+        symbol = proposal["symbol"]
+        
+        existing_orders = self.storage.fetch_all(
+            "SELECT id FROM orders WHERE symbol=? AND side='sell' AND status IN ('submitted', 'filled')",
+            (symbol,)
+        )
+        if existing_orders:
+            return False, "duplicate emergency exit order already submitted"
+
+        if self.broker is None:
+            return False, "broker client unavailable"
+            
+        positions = self.broker.get_positions()
+        pos_obj = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol.upper()), None)
+        if not pos_obj:
+            return False, f"no active broker position found for symbol {symbol}"
+            
+        qty_held = float(_value(pos_obj, "qty") or 0.0)
+        if qty_held <= 0:
+            return False, f"broker position quantity for {symbol} is 0"
+            
+        open_orders = self.broker.get_open_orders()
+        conflicting = any(str(_value(o, "symbol", "")).upper() == symbol.upper() and str(_value(o, "side", "")).lower() == "sell" for o in open_orders)
+        if conflicting:
+            return False, "conflicting open sell order exists"
+            
+        if not self.broker.is_market_open():
+            return False, "market is closed"
+            
+        trade = self.broker.get_latest_price(symbol)
+        refreshed_price = float(_value(trade, "price", 0) or 0)
+        refreshed_at = _dt(_value(trade, "timestamp", datetime.now(UTC)))
+        if not refreshed_price or refreshed_price <= 0:
+            return False, "failed to fetch refreshed price"
+            
+        price_age = (datetime.now(UTC) - refreshed_at).total_seconds()
+        if price_age > 60:
+            return False, f"refreshed price is stale (age: {price_age:.1f}s > 60s)"
+            
+        proposal_price = proposal.get("latest_price")
+        if proposal_price is not None and proposal_price > 0:
+            move_bps = (abs(refreshed_price - proposal_price) / proposal_price) * 10000
+            max_move_bps = self.config.get("telegram", {}).get("approval_max_price_move_bps", 25)
+            if move_bps > max_move_bps:
+                return False, f"price moved too much since emergency decision ({move_bps:.1f} bps > limit {max_move_bps} bps)"
+                
+        client_order_id = f"ta-emergency-{uuid.uuid4().hex[:16]}"
+        try:
+            order_args = {"qty": qty_held}
+            response = self.broker.submit_order(
+                symbol, "sell", order_args, "market", None, client_order_id
+            )
+            self.storage.execute(
+                "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), self.run_id, proposal["id"], str(_value(response, "id", "")) or None, client_order_id, symbol, "sell", None, qty_held, "submitted", json_dumps({"submitted": True}), iso_now(), iso_now()),
+            )
+            return True, "submitted"
+        except Exception as e:
+            return False, f"broker execution failed: {type(e).__name__} ({str(e)})"
+
+    def send_wake_summary(self, start_time: str, end_time: str) -> None:
+        suppressed_buys = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM market_memory WHERE candidate_suppression_reason='suppressed_by_sleep_mode' AND created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        
+        sell_alerts = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='sell' AND emergency_exit_triggered=0 AND created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        
+        emerg_triggered = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        
+        emerg_submitted = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND emergency_exit_final_decision='submitted' AND created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        emerg_blocked = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND status='blocked' AND created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        
+        orders_placed = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM orders WHERE created_at BETWEEN ? AND ?",
+            (start_time, end_time)
+        )[0]["cnt"]
+        
+        positions_cnt = 0
+        open_orders_cnt = 0
+        if self.broker is not None:
+            try:
+                positions_cnt = len(self.broker.get_positions())
+                open_orders_cnt = len(self.broker.get_open_orders())
+            except Exception:
+                pass
+                
+        def format_iso_to_sgt(iso_str):
+            try:
+                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                sgt_dt = dt.astimezone(timezone(timedelta(hours=8)))
+                return sgt_dt.strftime("%-I:%M %p SGT")
+            except Exception:
+                return iso_str
+                
+        window_str = f"{format_iso_to_sgt(start_time)}–{format_iso_to_sgt(end_time)}"
+        has_events = (suppressed_buys > 0 or sell_alerts > 0 or emerg_triggered > 0 or orders_placed > 0)
+        
+        if not has_events:
+            summary_msg = (
+                f"☀️ Sleep mode OFF — Overnight summary\n\n"
+                f"Window: {window_str}\n"
+                f"No emergency exits, no orders, no action needed."
+            )
+        else:
+            action_needed = "review Excel report / Telegram alert." if (emerg_triggered > 0 or orders_placed > 0) else "none."
+            summary_msg = (
+                f"☀️ Sleep mode OFF — Overnight summary\n\n"
+                f"Window: {window_str}\n"
+                f"Suppressed BUY candidates: {suppressed_buys}\n"
+                f"Emergency exits: {emerg_triggered} triggered, {emerg_submitted} submitted, {emerg_blocked} blocked\n"
+                f"Orders placed: {orders_placed} paper sell\n"
+                f"Current positions: {positions_cnt}\n"
+                f"Current open orders: {open_orders_cnt}\n"
+                f"Action needed: {action_needed}"
+            )
+        self.telegram.send_message(summary_msg)
+        self.storage.audit(self.run_id, "wake_summary_sent", {
+            "start_time": start_time,
+            "end_time": end_time,
+            "suppressed_buys": suppressed_buys,
+            "emerg_triggered": emerg_triggered,
+            "emerg_submitted": emerg_submitted,
+            "emerg_blocked": emerg_blocked,
+            "orders_placed": orders_placed,
+            "positions_cnt": positions_cnt,
+            "open_orders_cnt": open_orders_cnt
+        })
 
     def notify_expired_proposals(self) -> None:
         # Find all expired proposals that haven't been notified yet
@@ -644,6 +1129,11 @@ class TradingService:
             self.telegram.send_message("Blocked for safety: live trading is disabled.")
             return
 
+        sleep_mode_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
+        sleep_mode_started_at = self.storage.get_control_state("sleep_mode_started_at")
+        sleep_mode_ended_at = self.storage.get_control_state("sleep_mode_ended_at")
+        sleep_mode_reason = "sleep mode is active" if sleep_mode_active else None
+
         positions = self.broker.get_positions()
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
@@ -681,11 +1171,11 @@ class TradingService:
                 )
                 continue
                 
-            active_watchlist = profile.get("watchlist", [])
-            obs_watchlist = profile.get("observation_watchlist", [])
-            proposals_enabled = profile.get("proposals_enabled", False)
-            
-            all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist))
+            active_watchlist = [str(s).upper() for s in profile.get("watchlist", [])]
+            obs_watchlist = [str(s).upper() for s in profile.get("observation_watchlist", [])]
+            proposals_enabled = profile.get("proposals_enabled", True)
+            pos_symbols = [str(_value(p, "symbol", "")).upper() for p in positions if _value(p, "symbol")]
+            all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist + pos_symbols))
             
             spy_ret_20d = None
             if "SPY" in all_symbols or any(p.get("watchlist") and "SPY" in p.get("watchlist") for p in profiles.values()):
@@ -785,27 +1275,83 @@ class TradingService:
                         position_drawdown_pct=0.0
                     )
                 
+                # Calculate emergency exit risk score and check hard triggers
+                emergency_exit_score = None
+                emergency_exit_triggered = 0
+                emergency_exit_trigger_reason = None
+                emergency_exit_hard_trigger = None
+                emergency_exit_mode = None
+                emergency_exit_wait_seconds = None
+                emergency_exit_auto_execute_due_at = None
+                emergency_exit_final_decision = None
+                emergency_exit_block_reason = None
+                atr_value = None
+                adverse_move_atr = None
+                minutes_to_close = None
+                
+                if has_position:
+                    total_score, breakdown, hard_trigger_matched, hard_trigger_reason = self.calculate_emergency_exit_risk_score(
+                        symbol,
+                        position_drawdown_pct,
+                        avg_entry_price,
+                        price,
+                        signal.indicators or {},
+                        bars
+                    )
+                    emergency_exit_score = total_score
+                    atr_value = breakdown.get("atr_value")
+                    adverse_move_atr = breakdown.get("adverse_move_atr")
+                    minutes_to_close = breakdown.get("minutes_to_close")
+                    
+                    if total_score >= 85 and hard_trigger_matched:
+                        existing_proposals = self.storage.fetch_all(
+                            "SELECT id FROM trade_proposals WHERE symbol=? AND side='sell' AND emergency_exit_triggered=1 AND status IN ('pending', 'approved', 'submitted', 'filled', 'blocked')",
+                            (symbol,)
+                        )
+                        if not existing_proposals:
+                            emergency_exit_triggered = 1
+                            emergency_exit_trigger_reason = hard_trigger_reason
+                            emergency_exit_hard_trigger = hard_trigger_reason
+                            
+                            if total_score >= 95 or position_drawdown_pct <= -0.12:
+                                emergency_exit_mode = "extreme"
+                                emergency_exit_wait_seconds = 0
+                            elif sleep_mode_active:
+                                emergency_exit_mode = "sleep"
+                                emergency_exit_wait_seconds = 15
+                            else:
+                                emergency_exit_mode = "normal"
+                                emergency_exit_wait_seconds = 60
+                                
+                            due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
+                            emergency_exit_auto_execute_due_at = due_at.isoformat()
+                            
+                            signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
+                
                 exit_trigger_reason = None
                 if signal.action == "EXIT" and has_position:
-                    above_50 = True
-                    if not bars.empty:
-                        from app.features import build_features
-                        features_df = build_features(bars)
-                        if not features_df.empty and "ma_50" in features_df.columns:
-                            row = features_df.iloc[-1]
-                            above_50 = row["close"] > row["ma_50"]
-                        else:
-                            above_50 = True
-                    drawdown_triggered = (position_drawdown_pct <= -abs(strategy_config["stop_drawdown_pct"]))
-                    ma_triggered = not above_50
-                    if ma_triggered and drawdown_triggered:
-                        exit_trigger_reason = "both close below 50-day MA and drawdown stop reached"
-                    elif ma_triggered:
-                        exit_trigger_reason = "close below 50-day MA"
-                    elif drawdown_triggered:
-                        exit_trigger_reason = "drawdown stop reached"
+                    if emergency_exit_triggered == 1:
+                        exit_trigger_reason = hard_trigger_reason
                     else:
-                        exit_trigger_reason = "other exit criteria"
+                        above_50 = True
+                        if not bars.empty:
+                            from app.features import build_features
+                            features_df = build_features(bars)
+                            if not features_df.empty and "ma_50" in features_df.columns:
+                                row = features_df.iloc[-1]
+                                above_50 = row["close"] > row["ma_50"]
+                            else:
+                                above_50 = True
+                        drawdown_triggered = (position_drawdown_pct <= -abs(strategy_config["stop_drawdown_pct"]))
+                        ma_triggered = not above_50
+                        if ma_triggered and drawdown_triggered:
+                            exit_trigger_reason = "both close below 50-day MA and drawdown stop reached"
+                        elif ma_triggered:
+                            exit_trigger_reason = "close below 50-day MA"
+                        elif drawdown_triggered:
+                            exit_trigger_reason = "drawdown stop reached"
+                        else:
+                            exit_trigger_reason = "other exit criteria"
                 
                 signal_id = str(uuid.uuid4())
                 
@@ -951,6 +1497,18 @@ class TradingService:
                     "latest_position_price": latest_position_price,
                     "qty": qty_held,
                     "exit_trigger_reason": exit_trigger_reason,
+                    "emergency_exit_score": emergency_exit_score,
+                    "emergency_exit_triggered": emergency_exit_triggered,
+                    "emergency_exit_trigger_reason": emergency_exit_trigger_reason,
+                    "emergency_exit_hard_trigger": emergency_exit_hard_trigger,
+                    "emergency_exit_mode": emergency_exit_mode,
+                    "emergency_exit_wait_seconds": emergency_exit_wait_seconds,
+                    "emergency_exit_auto_execute_due_at": emergency_exit_auto_execute_due_at,
+                    "emergency_exit_final_decision": emergency_exit_final_decision,
+                    "emergency_exit_block_reason": emergency_exit_block_reason,
+                    "atr_value": atr_value,
+                    "adverse_move_atr": adverse_move_atr,
+                    "minutes_to_close": minutes_to_close,
                 })
 
             # Populate watchlist order first
@@ -1204,15 +1762,43 @@ class TradingService:
                 true_score_rank = res.get("true_score_rank")
                 watchlist_order = res.get("watchlist_order")
                 
+                emergency_exit_score = res.get("emergency_exit_score")
+                emergency_exit_triggered = res.get("emergency_exit_triggered", 0)
+                emergency_exit_trigger_reason = res.get("emergency_exit_trigger_reason")
+                emergency_exit_hard_trigger = res.get("emergency_exit_hard_trigger")
+                emergency_exit_mode = res.get("emergency_exit_mode")
+                emergency_exit_wait_seconds = res.get("emergency_exit_wait_seconds")
+                emergency_exit_auto_execute_due_at = res.get("emergency_exit_auto_execute_due_at")
+                emergency_exit_final_decision = res.get("emergency_exit_final_decision")
+                emergency_exit_block_reason = res.get("emergency_exit_block_reason")
+                atr_value = res.get("atr_value")
+                adverse_move_atr = res.get("adverse_move_atr")
+                minutes_to_close = res.get("minutes_to_close")
+                
                 ai_config = self.config.get("ai", {})
                 is_buy = (signal.action == "ENTRY" and signal.side == "buy")
                 is_exit = (signal.action == "EXIT" and signal.side == "sell")
                 
-                proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
+                suppressed_by_sleep_mode = 0
+                sleep_mode_suppressed_candidate = 0
+                
+                # Check sleep mode suppression for buys
+                if is_buy and sleep_mode_active:
+                    proposal_allowed = False
+                    no_action_reason = "suppressed by sleep mode"
+                    candidate_suppression_reason = "suppressed_by_sleep_mode"
+                    suppressed_by_sleep_mode = 1
+                    sleep_mode_suppressed_candidate = 1
+                elif emergency_exit_triggered == 1:
+                    proposal_allowed = True
+                    is_buy = False
+                    is_exit = True
+                else:
+                    proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
                 
                 gpt_called = False
                 proposal_generated = False
-                no_action_reason = ""
+                no_action_reason = "" if not (is_buy and sleep_mode_active) else "suppressed by sleep mode"
                 proposal_id = None
                 decision = None
                 proposal = None
@@ -1220,7 +1806,7 @@ class TradingService:
                 dedupe_status = res.get("dedupe_status", "skipped")
                 dedupe_reason = res.get("dedupe_reason", "not eligible for proposal")
                 paper_size_adjustment = 1.0
-                candidate_suppression_reason = None
+                candidate_suppression_reason = None if not (is_buy and sleep_mode_active) else "suppressed_by_sleep_mode"
                 deferred_ai_review_reason = None
                 
                 exit_priority_applied = 1 if exit_candidates_exist else 0
@@ -1230,7 +1816,7 @@ class TradingService:
                 final_proposal_message_category = "buy" if is_buy else ("exit" if is_exit else "suppressed")
                 
                 # Check exit prioritization suppression for buys
-                if is_buy and exit_candidates_exist:
+                if is_buy and exit_candidates_exist and not sleep_mode_active:
                     proposal_allowed = False
                     dedupe_status = "suppressed"
                     dedupe_reason = "suppressed due to exit priority"
@@ -1241,7 +1827,9 @@ class TradingService:
                     })
                 
                 if not proposal_allowed:
-                    if is_buy and candidate_suppression_reason == "suppressed_due_to_exit_priority":
+                    if is_buy and suppressed_by_sleep_mode == 1:
+                        pass
+                    elif is_buy and candidate_suppression_reason == "suppressed_due_to_exit_priority":
                         pass # Reason already set
                     elif is_buy and symbol in suppressed_buy_symbols:
                         no_action_reason = "suppressed due to simultaneous candidate limits"
@@ -1256,7 +1844,7 @@ class TradingService:
                         no_action_reason = f"trade score below threshold ({score} < {ai_config.get('ai_review_min_score', 65)})"
                 else:
                     # Check deduplication suppression
-                    if res["dedupe_status"] == "suppressed" and not (is_exit and has_position): # exits bypass buy cooldown/dedupe
+                    if res["dedupe_status"] == "suppressed" and not (is_exit and has_position) and not emergency_exit_triggered: # exits bypass buy cooldown/dedupe
                         proposal_allowed = False
                         no_action_reason = f"suppressed by dedupe: {dedupe_reason}"
                         self.storage.audit(self.run_id, "proposal_deduplicated", {
@@ -1360,14 +1948,38 @@ class TradingService:
                                 "setup_key": setup_key,
                                 "revival_reason": revival_reason,
                                 "exit_priority_applied": exit_priority_applied,
+                                # Emergency fields
+                                "emergency_exit_score": emergency_exit_score,
+                                "emergency_exit_triggered": emergency_exit_triggered,
+                                "emergency_exit_trigger_reason": emergency_exit_trigger_reason,
+                                "emergency_exit_hard_trigger": emergency_exit_hard_trigger,
+                                "emergency_exit_mode": emergency_exit_mode,
+                                "emergency_exit_wait_seconds": emergency_exit_wait_seconds,
+                                "emergency_exit_auto_execute_due_at": emergency_exit_auto_execute_due_at,
+                                "emergency_exit_final_decision": emergency_exit_final_decision,
+                                "emergency_exit_block_reason": emergency_exit_block_reason,
+                                "atr_value": atr_value,
+                                "adverse_move_atr": adverse_move_atr,
+                                "minutes_to_close": minutes_to_close,
+                                "sleep_mode_active": 1 if sleep_mode_active else 0,
+                                "suppressed_by_sleep_mode": 1 if suppressed_by_sleep_mode else 0,
+                                "sleep_mode_reason": sleep_mode_reason,
+                                "sleep_mode_suppressed_candidate": 1 if sleep_mode_suppressed_candidate else 0,
+                                "sleep_mode_started_at": sleep_mode_started_at,
+                                "sleep_mode_ended_at": sleep_mode_ended_at,
                             }
                             
-                            self._should_auto_execute(proposal)
-                            decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
-                            if not decision.passed:
-                                no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
-                                proposal_allowed = False
+                            if emergency_exit_triggered == 1:
+                                # Emergency exits bypass standard risk engine proposal evaluations
+                                pass
                             else:
+                                self._should_auto_execute(proposal)
+                                decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                                if not decision.passed:
+                                    no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                                    proposal_allowed = False
+                                    
+                            if proposal_allowed:
                                 if is_buy:
                                     require_gpt = self.config.get("risk", {}).get("require_gpt_review_for_buy_proposals", True)
                                     calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
@@ -1409,38 +2021,93 @@ class TradingService:
                                             proposal["ai_confidence"] = review.get("gpt_confidence", "Not called")
                                             proposal["ai_caution"] = review.get("gpt_caution", "Low")
                                 elif is_exit:
-                                    # Phase 5: GPT explanation for exits
-                                    use_gpt_for_exits = self.config.get("risk", {}).get("use_gpt_for_exit_explanations", True)
-                                    gpt_timeout = self.config.get("risk", {}).get("exit_gpt_max_wait_seconds", 3)
-                                    
-                                    if use_gpt_for_exits:
-                                        import concurrent.futures
-                                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                                            future = executor.submit(self.ai.review, proposal)
-                                            try:
-                                                review = future.result(timeout=gpt_timeout)
-                                                gpt_called = True
-                                                gpt_exit_explanation_status = "Completed"
-                                            except Exception as e:
-                                                logger.warning("GPT exit explanation failed or timed out: %s", e)
-                                                gpt_called = False
-                                                gpt_exit_explanation_status = "Not available; using rule-based exit reason"
-                                                review = deterministic_review(proposal, warning="AI review unavailable")
+                                    if emergency_exit_triggered == 1:
+                                        # Special emergency exit review & immediate execution check
+                                        gpt_explanation = self.get_gpt_exit_explanation(proposal)
+                                        gpt_exit_explanation_status = gpt_explanation["status"]
+                                        gpt_exit_confidence = gpt_explanation["confidence"]
+                                        gpt_exit_caution = gpt_explanation["caution"]
+                                        gpt_called = (gpt_explanation["status"] == "Completed")
+                                        
+                                        proposal["gpt_called"] = gpt_called
+                                        proposal["gpt_exit_explanation_status"] = gpt_exit_explanation_status
+                                        proposal["gpt_exit_confidence"] = gpt_exit_confidence
+                                        proposal["gpt_exit_caution"] = gpt_exit_caution
+                                        
+                                        review = {
+                                            "summary": gpt_explanation.get("telegram_message") or f"Emergency exit triggered: {emergency_exit_trigger_reason}",
+                                            "risks": [emergency_exit_trigger_reason],
+                                            "caution_level": gpt_exit_caution,
+                                            "gpt_confidence": gpt_exit_confidence,
+                                            "gpt_caution": gpt_exit_caution,
+                                            "main_risk": gpt_explanation.get("main_risk") or "N/A"
+                                        }
+                                        proposal["review"] = review
+                                        proposal_generated = True
+                                        no_action_reason = "proposal generated"
+                                        any_generated = True
+                                        
+                                        if emergency_exit_mode == "extreme":
+                                            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
+                                            if success:
+                                                emergency_exit_final_decision = "submitted"
+                                                proposal["status"] = "approved"
+                                                proposal["emergency_exit_final_decision"] = "submitted"
+                                                self.telegram.send_message(
+                                                    f"🚨 [EXTREME EMERGENCY EXIT] Immediate paper market order submitted for {symbol} ({qty_held} shares) due to high risk score {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}."
+                                                )
+                                                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "score": emergency_exit_score})
+                                            else:
+                                                emergency_exit_block_reason = err_reason
+                                                proposal["status"] = "blocked"
+                                                proposal["emergency_exit_block_reason"] = err_reason
+                                                self.telegram.send_message(
+                                                    f"🚨 [EXTREME EMERGENCY EXIT] Triggered for {symbol} but execution was blocked: {err_reason}."
+                                                )
+                                                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason})
+                                        elif emergency_exit_mode == "sleep":
+                                            self.telegram.send_message(
+                                                f"🚨 [SLEEP MODE EMERGENCY EXIT] Triggered for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. "
+                                                f"Auto-executing in 15 seconds unless cancelled."
+                                            )
+                                        else:
+                                            self.telegram.send_message(
+                                                f"🚨 [EMERGENCY EXIT ALERT] Triggered for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}.\n\n"
+                                                f"I will auto-execute in 60 seconds. Reply YES to execute immediately, or NO to cancel."
+                                            )
                                     else:
-                                        gpt_called = False
-                                        gpt_exit_explanation_status = "Not available; using rule-based exit reason"
-                                        review = deterministic_review(proposal, warning="AI review disabled for exits")
+                                        # Normal exit GPT explanation check
+                                        use_gpt_for_exits = self.config.get("risk", {}).get("use_gpt_for_exit_explanations", True)
+                                        gpt_timeout = self.config.get("risk", {}).get("exit_gpt_max_wait_seconds", 3)
                                         
-                                    proposal["gpt_called"] = gpt_called
-                                    proposal["review"] = review
-                                    proposal["gpt_exit_explanation_status"] = gpt_exit_explanation_status
-                                    if review:
-                                        proposal["gpt_exit_confidence"] = review.get("gpt_confidence", "Not called")
-                                        proposal["gpt_exit_caution"] = review.get("gpt_caution", "Low")
-                                        
-                                    proposal_generated = True
-                                    no_action_reason = "proposal generated"
-                                    any_generated = True
+                                        if use_gpt_for_exits:
+                                            import concurrent.futures
+                                            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                                                future = executor.submit(self.ai.review, proposal)
+                                                try:
+                                                    review = future.result(timeout=gpt_timeout)
+                                                    gpt_called = True
+                                                    gpt_exit_explanation_status = "Completed"
+                                                except Exception as e:
+                                                    logger.warning("GPT exit explanation failed or timed out: %s", e)
+                                                    gpt_called = False
+                                                    gpt_exit_explanation_status = "Not available; using rule-based exit reason"
+                                                    review = deterministic_review(proposal, warning="AI review unavailable")
+                                        else:
+                                            gpt_called = False
+                                            gpt_exit_explanation_status = "Not available; using rule-based exit reason"
+                                            review = deterministic_review(proposal, warning="AI review disabled for exits")
+                                            
+                                        proposal["gpt_called"] = gpt_called
+                                        proposal["review"] = review
+                                        proposal["gpt_exit_explanation_status"] = gpt_exit_explanation_status
+                                        if review:
+                                            proposal["gpt_exit_confidence"] = review.get("gpt_confidence", "Not called")
+                                            proposal["gpt_exit_caution"] = review.get("gpt_caution", "Low")
+                                            
+                                        proposal_generated = True
+                                        no_action_reason = "proposal generated"
+                                        any_generated = True
                             
                 if proposal_allowed and is_buy:
                     if review is None:
@@ -1467,8 +2134,8 @@ class TradingService:
                     final_proposal_message_category = "suppressed"
                 
                 self.storage.execute(
-                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category)
+                    "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, emergency_exit_hard_trigger, emergency_exit_mode, emergency_exit_wait_seconds, None, emergency_exit_auto_execute_due_at, None, emergency_exit_final_decision, emergency_exit_block_reason, price, atr_value, adverse_move_atr, minutes_to_close, 1 if sleep_mode_active else 0, suppressed_by_sleep_mode, sleep_mode_reason, sleep_mode_suppressed_candidate, sleep_mode_started_at, sleep_mode_ended_at)
                 )
                 
                 logger.info(
@@ -1482,7 +2149,7 @@ class TradingService:
                     continue
                     
                 self.storage.execute(
-                    "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,proposal_market_rank,proposal_eligible_rank,selection_reason,ai_review_status,ai_confidence,ai_caution,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,proposal_market_rank,proposal_eligible_rank,selection_reason,ai_review_status,ai_confidence,ai_caution,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         proposal_id,
                         self.run_id,
@@ -1490,7 +2157,7 @@ class TradingService:
                         symbol,
                         signal.side,
                         proposal["notional"],
-                        "pending",
+                        proposal.get("status", "pending"),
                         now.isoformat(),
                         expiry.isoformat(),
                         signal.strategy_version,
@@ -1519,7 +2186,28 @@ class TradingService:
                         gpt_exit_explanation_status,
                         gpt_exit_confidence,
                         gpt_exit_caution,
-                        final_proposal_message_category
+                        final_proposal_message_category,
+                        emergency_exit_score,
+                        emergency_exit_triggered,
+                        emergency_exit_trigger_reason,
+                        emergency_exit_hard_trigger,
+                        emergency_exit_mode,
+                        emergency_exit_wait_seconds,
+                        proposal.get("emergency_exit_user_response"),
+                        emergency_exit_auto_execute_due_at,
+                        proposal.get("emergency_exit_auto_execute_attempted_at"),
+                        emergency_exit_final_decision,
+                        emergency_exit_block_reason,
+                        price,
+                        atr_value,
+                        adverse_move_atr,
+                        minutes_to_close,
+                        1 if sleep_mode_active else 0,
+                        suppressed_by_sleep_mode,
+                        sleep_mode_reason,
+                        sleep_mode_suppressed_candidate,
+                        sleep_mode_started_at,
+                        sleep_mode_ended_at
                     )
                 )
                 

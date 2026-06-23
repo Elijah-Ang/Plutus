@@ -21,6 +21,12 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Market Memory", "market_memory"),
     ("Telegram Digests", "telegram_digests"),
     ("Errors", "errors"), ("Audit Events", "audit_events"), ("Config Snapshot", "config_snapshots"),
+    ("Control State", "control_state"),
+    ("Sleep Mode Events", "SELECT * FROM audit_events WHERE event_type IN ('sleep_mode_enabled', 'sleep_mode_disabled', 'sleep_mode_command_ignored_unauthorized', 'sleep_mode_command_ignored_old')"),
+    ("Emergency Exit Events", "SELECT * FROM audit_events WHERE event_type IN ('emergency_exit_auto_timeout_reached', 'emergency_exit_submitted', 'emergency_exit_blocked', 'emergency_exit_cancelled_by_user', 'emergency_exit_approved_by_user')"),
+    ("Emergency Exit Score Breakdown", "SELECT symbol, position_drawdown_pct, average_entry_price, latest_position_price, atr_value, adverse_move_atr, minutes_to_close, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, created_at FROM market_memory WHERE emergency_exit_score IS NOT NULL"),
+    ("Suppressed Sleep BUY Candidates", "SELECT symbol, price, signal, score, no_action_reason, candidate_suppression_reason, created_at FROM market_memory WHERE candidate_suppression_reason = 'suppressed_by_sleep_mode'"),
+    ("Wake Summary Events", "SELECT * FROM audit_events WHERE event_type = 'wake_summary_sent'"),
 ]
 
 
@@ -34,7 +40,7 @@ SECRET_VALUE_PATTERNS = (
 def redact_report_value(table: str, header: str, value: Any, include_raw_telegram: bool = False) -> Any:
     if table == "approvals" and header == "raw_message" and not include_raw_telegram:
         return "[REDACTED TELEGRAM TEXT]"
-    if table == "approvals" and header == "sender_id":
+    if (table == "approvals" or table == "control_state") and header in ("sender_id", "updated_by"):
         return "[REDACTED ID]"
     if value is None:
         return None
@@ -117,9 +123,12 @@ def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Pa
     summary.freeze_panes = "A3"
     summary.column_dimensions["A"].width = 32
     summary.column_dimensions["B"].width = 48
-    for name, table in SHEETS[1:]:
+    for name, query_or_table in SHEETS[1:]:
         sheet = workbook.create_sheet(name)
-        _write_rows(sheet, storage.fetch_all(f'SELECT * FROM "{table}"'), str(table), include_raw_telegram)
+        if query_or_table.startswith("SELECT"):
+            _write_rows(sheet, storage.fetch_all(query_or_table), name.lower().replace(" ", "_"), include_raw_telegram)
+        else:
+            _write_rows(sheet, storage.fetch_all(f'SELECT * FROM "{query_or_table}"'), str(query_or_table), include_raw_telegram)
         sheet.conditional_formatting.add("A2:Z10000", CellIsRule(operator="lessThan", formula=["0"], fill=PatternFill("solid", fgColor="F4CCCC")))
     workbook.save(output)
     return output

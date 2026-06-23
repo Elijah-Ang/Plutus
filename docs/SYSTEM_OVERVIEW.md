@@ -436,7 +436,39 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Throttling Constraints**: Computes data from the last 30 minutes, requiring a minimum of 2 successful cycles logged in `market_memory`. It checks `telegram_digests` history to ensure it is sent at most once per 30 minutes.
 - **GPT Usage**: GPT is not used for digests by default (`telegram_digest_use_gpt: false`). It relies entirely on rules-based, logged sqlite data to construct summaries.
 
-## 25. Change Log
+## 28. Manual Telegram Sleep Mode
+- **Purpose**: Allows the user to put the trading agent into a silent "Sleep Mode" via Telegram commands (e.g. `/sleep`, `sleep mode on`).
+- **Behavior**: When sleep mode is active:
+  - Normal BUY candidates are fully scanned and logged but suppressed from generating proposals.
+  - GPT review API calls are skipped for BUY candidates.
+  - Telegram alert notifications are skipped for BUY candidates.
+  - The agent continues scanning and evaluates active positions for emergency paper-exit signals.
+- **Authorization**: Sleep/wake commands are checked against authorized Telegram user IDs.
+- **Command Age Check**: Commands older than 24 hours are ignored to prevent stale state toggles.
+- **Wake Up & Summary**: Toggling sleep mode OFF (e.g., `/awake`, `wake up`) triggers an overnight wake summary to Telegram detailing suppressed buys, normal sells, emergency exit triggers, and current positions/orders.
+
+## 29. Emergency Auto-Exit Engine (Paper Mode Only)
+- **Objective**: Deterministic risk management for active paper positions. Operating strictly under paper mode, live auto-execution is disabled.
+- **6-Point Risk Score (0-100)**: Calculates a position risk score based on:
+  1. Drawdown (max 35 pts): Bands from 0% to -10%+. Falls back to fill prices or fail-closed max points if entry price is missing.
+  2. Trend Breakdown (max 20 pts): Close below MA200 (20 pts), MA50 falling (16 pts), or MA50 (12 pts).
+  3. Adverse Move (max 15 pts): Decline from entry price / ATR (or volatility proxy if ATR missing). Bands for 0.75, 1.0, 1.5 ATR.
+  4. Volatility Regime (max 10 pts): Extreme (10 pts), High (7 pts), Elevated (4 pts), Normal (0 pts).
+  5. Near-Close Risk (max 10 pts): < 30m to close (10 pts), 30-90m (5 pts), > 90m (0 pts).
+  6. Data Quality (max 10 pts): Fresh price (5 pts), position verified (3 pts), no conflict (2 pts).
+- **Hard Triggers**: Matches if risk score >= 85 and:
+  - Drawdown <= -8% and close < MA50
+  - Drawdown <= -10%
+  - Close < MA200 and position losing
+  - Adverse move >= 1.5 ATR and drawdown <= -6%
+- **Execution Modes**:
+  - **Extreme Mode** (score >= 95 or drawdown <= -12%): Immediate execution with no wait.
+  - **Sleep Mode**: 15 seconds auto-exit wait, alerts sent to Telegram.
+  - **Normal Mode**: 60 seconds auto-exit wait, allowing Telegram user override.
+- **Revalidation**: Execution enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
+- **GPT Exit Explanations**: Exit reviews are executed by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout to avoid delaying execution.
+
+## 30. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
@@ -448,3 +480,4 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-22**: Repaired authoritative final-risk context, hard-disabled live/auto capabilities, added read-only order/fill reconciliation, safe stale-lock recovery, report/Telegram redaction, and functional near-close clock handling.
 - **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.
 - **2026-06-23**: Implemented Telegram reply-to proposal targeting, ambiguity resolution, instant acknowledgements, simultaneous BUY limits with 6-tier tie-breaking, and GPT review requirement/deferral logic.
+- **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, paper-only emergency auto-exit wait triggers (Normal, Sleep, and Extreme), GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
