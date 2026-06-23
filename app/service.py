@@ -154,6 +154,50 @@ class TradingService:
         orders = state["orders"]
         account = state["account"]
         symbol = proposal["symbol"]
+
+        # Calculate exposure snapshot from current positions
+        snapshot = self._get_exposure_snapshot(positions, account)
+        equity = snapshot["portfolio_equity"]
+
+        # Proposal notional
+        proposal_notional = float(proposal.get("notional") or 0.0)
+        proposal_notional_pct = (proposal_notional / equity) * 100 if equity > 0 else 0.0
+
+        # Proposed total exposure %
+        proposed_total_exposure_pct = snapshot["total_exposure_pct"] + proposal_notional_pct
+
+        # Proposed symbol exposure %
+        current_symbol_exposure = snapshot["single_exposures"].get(symbol.upper(), 0.0)
+        proposed_symbol_exposure_pct = current_symbol_exposure + proposal_notional_pct
+
+        # Cluster parameters
+        c_name = self._get_symbol_cluster(symbol)
+        proposed_cluster_positions_count = 0
+        proposed_cluster_exposure_pct = 0.0
+        if c_name:
+            current_cluster_count = snapshot["cluster_counts"].get(c_name, 0)
+            current_cluster_exposure = snapshot["cluster_exposures"].get(c_name, 0.0)
+            has_symbol_pos = any(str(_value(p, "symbol", "")).upper() == symbol.upper() for p in positions)
+            proposed_cluster_positions_count = current_cluster_count + (0 if has_symbol_pos else 1)
+            proposed_cluster_exposure_pct = current_cluster_exposure + proposal_notional_pct
+
+        # exit_pending
+        pending_exits = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='sell' AND status IN ('pending', 'approved', 'submitted')"
+        )
+        exit_pending = (pending_exits[0]["cnt"] > 0) if pending_exits else False
+
+        # max_emergency_exit_score
+        max_emergency_exit_score = 0.0
+        for pos in positions:
+            p_sym = str(_value(pos, "symbol", "")).upper()
+            latest_mem = self.storage.fetch_all(
+                "SELECT emergency_exit_score FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
+                (p_sym,)
+            )
+            if latest_mem and latest_mem[0]["emergency_exit_score"] is not None:
+                max_emergency_exit_score = max(max_emergency_exit_score, float(latest_mem[0]["emergency_exit_score"]))
+
         today_orders = self.storage.fetch_all("SELECT id FROM orders WHERE substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
         today_buy_orders = self.storage.fetch_all("SELECT id FROM orders WHERE side='buy' AND substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
         return {
@@ -172,13 +216,21 @@ class TradingService:
             "weekly_loss": state["weekly_loss"],
             "buying_power": float(_value(account, "buying_power", 0) or 0) if account is not None else 0.0,
             "approval_valid": approval_valid,
+
+            # Exposure context fields
+            "proposed_total_exposure_pct": proposed_total_exposure_pct,
+            "proposed_symbol_exposure_pct": proposed_symbol_exposure_pct,
+            "proposed_cluster_positions_count": proposed_cluster_positions_count,
+            "proposed_cluster_exposure_pct": proposed_cluster_exposure_pct,
+            "exit_pending": exit_pending,
+            "max_emergency_exit_score": max_emergency_exit_score,
         }
 
     def process_telegram(self) -> None:
         updates = self.telegram.get_updates(timeout=0)
         if not updates:
             return
-        
+
         processed_update_ids = set()
         max_id = 0
         for update in updates:
@@ -187,10 +239,10 @@ class TradingService:
                 if update_id in processed_update_ids:
                     continue
                 processed_update_ids.add(update_id)
-            
+
             max_id = max(max_id, update.get("update_id", 0) if update_id is not None else 0)
             message = update.get("message") or {}
-            
+
             # 0. Duplicate Update Prevention (Only in production, not with MockTelegramBot)
             is_mock_bot = getattr(self.telegram, "is_mock", False) or "Mock" in type(self.telegram).__name__
             if not is_mock_bot and update_id is not None:
@@ -215,7 +267,7 @@ class TradingService:
             is_sleep_off = normalized_cmd in (
                 "/awake", "awake", "i'm awake", "im awake", "sleep mode off", "wake up"
             )
-            
+
             if is_sleep_on or is_sleep_off:
                 if not self.telegram.is_authorized(sender):
                     self.storage.audit(self.run_id, "sleep_mode_command_ignored_unauthorized", {
@@ -223,7 +275,7 @@ class TradingService:
                         "raw_command": text
                     })
                     continue
-                    
+
                 message_date = message.get("date")
                 if message_date is not None:
                     if message_date < time.time() - 86400:
@@ -236,10 +288,10 @@ class TradingService:
                             str((message.get("chat") or {}).get("id", self.telegram.chat_id))
                         )
                         continue
-                
+
                 update_id = update.get("update_id")
                 message_id = message.get("message_id")
-                
+
                 if is_sleep_on:
                     was_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
                     if was_active:
@@ -250,14 +302,14 @@ class TradingService:
                     else:
                         self.storage.set_control_state("sleep_mode_active", "1", sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command", "sleep", sender, "telegram", text, update_id, message_id, message_date)
-                        
+
                         start_time_iso = datetime.fromtimestamp(message_date, UTC).isoformat() if message_date else iso_now()
                         self.storage.set_control_state("sleep_mode_started_at", start_time_iso, sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command_sent_at", start_time_iso, sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command_processed_at", iso_now(), sender, "telegram", text, update_id, message_id, message_date)
-                        
+
                         self.storage.audit(self.run_id, "sleep_mode_enabled", {"raw_command": text})
-                        
+
                         self.telegram.send_message(
                             "🌙 Sleep mode ON. I will keep scanning and logging, suppress normal BUY proposals, and only alert/act on serious paper-exit risk according to the configured emergency-exit rules. No live trading is enabled.",
                             str((message.get("chat") or {}).get("id", self.telegram.chat_id))
@@ -273,14 +325,14 @@ class TradingService:
                         start_time_iso = self.storage.get_control_state("sleep_mode_started_at", iso_now())
                         self.storage.set_control_state("sleep_mode_active", "0", sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command", "awake", sender, "telegram", text, update_id, message_id, message_date)
-                        
+
                         end_time_iso = iso_now()
                         self.storage.set_control_state("sleep_mode_ended_at", end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command_sent_at", datetime.fromtimestamp(message_date, UTC).isoformat() if message_date else end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
                         self.storage.set_control_state("sleep_mode_last_command_processed_at", end_time_iso, sender, "telegram", text, update_id, message_id, message_date)
-                        
+
                         self.storage.audit(self.run_id, "sleep_mode_disabled", {"raw_command": text})
-                        
+
                         self.telegram.send_message(
                             "☀️ Sleep mode OFF. Normal paper proposal alerts are enabled again. No orders were placed unless explicitly approved or emergency paper-exit rules were triggered.",
                             str((message.get("chat") or {}).get("id", self.telegram.chat_id))
@@ -313,7 +365,7 @@ class TradingService:
                             str((message.get("chat") or {}).get("id", self.telegram.chat_id))
                         )
                     continue
-            
+
             # Live safety check before processing approvals
             if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
                 self.telegram.send_message("Blocked for safety: live trading is disabled.")
@@ -321,7 +373,7 @@ class TradingService:
 
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
-            
+
             # Determine targeting method
             targeting_method = None
             if reply_to_message_id is not None:
@@ -346,46 +398,46 @@ class TradingService:
                             targeting_method = "symbol"
                         else:
                             targeting_method = "single_pending"
-                            
+
             pending = self.storage.active_proposals()
-            
+
             # Check reply-to targeting validations (wrong/expired/handled proposals)
             if reply_to_message_id is not None:
                 proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE telegram_message_id=?", (str(reply_to_message_id),))
                 if not proposal_rows:
                     self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
                     continue
-                    
+
                 proposal_row = proposal_rows[0]
                 prop_status = proposal_row.get("status")
                 prop_symbol = proposal_row.get("symbol", "")
                 prop_side = proposal_row.get("side", "").upper()
-                
+
                 # Check text matches yes/no action
                 normalized = " ".join(text.lower().strip().split())
                 reject_words = r"(?:no|reject|rejected)(?: thanks)?"
                 approve_words = r"(?:yes|approve|approved)(?: please)?"
                 is_approve = bool(re.fullmatch(approve_words, normalized)) or bool(re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized))
                 is_reject = bool(re.fullmatch(reject_words, normalized)) or bool(re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized))
-                
+
                 if not is_approve and not is_reject:
                     self.telegram.send_message("I did not take any action because I could not tell whether you meant yes or no. Please reply yes to approve or no to reject.")
                     continue
-                    
+
                 if prop_status == "expired":
                     self.telegram.send_message("⏳ This proposal has already expired. No order was placed.")
                     continue
                 elif prop_status in ("approved", "rejected", "superseded"):
                     self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                     continue
-            
+
             # Check plain yes/no ambiguity
             normalized = " ".join(text.lower().strip().split())
             reject_words = r"(?:no|reject|rejected)(?: thanks)?"
             approve_words = r"(?:yes|approve|approved)(?: please)?"
             is_plain_reject = bool(re.fullmatch(reject_words, normalized))
             is_plain_approve = bool(re.fullmatch(approve_words, normalized))
-            
+
             if reply_to_message_id is None and (is_plain_approve or is_plain_reject):
                 if len(pending) > 1:
                     self.telegram.send_message("I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.")
@@ -409,34 +461,34 @@ class TradingService:
                 pending,
                 reply_to_message_id=reply_to_message_id
             )
-            
+
             # If not authorized, ignore
             if parsed.reason == "unauthorized sender":
                 continue
-                
+
             approval_id = str(uuid.uuid4())
             ack_status = "rejected" if parsed.action == "reject" else "received"
             approval_received_at = iso_now()
-            
+
             self.storage.execute(
                 "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "accepted" if parsed.accepted else "rejected", iso_now(), str(reply_to_message_id) if reply_to_message_id is not None else None, targeting_method, ack_status, approval_received_at),
             )
-            
+
             if not parsed.accepted or not parsed.proposal_id:
                 msg = translate_reason(parsed.reason)
                 self.telegram.send_message(msg)
-                
+
                 # Update delay for non-accepted/expired/ambiguous updates
                 ack_sent = iso_now()
                 delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
                 continue
-                
+
             row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
             prop_symbol = row.get("symbol", "")
             prop_side = row.get("side", "").lower()
-            
+
             if parsed.action == "reject":
                 if row.get("emergency_exit_triggered") == 1:
                     self.storage.execute("UPDATE trade_proposals SET status='rejected', emergency_exit_final_decision='cancelled', emergency_exit_user_response='no' WHERE id=? AND status='pending'", (parsed.proposal_id,))
@@ -445,23 +497,29 @@ class TradingService:
                 else:
                     self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (parsed.proposal_id,))
                     self.telegram.send_message(f"❌ Received: NO for {prop_symbol} paper {prop_side} proposal. Proposal rejected. No order will be placed.")
+
+                # Create shadow trade for the rejected proposal
+                updated_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))
+                if updated_rows:
+                    self._create_shadow_trade_from_proposal(updated_rows[0], "rejected_by_user")
+
                 ack_sent = iso_now()
                 delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
                 continue
-                
+
             if row.get("emergency_exit_triggered") == 1:
                 self.telegram.send_message(f"✅ Received: YES for {prop_symbol} emergency paper sell proposal. I will now run the final safety check.")
                 ack_sent = iso_now()
                 delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
-                
+
                 if not self.storage.consume_approval(parsed.proposal_id, approval_id):
                     self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                     continue
-                
+
                 self.storage.audit(self.run_id, "emergency_exit_approved_by_user", {"symbol": prop_symbol, "proposal_id": parsed.proposal_id})
-                
+
                 proposal = {**json.loads(row.get("payload") or "{}"), **row}
                 success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
                 if success:
@@ -479,28 +537,28 @@ class TradingService:
             ack_sent = iso_now()
             delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
             self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
-            
+
             if not self.storage.consume_approval(parsed.proposal_id, approval_id):
                 self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                 continue
-                
+
             final_revalidation_started_at = iso_now()
-            
+
             # Retrieve parameters from config
             telegram_cfg = self.config.get("telegram", {})
             refresh_required = telegram_cfg.get("approval_price_refresh_required", True)
             max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 60)
             max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
-            
+
             refreshed_price_val = None
             refreshed_price_at = None
             price_refreshed_at = None
             refreshed_price_age_seconds = None
             price_move_bps_since_proposal = None
             block_reason = None
-            
+
             now_dt = datetime.now(UTC)
-            
+
             # Fetch latest price
             if self.broker is not None:
                 try:
@@ -512,7 +570,7 @@ class TradingService:
                         refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
                 except Exception as e:
                     logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
-            
+
             # Check market open status
             market_open = False
             if self.broker is not None:
@@ -520,7 +578,7 @@ class TradingService:
                     market_open = self.broker.is_market_open()
                 except Exception:
                     market_open = False
-            
+
             # Get the proposal price
             proposal_price = None
             try:
@@ -530,7 +588,7 @@ class TradingService:
                 pass
             if proposal_price is None:
                 proposal_price = row.get("price")
-                
+
             # Perform revalidation checks
             if refresh_required:
                 if refreshed_price_val is None or refreshed_price_val <= 0:
@@ -547,29 +605,53 @@ class TradingService:
             else:
                 if not market_open:
                     block_reason = "Market is closed"
-            
+
             proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
             if block_reason:
                 # Set up mock Executor result for blocked order
                 result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
             else:
+                # Get authoritative account & positions to compute fresh snapshot
+                try:
+                    state = self._authoritative_runtime_state(force=True)
+                    positions_fresh = state["positions"]
+                    account_fresh = state["account"]
+                    snapshot_fresh = self._get_exposure_snapshot(positions_fresh, account_fresh)
+                except Exception as e:
+                    logger.warning("Failed to retrieve authoritative snapshot during revalidation: %s", e)
+                    snapshot_fresh = None
+
                 # Update proposal dict with fresh price data so risk engine evaluates using it
                 if refreshed_price_val is not None:
                     proposal["latest_price"] = refreshed_price_val
                 if refreshed_price_at is not None:
                     proposal["price_at"] = refreshed_price_at.isoformat()
-                    
+
+                # Recalculate dynamic sizing if sizing enabled and is buy
+                if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and proposal.get("side") == "buy":
+                    try:
+                        bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
+                        volatility_regime = proposal.get("volatility_regime", "normal")
+                        score = proposal.get("score", 70.0)
+                        is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
+                        size_dict = self._calculate_dynamic_size(prop_symbol, score, volatility_regime, refreshed_price_val, bars_fresh, snapshot_fresh, is_add=is_add)
+
+                        proposal["notional"] = size_dict["final_notional"]
+                        proposal["qty"] = size_dict["suggested_shares"]
+                    except Exception as e:
+                        logger.warning("Recalculate dynamic size failed during revalidation: %s", e)
+
                 context = self._portfolio_context(proposal, approval_valid=True)
-                
+
                 # Execute
                 result = Executor(self.broker, self._risk_engine(parsed.proposal_id, "final")).execute(proposal, context)
-                
+
             final_revalidation_completed_at = iso_now()
-            
+
             # Record order decision
             final_order_decision = "submitted" if result.submitted else "blocked"
             final_block_reason = result.reason if not result.submitted else None
-            
+
             self.storage.execute(
                 "UPDATE approvals SET final_revalidation_started_at=?, final_revalidation_completed_at=?, price_refreshed_at=?, refreshed_price=?, refreshed_price_age_seconds=?, price_move_bps_since_proposal=?, final_order_decision=?, final_block_reason=? WHERE id=?",
                 (
@@ -584,12 +666,12 @@ class TradingService:
                     approval_id
                 )
             )
-            
+
             self.storage.execute(
                 "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal.get("symbol", prop_symbol), proposal.get("side", prop_side), proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
             )
-            
+
             if result.submitted:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
                 notional_val = proposal.get("notional", 5)
@@ -599,7 +681,7 @@ class TradingService:
                 else:
                     qty_str = f"{qty_val} shares" if qty_val is not None else f"${notional_val:.0f}"
                     self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {qty_str}. Mode: paper only.")
-                    
+
                 if prop_side == "buy":
                     other_buys = self.storage.fetch_all("SELECT id FROM trade_proposals WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
                     if other_buys:
@@ -628,12 +710,12 @@ class TradingService:
             qty = row["qty"]
             total_score = row["emergency_exit_score"]
             proposal = {**json.loads(row["payload"] or "{}"), **row}
-            
+
             # Consume first to prevent race condition
             self.storage.execute("UPDATE trade_proposals SET status='approved', emergency_exit_auto_execute_attempted_at=? WHERE id=?", (iso_now(), proposal_id))
-            
+
             self.storage.audit(self.run_id, "emergency_exit_auto_timeout_reached", {"symbol": symbol, "proposal_id": proposal_id})
-            
+
             success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
             if success:
                 self.storage.execute("UPDATE trade_proposals SET emergency_exit_final_decision='submitted' WHERE id=?", (proposal_id,))
@@ -684,15 +766,15 @@ class TradingService:
         features_df = build_features(bars)
         row = features_df.iloc[-1]
         prev_row = features_df.iloc[-2] if len(features_df) >= 2 else None
-        
+
         close_val = float(row["close"])
         ma_50_val = float(row["ma_50"]) if "ma_50" in row and not pd.isna(row["ma_50"]) else None
         ma_200_val = float(row["ma_200"]) if "ma_200" in row and not pd.isna(row["ma_200"]) else None
-        
+
         ma_50_current = ma_50_val
         ma_50_prev = float(prev_row["ma_50"]) if (prev_row is not None and "ma_50" in prev_row and not pd.isna(prev_row["ma_50"])) else None
         ma_50_falling = (ma_50_current < ma_50_prev) if (ma_50_current is not None and ma_50_prev is not None) else False
-        
+
         trend_points = 0
         if ma_200_val is not None and close_val < ma_200_val:
             trend_points = 20
@@ -712,7 +794,7 @@ class TradingService:
             atr_series = tr.rolling(20).mean()
             if not atr_series.empty and not pd.isna(atr_series.iloc[-1]):
                 atr_value = float(atr_series.iloc[-1])
-        
+
         is_atr_proxy = False
         vol_20 = indicators.get("volatility_20")
         if atr_value is None:
@@ -726,7 +808,7 @@ class TradingService:
         if average_entry_price and average_entry_price > 0:
             adverse_move = average_entry_price - current_price
             adverse_move_atr = adverse_move / atr_value if atr_value > 0 else 0.0
-            
+
             if adverse_move_atr >= 1.50:
                 adverse_points = 15
             elif adverse_move_atr >= 1.00:
@@ -759,7 +841,7 @@ class TradingService:
                     minutes_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
             except Exception:
                 pass
-        
+
         if minutes_to_close is None or minutes_to_close > 90:
             near_close_points = 0
         elif 30 <= minutes_to_close <= 90:
@@ -769,7 +851,7 @@ class TradingService:
 
         quality_points = 0
         price_age = float("inf")
-        
+
         # Get price_at from parameters
         price_at_dt = None
         for r in self.storage.fetch_all("SELECT price_at FROM market_snapshots WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (symbol,)):
@@ -779,12 +861,12 @@ class TradingService:
                 pass
         if price_at_dt:
             price_age = (datetime.now(UTC) - price_at_dt).total_seconds()
-        
+
         if price_age <= 30:
             quality_points += 5
-            
+
         quality_points += 3
-        
+
         open_orders = []
         if self.broker is not None:
             try:
@@ -794,9 +876,9 @@ class TradingService:
         conflicting = any(str(_value(o, "symbol", "")).upper() == symbol.upper() and str(_value(o, "side", "")).lower() == "sell" for o in open_orders)
         if not conflicting:
             quality_points += 2
-            
+
         total_score = drawdown_points + trend_points + adverse_points + vol_points + near_close_points + quality_points
-        
+
         breakdown = {
             "drawdown_points": drawdown_points,
             "trend_points": trend_points,
@@ -810,12 +892,12 @@ class TradingService:
             "minutes_to_close": minutes_to_close,
             "price_age_seconds": price_age
         }
-        
+
         hard_trigger_1 = (dd_val <= -0.08) and (ma_50_val is not None and close_val < ma_50_val)
         hard_trigger_2 = (dd_val <= -0.10)
         hard_trigger_3 = (ma_200_val is not None and close_val < ma_200_val) and (dd_val < 0)
         hard_trigger_4 = (adverse_move_atr >= 1.50) and (dd_val <= -0.06)
-        
+
         hard_trigger_matched = any([hard_trigger_1, hard_trigger_2, hard_trigger_3, hard_trigger_4])
         hard_trigger_reason = ""
         if hard_trigger_matched:
@@ -825,7 +907,7 @@ class TradingService:
             if hard_trigger_3: reasons.append("below MA200 and position losing")
             if hard_trigger_4: reasons.append("adverse move >= 1.5 ATR and drawdown <= -6%")
             hard_trigger_reason = "; ".join(reasons)
-            
+
         return float(total_score), breakdown, hard_trigger_matched, hard_trigger_reason
 
     def get_gpt_exit_explanation(self, proposal: dict[str, Any], timeout: float = 3.0) -> dict[str, Any]:
@@ -854,19 +936,19 @@ class TradingService:
     def revalidate_and_execute_emergency_exit(self, proposal: dict[str, Any]) -> tuple[bool, str]:
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             return False, "not in paper mode / live enabled"
-        
+
         emergency_cfg = self.config.get("emergency_exit", {})
         if not emergency_cfg.get("enabled", True):
             return False, "emergency exit disabled in configuration"
-            
+
         if not self.storage.writable():
             return False, "database is not writable"
-            
+
         if (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             return False, "kill switch active"
-            
+
         symbol = proposal["symbol"]
-        
+
         existing_orders = self.storage.fetch_all(
             "SELECT id FROM orders WHERE symbol=? AND side='sell' AND status IN ('submitted', 'filled')",
             (symbol,)
@@ -876,41 +958,41 @@ class TradingService:
 
         if self.broker is None:
             return False, "broker client unavailable"
-            
+
         positions = self.broker.get_positions()
         pos_obj = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol.upper()), None)
         if not pos_obj:
             return False, f"no active broker position found for symbol {symbol}"
-            
+
         qty_held = float(_value(pos_obj, "qty") or 0.0)
         if qty_held <= 0:
             return False, f"broker position quantity for {symbol} is 0"
-            
+
         open_orders = self.broker.get_open_orders()
         conflicting = any(str(_value(o, "symbol", "")).upper() == symbol.upper() and str(_value(o, "side", "")).lower() == "sell" for o in open_orders)
         if conflicting:
             return False, "conflicting open sell order exists"
-            
+
         if not self.broker.is_market_open():
             return False, "market is closed"
-            
+
         trade = self.broker.get_latest_price(symbol)
         refreshed_price = float(_value(trade, "price", 0) or 0)
         refreshed_at = _dt(_value(trade, "timestamp", datetime.now(UTC)))
         if not refreshed_price or refreshed_price <= 0:
             return False, "failed to fetch refreshed price"
-            
+
         price_age = (datetime.now(UTC) - refreshed_at).total_seconds()
         if price_age > 60:
             return False, f"refreshed price is stale (age: {price_age:.1f}s > 60s)"
-            
+
         proposal_price = proposal.get("latest_price")
         if proposal_price is not None and proposal_price > 0:
             move_bps = (abs(refreshed_price - proposal_price) / proposal_price) * 10000
             max_move_bps = self.config.get("telegram", {}).get("approval_max_price_move_bps", 25)
             if move_bps > max_move_bps:
                 return False, f"price moved too much since emergency decision ({move_bps:.1f} bps > limit {max_move_bps} bps)"
-                
+
         client_order_id = f"ta-emergency-{uuid.uuid4().hex[:16]}"
         try:
             order_args = {"qty": qty_held}
@@ -930,17 +1012,17 @@ class TradingService:
             "SELECT COUNT(*) as cnt FROM market_memory WHERE candidate_suppression_reason='suppressed_by_sleep_mode' AND created_at BETWEEN ? AND ?",
             (start_time, end_time)
         )[0]["cnt"]
-        
+
         sell_alerts = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='sell' AND emergency_exit_triggered=0 AND created_at BETWEEN ? AND ?",
             (start_time, end_time)
         )[0]["cnt"]
-        
+
         emerg_triggered = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND created_at BETWEEN ? AND ?",
             (start_time, end_time)
         )[0]["cnt"]
-        
+
         emerg_submitted = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND emergency_exit_final_decision='submitted' AND created_at BETWEEN ? AND ?",
             (start_time, end_time)
@@ -949,12 +1031,12 @@ class TradingService:
             "SELECT COUNT(*) as cnt FROM trade_proposals WHERE emergency_exit_triggered=1 AND status='blocked' AND created_at BETWEEN ? AND ?",
             (start_time, end_time)
         )[0]["cnt"]
-        
+
         orders_placed = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM orders WHERE created_at BETWEEN ? AND ?",
             (start_time, end_time)
         )[0]["cnt"]
-        
+
         positions_cnt = 0
         open_orders_cnt = 0
         if self.broker is not None:
@@ -963,11 +1045,11 @@ class TradingService:
                 open_orders_cnt = len(self.broker.get_open_orders())
             except Exception:
                 pass
-                
+
         window_str = _format_sleep_window(start_time, end_time)
         duration_str = _format_sleep_duration(start_time, end_time)
         has_events = (suppressed_buys > 0 or sell_alerts > 0 or emerg_triggered > 0 or orders_placed > 0)
-        
+
         if not has_events:
             summary_msg = (
                 f"☀️ Sleep mode OFF — Overnight summary\n\n"
@@ -1011,7 +1093,10 @@ class TradingService:
             symbol = row["symbol"]
             expires_at = row["expires_at"]
             expires_fmt = format_sgt(expires_at)
-            
+
+            # Create shadow trade for the expired proposal
+            self._create_shadow_trade_from_proposal(row, "expired: no response")
+
             msg = (
                 f"⏳ Proposal expired\n\n"
                 f"The {symbol} paper trade proposal expired at {expires_fmt}.\n"
@@ -1019,7 +1104,7 @@ class TradingService:
                 f"Reason: no yes/no reply before expiry."
             )
             self.telegram.send_message(msg)
-            
+
             self.storage.execute(
                 "UPDATE trade_proposals SET expiry_notified=1 WHERE id=?",
                 (proposal_id,)
@@ -1044,7 +1129,7 @@ class TradingService:
                 score_liq = 10.0
             else:
                 score_liq = 5.0
-                
+
         # 2. Trend strength (max 20)
         score_trend = 10.0
         if isinstance(bars, pd.DataFrame) and not bars.empty and len(bars) >= 50 and "close" in bars.columns:
@@ -1062,7 +1147,7 @@ class TradingService:
                     score_trend = 5.0
             else:
                 score_trend = 15.0 if close > ma_50 else 5.0
-                
+
         # 3. Volatility sanity (max 20)
         score_vol = 10.0
         vol_20 = signal.indicators.get("volatility_20")
@@ -1073,7 +1158,7 @@ class TradingService:
                 score_vol = 12.0
             else:
                 score_vol = 5.0
-                
+
         # 4. Relative strength vs SPY (max 15)
         score_rel = 10.0
         if isinstance(bars, pd.DataFrame) and not bars.empty and len(bars) >= 20 and "close" in bars.columns:
@@ -1085,14 +1170,14 @@ class TradingService:
                     score_rel = 10.0
                 else:
                     score_rel = 5.0
-                    
+
         # 5. Signal confirmation (max 15)
         score_sig = 5.0
         if signal.action in {"ENTRY", "EXIT"}:
             score_sig = 15.0
         elif signal.side in {"buy", "sell"}:
             score_sig = 10.0
-            
+
         # 6. Data quality/confidence (max 10)
         age = (now - price_at).total_seconds() if price_at else float("inf")
         fresh_price = -5 <= age <= 120
@@ -1103,7 +1188,7 @@ class TradingService:
             score_data = 5.0
         else:
             score_data = 2.0
-            
+
         total = score_liq + score_trend + score_vol + score_rel + score_sig + score_data
         return float(round(total, 2))
 
@@ -1131,9 +1216,9 @@ class TradingService:
         default_exp = self.config.get("proposal_expiry_default_minutes", 15)
         high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
         low_vol_thresh = self.config.get("proposal_expiry_low_volatility_threshold", 0.12)
-        
+
         is_exit = signal.action == "EXIT" or signal.side == "sell"
-        
+
         # Base expiry depending on Volatility and Action type
         if vol_20 is None or not isinstance(vol_20, (int, float)) or vol_20 <= 0:
             expiry_minutes = 10 if is_exit else default_exp
@@ -1175,7 +1260,7 @@ class TradingService:
         ma_200 = float(indicators.get("ma_200") or 0.0)
         above_50 = "above_50" if close > ma_50 else "below_50"
         above_200 = "above_200" if (not ma_200 or close > ma_200) else "below_200"
-        
+
         vol_20 = indicators.get("volatility_20")
         if vol_20 is None:
             vol_regime = "missing"
@@ -1191,11 +1276,11 @@ class TradingService:
             vol_regime = "too_quiet"
         else:
             vol_regime = "unknown"
-            
+
         score_band = f"score_{int(score // 10) * 10}"
         side_str = str(side or "").lower()
         action_str = str(action or "").upper()
-        
+
         return f"{symbol}:{side_str}:{action_str}:{above_50}:{above_200}:{vol_regime}:{score_band}"
 
     def scan(self) -> None:
@@ -1212,10 +1297,31 @@ class TradingService:
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
         strategy_config = __import__("yaml").safe_load((PROJECT_ROOT / "config" / "strategies.yaml").read_text())["rule_based_v1"]
-        
+
         now = datetime.now(UTC)
         today_start = now.date().isoformat() + "T00:00:00"
-        
+
+        try:
+            account = self.broker.get_account()
+        except Exception:
+            account = None
+
+        snapshot = self._get_exposure_snapshot(positions, account)
+
+        # Insert portfolio exposure snapshot
+        snapshot_id = str(uuid.uuid4())
+        self.storage.execute(
+            """INSERT INTO portfolio_exposure_snapshots(
+                id, run_id, timestamp, total_exposure_pct, total_exposure_dollars,
+                single_symbol_exposure_json, cluster_exposure_json
+            ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                snapshot_id, self.run_id, now.isoformat(),
+                snapshot["total_exposure_pct"], snapshot["total_exposure_dollars"],
+                json.dumps(snapshot["single_exposures"]), json.dumps(snapshot["cluster_exposures"])
+            )
+        )
+
         profiles = self.config.get("market_profiles", {})
         if not profiles:
             # Fallback if config has no profiles
@@ -1234,7 +1340,7 @@ class TradingService:
             status = profile.get("status", "disabled")
             if status == "disabled":
                 continue
-                
+
             broker_name = profile.get("broker")
             if broker_name != "alpaca":
                 # Report data_source_missing safely and skip
@@ -1244,13 +1350,13 @@ class TradingService:
                     {"profile": profile_key, "broker": broker_name}
                 )
                 continue
-                
+
             active_watchlist = [str(s).upper() for s in profile.get("watchlist", [])]
             obs_watchlist = [str(s).upper() for s in profile.get("observation_watchlist", [])]
             proposals_enabled = profile.get("proposals_enabled", True)
             pos_symbols = [str(_value(p, "symbol", "")).upper() for p in positions if _value(p, "symbol")]
             all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist + pos_symbols))
-            
+
             spy_ret_20d = None
             if "SPY" in all_symbols or any(p.get("watchlist") and "SPY" in p.get("watchlist") for p in profiles.values()):
                 try:
@@ -1259,9 +1365,9 @@ class TradingService:
                         spy_ret_20d = float(spy_bars["close"].iloc[-1] / spy_bars["close"].iloc[-20]) - 1.0
                 except Exception:
                     pass
-            
+
             profile_results = []
-            
+
             for symbol in all_symbols:
                 try:
                     trade = self.broker.get_latest_price(symbol)
@@ -1270,30 +1376,30 @@ class TradingService:
                 except Exception:
                     price = 0.0
                     price_at = now
-                    
+
                 bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
                 volume = float(bars.iloc[-1]["volume"]) if not bars.empty else 0.0
-                
+
                 self.storage.execute(
                     "INSERT INTO market_snapshots(run_id,symbol,price,price_at,volume,payload,created_at) VALUES(?,?,?,?,?,?,?)",
                     (self.run_id, symbol, price, price_at.isoformat() if hasattr(price_at, "isoformat") else str(price_at), volume, json_dumps({"price": price, "volume": volume}), now.isoformat())
                 )
-                
+
                 pos_obj = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
                 has_position = pos_obj is not None
                 has_order = any(str(_value(o, "symbol", "")).upper() == symbol for o in orders)
-                
+
                 position_drawdown_pct = 0.0
                 qty_held = None
                 avg_entry_price = None
                 latest_position_price = None
-                
+
                 if has_position:
                     try:
                         qty_held = float(_value(pos_obj, "qty") or 0.0)
                         avg_entry_price = float(_value(pos_obj, "avg_entry_price") or 0.0)
                         latest_position_price = float(_value(pos_obj, "current_price") or 0.0)
-                        
+
                         # Fallback for average entry price
                         if not avg_entry_price or avg_entry_price <= 0:
                             last_fill = self.storage.fetch_all(
@@ -1303,10 +1409,10 @@ class TradingService:
                             if last_fill:
                                 avg_entry_price = float(last_fill[0]["price"])
                                 logger.info("Using fallback average entry price from fills for %s: %f", symbol, avg_entry_price)
-                        
+
                         if not latest_position_price or latest_position_price <= 0:
                             latest_position_price = price
-                            
+
                         if avg_entry_price and avg_entry_price > 0 and latest_position_price and latest_position_price > 0:
                             position_drawdown_pct = (latest_position_price - avg_entry_price) / avg_entry_price
                         else:
@@ -1324,7 +1430,7 @@ class TradingService:
                             "symbol": symbol,
                             "error": str(e)
                         })
-                
+
                 signal = evaluate_symbol(
                     symbol,
                     bars,
@@ -1335,7 +1441,7 @@ class TradingService:
                     strategy_config["stop_drawdown_pct"],
                     position_drawdown_pct=position_drawdown_pct
                 )
-                
+
                 # Make sure exits only happen with real position
                 if signal.action == "EXIT" and not has_position:
                     signal = evaluate_symbol(
@@ -1348,7 +1454,7 @@ class TradingService:
                         strategy_config["stop_drawdown_pct"],
                         position_drawdown_pct=0.0
                     )
-                
+
                 # Calculate emergency exit risk score and check hard triggers
                 emergency_exit_score = None
                 emergency_exit_triggered = 0
@@ -1362,7 +1468,7 @@ class TradingService:
                 atr_value = None
                 adverse_move_atr = None
                 minutes_to_close = None
-                
+
                 if has_position:
                     total_score, breakdown, hard_trigger_matched, hard_trigger_reason = self.calculate_emergency_exit_risk_score(
                         symbol,
@@ -1376,7 +1482,7 @@ class TradingService:
                     atr_value = breakdown.get("atr_value")
                     adverse_move_atr = breakdown.get("adverse_move_atr")
                     minutes_to_close = breakdown.get("minutes_to_close")
-                    
+
                     if total_score >= 85 and hard_trigger_matched:
                         existing_proposals = self.storage.fetch_all(
                             "SELECT id FROM trade_proposals WHERE symbol=? AND side='sell' AND emergency_exit_triggered=1 AND status IN ('pending', 'approved', 'submitted', 'filled', 'blocked')",
@@ -1390,7 +1496,7 @@ class TradingService:
                                 emergency_exit_mode = "blocked"
                                 emergency_exit_block_reason = "emergency_drawdown_unavailable"
                                 emergency_exit_final_decision = "blocked"
-                                
+
                                 self.telegram.send_message(
                                     f"Emergency exit was blocked because position drawdown could not be reliably calculated. No order was placed."
                                 )
@@ -1404,7 +1510,7 @@ class TradingService:
                                 emergency_exit_triggered = 1
                                 emergency_exit_trigger_reason = hard_trigger_reason
                                 emergency_exit_hard_trigger = hard_trigger_reason
-                                
+
                                 if total_score >= 95 or position_drawdown_pct <= -0.12:
                                     emergency_exit_mode = "extreme"
                                     emergency_exit_wait_seconds = 0
@@ -1414,12 +1520,12 @@ class TradingService:
                                 else:
                                     emergency_exit_mode = "normal"
                                     emergency_exit_wait_seconds = 60
-                                    
+
                                 due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
                                 emergency_exit_auto_execute_due_at = due_at.isoformat()
-                                
+
                                 signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
-                
+
                 exit_trigger_reason = None
                 if signal.action == "EXIT" and has_position:
                     if emergency_exit_triggered == 1:
@@ -1444,13 +1550,86 @@ class TradingService:
                             exit_trigger_reason = "drawdown stop reached"
                         else:
                             exit_trigger_reason = "other exit criteria"
-                
+
+                # Check pyramiding / add-to-winner eligibility
+                is_add = False
+                unrealized_gain_pct = 0.0
+                add_block_reasons = []
+
+                pyramiding_cfg = self.config.get("add_to_position", {})
+                if pyramiding_cfg.get("enabled", True) and has_position and signal.action != "EXIT" and not has_order:
+                    # Run evaluate_symbol pretending we don't have a position to see if buy setup exists
+                    buy_setup_signal = evaluate_symbol(
+                        symbol,
+                        bars,
+                        False, # has_position = False
+                        has_order,
+                        market_open,
+                        strategy_config["maximum_volatility_20d"],
+                        strategy_config["stop_drawdown_pct"],
+                        position_drawdown_pct=0.0
+                    )
+
+                    if buy_setup_signal.action == "ENTRY" and buy_setup_signal.side == "buy":
+                        # A buy setup is active! Let's check pyramiding constraints.
+
+                        # 1. Profitability & Averaging Down
+                        unrealized_gain_pct = 0.0
+                        if avg_entry_price and avg_entry_price > 0:
+                            unrealized_gain_pct = (price - avg_entry_price) / avg_entry_price * 100
+
+                        only_if_profitable = pyramiding_cfg.get("only_if_profitable", True)
+                        min_gain = float(pyramiding_cfg.get("min_unrealized_gain_pct", 0.5))
+                        if only_if_profitable and unrealized_gain_pct < min_gain:
+                            add_block_reasons.append(f"position not sufficiently profitable ({unrealized_gain_pct:.2f}% < {min_gain}%)")
+
+                        if pyramiding_cfg.get("block_averaging_down", True) and unrealized_gain_pct < 0:
+                            add_block_reasons.append("cannot average down")
+
+                        # 2. Risk warnings & Emergency exit score
+                        if pyramiding_cfg.get("block_if_exit_warning", True):
+                            if emergency_exit_score is not None and emergency_exit_score > float(pyramiding_cfg.get("block_if_emergency_exit_score_above", 40)):
+                                add_block_reasons.append(f"emergency exit score too high ({emergency_exit_score:.1f} > 40)")
+
+                        # 3. Max additions caps
+                        max_adds_day = int(pyramiding_cfg.get("max_adds_per_symbol_per_day", 1))
+                        # Count adds today
+                        adds_today_res = self.storage.fetch_all(
+                            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE symbol=? AND side='buy' AND json_extract(payload, '$.action')='add' AND status IN ('submitted', 'approved', 'filled') AND created_at >= ?",
+                            (symbol, today_start)
+                        )
+                        adds_today_cnt = adds_today_res[0]["cnt"] if adds_today_res else 0
+                        if adds_today_cnt >= max_adds_day:
+                            add_block_reasons.append(f"max adds per day reached ({adds_today_cnt} >= {max_adds_day})")
+
+                        max_adds_total = int(pyramiding_cfg.get("max_total_adds_per_symbol", 2))
+                        # Count total adds for current position
+                        latest_entry = self.storage.fetch_all(
+                            "SELECT created_at FROM trade_proposals WHERE symbol=? AND side='buy' AND json_extract(payload, '$.action')='entry' AND status IN ('submitted', 'approved', 'filled') ORDER BY created_at DESC LIMIT 1",
+                            (symbol,)
+                        )
+                        if latest_entry:
+                            entry_time = latest_entry[0]["created_at"]
+                            adds_total_res = self.storage.fetch_all(
+                                "SELECT COUNT(*) as cnt FROM trade_proposals WHERE symbol=? AND side='buy' AND json_extract(payload, '$.action')='add' AND status IN ('submitted', 'approved', 'filled') AND created_at > ?",
+                                (symbol, entry_time)
+                            )
+                            adds_total_cnt = adds_total_res[0]["cnt"] if adds_total_res else 0
+                        else:
+                            adds_total_cnt = 0
+                        if adds_total_cnt >= max_adds_total:
+                            add_block_reasons.append(f"max total adds reached ({adds_total_cnt} >= {max_adds_total})")
+
+                        # Set signal action to ENTRY so we compute the score
+                        signal = dataclasses.replace(buy_setup_signal, action="ENTRY")
+                        is_add = True
+
                 signal_id = str(uuid.uuid4())
-                
+
                 vol_20 = signal.indicators.get("volatility_20")
                 asset_score = self._calculate_asset_selection_score(symbol, bars, price_at, signal, now, spy_ret_20d)
                 asset_classification = self._classify_asset_score(asset_score)
-                
+
                 prev_row = self.storage.fetch_all("SELECT price, score, signal FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (symbol,))
                 prev_price = float(prev_row[0]["price"]) if prev_row else price
                 session_row = self.storage.fetch_all("SELECT price FROM market_memory WHERE symbol=? AND created_at>=? ORDER BY created_at ASC LIMIT 1", (symbol, today_start))
@@ -1459,10 +1638,10 @@ class TradingService:
                 price_change_pct = (price / prev_price - 1) * 100 if prev_price > 0 else 0.0
                 session_change = price - session_start_price
                 session_change_pct = (price / session_start_price - 1) * 100 if session_start_price > 0 else 0.0
-                
+
                 score_rule = 25.0 if signal.action in {"ENTRY", "EXIT"} else 0.0
                 score_asset = 15.0 if asset_score >= 80 else (12.0 if asset_score >= 65 else (8.0 if asset_score >= 50 else 3.0))
-                
+
                 score_5m = 5.0
                 if prev_row:
                     if signal.side == "buy":
@@ -1471,7 +1650,7 @@ class TradingService:
                         score_5m = 10.0 if price < prev_price else (5.0 if price == prev_price else 0.0)
                     else:
                         score_5m = 5.0 if price == prev_price else (10.0 if price > prev_price else 0.0)
-                
+
                 score_session = 5.0
                 if session_row:
                     if signal.side == "buy":
@@ -1480,7 +1659,7 @@ class TradingService:
                         score_session = 10.0 if price < session_start_price else (5.0 if price == session_start_price else 0.0)
                     else:
                         score_session = 5.0 if price == session_start_price else (10.0 if price > session_start_price else 0.0)
-                
+
                 volatility_regime = "unknown"
                 volatility_gate_result = "fail-safe HOLD"
                 if vol_20 is None:
@@ -1511,7 +1690,7 @@ class TradingService:
                     score_vol = 0.0
                     volatility_regime = "unknown"
                     volatility_gate_result = "fail-safe HOLD"
-                
+
                 port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
                 safety_ok = True
                 if port_context.get("duplicate_order") or port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
@@ -1519,15 +1698,85 @@ class TradingService:
                 if signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
                     safety_ok = False
                 score_safety = 15.0 if safety_ok else 0.0
-                
+
                 age = (now - price_at).total_seconds() if price_at else float("inf")
                 fresh_price = -5 <= age <= self.config["risk"].get("max_price_age_seconds", 120)
                 enough_bars = len(bars) >= self.config["risk"].get("min_historical_bars", 50)
                 score_data = 10.0 if (fresh_price and enough_bars) else (5.0 if fresh_price else 0.0)
-                
+
                 score = float(round(score_rule + score_asset + score_5m + score_session + score_vol + score_safety + score_data, 2))
                 classification = self._classify_trade_score(score)
-                
+
+                # Check pyramiding constraints that require trade score
+                if is_add:
+                    min_trade_score = float(pyramiding_cfg.get("min_trade_score", 85))
+                    if score < min_trade_score:
+                        add_block_reasons.append(f"trade score below threshold ({score:.2f} < {min_trade_score})")
+
+                    min_score_imp = float(pyramiding_cfg.get("min_score_improvement", 5))
+                    add_score_improvement = 0.0
+                    prev_buy_prop = self.storage.fetch_all(
+                        "SELECT json_extract(payload, '$.score') as score FROM trade_proposals WHERE symbol=? AND side='buy' AND status IN ('submitted', 'approved', 'filled') ORDER BY created_at DESC LIMIT 1",
+                        (symbol,)
+                    )
+                    if prev_buy_prop:
+                        prev_score = float(prev_buy_prop[0]["score"])
+                        add_score_improvement = score - prev_score
+                        if add_score_improvement < min_score_imp:
+                            add_block_reasons.append(f"insufficient score improvement ({add_score_improvement:.2f} < {min_score_imp})")
+
+                # Calculate dynamic sizing
+                final_notional = 5.0
+                suggested_shares = 0.0
+                stop_price = None
+                stop_distance_pct = None
+                stop_distance_dollars = None
+                risk_budget = 0.0
+                score_mult = 1.0
+                vol_mult = 1.0
+                stop_method = "default"
+                risk_based_shares = 0.0
+                score_adjusted_notional = 5.0
+                vol_adjusted_notional = 5.0
+                base_notional = 5.0
+
+                if signal.action == "ENTRY" and signal.side == "buy":
+                    size_dict = self._calculate_dynamic_size(symbol, score, volatility_regime, price, bars, snapshot, is_add=is_add)
+                    final_notional = size_dict["final_notional"]
+                    suggested_shares = size_dict["suggested_shares"]
+                    stop_price = size_dict["stop_price"]
+                    stop_distance_pct = size_dict["stop_distance_pct"]
+                    stop_distance_dollars = size_dict["stop_distance_dollars"]
+                    risk_budget = size_dict["risk_budget"]
+                    score_mult = size_dict["score_multiplier"]
+                    vol_mult = size_dict["volatility_multiplier"]
+                    stop_method = size_dict["stop_model_used"]
+                    risk_based_shares = size_dict["risk_based_shares"]
+                    score_adjusted_notional = size_dict["score_adjusted_notional"]
+                    vol_adjusted_notional = size_dict["vol_adjusted_notional"]
+                    base_notional = size_dict["base_notional"]
+
+                # Log add-on opportunity
+                if is_add:
+                    passed_add = 1 if len(add_block_reasons) == 0 else 0
+                    self.storage.execute(
+                        """INSERT INTO add_on_opportunities(
+                            id, run_id, timestamp, symbol, current_qty, avg_entry_price, current_price,
+                            unrealized_gain_pct, proposed_add_notional, proposed_add_shares, score,
+                            score_improvement, passed, block_reasons
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            str(uuid.uuid4()), self.run_id, now.isoformat(), symbol, qty_held, avg_entry_price, price,
+                            unrealized_gain_pct, final_notional, suggested_shares, score,
+                            add_score_improvement, passed_add, "; ".join(add_block_reasons)
+                        )
+                    )
+
+                    if not passed_add:
+                        # If check failed, revert signal back to HOLD
+                        signal = dataclasses.replace(signal, action="HOLD", reason="Pyramiding check failed: " + "; ".join(add_block_reasons))
+                        no_action_reason = "Pyramiding check failed: " + "; ".join(add_block_reasons)
+
                 system_confidence = "No action suggested"
                 if score >= 90:
                     system_confidence = "Very strong"
@@ -1537,9 +1786,9 @@ class TradingService:
                     system_confidence = "Moderate"
                 elif score >= 50:
                     system_confidence = "Weak"
-                
+
                 expiry_minutes = self._calculate_expiry_minutes(symbol, signal, vol_20, score, price_at, now)
-                
+
                 high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
                 low_vol_thresh = self.config.get("proposal_expiry_low_volatility_threshold", 0.12)
                 if vol_20 is None or not isinstance(vol_20, (int, float)) or vol_20 <= 0:
@@ -1550,12 +1799,12 @@ class TradingService:
                     volatility_class = "low"
                 else:
                     volatility_class = "normal"
-                
+
                 expiry = now + timedelta(minutes=expiry_minutes)
-                
+
                 self.storage.execute("INSERT INTO signals(id,run_id,symbol,side,action,strategy_version,reason,confidence,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (signal_id, self.run_id, symbol, signal.side, signal.action, signal.strategy_version, signal.reason, signal.confidence, now.isoformat(), expiry.isoformat(), json_dumps(signal.indicators)))
                 self.storage.execute("INSERT INTO indicators(run_id,symbol,values_json,created_at) VALUES(?,?,?,?)", (self.run_id, symbol, json_dumps(signal.indicators), now.isoformat()))
-                
+
                 profile_results.append({
                     "symbol": symbol,
                     "price": price,
@@ -1601,6 +1850,21 @@ class TradingService:
                     "atr_value": atr_value,
                     "adverse_move_atr": adverse_move_atr,
                     "minutes_to_close": minutes_to_close,
+                    # New sizing fields
+                    "is_add": is_add,
+                    "final_notional": final_notional,
+                    "suggested_shares": suggested_shares,
+                    "stop_price": stop_price,
+                    "stop_distance_pct": stop_distance_pct,
+                    "stop_distance_dollars": stop_distance_dollars,
+                    "risk_budget": risk_budget,
+                    "score_multiplier": score_mult,
+                    "volatility_multiplier": vol_mult,
+                    "stop_model_used": stop_method,
+                    "risk_based_shares": risk_based_shares,
+                    "score_adjusted_notional": score_adjusted_notional,
+                    "vol_adjusted_notional": vol_adjusted_notional,
+                    "base_notional": base_notional,
                 })
 
             # Populate watchlist order first
@@ -1616,7 +1880,7 @@ class TradingService:
                     return order.index(regime)
                 except ValueError:
                     return len(order)
-            
+
             def score_sort_key(candidate):
                 return (
                     -candidate["score"],
@@ -1627,11 +1891,11 @@ class TradingService:
                     -candidate["session_change_pct"],
                     candidate["symbol"]
                 )
-            
+
             active_results.sort(key=score_sort_key)
             for rank_idx, res in enumerate(active_results):
                 res["true_score_rank"] = rank_idx + 1
-            
+
             # For non-active watchlist candidates, true_score_rank is None
             for res in profile_results:
                 if res["symbol"] not in active_watchlist:
@@ -1640,9 +1904,9 @@ class TradingService:
             # Split exits vs buys
             exit_candidates = [r for r in profile_results if r["signal"].action == "EXIT" and r["has_position"]]
             buy_candidates_all = [r for r in profile_results if r["signal"].action == "ENTRY" and r["signal"].side == "buy"]
-            
+
             exit_candidates_exist = len(exit_candidates) > 0
-            
+
             # Setup key and dedupe status pre-evaluation
             for res in profile_results:
                 symbol = res["symbol"]
@@ -1650,17 +1914,17 @@ class TradingService:
                 score = res["score"]
                 has_position = res["has_position"]
                 volatility_regime = res["volatility_regime"]
-                
+
                 # Check 1: Pending proposal blocks duplicate
                 pending_proposals = self.storage.fetch_all(
                     "SELECT * FROM trade_proposals WHERE symbol=? AND side=? AND status='pending'",
                     (symbol, signal.side)
                 )
-                
+
                 # Compute setup key
                 setup_key = self._compute_setup_key(symbol, signal.side, signal.action, signal.indicators, score)
                 res["setup_key"] = setup_key
-                
+
                 cooldown_applied = 0
                 cooldown_remaining_minutes = 0.0
                 cooldown_reason = None
@@ -1669,7 +1933,7 @@ class TradingService:
                 last_proposal_score = 0.0
                 score_delta = 0.0
                 volatility_regime_change = None
-                
+
                 if pending_proposals:
                     cooldown_applied = 1
                     cooldown_reason = "pending_proposal_exists"
@@ -1689,7 +1953,7 @@ class TradingService:
                             last_proposal_status = competing[0]["status"]
                             dedupe_status = "suppressed"
                             dedupe_reason = "competing approved/submitted buy proposal exists"
-                    
+
                     if not cooldown_applied:
                         # Check setup key cooldown
                         last_prop_rows = self.storage.fetch_all(
@@ -1701,7 +1965,7 @@ class TradingService:
                             last_proposal_status = last_prop["status"]
                             last_created_at = datetime.fromisoformat(last_prop["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
                             elapsed_mins = (now - last_created_at).total_seconds() / 60
-                            
+
                             try:
                                 payload_dict = json.loads(last_prop["payload"])
                                 last_score = float(payload_dict.get("score", 0))
@@ -1709,21 +1973,21 @@ class TradingService:
                             except Exception:
                                 last_score = float(last_prop.get("score") or 0.0)
                                 last_vol_regime = "normal"
-                                
+
                             last_proposal_score = last_score
                             score_delta = score - last_score
-                            
+
                             cooldown_duration = 60.0
                             if last_proposal_status == "rejected":
                                 cooldown_duration = 120.0
-                                
+
                             if elapsed_mins < cooldown_duration:
                                 cooldown_applied = 1
                                 cooldown_remaining_minutes = max(0.0, cooldown_duration - elapsed_mins)
                                 cooldown_reason = f"setup cooldown active (status: {last_proposal_status})"
                                 dedupe_status = "suppressed"
                                 dedupe_reason = f"duplicate proposal cooldown (elapsed: {elapsed_mins:.1f}m)"
-                                
+
                                 # Revival checks
                                 is_exit_action = (signal.action == "EXIT" and has_position)
                                 if is_exit_action:
@@ -1745,7 +2009,7 @@ class TradingService:
                                         vol_improved = True
                                     elif last_vol_regime == "elevated" and volatility_regime == "normal":
                                         vol_improved = True
-                                        
+
                                     if vol_improved:
                                         cooldown_applied = 0
                                         dedupe_status = "allowed"
@@ -1757,7 +2021,7 @@ class TradingService:
                         else:
                             dedupe_status = "allowed"
                             dedupe_reason = "no previous setup proposal found"
-                            
+
                 res["cooldown_applied"] = cooldown_applied
                 res["cooldown_remaining_minutes"] = cooldown_remaining_minutes
                 res["cooldown_reason"] = cooldown_reason
@@ -1774,23 +2038,29 @@ class TradingService:
             for res in buy_candidates_all:
                 ai_config = self.config.get("ai", {})
                 symbol = res["symbol"]
-                port_ctx = self._portfolio_context({"symbol": symbol, "side": "buy"})
+                port_ctx = self._portfolio_context({
+                    "symbol": symbol,
+                    "side": "buy",
+                    "action": "add" if res.get("is_add") else "entry",
+                    "notional": res.get("final_notional", 5.0)
+                })
                 mock_prop = {
                     "symbol": symbol,
                     "side": "buy",
-                    "action": "entry",
+                    "action": "add" if res.get("is_add") else "entry",
+                    "is_add": res.get("is_add", False),
                     "latest_price": res["price"],
                     "price_at": str(res["price_at"]),
                     "historical_bars": len(res["bars"]),
                     "volume": res["volume"],
-                    "notional": float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5)),
+                    "notional": res.get("final_notional", 5.0),
                     "created_at": now.isoformat(),
                     "expires_at": res["expiry"].isoformat(),
                     "strategy_version": res["signal"].strategy_version,
                     "reason": res["signal"].reason,
                 }
                 decision = self._risk_engine("mock_id", "proposal").evaluate(mock_prop, port_ctx)
-                
+
                 is_eligible_buy = (
                     res["symbol"] in active_watchlist
                     and proposals_enabled
@@ -1800,20 +2070,54 @@ class TradingService:
                 )
                 if is_eligible_buy:
                     buy_candidates.append(res)
-                    
-            buy_candidates.sort(key=score_sort_key)
-            
+
+            buy_candidates = self._rank_candidates(buy_candidates, snapshot)
+
             risk_cfg = self.config.get("risk", {})
-            max_new_buy_per_cycle = risk_cfg.get("max_new_buy_proposals_per_cycle", 1)
-            max_pending_buy = risk_cfg.get("max_pending_buy_proposals", 1)
+            portfolio_behavior_cfg = self.config.get("portfolio_behavior", {})
+            max_new_buy_per_cycle = portfolio_behavior_cfg.get(
+                "max_new_buy_proposals_per_cycle",
+                risk_cfg.get("max_new_buy_proposals_per_cycle", 1),
+            )
+            max_pending_buy = portfolio_behavior_cfg.get(
+                "max_pending_buy_proposals",
+                risk_cfg.get("max_pending_buy_proposals", 1),
+            )
             pending_in_db = self.storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='buy' AND status='pending'")[0]["cnt"]
             allowed_new_buys = max(0, min(max_new_buy_per_cycle, max_pending_buy - pending_in_db))
-            
+
             allowed_buy_symbols = {c["symbol"] for c in buy_candidates[:allowed_new_buys]}
             suppressed_buy_symbols = {c["symbol"] for c in buy_candidates[allowed_new_buys:]}
-            
+
+            # Record rankings in candidate_rankings table
+            for c in buy_candidates:
+                reason_selected = None
+                reason_not_selected = None
+                if c["symbol"] in allowed_buy_symbols:
+                    reason_selected = c.get("selection_reason") or "Top ranked candidate passing exposure/risk limits"
+                else:
+                    if c["symbol"] in suppressed_buy_symbols:
+                        reason_not_selected = "suppressed due to simultaneous candidate limits"
+                    else:
+                        reason_not_selected = c.get("no_action_reason") or "Did not meet ranking criteria or limits"
+
+                self.storage.execute(
+                    """INSERT INTO candidate_rankings(
+                        id, run_id, timestamp, symbol, true_score_rank, final_candidate_rank,
+                        setup_quality_score, portfolio_fit_score, diversification_score, sizing_score,
+                        reason_selected, reason_not_selected
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(uuid.uuid4()), self.run_id, now.isoformat(), c["symbol"],
+                        c.get("true_score_rank"), c.get("final_candidate_rank"),
+                        c.get("setup_quality_score"), c.get("portfolio_fit_score"),
+                        c.get("diversification_score"), c.get("sizing_score"),
+                        reason_selected, reason_not_selected
+                    )
+                )
+
             any_generated = False
-            
+
             # Sort profile_results: EXITS first, then BUYS, then HOLDS
             def scan_processing_order(r):
                 action = r["signal"].action
@@ -1824,7 +2128,7 @@ class TradingService:
                 else:
                     return 2
             profile_results.sort(key=scan_processing_order)
-            
+
             # Proposal generation loop
             for idx, res in enumerate(profile_results):
                 symbol = res["symbol"]
@@ -1850,11 +2154,11 @@ class TradingService:
                 asset_score = res["asset_score"]
                 asset_classification = res["asset_classification"]
                 has_position = res["has_position"]
-                
+
                 score_vol = res.get("score_vol", 0.0)
                 volatility_regime = res.get("volatility_regime", "unknown")
                 volatility_gate_result = res.get("volatility_gate_result", "fail-safe HOLD")
-                
+
                 # New fields from Phase 3 & 6
                 position_drawdown_pct = res.get("position_drawdown_pct", 0.0)
                 average_entry_price = res.get("average_entry_price")
@@ -1872,7 +2176,7 @@ class TradingService:
                 volatility_regime_change = res.get("volatility_regime_change")
                 true_score_rank = res.get("true_score_rank")
                 watchlist_order = res.get("watchlist_order")
-                
+
                 emergency_exit_score = res.get("emergency_exit_score")
                 emergency_exit_triggered = res.get("emergency_exit_triggered", 0)
                 emergency_exit_trigger_reason = res.get("emergency_exit_trigger_reason")
@@ -1885,14 +2189,14 @@ class TradingService:
                 atr_value = res.get("atr_value")
                 adverse_move_atr = res.get("adverse_move_atr")
                 minutes_to_close = res.get("minutes_to_close")
-                
+
                 ai_config = self.config.get("ai", {})
                 is_buy = (signal.action == "ENTRY" and signal.side == "buy")
                 is_exit = (signal.action == "EXIT" and signal.side == "sell")
-                
+
                 suppressed_by_sleep_mode = 0
                 sleep_mode_suppressed_candidate = 0
-                
+
                 # Check sleep mode suppression for buys
                 if is_buy and sleep_mode_active:
                     proposal_allowed = False
@@ -1906,7 +2210,7 @@ class TradingService:
                     is_exit = True
                 else:
                     proposal_allowed = (symbol in active_watchlist and proposals_enabled and signal.action in {"ENTRY", "EXIT"} and score >= ai_config.get("ai_review_min_score", 65))
-                
+
                 gpt_called = False
                 proposal_generated = False
                 no_action_reason = "" if not (is_buy and sleep_mode_active) else "suppressed by sleep mode"
@@ -1919,13 +2223,13 @@ class TradingService:
                 paper_size_adjustment = 1.0
                 candidate_suppression_reason = None if not (is_buy and sleep_mode_active) else "suppressed_by_sleep_mode"
                 deferred_ai_review_reason = None
-                
+
                 exit_priority_applied = 1 if exit_candidates_exist else 0
                 gpt_exit_explanation_status = None
                 gpt_exit_confidence = None
                 gpt_exit_caution = None
                 final_proposal_message_category = "buy" if is_buy else ("exit" if is_exit else "suppressed")
-                
+
                 # Check exit prioritization suppression for buys
                 if is_buy and exit_candidates_exist and not sleep_mode_active:
                     proposal_allowed = False
@@ -1936,7 +2240,7 @@ class TradingService:
                     self.storage.audit(self.run_id, "proposal_suppressed", {
                         "symbol": symbol, "reason": "suppressed_due_to_exit_priority", "score": score
                     })
-                
+
                 if not proposal_allowed:
                     if is_buy and suppressed_by_sleep_mode == 1:
                         pass
@@ -1974,7 +2278,7 @@ class TradingService:
                             })
                         else:
                             proposal_id = str(uuid.uuid4())
-                            
+
                             # Ranks and selection reasons
                             eligible_rank = None
                             selection_reason = None
@@ -1983,7 +2287,7 @@ class TradingService:
                                     eligible_rank = [c["symbol"] for c in buy_candidates].index(symbol) + 1
                                 except ValueError:
                                     eligible_rank = None
-                                    
+
                                 higher_rank_suppressed_cooldown = False
                                 higher_rank_suppressed_pending = False
                                 for r in profile_results:
@@ -1995,33 +2299,50 @@ class TradingService:
                                                     higher_rank_suppressed_pending = True
                                                 else:
                                                     higher_rank_suppressed_cooldown = True
-                                                    
+
                                 if higher_rank_suppressed_cooldown:
                                     selection_reason = "Selected because higher-scoring candidates were recently proposed and are still cooling down."
                                 elif higher_rank_suppressed_pending:
                                     selection_reason = "Selected because it was the best candidate that passed cooldown and pending-proposal checks."
                                 else:
                                     selection_reason = "Selected because it was the strongest eligible candidate."
-                            
-                            # Size adjustment calculation
-                            base_notional = float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5))
-                            notional = base_notional
+
+                            # Size adjustment calculation from res
+                            notional = res.get("final_notional", 5.0)
+                            qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else qty_held
+
+                            stop_price = res.get("stop_price")
+                            stop_distance_pct = res.get("stop_distance_pct")
+                            stop_distance_dollars = res.get("stop_distance_dollars")
+                            stop_model_used = res.get("stop_model_used")
+                            risk_budget = res.get("risk_budget")
+                            score_multiplier = res.get("score_multiplier")
+                            volatility_multiplier = res.get("volatility_multiplier")
+                            if volatility_multiplier is not None:
+                                paper_size_adjustment = volatility_multiplier
+
+                            port_context = self._portfolio_context({
+                                "symbol": symbol,
+                                "side": "buy",
+                                "action": "add" if res.get("is_add") else "entry",
+                                "notional": notional
+                            })
+
                             notional_adjustment_note = ""
-                            if signal.action == "ENTRY" and signal.side == "buy":
-                                if vol_20 is not None and 0.25 <= vol_20 <= 0.35:
-                                    notional = base_notional * 0.5
-                                    paper_size_adjustment = 0.5
-                                    notional_adjustment_note = " (reduced by 50% due to elevated volatility)"
-                                    
+                            if volatility_multiplier is not None and volatility_multiplier < 1.0:
+                                pct = int(round((1.0 - volatility_multiplier) * 100))
+                                notional_adjustment_note = f" (reduced by {pct}% due to volatility multiplier: {volatility_multiplier})"
+
                             proposal = {
                                 "id": proposal_id,
                                 "run_id": self.run_id,
                                 "signal_id": signal_id,
                                 "symbol": symbol,
                                 "side": signal.side,
-                                "action": "entry" if signal.action == "ENTRY" else "exit",
+                                "action": "add" if res.get("is_add") else ("entry" if signal.action == "ENTRY" else "exit"),
+                                "is_add": 1 if res.get("is_add") else 0,
                                 "notional": notional,
-                                "qty": qty_held,
+                                "qty": qty_val,
                                 "notional_adjustment_note": notional_adjustment_note,
                                 "latest_price": price,
                                 "price_at": str(price_at),
@@ -2059,6 +2380,16 @@ class TradingService:
                                 "setup_key": setup_key,
                                 "revival_reason": revival_reason,
                                 "exit_priority_applied": exit_priority_applied,
+                                # Sizing & risk details
+                                "stop_price": stop_price,
+                                "stop_distance_pct": stop_distance_pct,
+                                "stop_distance_dollars": stop_distance_dollars,
+                                "stop_model_used": stop_model_used,
+                                "risk_budget": risk_budget,
+                                "score_multiplier": score_multiplier,
+                                "volatility_multiplier": volatility_multiplier,
+                                "proposed_total_exposure_pct": port_context.get("proposed_total_exposure_pct"),
+                                "proposed_cluster_exposure_pct": port_context.get("proposed_cluster_exposure_pct"),
                                 # Emergency fields
                                 "emergency_exit_score": emergency_exit_score,
                                 "emergency_exit_triggered": emergency_exit_triggered,
@@ -2079,17 +2410,17 @@ class TradingService:
                                 "sleep_mode_started_at": sleep_mode_started_at,
                                 "sleep_mode_ended_at": sleep_mode_ended_at,
                             }
-                            
+
                             if emergency_exit_triggered == 1:
                                 # Emergency exits bypass standard risk engine proposal evaluations
                                 pass
                             else:
                                 self._should_auto_execute(proposal)
-                                decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, self._portfolio_context(proposal))
+                                decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, port_context)
                                 if not decision.passed:
                                     no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                                     proposal_allowed = False
-                                    
+
                             if proposal_allowed:
                                 if is_buy:
                                     require_gpt = self.config.get("risk", {}).get("require_gpt_review_for_buy_proposals", True)
@@ -2098,7 +2429,7 @@ class TradingService:
                                     time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
                                     if (ai_config.get("ai_review_on_every_run", False) or (calls_today < ai_config.get("ai_daily_call_limit", 10) and self.ai.calls_made < ai_config.get("ai_max_calls_per_run", 2) and time_since >= ai_config.get("ai_review_min_interval_minutes", 30))):
                                         gpt_called = True
-                                        
+
                                     try:
                                         if gpt_called:
                                             review = self.ai.review(proposal)
@@ -2110,10 +2441,10 @@ class TradingService:
                                         logger.error("GPT review failed: %s", e)
                                         gpt_called = False
                                         review = deterministic_review(proposal, warning="AI review failed: " + str(e))
-                                        
+
                                     proposal["gpt_called"] = gpt_called
                                     proposal["review"] = review
-                                    
+
                                     if require_gpt and not gpt_called:
                                         proposal_generated = False
                                         proposal_allowed = False
@@ -2139,12 +2470,12 @@ class TradingService:
                                         gpt_exit_confidence = gpt_explanation["confidence"]
                                         gpt_exit_caution = gpt_explanation["caution"]
                                         gpt_called = (gpt_explanation["status"] == "Completed")
-                                        
+
                                         proposal["gpt_called"] = gpt_called
                                         proposal["gpt_exit_explanation_status"] = gpt_exit_explanation_status
                                         proposal["gpt_exit_confidence"] = gpt_exit_confidence
                                         proposal["gpt_exit_caution"] = gpt_exit_caution
-                                        
+
                                         review = {
                                             "summary": gpt_explanation.get("telegram_message") or f"Emergency exit triggered: {emergency_exit_trigger_reason}",
                                             "risks": [emergency_exit_trigger_reason],
@@ -2157,7 +2488,7 @@ class TradingService:
                                         proposal_generated = True
                                         no_action_reason = "proposal generated"
                                         any_generated = True
-                                        
+
                                         if emergency_exit_mode == "blocked":
                                             proposal["status"] = "blocked"
                                             proposal["emergency_exit_block_reason"] = "emergency_drawdown_unavailable"
@@ -2194,7 +2525,7 @@ class TradingService:
                                         # Normal exit GPT explanation check
                                         use_gpt_for_exits = self.config.get("risk", {}).get("use_gpt_for_exit_explanations", True)
                                         gpt_timeout = self.config.get("risk", {}).get("exit_gpt_max_wait_seconds", 3)
-                                        
+
                                         if use_gpt_for_exits:
                                             import concurrent.futures
                                             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -2212,18 +2543,18 @@ class TradingService:
                                             gpt_called = False
                                             gpt_exit_explanation_status = "Not available; using rule-based exit reason"
                                             review = deterministic_review(proposal, warning="AI review disabled for exits")
-                                            
+
                                         proposal["gpt_called"] = gpt_called
                                         proposal["review"] = review
                                         proposal["gpt_exit_explanation_status"] = gpt_exit_explanation_status
                                         if review:
                                             proposal["gpt_exit_confidence"] = review.get("gpt_confidence", "Not called")
                                             proposal["gpt_exit_caution"] = review.get("gpt_caution", "Low")
-                                            
+
                                         proposal_generated = True
                                         no_action_reason = "proposal generated"
                                         any_generated = True
-                            
+
                 if proposal_allowed and is_buy:
                     if review is None:
                         review = self.ai.review(proposal) if gpt_called else deterministic_review(proposal, warning="AI review throttled to avoid spam")
@@ -2232,12 +2563,12 @@ class TradingService:
                         proposal["ai_review_status"] = "Completed" if gpt_called else "Not available"
                         proposal["ai_confidence"] = review.get("gpt_confidence", "Not called")
                         proposal["ai_caution"] = review.get("gpt_caution", "Low")
-                        
+
                 g_conf = review.get("gpt_confidence", "Not called") if (gpt_called and review) else "Not called"
                 g_caut = review.get("gpt_caution", "Low") if (gpt_called and review) else "N/A"
                 m_risk = review.get("main_risk", "No AI risk evaluation was performed.") if (gpt_called and review) else "N/A"
                 exp_sgt = format_sgt(expiry)
-                
+
                 # Check category for final_proposal_message_category
                 if not proposal_generated:
                     final_proposal_message_category = "suppressed"
@@ -2247,22 +2578,22 @@ class TradingService:
                     final_proposal_message_category = "exit"
                 else:
                     final_proposal_message_category = "suppressed"
-                
+
                 self.storage.execute(
                     "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, emergency_exit_hard_trigger, emergency_exit_mode, emergency_exit_wait_seconds, None, emergency_exit_auto_execute_due_at, None, emergency_exit_final_decision, emergency_exit_block_reason, price, atr_value, adverse_move_atr, minutes_to_close, 1 if sleep_mode_active else 0, suppressed_by_sleep_mode, sleep_mode_reason, sleep_mode_suppressed_candidate, sleep_mode_started_at, sleep_mode_ended_at)
                 )
-                
+
                 logger.info(
                     "Symbol: %s | Profile: %s | Asset Score: %.2f (%s) | Trade Score: %.2f (%s) | Watchlist Order: #%d | True Score Rank: %s | Prev Change: %.2f%% | Session Change: %.2f | Proposal Allowed: %s | GPT Called: %s | Proposal Generated: %s | No-Action Reason: %s",
                     symbol, profile_key, asset_score, asset_classification, score, classification, watchlist_order, true_score_rank, price_change_pct, session_change, proposal_allowed, gpt_called, proposal_generated, no_action_reason or "N/A"
                 )
-                
+
                 if not proposal_generated:
                     if proposal_allowed and decision and not decision.passed:
                         self.storage.audit(self.run_id, "proposal_blocked", {"symbol": symbol, "reasons": decision.reasons})
                     continue
-                    
+
                 self.storage.execute(
                     "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,proposal_market_rank,proposal_eligible_rank,selection_reason,ai_review_status,ai_confidence,ai_caution,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
@@ -2325,9 +2656,27 @@ class TradingService:
                         sleep_mode_ended_at
                     )
                 )
-                
+
+                if is_buy or (is_add and proposal_generated):
+                    self.storage.execute(
+                        """INSERT INTO position_sizing_decisions(
+                            id, run_id, symbol, timestamp, portfolio_equity, risk_budget,
+                            stop_distance_dollars, risk_based_shares, score_adjusted_notional,
+                            vol_adjusted_notional, final_notional, suggested_shares,
+                            base_notional, score_multiplier, volatility_multiplier, stop_model_used
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            str(uuid.uuid4()), self.run_id, symbol, now.isoformat(),
+                            snapshot["portfolio_equity"], risk_budget, stop_distance_dollars,
+                            risk_budget / stop_distance_dollars if stop_distance_dollars and stop_distance_dollars > 0 else 0.0,
+                            res.get("score_adjusted_notional"), res.get("vol_adjusted_notional"),
+                            proposal["notional"], qty_val,
+                            res.get("base_notional"), score_multiplier, volatility_multiplier, stop_model_used
+                        )
+                    )
+
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
-                
+
                 res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
                 if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
                     self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
@@ -2336,19 +2685,21 @@ class TradingService:
                 best_watch_res = profile_results[0]
                 active_results = [r for r in profile_results if r["symbol"] in active_watchlist]
                 best_trade_res = max(active_results, key=lambda x: x["score"]) if active_results else (max(profile_results, key=lambda x: x["score"]) if profile_results else None)
-                
+
                 logger.info("=== Profile '%s' Scan Summary ===", profile_key)
                 logger.info("Best symbol to watch: %s (Asset Score: %.2f)", best_watch_res["symbol"], best_watch_res["asset_score"])
                 if best_trade_res:
                     logger.info("Best symbol for trade consideration: %s (Trade Score: %.2f)", best_trade_res["symbol"], best_trade_res["score"])
                 else:
                     logger.info("Best symbol for trade consideration: None")
-                
+
                 if any_generated:
                     logger.info("Why no proposal was generated: N/A (Proposal was generated)")
                 else:
                     reasons_summary = ", ".join(f"{r['symbol']}: {r.get('no_action_reason') or 'N/A'}" for r in profile_results)
                     logger.info("Why no proposal was generated: %s", reasons_summary)
+
+                self._run_performance_lab(profile_results, active_watchlist, positions, now, snapshot)
 
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
@@ -2379,7 +2730,7 @@ class TradingService:
         # 2. Minimum cycles
         window_start = now - timedelta(minutes=interval_minutes)
         window_start_iso = window_start.isoformat()
-        
+
         cycles = self.storage.fetch_all(
             "SELECT COUNT(DISTINCT run_id) as cnt FROM market_memory WHERE created_at >= ?",
             (window_start_iso,)
@@ -2398,7 +2749,7 @@ class TradingService:
             if p.get("status") == "active":
                 active_watchlist.extend(p.get("watchlist", []))
                 obs_watchlist.extend(p.get("observation_watchlist", []))
-                
+
         allowed_symbols = set(active_watchlist)
         if include_obs:
             allowed_symbols.update(obs_watchlist)
@@ -2428,12 +2779,12 @@ class TradingService:
             p_first = first_row["price"]
             p_latest = latest_row["price"]
             change_30m = ((p_latest / p_first) - 1.0) * 100.0 if p_first > 0 else 0.0
-            
+
             p_session_start = latest_row.get("session_start_price") or p_latest
             session_change = ((p_latest / p_session_start) - 1.0) * 100.0 if p_session_start > 0 else 0.0
-            
+
             has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
-            
+
             # Map detailed status reasons
             if sym in obs_watchlist:
                 status_str = "Observation only — no proposal allowed"
@@ -2443,7 +2794,7 @@ class TradingService:
                 no_act = latest_row.get("no_action_reason") or ""
                 score_val = latest_row.get("score") or 0.0
                 sig_action = latest_row.get("signal")
-                
+
                 if score_val < 65:
                     status_str = "No proposal — score below threshold"
                 elif sig_action not in {"ENTRY", "EXIT"}:
@@ -2456,6 +2807,20 @@ class TradingService:
                     status_str = "Watch — GPT review unavailable"
                 elif "already holding" in no_act.lower() or "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
                     status_str = "Watch — already holding a position"
+                elif "total portfolio exposure" in no_act.lower() or "portfolio_total_exposure" in no_act.lower():
+                    status_str = "Watch — total portfolio exposure cap reached"
+                elif "single symbol exposure" in no_act.lower() or "portfolio_single_symbol_exposure" in no_act.lower():
+                    status_str = "Watch — single symbol exposure cap reached"
+                elif "cluster positions limit" in no_act.lower() or "portfolio_cluster_positions_limit" in no_act.lower():
+                    status_str = "Watch — same cluster positions limit reached"
+                elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
+                    status_str = "Watch — same cluster exposure limit reached"
+                elif "exit is pending" in no_act.lower() or "block_new_buy_if_exit_pending" in no_act.lower():
+                    status_str = "Watch — new buy blocked due to pending exit"
+                elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
+                    status_str = "Watch — new buy blocked due to emergency exit risk"
+                elif "pyramiding check failed" in no_act.lower() or "add_on_check_failed" in no_act.lower() or "position not sufficiently profitable" in no_act.lower() or "cannot average down" in no_act.lower():
+                    status_str = "Watch — pyramiding check failed"
                 elif "max open positions" in no_act.lower() or "open-position limit" in no_act.lower() or "max_positions" in no_act.lower():
                     status_str = "Watch — max open positions reached"
                 elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
@@ -2469,11 +2834,23 @@ class TradingService:
                         status_str = "Watch — daily trade limit reached"
                     elif "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
                         status_str = "Watch — already holding a position"
+                    elif "total portfolio exposure" in no_act.lower() or "portfolio_total_exposure" in no_act.lower():
+                        status_str = "Watch — total portfolio exposure cap reached"
+                    elif "single symbol exposure" in no_act.lower() or "portfolio_single_symbol_exposure" in no_act.lower():
+                        status_str = "Watch — single symbol exposure cap reached"
+                    elif "cluster positions limit" in no_act.lower() or "portfolio_cluster_positions_limit" in no_act.lower():
+                        status_str = "Watch — same cluster positions limit reached"
+                    elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
+                        status_str = "Watch — same cluster exposure limit reached"
+                    elif "exit is pending" in no_act.lower() or "block_new_buy_if_exit_pending" in no_act.lower():
+                        status_str = "Watch — new buy blocked due to pending exit"
+                    elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
+                        status_str = "Watch — new buy blocked due to emergency exit risk"
                     else:
                         status_str = "Watch — blocked by risk checks"
                 else:
                     status_str = "Watch — no proposal"
-                
+
             symbols_list.append({
                 "symbol": sym,
                 "trade_score": latest_row["score"],
@@ -2497,15 +2874,15 @@ class TradingService:
             (window_start_iso,)
         )
         prop_cnt = proposals[0]["cnt"] if proposals else 0
-        
+
         orders = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM orders WHERE created_at >= ?",
             (window_start_iso,)
         )
         order_cnt = orders[0]["cnt"] if orders else 0
-        
+
         gpt_calls = sum(bool(r.get("gpt_called")) for r in rows)
-        
+
         expired = self.storage.fetch_all(
             "SELECT COUNT(*) as cnt FROM trade_proposals WHERE status='expired' AND expires_at >= ? AND expires_at <= ?",
             (window_start_iso, now.isoformat())
@@ -2553,14 +2930,14 @@ class TradingService:
 
         from .utils import format_digest_message
         message_text = format_digest_message(digest_data, self.config)
-        
+
         try:
             self.telegram.send_message(message_text)
             status = "sent"
         except Exception as e:
             status = "error"
             self.storage.record_check(self.run_id, "digest_send", False, str(e), stage="digest")
-            
+
         symbols_str = ", ".join(x["symbol"] for x in top_watched)
         self.storage.execute(
             "INSERT INTO telegram_digests(run_id,window_start,window_end,sent_at,symbols,summary_text,status) VALUES(?,?,?,?,?,?,?)",
@@ -2569,13 +2946,546 @@ class TradingService:
         self.storage.audit(self.run_id, "digest_processed", {"status": status, "window_start": window_start_iso, "window_end": now.isoformat()})
 
     def run_cycle(self) -> None:
+        self._update_forward_outcomes()
         BrokerReconciler(self.broker, self.storage, self.run_id).reconcile()
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
         self._context_cache = None
+        self.storage.expire_proposals()
         self.notify_expired_proposals()
         if self.config.get("telegram", {}).get("market_scan_processes_telegram_updates", True):
             self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
         self.check_and_send_digest()
+
+    def _get_symbol_cluster(self, symbol: str) -> str | None:
+        clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})
+        if not clusters:
+            clusters = {
+                "us_broad_market": ["SPY", "DIA", "IWM"],
+                "us_growth_tech": ["QQQ", "XLK"],
+                "defensive_healthcare": ["XLV"],
+                "financials": ["XLF"],
+                "energy": ["XLE"],
+            }
+        for c_name, c_symbols in clusters.items():
+            if symbol.upper() in [s.upper() for s in c_symbols]:
+                return c_name
+        return None
+
+    def _get_exposure_snapshot(self, positions: list[Any], account: Any) -> dict[str, Any]:
+        equity = 10000.0
+        if account is not None:
+            equity = float(_value(account, "equity", 10000.0) or 10000.0)
+            if equity <= 0:
+                equity = 10000.0
+
+        total_val = 0.0
+        single_exposures = {}
+        cluster_values = {}
+        cluster_counts = {}
+
+        clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})
+        if not clusters:
+            clusters = {
+                "us_broad_market": ["SPY", "DIA", "IWM"],
+                "us_growth_tech": ["QQQ", "XLK"],
+                "defensive_healthcare": ["XLV"],
+                "financials": ["XLF"],
+                "energy": ["XLE"],
+            }
+        for c in clusters:
+            cluster_values[c] = 0.0
+            cluster_counts[c] = 0
+
+        for pos in positions:
+            sym = str(_value(pos, "symbol", "")).upper()
+            qty = float(_value(pos, "qty", 0.0) or 0.0)
+            price = float(_value(pos, "current_price", 0.0) or _value(pos, "avg_entry_price", 0.0) or 0.0)
+            val = float(_value(pos, "market_value", 0.0) or (qty * price))
+            total_val += val
+            single_exposures[sym] = (val / equity) * 100
+
+            c_name = self._get_symbol_cluster(sym)
+            if c_name:
+                cluster_values[c_name] += val
+                cluster_counts[c_name] += 1
+
+        cluster_exposures = {}
+        for c in cluster_values:
+            cluster_exposures[c] = (cluster_values[c] / equity) * 100
+
+        return {
+            "portfolio_equity": equity,
+            "total_exposure_dollars": total_val,
+            "total_exposure_pct": (total_val / equity) * 100,
+            "single_exposures": single_exposures,
+            "cluster_exposures": cluster_exposures,
+            "cluster_counts": cluster_counts,
+        }
+
+    def _calculate_dynamic_size(self, symbol: str, score: float, volatility_regime: str, price: float, bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False) -> dict[str, Any]:
+        sizing_cfg = self.config.get("position_sizing", {})
+        if not sizing_cfg.get("enabled", True):
+            base_notional = float(self.config.get("risk", {}).get("max_trade_notional_paper", 5.0))
+            vol_mult = 1.0
+            if volatility_regime == "elevated":
+                vol_mult = 0.5
+                base_notional = base_notional * 0.5
+            elif volatility_regime in ("high", "extreme"):
+                vol_mult = 0.0
+                base_notional = 0.0
+            elif volatility_regime == "too quiet":
+                vol_mult = 0.75
+                base_notional = base_notional * 0.75
+            return {
+                "final_notional": base_notional,
+                "suggested_shares": base_notional / price if price > 0 else 0.0,
+                "stop_price": price * 0.92,
+                "stop_distance_pct": 8.0,
+                "stop_distance_dollars": price * 0.08,
+                "risk_budget": 0.0,
+                "score_multiplier": 1.0,
+                "volatility_multiplier": vol_mult,
+                "stop_model_used": "fixed_8pct_fallback",
+                "risk_based_shares": 0.0,
+                "score_adjusted_notional": base_notional,
+                "vol_adjusted_notional": base_notional,
+                "base_notional": base_notional
+            }
+
+        equity = snapshot["portfolio_equity"]
+        risk_per_trade_pct = float(sizing_cfg.get("risk_per_trade_pct", 0.05))
+        risk_budget = equity * risk_per_trade_pct / 100
+
+        stop_model = sizing_cfg.get("stop_model", {})
+        atr_multiple = float(stop_model.get("atr_multiple", 2.0))
+        max_stop_pct = float(stop_model.get("max_stop_pct", 8.0))
+        min_stop_pct = float(stop_model.get("min_stop_pct", 1.0))
+
+        vol_20 = None
+        if not bars.empty and "volatility_20" in bars.columns:
+            vol_20 = bars["volatility_20"].iloc[-1]
+            if pd.isna(vol_20):
+                vol_20 = None
+
+        atr_value = 0.0
+        if "high" in bars.columns and "low" in bars.columns and "close" in bars.columns:
+            high = bars["high"].astype(float)
+            low = bars["low"].astype(float)
+            close = bars["close"].astype(float)
+            close_prev = close.shift(1)
+            tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
+            atr_series = tr.rolling(20).mean()
+            if not atr_series.empty and not pd.isna(atr_series.iloc[-1]):
+                atr_value = float(atr_series.iloc[-1])
+
+        if atr_value <= 0:
+            if vol_20 is not None:
+                vol_daily = vol_20 / math.sqrt(252)
+                atr_value = price * vol_daily
+            else:
+                atr_value = 0.0
+
+        atr_stop_distance = atr_value * atr_multiple
+
+        technical_stop_distance = 0.0
+        if not bars.empty:
+            close_s = bars["close"].astype(float) if "close" in bars.columns else None
+            ma50 = close_s.rolling(50).mean().iloc[-1] if (close_s is not None and len(bars) >= 50) else None
+            recent_low = bars["low"].iloc[-20:].min() if ("low" in bars.columns and len(bars) >= 20) else None
+
+            tech_level = None
+            if ma50 is not None and not pd.isna(ma50) and recent_low is not None and not pd.isna(recent_low):
+                tech_level = min(ma50, recent_low)
+            elif ma50 is not None and not pd.isna(ma50):
+                tech_level = ma50
+            elif recent_low is not None and not pd.isna(recent_low):
+                tech_level = recent_low
+
+            if tech_level is not None and tech_level < price:
+                technical_stop_distance = price - tech_level
+
+        stop_distance_dollars = max(atr_stop_distance, technical_stop_distance)
+        stop_method = "max_of_atr_or_technical"
+
+        if stop_distance_dollars <= 0:
+            stop_distance_dollars = price * max_stop_pct / 100
+            stop_method = "fallback_max_stop"
+
+        stop_distance_pct = (stop_distance_dollars / price) * 100
+
+        if stop_distance_pct > max_stop_pct:
+            stop_distance_pct = max_stop_pct
+            stop_distance_dollars = price * max_stop_pct / 100
+        elif stop_distance_pct < min_stop_pct:
+            stop_distance_pct = min_stop_pct
+            stop_distance_dollars = price * min_stop_pct / 100
+
+        stop_price = price - stop_distance_dollars
+
+        risk_based_shares = risk_budget / stop_distance_dollars
+        risk_based_notional = risk_based_shares * price
+
+        score_mult = 1.0
+        score_mult_map = sizing_cfg.get("score_multiplier", {})
+        if score >= 95:
+            score_mult = float(score_mult_map.get("95_100", 2.0))
+        elif score >= 85:
+            score_mult = float(score_mult_map.get("85_94", 1.5))
+        elif score >= 75:
+            score_mult = float(score_mult_map.get("75_84", 1.0))
+        elif score >= 65:
+            score_mult = float(score_mult_map.get("65_74", 0.5))
+
+        vol_mult = 1.0
+        vol_mult_map = sizing_cfg.get("volatility_multiplier", {})
+        if volatility_regime == "too quiet":
+            vol_mult = float(vol_mult_map.get("too_quiet", 0.75))
+        elif volatility_regime == "normal":
+            vol_mult = float(vol_mult_map.get("normal", 1.0))
+        elif volatility_regime == "elevated":
+            vol_mult = float(vol_mult_map.get("elevated", 0.5))
+        elif volatility_regime == "high":
+            vol_mult = float(vol_mult_map.get("high", 0.0))
+        elif volatility_regime == "extreme":
+            vol_mult = float(vol_mult_map.get("extreme", 0.0))
+
+        base_paper_notional = float(sizing_cfg.get("base_paper_notional", 10.0))
+        score_adjusted_notional = base_paper_notional * score_mult
+        vol_adjusted_notional = score_adjusted_notional * vol_mult
+
+        final_notional = min(risk_based_notional, vol_adjusted_notional)
+
+        min_notional = float(sizing_cfg.get("min_paper_notional", 5.0))
+        max_notional_cap = float(sizing_cfg.get("max_initial_paper_notional", 50.0))
+        if is_add:
+            max_notional_cap = float(sizing_cfg.get("max_add_paper_notional", 25.0))
+
+        if final_notional < min_notional:
+            final_notional = min_notional
+        if final_notional > max_notional_cap:
+            final_notional = max_notional_cap
+
+        if vol_mult == 0.0:
+            final_notional = 0.0
+
+        max_single_exposure_pct = float(self.config.get("portfolio_behavior", {}).get("max_single_symbol_exposure_pct", 2.5))
+        current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100 * equity
+        allowed_additional_single = max(0.0, (equity * max_single_exposure_pct / 100) - current_symbol_value)
+        final_notional = min(final_notional, allowed_additional_single)
+
+        max_total_exposure_pct = float(self.config.get("portfolio_behavior", {}).get("max_total_portfolio_exposure_pct", 6.0))
+        current_total_value = snapshot["total_exposure_dollars"]
+        allowed_additional_total = max(0.0, (equity * max_total_exposure_pct / 100) - current_total_value)
+        final_notional = min(final_notional, allowed_additional_total)
+
+        c_name = self._get_symbol_cluster(symbol)
+        if c_name:
+            max_cluster_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0))
+            current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100 * equity
+            allowed_additional_cluster = max(0.0, (equity * max_cluster_exposure_pct / 100) - current_cluster_value)
+            final_notional = min(final_notional, allowed_additional_cluster)
+
+        final_notional = max(0.0, final_notional)
+        suggested_shares = final_notional / price if price > 0 else 0.0
+
+        return {
+            "final_notional": final_notional,
+            "suggested_shares": suggested_shares,
+            "stop_price": stop_price,
+            "stop_distance_pct": stop_distance_pct,
+            "stop_distance_dollars": stop_distance_dollars,
+            "risk_budget": risk_budget,
+            "score_multiplier": score_mult,
+            "volatility_multiplier": vol_mult,
+            "stop_model_used": stop_method,
+            "risk_based_shares": risk_based_shares,
+            "score_adjusted_notional": score_adjusted_notional,
+            "vol_adjusted_notional": vol_adjusted_notional,
+            "base_notional": base_paper_notional
+        }
+
+    def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        ranked = []
+        for c in buy_candidates:
+            symbol = c["symbol"]
+            score = c["score"]
+            notional = c.get("final_notional", 5.0)
+
+            setup_quality = score
+
+            c_name = self._get_symbol_cluster(symbol)
+            cluster_exp = snapshot["cluster_exposures"].get(c_name or "", 0.0)
+            portfolio_fit = 100.0 - (cluster_exp * 10.0)
+
+            diversification = 100.0
+            if c_name:
+                if snapshot["cluster_counts"].get(c_name, 0) > 0:
+                    diversification -= 20.0
+                else:
+                    diversification += 10.0
+
+            sizing_score = min(100.0, notional * 2.0)
+
+            ranking_score = setup_quality * 0.4 + portfolio_fit * 0.3 + diversification * 0.2 + sizing_score * 0.1
+
+            if c.get("is_observation"):
+                ranking_score -= 50.0
+            if c.get("dedupe_status") == "suppressed" or c.get("cooldown_applied") == 1:
+                ranking_score -= 50.0
+
+            ranked.append({
+                **c,
+                "setup_quality_score": setup_quality,
+                "portfolio_fit_score": portfolio_fit,
+                "diversification_score": diversification,
+                "sizing_score": sizing_score,
+                "ranking_score": ranking_score
+            })
+
+        ranked.sort(key=lambda x: (-x["ranking_score"], x["symbol"]))
+
+        for idx, c in enumerate(ranked):
+            c["final_candidate_rank"] = idx + 1
+
+        return ranked
+
+    def _run_performance_lab(self, profile_results: list[dict[str, Any]], active_watchlist: list[str], positions: list[Any], now: datetime, snapshot: dict[str, Any]) -> None:
+        qualified_setups_cnt = 0
+        shadow_trades_cnt = 0
+        actual_trades_cnt = 0
+
+        for res in profile_results:
+            score = res["score"]
+            symbol = res["symbol"]
+            signal = res["signal"]
+
+            is_qualified = (score >= 65 or signal.action in ("ENTRY", "EXIT"))
+            if not is_qualified:
+                continue
+
+            qualified_setups_cnt += 1
+            setup_id = str(uuid.uuid4())
+            is_active = 1 if symbol in active_watchlist else 0
+
+            self.storage.execute(
+                """INSERT INTO trade_setups(
+                    id, run_id, symbol, timestamp, side, action, setup_key, is_active,
+                    price, score, asset_score, volatility_regime, trend_state, gpt_status,
+                    proposal_eligible, proposal_sent, block_reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    setup_id, self.run_id, symbol, now.isoformat(), signal.side, signal.action, res.get("setup_key"), is_active,
+                    res["price"], score, res["asset_score"], res["volatility_regime"], signal.reason,
+                    "Completed" if res.get("gpt_called") else "Not called",
+                    1 if res.get("proposal_allowed") else 0,
+                    1 if res.get("proposal_generated") else 0,
+                    res.get("no_action_reason")
+                )
+            )
+
+            is_tradable_buy = (score >= 65 and signal.side == "buy" and signal.action == "ENTRY")
+            if is_tradable_buy:
+                actual_proposal = self.storage.fetch_all(
+                    "SELECT id, status FROM trade_proposals WHERE run_id=? AND symbol=? AND side='buy' AND status IN ('submitted', 'approved', 'filled')",
+                    (self.run_id, symbol)
+                )
+                if not actual_proposal:
+                    shadow_trades_cnt += 1
+                    shadow_id = str(uuid.uuid4())
+
+                    port_state = {
+                        "portfolio_equity": snapshot["portfolio_equity"],
+                        "total_exposure_pct": snapshot["total_exposure_pct"],
+                        "single_exposure_pct": snapshot["single_exposures"].get(symbol, 0.0),
+                        "cluster_exposures": snapshot["cluster_exposures"]
+                    }
+
+                    self.storage.execute(
+                        """INSERT INTO shadow_trades(
+                            id, run_id, setup_id, symbol, side, would_have_entry_price, would_have_entry_time,
+                            would_have_notional, would_have_shares, would_have_stop_price, would_have_stop_distance_pct,
+                            reason_not_executed, score, volatility_regime, gpt_confidence, gpt_caution, setup_key,
+                            portfolio_state_json, sleep_mode_active, cooldown_state, selected_actual_trade_this_cycle
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            shadow_id, self.run_id, setup_id, symbol, "buy", res["price"], now.isoformat(),
+                            res.get("final_notional", 5.0), res.get("suggested_shares", 0.0), res.get("stop_price"), res.get("stop_distance_pct"),
+                            res.get("no_action_reason") or "suppressed", score, res["volatility_regime"],
+                            res.get("gpt_confidence"), res.get("gpt_caution"), res.get("setup_key"),
+                            json.dumps(port_state), res.get("sleep_mode_active", 0),
+                            res.get("dedupe_status"), 0
+                        )
+                    )
+
+                    self.storage.execute(
+                        """INSERT INTO trade_outcomes(
+                            id, trade_id, actual_or_shadow, symbol, entry_time, entry_price, outcome_status,
+                            stop_hit, target_reached, add_on_improved, beat_shadow_alternatives, updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            str(uuid.uuid4()), shadow_id, "shadow", symbol, now.isoformat(), res["price"], "pending",
+                            0, 0, None, None, now.isoformat()
+                        )
+                    )
+                else:
+                    actual_trades_cnt += 1
+
+        self.storage.execute(
+            "INSERT INTO performance_lab_summaries(id, run_id, timestamp, total_qualified_setups, total_shadow_trades, total_actual_trades) VALUES(?,?,?,?,?,?)",
+            (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt)
+        )
+
+    def _update_forward_outcomes(self) -> None:
+        now = datetime.now(UTC)
+        pending = self.storage.fetch_all("SELECT * FROM trade_outcomes WHERE outcome_status='pending'")
+        if not pending:
+            return
+
+        logger.info("Updating %d pending trade outcomes...", len(pending))
+        for out in pending:
+            out_id = out["id"]
+            trade_id = out["trade_id"]
+            actual_or_shadow = out["actual_or_shadow"]
+            symbol = out["symbol"]
+            entry_price = float(out["entry_price"])
+            entry_time_str = out["entry_time"]
+
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00")).replace(tzinfo=UTC)
+            except Exception:
+                continue
+
+            stop_price = None
+            if actual_or_shadow == "shadow":
+                shadow_row = self.storage.fetch_all("SELECT would_have_stop_price FROM shadow_trades WHERE id=?", (trade_id,))
+                if shadow_row and shadow_row[0]["would_have_stop_price"] is not None:
+                    stop_price = float(shadow_row[0]["would_have_stop_price"])
+            else:
+                order_row = self.storage.fetch_all("SELECT proposal_id FROM orders WHERE id=?", (trade_id,))
+                if order_row:
+                    prop_id = order_row[0]["proposal_id"]
+                    prop_row = self.storage.fetch_all("SELECT payload FROM trade_proposals WHERE id=?", (prop_id,))
+                    if prop_row:
+                        try:
+                            payload = json.loads(prop_row[0]["payload"])
+                            stop_price = payload.get("stop_price")
+                        except Exception:
+                            pass
+            if not stop_price or stop_price >= entry_price:
+                stop_price = entry_price * 0.92
+
+            target_price = entry_price + 2.0 * (entry_price - stop_price)
+
+            if self.broker is None:
+                continue
+            try:
+                bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
+            except Exception as e:
+                logger.warning("Failed to fetch historical bars for %s during outcome update: %s", symbol, e)
+                continue
+
+            if bars.empty:
+                continue
+
+            future_bars = []
+            for idx, row in bars.iterrows():
+                bar_dt = idx
+                if hasattr(bar_dt, "to_pydatetime"):
+                    bar_dt = bar_dt.to_pydatetime()
+                if bar_dt.tzinfo is None:
+                    bar_dt = bar_dt.replace(tzinfo=UTC)
+                else:
+                    bar_dt = bar_dt.astimezone(UTC)
+                if bar_dt > entry_dt:
+                    future_bars.append((bar_dt, row))
+
+            if not future_bars:
+                continue
+
+            ret_1d = None
+            ret_5d = None
+            ret_20d = None
+
+            if len(future_bars) >= 1:
+                ret_1d = float(future_bars[0][1]["close"] / entry_price - 1.0) * 100
+            if len(future_bars) >= 5:
+                ret_5d = float(future_bars[4][1]["close"] / entry_price - 1.0) * 100
+            if len(future_bars) >= 20:
+                ret_20d = float(future_bars[19][1]["close"] / entry_price - 1.0) * 100
+
+            max_high = max(float(row["high"]) for _, row in future_bars[:20])
+            min_low = min(float(row["low"]) for _, row in future_bars[:20])
+            mfe = (max_high - entry_price) / entry_price * 100
+            mae = (min_low - entry_price) / entry_price * 100
+
+            stop_hit = 1 if min_low <= stop_price else 0
+            target_reached = 1 if max_high >= target_price else 0
+
+            outcome_status = "complete" if (len(future_bars) >= 20 or stop_hit == 1) else "pending"
+
+            self.storage.execute(
+                """UPDATE trade_outcomes SET
+                    forward_return_1d=?, forward_return_5d=?, forward_return_20d=?,
+                    max_favorable_excursion=?, max_adverse_excursion=?, stop_hit=?,
+                    target_reached=?, outcome_status=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    ret_1d, ret_5d, ret_20d, mfe, mae, stop_hit, target_reached,
+                    outcome_status, now.isoformat(), out_id
+                )
+            )
+
+            if outcome_status == "complete" and actual_or_shadow == "actual" and ret_20d is not None:
+                shadows = self.storage.fetch_all(
+                    "SELECT forward_return_20d FROM trade_outcomes WHERE actual_or_shadow='shadow' AND symbol=? AND outcome_status='complete'",
+                    (symbol,)
+                )
+                if shadows:
+                    max_shadow = max([float(s["forward_return_20d"]) for s in shadows if s["forward_return_20d"] is not None] + [-999.0])
+                    beat = 1 if ret_20d > max_shadow else 0
+                    self.storage.execute("UPDATE trade_outcomes SET beat_shadow_alternatives=? WHERE id=?", (beat, out_id))
+
+    def _create_shadow_trade_from_proposal(self, prop_row: dict[str, Any], reason: str) -> None:
+        exists = self.storage.fetch_all("SELECT 1 FROM shadow_trades WHERE id=?", (prop_row["id"],))
+        if exists:
+            return
+
+        now = datetime.now(UTC)
+        try:
+            payload = json.loads(prop_row.get("payload") or "{}")
+        except Exception:
+            payload = {}
+
+        shadow_id = prop_row["id"]
+        self.storage.execute(
+            """INSERT INTO shadow_trades(
+                id, run_id, setup_id, symbol, side, would_have_entry_price, would_have_entry_time,
+                would_have_notional, would_have_shares, would_have_stop_price, would_have_stop_distance_pct,
+                reason_not_executed, score, volatility_regime, gpt_confidence, gpt_caution, setup_key,
+                portfolio_state_json, sleep_mode_active, cooldown_state, selected_actual_trade_this_cycle
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                shadow_id, prop_row["run_id"], prop_row.get("signal_id"), prop_row["symbol"], prop_row["side"],
+                prop_row.get("price") or payload.get("latest_price") or prop_row.get("current_price"), prop_row["created_at"],
+                prop_row.get("notional"), payload.get("suggested_shares", 0.0), payload.get("stop_price"), payload.get("stop_distance_pct"),
+                reason, prop_row.get("score"), payload.get("volatility_regime"),
+                prop_row.get("ai_confidence"), prop_row.get("ai_caution"), prop_row.get("setup_key"),
+                json.dumps({}), prop_row.get("sleep_mode_active", 0),
+                prop_row.get("cooldown_reason"), 0
+            )
+        )
+
+        self.storage.execute(
+            """INSERT INTO trade_outcomes(
+                id, trade_id, actual_or_shadow, symbol, entry_time, entry_price, outcome_status,
+                stop_hit, target_reached, add_on_improved, beat_shadow_alternatives, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(uuid.uuid4()), shadow_id, "shadow", prop_row["symbol"], prop_row["created_at"],
+                prop_row.get("price") or payload.get("latest_price") or prop_row.get("current_price"), "pending",
+                0, 0, None, None, now.isoformat()
+            )
+        )

@@ -31,6 +31,10 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 
 - **GitHub Remote**: Plutus points to `git@github.com:Elijah-Ang/Plutus.git`. Run `scripts/safe_commit_push.sh` to safely run tests, scan for secrets, and commit changes.
 - **10-Minute Telemetry**: Scheduled launchd runs observation cycles every 10 minutes to calculate deterministic scores (0-100), log snapshots to `market_memory`, and compare short-term trends without spamming Telegram or calling GPT.
+- **Performance Lab**: Every meaningful setup can be recorded as an actual or shadow opportunity, with forward outcome tracking for actual-vs-shadow review.
+- **Dynamic Paper Sizing**: BUY proposals use deterministic score, volatility, stop distance, and portfolio exposure caps instead of a fixed `$5` amount.
+- **Portfolio Controls**: Paper BUY proposals are constrained by max open positions, buy-order/day limits, single-symbol exposure, total exposure, and correlated ETF cluster exposure.
+- **Add-to-Winner Rules**: Add-on BUY proposals are allowed only for profitable positions with stronger setups; averaging down is blocked.
 - **GPT Throttling**: GPT calls are limited by daily caps (10/day), score thresholds (>= 65), and minimum time intervals (30 minutes).
 
 ## Current hard safety capabilities
@@ -41,4 +45,3 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 - Each cycle reconciles existing local orders/fills from Alpaca using broker/client order IDs without resubmitting anything.
 - Excel reports redact Telegram text, sender IDs, and sensitive payload fields by default.
 - The launchd lock records PID/time and only recovers a dead, sufficiently old lock.
-

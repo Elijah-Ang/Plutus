@@ -70,30 +70,63 @@ class RiskEngine:
         check("price_gap", abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious price gap blocked")
 
         positions = int(context.get("open_positions", 0))
-        is_entry = str(proposal.get("action", "entry")) == "entry"
-        check("max_positions", not is_entry or positions < self.risk.get("max_open_positions", 1), "open-position limit")
-        check("max_trades", int(context.get("trades_today", 0)) < self.risk.get("max_trades_per_day", 1), "daily trade limit")
+        is_entry = str(proposal.get("action", "entry")) in {"entry", "add"}
+        is_add = str(proposal.get("action", "entry")) == "add" or bool(proposal.get("is_add", False))
+
+        max_pos = self.config.get("portfolio_behavior", {}).get("max_open_positions", 3)
+        check("max_positions", not is_entry or (is_add or positions < max_pos), "open-position limit")
+
+        max_buys_day = self.config.get("portfolio_behavior", {}).get("max_new_buy_orders_per_day", 3)
+        check("max_buy_trades_today", not is_entry or int(context.get("buy_trades_today", 0)) < max_buys_day, "daily buy order limit")
+
+        # Portfolio Exposure caps
+        max_total_exposure = self.config.get("portfolio_behavior", {}).get("max_total_portfolio_exposure_pct", 6.0)
+        check("portfolio_total_exposure", not is_entry or context.get("proposed_total_exposure_pct", 0.0) <= max_total_exposure, "total portfolio exposure cap")
+
+        max_single_exposure = self.config.get("portfolio_behavior", {}).get("max_single_symbol_exposure_pct", 2.5)
+        check("portfolio_single_symbol_exposure", not is_entry or context.get("proposed_symbol_exposure_pct", 0.0) <= max_single_exposure, "single symbol exposure cap")
+
+        max_cluster_pos = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_positions", 2)
+        check("portfolio_cluster_positions_limit", not is_entry or context.get("proposed_cluster_positions_count", 0) <= max_cluster_pos, "same cluster positions limit")
+
+        max_cluster_exposure = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0)
+        check("portfolio_cluster_exposure_limit", not is_entry or context.get("proposed_cluster_exposure_pct", 0.0) <= max_cluster_exposure, "same cluster exposure limit")
+
+        # Warning / Exit pending controls
+        block_if_exit_pending = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_exit_pending", True)
+        if block_if_exit_pending and is_entry and context.get("exit_pending", False):
+            check("block_new_buy_if_exit_pending", False, "new buy blocked because an exit is pending")
+
+        block_if_emergency_exit_score_above = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_emergency_exit_score_above", 40)
+        if is_entry and context.get("max_emergency_exit_score", 0.0) > block_if_emergency_exit_score_above:
+            check("block_new_buy_if_emergency_exit_score_above", False, f"new buy blocked because max emergency exit score is {context.get('max_emergency_exit_score', 0.0):.1f} (> {block_if_emergency_exit_score_above})")
+
         limit = self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5)
+        # Sizing engine overrides limit if enabled, so we fetch limit from proposal size dict or max limit
+        sizing_enabled = self.config.get("position_sizing", {}).get("enabled", True)
+        if sizing_enabled:
+            limit = max(limit, self.config.get("position_sizing", {}).get("max_initial_paper_notional", 50.0))
+
         notional = proposal.get("notional")
         check("notional", isinstance(notional, (int, float)) and 0 < notional <= limit, "notional must be positive and within limit")
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
-        check("duplicate_position", not (is_entry and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
+        check("duplicate_position", not (is_entry and not is_add and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
 
         # Explicit Guardrails
-        allow_add = self.risk.get("allow_add_to_existing_position", False)
+        allow_add = self.risk.get("allow_add_to_existing_position", False) or self.config.get("portfolio_behavior", {}).get("allow_add_to_existing_position", False)
         if not allow_add and is_entry and context.get("same_symbol_position", False):
             check("allow_add_to_existing_position", False, "adding to existing position is disabled")
 
         block_any_pos = self.risk.get("block_new_buys_when_any_position_open", True)
-        if block_any_pos and is_entry and positions > 0:
+        if block_any_pos and is_entry and not is_add and positions > 0:
             check("block_new_buys_when_any_position_open", False, "new buys blocked when any position is open")
 
         block_buy_today = self.risk.get("block_new_buys_after_buy_order_submitted_today", True)
-        if block_buy_today and is_entry and context.get("buy_trades_today", 0) > 0:
+        if block_buy_today and is_entry and not is_add and context.get("buy_trades_today", 0) > 0:
             check("block_new_buys_after_buy_order_submitted_today", False, "new buys blocked since a buy order was already submitted today")
 
         block_same_rebuy = self.risk.get("block_same_symbol_rebuy_while_position_open", True)
-        if block_same_rebuy and is_entry and context.get("same_symbol_position", False):
+        if block_same_rebuy and is_entry and not is_add and context.get("same_symbol_position", False):
             check("block_same_symbol_rebuy_while_position_open", False, "same symbol rebuy is blocked while position is open")
         uses_margin = context.get("uses_margin")
         check("margin_state_known", isinstance(uses_margin, bool), "margin-use state must be authoritative")
@@ -102,7 +135,7 @@ class RiskEngine:
         # Profile universe checks
         profiles = self.config.get("market_profiles", {})
         symbol = proposal.get("symbol", "").upper()
-        
+
         if not profiles:
             # Fallback for configuration snapshots / testing that do not define profiles
             watchlist = self.config.get("watchlist", ["SPY", "QQQ"])
@@ -122,29 +155,29 @@ class RiskEngine:
                     symbol_profile = p_val
                     symbol_profile_key = p_key
                     break
-                    
+
             if symbol_profile:
                 # Check if active profile
                 is_active_profile = symbol_profile.get("status") == "active"
                 check("active_profile", is_active_profile, f"profile {symbol_profile_key} is not active")
-                
+
                 # Check watchlist
                 check("approved_universe", symbol in symbol_profile.get("watchlist", []), f"symbol {symbol} not in active watchlist")
-                
+
                 # Check execution
                 check("profile_execution_enabled", symbol_profile.get("execution_enabled", False) is True, f"execution disabled for profile {symbol_profile_key}")
-                
+
                 # Check proposals
                 check("profile_proposals_enabled", symbol_profile.get("proposals_enabled", False) is True, f"proposals disabled for profile {symbol_profile_key}")
-                
+
                 # Check broker
                 check("profile_broker_alpaca", symbol_profile.get("broker") == "alpaca", f"broker must be alpaca for execution")
-                
+
                 # Alpaca cannot be SGX/HKEX broker/data provider
                 is_sgx_or_hkex = symbol.endswith(".SI") or symbol.endswith(".HK")
                 if is_sgx_or_hkex:
                     check("sgx_hkex_no_alpaca", symbol_profile.get("broker") != "alpaca", "Alpaca cannot be assigned as SGX/HKEX broker/data provider")
-                
+
                 # Blocked asset class checks
                 check("asset_class", proposal.get("asset_class", "equity") == "equity", "only equities are allowed")
                 check("options_blocked", proposal.get("asset_class") != "option", "options are blocked")

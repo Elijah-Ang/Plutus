@@ -240,6 +240,14 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `daily_summaries`: Daily equity audits.
 - `market_memory`: Logs of scheduled observation telemetry (currently a 10-minute target interval), indicators, and recommendation scores.
 - `telegram_digests`: History of 30-minute Telegram informational digests.
+- `trade_setups`: Performance Lab records for meaningful setups, including active/observation status, score, proposal eligibility, and no-proposal reason.
+- `shadow_trades`: Measurement-only trades for setups that were not actually executed. These never create broker orders or Telegram actionable proposals.
+- `trade_outcomes`: Forward-return, MAE/MFE, stop/target, and actual-vs-shadow outcome labels.
+- `position_sizing_decisions`: Deterministic paper sizing calculations and stop model inputs.
+- `portfolio_exposure_snapshots`: Total, symbol, and cluster exposure snapshots.
+- `candidate_rankings`: Final candidate ranking components and selection/non-selection reasons.
+- `add_on_opportunities`: Add-to-winner eligibility checks and block reasons.
+- `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
 
 ## 13. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
@@ -260,6 +268,16 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Audit Events**: Directly database-backed (`audit_events`).
 - **Config Snapshot**: Directly database-backed (`config_snapshots`).
 - **Market Memory**: Telemetry comparison logs (`market_memory`).
+- **Performance Lab Summary**: Per-run setup/shadow/actual counts.
+- **Shadow Trades**: Measurement-only suppressed or non-executed opportunities.
+- **Actual vs Shadow**: Outcome rows comparing actual and shadow trades.
+- **Forward Returns**: 1-day, 5-day, and 20-day forward return labels where available.
+- **MAE MFE**: Maximum favorable/adverse excursion and stop/target labels.
+- **Score Band Performance** and **Symbol Performance**: Aggregated outcome views by score/symbol.
+- **Add-on Opportunities**: Add-to-winner eligibility decisions.
+- **Portfolio Exposure**: Exposure snapshots by symbol and correlated ETF cluster.
+- **Position Sizing Decisions**: Dynamic sizing inputs and final notional/share decisions.
+- **Candidate Ranking Decisions**: Ranking components and selection reasons.
 
 ## 14. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).
@@ -429,14 +447,24 @@ To support the bot's current 10-minute schedule during trading hours:
   - The system must not hallucinate, mock, or infer live market data. If real, structured data is not available from an approved API, the symbol/profile is skipped.
   - Profiles for SGX/HKEX are configured as `observation_only` or `disabled` with `execution_enabled: false` and `proposals_enabled: false` to ensure no proposals are created or executed.
 
-## 27. Telegram Market Digest
+## 27. Portfolio Intelligence and Performance Lab
+- **Paper-only scope**: The upgrade changes proposal sizing, measurement, ranking, and reporting only. Live trading and live auto-execution remain unsupported and disabled.
+- **Performance Lab**: Meaningful setups are recorded even when no proposal is sent. Suppressed candidates, observation-only candidates, cooldown blocks, sleep-mode blocks, GPT deferrals, exposure blocks, rejected proposals, and expired proposals can become shadow trades for later analysis.
+- **Shadow trades**: Shadow records are measurement-only. They do not create broker orders, do not create actionable Telegram proposals, and do not alter broker state.
+- **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives once enough future bars exist.
+- **Dynamic sizing**: Initial BUY proposals use `position_sizing` rules: score multiplier, volatility multiplier, risk budget, ATR/technical stop distance, min/max paper notional, single-symbol exposure cap, total exposure cap, and cluster exposure cap. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
+- **Portfolio exposure controls**: `portfolio_behavior` and `portfolio_optimizer` cap open positions, buy orders per day, pending/new BUY proposals, single-symbol exposure, total exposure, same-cluster positions, and same-cluster exposure. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.
+- **Add-to-winner**: `add_to_position` permits add-on BUY proposals only when an existing paper position is profitable, the setup score is strong enough, the setup improves, add counts remain within limits, exposure caps pass, and no exit/emergency warning blocks the add. Averaging down is blocked.
+- **Final revalidation**: Approved BUY/ADD orders still refresh price, re-evaluate size and exposure, check market/broker/database/Telegram/internet/paper-mode state, and can block after approval. `YES` means permission to attempt after final safety checks, not guaranteed order.
+
+## 28. Telegram Market Digest
 - **Purpose**: Sends a 30-minute informational digest to the user during active US regular trading hours (9:30 PM to 4:00 AM SGT, or based on the broker's clock is_open API) summarizing recent telemetry.
 - **Informational Only**: Unlike trade proposal messages, the digest is strictly informational. It does not ask for user approval, does not create trade proposals in the database, and does not place or execute broker orders.
 - **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
 - **Throttling Constraints**: Computes data from the last 30 minutes, requiring a minimum of 2 successful cycles logged in `market_memory`. It checks `telegram_digests` history to ensure it is sent at most once per 30 minutes.
 - **GPT Usage**: GPT is not used for digests by default (`telegram_digest_use_gpt: false`). It relies entirely on rules-based, logged sqlite data to construct summaries.
 
-## 28. Manual Telegram Sleep Mode
+## 29. Manual Telegram Sleep Mode
 - **Purpose**: Allows the user to put the trading agent into a silent "Sleep Mode" via Telegram commands (e.g. `/sleep`, `sleep mode on`).
 - **Behavior**: When sleep mode is active:
   - Normal BUY candidates are fully scanned and logged but suppressed from generating proposals.
@@ -447,7 +475,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Command Age Check**: Commands older than 24 hours are ignored to prevent stale state toggles.
 - **Wake Up & Summary**: Toggling sleep mode OFF (e.g., `/awake`, `wake up`) triggers an overnight wake summary to Telegram detailing suppressed buys, normal sells, emergency exit triggers, and current positions/orders.
 
-## 29. Emergency Auto-Exit Engine (Paper Mode Only)
+## 30. Emergency Auto-Exit Engine (Paper Mode Only)
 - **Objective**: Deterministic risk management for active paper positions. Operating strictly under paper mode, live auto-execution is disabled.
 - **6-Point Risk Score (0-100)**: Calculates a position risk score based on:
   1. Drawdown (max 35 pts): Bands from 0% to -10%+. Falls back to fill prices or fail-closed max points if entry price is missing.
@@ -468,7 +496,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Revalidation**: Execution enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
 - **GPT Exit Explanations**: Exit reviews are executed by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout to avoid delaying execution.
 
-## 30. Change Log
+## 31. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.
@@ -481,3 +509,4 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.
 - **2026-06-23**: Implemented Telegram reply-to proposal targeting, ambiguity resolution, instant acknowledgements, simultaneous BUY limits with 6-tier tie-breaking, and GPT review requirement/deferral logic.
 - **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, paper-only emergency auto-exit wait triggers (Normal, Sleep, and Extreme), GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
+- **2026-06-24**: Added paper-only portfolio intelligence: Performance Lab setup/shadow/outcome tables, dynamic position sizing, ETF cluster exposure controls, add-to-winner eligibility, richer BUY proposal explanations, actual-vs-shadow Excel sheets, and regression tests.

@@ -27,6 +27,17 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Emergency Exit Score Breakdown", "SELECT symbol, position_drawdown_pct, average_entry_price, latest_position_price, atr_value, adverse_move_atr, minutes_to_close, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, created_at FROM market_memory WHERE emergency_exit_score IS NOT NULL"),
     ("Suppressed Sleep BUY Candidates", "SELECT symbol, price, signal, score, no_action_reason, candidate_suppression_reason, created_at FROM market_memory WHERE candidate_suppression_reason = 'suppressed_by_sleep_mode'"),
     ("Wake Summary Events", "SELECT * FROM audit_events WHERE event_type = 'wake_summary_sent'"),
+    ("Performance Lab Summary", "performance_lab_summaries"),
+    ("Shadow Trades", "shadow_trades"),
+    ("Actual vs Shadow", "SELECT * FROM trade_outcomes"),
+    ("Forward Returns", "SELECT symbol, actual_or_shadow, entry_time, entry_price, forward_return_1d, forward_return_5d, forward_return_20d, outcome_status FROM trade_outcomes"),
+    ("MAE MFE", "SELECT symbol, actual_or_shadow, entry_time, entry_price, max_favorable_excursion, max_adverse_excursion, stop_hit, target_reached FROM trade_outcomes"),
+    ("Score Band Performance", "SELECT t.symbol, t.actual_or_shadow, COALESCE(s.score, json_extract(p.payload, '$.score')) as score, t.forward_return_1d, t.forward_return_5d, t.forward_return_20d, t.outcome_status FROM trade_outcomes t LEFT JOIN shadow_trades s ON t.trade_id = s.id LEFT JOIN orders o ON t.trade_id = o.id LEFT JOIN trade_proposals p ON o.proposal_id = p.id"),
+    ("Symbol Performance", "SELECT symbol, actual_or_shadow, COUNT(*) as count, AVG(forward_return_20d) as avg_return_20d FROM trade_outcomes GROUP BY symbol, actual_or_shadow"),
+    ("Add-on Opportunities", "add_on_opportunities"),
+    ("Portfolio Exposure", "portfolio_exposure_snapshots"),
+    ("Position Sizing Decisions", "position_sizing_decisions"),
+    ("Candidate Ranking Decisions", "candidate_rankings"),
 ]
 
 
@@ -67,7 +78,7 @@ def redact_report_value(table: str, header: str, value: Any, include_raw_telegra
         return "[REDACTED ID]"
     if value is None:
         return None
-    if header in {"payload", "values_json", "config_json", "detail", "risks"} and isinstance(value, str):
+    if header in {"payload", "values_json", "config_json", "detail", "risks", "portfolio_state_json", "single_symbol_exposure_json", "cluster_exposure_json"} and isinstance(value, str):
         try:
             value = json_dumps(redact_report_payload(json.loads(value)))
         except (ValueError, TypeError):

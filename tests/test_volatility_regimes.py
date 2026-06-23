@@ -29,7 +29,7 @@ def test_volatility_score_grading(temp_storage):
 
     # We mock evaluate_symbol to return signals with different volatility levels
     from app.strategy_rule_based import Signal
-    
+
     def get_score_for_vol(vol_val):
         import app.service
         original_evaluate = app.service.evaluate_symbol
@@ -88,6 +88,7 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     # 35%–45%: watch-only, no proposal generated
     # >45%: extreme blocked, no proposal generated
     config = load_config()
+    config["position_sizing"] = {"enabled": False}
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()
@@ -96,7 +97,9 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
         from app.strategy_rule_based import Signal
         import app.service
         original_evaluate = app.service.evaluate_symbol
-        def mock_evaluate(*args, **kwargs):
+        def mock_evaluate(symbol, *args, **kwargs):
+            if symbol != "SPY":
+                return Signal("HOLD", None, symbol, "not SPY", 0.0, {})
             if vol_val is None:
                 return Signal("HOLD", None, "SPY", "missing volatility data; fail-safe HOLD", 0.0, {})
             elif vol_val > 0.45:
@@ -169,12 +172,14 @@ def test_state_based_proposal_deduplication(temp_storage):
         from app.strategy_rule_based import Signal
         import app.service
         original_evaluate = app.service.evaluate_symbol
-        def mock_evaluate(*args, **kwargs):
+        def mock_evaluate(sym, *args, **kwargs):
+            if sym != symbol:
+                return Signal("HOLD", None, sym, "not target symbol", 0.0, {})
             return Signal(action, side, symbol, "Reason", 0.7, {"volatility_20": vol})
-        
+
         original_score = service._calculate_asset_selection_score
-        service._calculate_asset_selection_score = lambda *a, **k: 80.0 
-        
+        service._calculate_asset_selection_score = lambda *a, **k: 80.0
+
         app.service.evaluate_symbol = mock_evaluate
         try:
             service.scan()
@@ -183,7 +188,7 @@ def test_state_based_proposal_deduplication(temp_storage):
             service._calculate_asset_selection_score = original_score
 
     now = datetime.now(UTC)
-    
+
     # 1. Pending proposal blocks duplicate
     temp_storage.execute("DELETE FROM trade_proposals")
     temp_storage.execute("DELETE FROM market_memory")
@@ -191,7 +196,7 @@ def test_state_based_proposal_deduplication(temp_storage):
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("p1", "r1", "s1", "SPY", "buy", 5, "pending", now.isoformat(), (now + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 70}))
     )
-    
+
     run_scan_with_custom_signal("ENTRY", "buy", 70)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
     assert memory["dedupe_status"] == "suppressed"
@@ -206,7 +211,7 @@ def test_state_based_proposal_deduplication(temp_storage):
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         ("p2", "r1", "s2", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 95.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
-    
+
     run_scan_with_custom_signal("ENTRY", "buy", 75)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
     assert memory["dedupe_status"] == "suppressed"
@@ -220,7 +225,7 @@ def test_state_based_proposal_deduplication(temp_storage):
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         ("p3", "r1", "s3", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 70.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
-    
+
     # Run scan which will result in score 80 (delta = 10 from 70)
     run_scan_with_custom_signal("ENTRY", "buy", 80)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
@@ -236,7 +241,7 @@ def test_state_based_proposal_deduplication(temp_storage):
         ("p4", "r1", "s4", "SPY", "sell", 5, "approved", (now - timedelta(minutes=5)).isoformat(), now.isoformat(), "rule_based_v1", json.dumps({"score": 95.0}), "SPY:sell:EXIT:below_50:above_200:normal:score_90")
     )
     broker.positions = [type("Pos", (), {"symbol": "SPY", "qty": 10, "market_value": 5000})()]
-    
+
     run_scan_with_custom_signal("EXIT", "sell", 70)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
     assert memory["dedupe_status"] == "allowed"
@@ -258,13 +263,13 @@ def test_excel_export_includes_volatility_and_dedupe_fields(temp_storage, tmp_pa
 
     excel_path = tmp_path / "test_report_vol.xlsx"
     export_excel(temp_storage, config, excel_path)
-    
+
     workbook = load_workbook(excel_path)
     sheet = workbook["Market Memory"]
     rows = list(sheet.iter_rows(values_only=True))
     assert len(rows) > 1
     headers = rows[0]
-    
+
     assert "volatility_regime" in headers
     assert "volatility_score_contribution" in headers
     assert "volatility_gate_result" in headers

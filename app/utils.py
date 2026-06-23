@@ -89,14 +89,14 @@ def format_expiry(expiry_dt: datetime | str, now: datetime | None = None) -> str
         expiry_dt = datetime.fromisoformat(expiry_dt.replace("Z", "+00:00"))
     if expiry_dt.tzinfo is None:
         expiry_dt = expiry_dt.replace(tzinfo=UTC)
-    
+
     now = now or datetime.now(UTC)
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-        
+
     diff = expiry_dt - now
     diff_minutes = round(diff.total_seconds() / 60)
-    
+
     sgt_str = format_sgt(expiry_dt)
     if 0 < diff_minutes <= 120:
         return f"{sgt_str} (about {diff_minutes} minutes)"
@@ -109,7 +109,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     notional = proposal.get("notional")
     qty = proposal.get("qty")
     expiry = proposal.get("expires_at", "")
-    
+
     expiry_minutes = proposal.get("expiry_minutes", 15)
     expiry_fmt = format_sgt(expiry)
 
@@ -134,11 +134,30 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     side_lower = side.lower()
 
     if side_lower == "buy":
-        header = "📄 Paper trade proposal\n\n"
-        action_line = f"Buy {symbol} — {mode_notice}\n"
-        notional_adjustment_note = proposal.get("notional_adjustment_note", "")
-        amount_line = f"Amount: ${notional:.0f}{notional_adjustment_note}\n\n"
-        
+        is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
+        if is_add:
+            header = "📄 Paper trade ADD proposal\n\n"
+            action_line = f"Add to {symbol} — {mode_notice}\n"
+
+            avg_entry = proposal.get("average_entry_price")
+            current_drawdown = proposal.get("position_drawdown_pct")
+
+            avg_entry_str = f"Current avg entry: ${avg_entry:.2f}\n" if avg_entry else ""
+            drawdown_str = f"Current drawdown: {current_drawdown * 100:.2f}%\n" if current_drawdown is not None else ""
+            pos_stats = f"{avg_entry_str}{drawdown_str}"
+            if pos_stats:
+                pos_stats = f"Current position:\n{pos_stats}\n"
+            else:
+                pos_stats = ""
+
+            notional_adjustment_note = proposal.get("notional_adjustment_note", "")
+            amount_line = f"{pos_stats}Add amount: ${notional:.0f}{notional_adjustment_note}\n\n"
+        else:
+            header = "📄 Paper trade proposal\n\n"
+            action_line = f"Buy {symbol} — {mode_notice}\n"
+            notional_adjustment_note = proposal.get("notional_adjustment_note", "")
+            amount_line = f"Amount: ${notional:.0f}{notional_adjustment_note}\n\n"
+
         score_val = proposal.get("score")
         system_confidence = "No action suggested"
         if score_val is not None:
@@ -150,16 +169,16 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 system_confidence = "Moderate"
             elif score_val >= 50:
                 system_confidence = "Weak"
-                
+
         confidence_line = f"Confidence: {system_confidence}\n"
         score_line = f"Trade score: {score_val:.0f}/100\n" if score_val is not None else ""
-        
+
         watchlist_order = proposal.get("watchlist_order")
         total_active = proposal.get("total_active_symbols")
         true_score_rank = proposal.get("true_score_rank")
         eligible_rank = proposal.get("proposal_eligible_rank")
         selection_reason = proposal.get("selection_reason")
-        
+
         rank_line = ""
         if watchlist_order is not None and total_active is not None:
             rank_line += f"Watchlist order: #{watchlist_order} of {total_active}\n"
@@ -169,9 +188,31 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             rank_line += f"Eligible proposal rank: #{eligible_rank} currently eligible candidate\n"
         if selection_reason:
             rank_line += f"Selection reason: {selection_reason}\n"
-            
-        scores_section = f"{confidence_line}{score_line}{rank_line}\n"
-        
+
+        # Sizing and Stops section
+        stop_price = proposal.get("stop_price")
+        stop_dist_pct = proposal.get("stop_distance_pct")
+        stop_dist_dollars = proposal.get("stop_distance_dollars")
+        stop_model = proposal.get("stop_model_used", "default")
+
+        sizing_section = ""
+        if stop_price is not None:
+            sizing_section += f"Stop price: ${stop_price:.2f} ({stop_model})\n"
+        if stop_dist_pct is not None:
+            sizing_section += f"Stop distance: {stop_dist_pct:.2f}% (${stop_dist_dollars:.2f})\n"
+
+        proposed_total_exposure = proposal.get("proposed_total_exposure_pct")
+        proposed_cluster_exposure = proposal.get("proposed_cluster_exposure_pct")
+        if proposed_total_exposure is not None:
+            sizing_section += f"Proposed total exposure: {proposed_total_exposure:.2f}%\n"
+        if proposed_cluster_exposure is not None:
+            sizing_section += f"Proposed cluster exposure: {proposed_cluster_exposure:.2f}%\n"
+
+        if sizing_section:
+            sizing_section = f"Sizing & Risk:\n{sizing_section}\n"
+
+        scores_section = f"{confidence_line}{score_line}{rank_line}\n{sizing_section}"
+
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
             why_text = "The longer-term trend passed the bot’s filters, and volatility is normal for this ETF."
@@ -179,7 +220,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             why_text = "The longer-term trend passed the bot’s filters, and volatility is elevated for this ETF."
         else:
             why_text = "The longer-term trend passed the bot’s filters, and volatility is normal for this ETF."
-            
+
         revival_reason = proposal.get("revival_reason")
         if revival_reason:
             if "score improved" in revival_reason:
@@ -193,13 +234,13 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             else:
                 revival_msg = f"This setup was re-proposed: {revival_reason}."
             why_text += f"\n{revival_msg}"
-            
+
         why_section = f"Why this appeared:\n{why_text}\n\n"
-        
+
         price_change_pct = proposal.get("price_change_pct", 0.0)
         session_change_pct = proposal.get("session_change_pct", 0.0)
         vol_20 = proposal.get("volatility") or proposal.get("indicators", {}).get("volatility_20")
-        
+
         vol_regime_str = ""
         if vol_20 is not None and isinstance(vol_20, (int, float)):
             vol_pct = vol_20 * 100
@@ -215,14 +256,14 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             else:
                 regime = "normal ETF regime"
             vol_regime_str = f"Volatility: {vol_pct:.1f}% annualized — {regime}\n"
-            
+
         movement_section = (
             f"Current movement:\n"
             f"Since last check: {price_change_pct:+.2f}%\n"
             f"Since market open: {session_change_pct:+.2f}%\n"
             f"{vol_regime_str}\n"
         )
-        
+
         review = proposal.get("review")
         gpt_called = proposal.get("gpt_called", True)
         if gpt_called and review:
@@ -240,18 +281,19 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 f"AI review: Not available\n"
                 f"Rule-based only. AI review was not available. Treat with extra caution.\n\n"
             )
-            
+
         decision_time_str = f"Decision time: {expiry_minutes} minutes\n"
         expires_str = f"Expires: {expiry_fmt}\n\n"
-        
+
+        side_lower_instr = "add" if is_add else "buy"
         instructions = (
             f"Reply to this message with:\n"
-            f"yes = approve this {symbol} paper {side_lower}\n"
-            f"no = reject this {symbol} paper {side_lower}\n\n"
+            f"yes = approve this {symbol} paper {side_lower_instr}\n"
+            f"no = reject this {symbol} paper {side_lower_instr}\n\n"
             f"No reply = expires and no order is placed.\n"
             f"yes means permission to attempt, not guaranteed order. A final safety check still runs after yes."
         )
-        
+
         return (
             f"{header}"
             f"{action_line}"
@@ -264,7 +306,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"{expires_str}"
             f"{instructions}"
         )
-        
+
     else:
         # Sell / Exit proposal
         header = "📄 Paper sell proposal\n\n"
@@ -273,26 +315,26 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             amount_line = f"Quantity: {qty:.4f} shares\n" if isinstance(qty, float) and qty % 1 != 0 else f"Quantity: {int(qty)} shares\n"
         else:
             amount_line = ""
-            
+
         exit_trigger = proposal.get("exit_trigger_reason", "exit condition met")
         trigger_line = f"Reason for exit: {exit_trigger}\n"
-        
+
         drawdown_pct = proposal.get("position_drawdown_pct", 0.0)
         drawdown_str = f"Current drawdown: {drawdown_pct * 100:.2f}%\n" if drawdown_pct is not None else ""
-        
+
         latest_price_val = proposal.get("latest_price")
         price_str = f"Latest price: ${latest_price_val:.2f}\n" if latest_price_val is not None else ""
-        
+
         avg_entry = proposal.get("average_entry_price")
         avg_entry_str = f"Average entry price: ${avg_entry:.2f}\n" if avg_entry is not None else ""
-        
+
         details_section = f"{amount_line}{trigger_line}{drawdown_str}{price_str}{avg_entry_str}\n"
-        
+
         # AI Explanation
         gpt_exit_explanation_status = proposal.get("gpt_exit_explanation_status") or "Not available; using rule-based exit reason"
         review = proposal.get("review")
         gpt_called = proposal.get("gpt_called", False)
-        
+
         if gpt_called and review:
             ai_confidence = review.get("gpt_confidence", "Not called")
             ai_caution = review.get("gpt_caution", "Low")
@@ -311,10 +353,10 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 ai_explanation_section += f"Main risk:\n{review.get('main_risk')}\n\n"
             else:
                 ai_explanation_section += "\n"
-                
+
         decision_time_str = f"Decision time: {expiry_minutes} minutes\n"
         expires_str = f"Expires: {expiry_fmt}\n\n"
-        
+
         instructions = (
             f"Reply to this message with:\n"
             f"yes = approve this {symbol} paper {side_lower}\n"
@@ -322,7 +364,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"No reply = expires and no order is placed.\n"
             f"yes means permission to attempt exit after final safety check."
         )
-        
+
         return (
             f"{header}"
             f"{action_line}"
@@ -390,10 +432,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         minute = dt_sgt.strftime("%M")
         ampm = dt_sgt.strftime("%p")
         return f"{hour}:{minute} {ampm}"
-        
+
     w_start = format_time_only(parse_dt(digest_data["window_start"]))
     w_end = format_time_only(parse_dt(digest_data["window_end"]))
-    
+
     msg_parts = [
         f"📊 30-min market digest\n",
         f"US market: {digest_data['market_open_status']}",
@@ -401,44 +443,44 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         f"Mode: {mode_str}\n",
         "Top watched:"
     ]
-    
+
     for idx, sym_data in enumerate(digest_data["symbols_list"]):
         rank = idx + 1
         score_val = sym_data["trade_score"]
         score_str = f"{score_val:.1f}" if isinstance(score_val, (int, float)) else "N/A"
         class_str = sym_data["trade_classification"]
-        
+
         change_30m = sym_data["price_change_30m"]
         change_30m_str = f"{change_30m:+.2f}%" if isinstance(change_30m, (int, float)) else "0.00%"
-        
+
         session_change = sym_data["session_change"]
         session_change_str = f"{session_change:+.2f}%" if isinstance(session_change, (int, float)) else "0.00%"
-        
+
         msg_parts.append(
             f"{rank}. {sym_data['symbol']} — Trade score {score_str}, {class_str}\n"
             f"   30-min: {change_30m_str} | Session: {session_change_str}\n"
             f"   Status: {sym_data['status']}"
         )
-        
+
     weakest_score = digest_data.get("weakest_score")
     weakest_score_str = f"{weakest_score:.1f}" if isinstance(weakest_score, (int, float)) else "N/A"
     msg_parts.append(
         f"\nWeakest: {digest_data['weakest_symbol']} — {weakest_score_str}, {digest_data.get('weakest_classification', 'No action suggested')}\n"
     )
-    
+
     actions = digest_data.get("actions", {})
     msg_parts.append(
         f"Past 30 min actions:\n"
         f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
     )
-    
+
     msg_parts.append(f"Summary: {digest_data.get('summary', '')}\n")
-    
+
     if actions.get('proposals', 0) > 0:
         msg_parts.append("No action needed unless approving the active proposal above.")
     else:
         msg_parts.append("No action needed.")
-        
+
     return "\n".join(msg_parts)
 
 

@@ -91,14 +91,14 @@ ai:
   ai_max_calls_per_run: 2
 ml_shadow_enabled: false
 risk:
-  max_trade_notional_paper: 5
+  max_trade_notional_paper: 50
   max_trade_notional_live: 5
-  max_trades_per_day: 1
-  max_open_positions: 1
-  allow_add_to_existing_position: false
-  block_new_buys_when_any_position_open: true
-  block_new_buys_after_buy_order_submitted_today: true
-  block_same_symbol_rebuy_while_position_open: true
+  max_trades_per_day: 3
+  max_open_positions: 3
+  allow_add_to_existing_position: true
+  block_new_buys_when_any_position_open: false
+  block_new_buys_after_buy_order_submitted_today: false
+  block_same_symbol_rebuy_while_position_open: false
   allow_margin: false
   allow_shorting: false
   allow_options: false
@@ -116,6 +116,73 @@ risk:
   max_pending_buy_proposals: 1
   allow_multiple_exit_proposals: true
   require_gpt_review_for_buy_proposals: true
+
+portfolio_behavior:
+  max_open_positions: 3
+  max_new_buy_orders_per_day: 3
+  max_new_buy_proposals_per_cycle: 1
+  max_pending_buy_proposals: 1
+  allow_add_to_existing_position: true
+  block_averaging_down: true
+  max_adds_per_symbol_per_day: 1
+  max_total_adds_per_symbol: 2
+  max_total_portfolio_exposure_pct: 6.0
+  max_single_symbol_exposure_pct: 2.5
+  max_correlated_us_equity_exposure_pct: 5.0
+  block_new_buy_if_exit_pending: true
+  block_new_buy_if_emergency_exit_score_above: 40
+
+position_sizing:
+  enabled: true
+  base_paper_notional: 10
+  min_paper_notional: 5
+  max_initial_paper_notional: 50
+  max_add_paper_notional: 25
+  risk_per_trade_pct: 0.05
+  max_position_notional_pct: 2.0
+  stop_model:
+    method: max_of_atr_or_technical
+    atr_multiple: 2.0
+    technical_stop: below_ma50_or_recent_swing_low
+    max_stop_pct: 8.0
+    min_stop_pct: 1.0
+  score_multiplier:
+    "65_74": 0.5
+    "75_84": 1.0
+    "85_94": 1.5
+    "95_100": 2.0
+  volatility_multiplier:
+    too_quiet: 0.75
+    normal: 1.0
+    elevated: 0.5
+    high: 0.0
+    extreme: 0.0
+
+portfolio_optimizer:
+  clusters:
+    us_broad_market: [SPY, DIA, IWM]
+    us_growth_tech: [QQQ, XLK]
+    defensive_healthcare: [XLV]
+    financials: [XLF]
+    energy: [XLE]
+  max_same_cluster_positions: 2
+  max_same_cluster_exposure_pct: 5.0
+  max_total_portfolio_exposure_pct: 6.0
+  max_single_symbol_exposure_pct: 2.5
+
+add_to_position:
+  enabled: true
+  only_if_profitable: true
+  min_unrealized_gain_pct: 0.5
+  min_trade_score: 85
+  min_score_improvement: 5
+  require_new_breakout_or_pullback_reclaim: true
+  max_add_size_fraction_of_initial: 0.5
+  max_adds_per_symbol_per_day: 1
+  max_total_adds_per_symbol: 2
+  block_averaging_down: true
+  block_if_exit_warning: true
+  block_if_emergency_exit_score_above: 40
 cash_management:
   enabled: true
   mode: recommend_only

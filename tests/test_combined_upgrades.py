@@ -114,7 +114,7 @@ def test_telegram_stale_messages_ignored(temp_storage, base_config):
     service.telegram.chat_id = "12345"
     service.telegram.allowed_user_id = "12345"
     service.telegram.is_authorized.return_value = True
-    
+
     # Message dated 5 minutes before listener startup
     stale_date = int(time.time() - 300)
     update_stale_yes = {
@@ -126,7 +126,7 @@ def test_telegram_stale_messages_ignored(temp_storage, base_config):
             "from": {"id": "12345"}
         }
     }
-    
+
     # Message dated 5 seconds after listener startup
     fresh_date = int(time.time() + 5)
     update_fresh_yes = {
@@ -138,31 +138,31 @@ def test_telegram_stale_messages_ignored(temp_storage, base_config):
             "from": {"id": "12345"}
         }
     }
-    
+
     # Create proposal in db
     pid = "proposal-1"
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (pid, "run-1", "sig-1", "DIA", "buy", 5.0, "pending", datetime.now(UTC).isoformat(), (datetime.now(UTC) + timedelta(minutes=15)).isoformat(), "rule_based_v1", json.dumps({"symbol": "DIA", "side": "buy", "notional": 5.0, "latest_price": 100.0, "price_at": datetime.now(UTC).isoformat()}))
     )
-    
+
     # Setup listener startup time to current time
     service.listener_started_at = time.time()
-    
+
     # Run process_telegram with stale update first
     service.telegram.get_updates.side_effect = [[update_stale_yes], []]
     service.process_telegram()
-    
+
     # Verify stale update sent clarification but did NOT execute
     service.telegram.send_message.assert_any_call(
         "I ignored an old approval message from before the fast listener started. Please reply again to the current proposal if it is still pending.",
         service.telegram.chat_id
     )
-    
+
     # Verify proposal status is still pending (stale yes was ignored)
     prop = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id=?", (pid,))[0]
     assert prop["status"] == "pending"
-    
+
     # Verify stale update is recorded in audit_events
     events = temp_storage.fetch_all("SELECT event_type FROM audit_events WHERE event_type='listener_bootstrap_update_ignored'")
     assert len(events) == 1
@@ -170,7 +170,7 @@ def test_telegram_stale_messages_ignored(temp_storage, base_config):
     # Now run with fresh update
     service.telegram.get_updates.side_effect = [[update_fresh_yes], []]
     service.process_telegram()
-    
+
     # Proposal should be processed (approved/blocked/submitted)
     prop2 = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id=?", (pid,))[0]
     assert prop2["status"] != "pending"
@@ -179,7 +179,7 @@ def test_true_score_ranking_and_watchlist_order(temp_storage, base_config):
     # Verify true score ranking is calculated correctly
     broker = MockBroker()
     service = TradingService(base_config, temp_storage, broker, "run-1")
-    
+
     # Mock _calculate_asset_selection_score to return different scores
     def mock_calc(symbol, *args, **kwargs):
         if symbol == "SPY":
@@ -189,7 +189,7 @@ def test_true_score_ranking_and_watchlist_order(temp_storage, base_config):
         else:
             return 55.0
     service._calculate_asset_selection_score = mock_calc
-    
+
     # Mock evaluate_symbol to return signals with different scores
     with patch("app.service.evaluate_symbol") as mock_eval:
         def side_effect(symbol, *args, **kwargs):
@@ -200,25 +200,25 @@ def test_true_score_ranking_and_watchlist_order(temp_storage, base_config):
             else:
                 return Signal("ENTRY", "buy", symbol, "trend up", 0.7, {"close": 100.0, "ma_50": 97.0, "volatility_20": 0.1})
         mock_eval.side_effect = side_effect
-        
+
         # Run scan
         service.scan()
-        
+
         # Verify stored ranks in market_memory
         results = temp_storage.fetch_all("SELECT symbol, true_score_rank, watchlist_order FROM market_memory WHERE run_id='run-1'")
-        
+
         spy_row = next(r for r in results if r["symbol"] == "SPY")
         qqq_row = next(r for r in results if r["symbol"] == "QQQ")
         dia_row = next(r for r in results if r["symbol"] == "DIA")
-        
+
         assert spy_row["watchlist_order"] == 1
         assert qqq_row["watchlist_order"] == 2
         assert dia_row["watchlist_order"] == 3
-        
+
         assert spy_row["true_score_rank"] == 1
         assert dia_row["true_score_rank"] == 2
         assert qqq_row["true_score_rank"] == 3
-        
+
         # Verify formatting matches new fields
         msg = format_proposal_message({
             "symbol": "DIA",
@@ -234,7 +234,7 @@ def test_true_score_ranking_and_watchlist_order(temp_storage, base_config):
             "gpt_called": False,
             "review": None
         }, base_config)
-        
+
         assert "Watchlist order: #3 of 4" in msg
         assert "Score rank: #2 of 4 active ETFs" in msg
         assert "Eligible proposal rank: #1" in msg
@@ -243,40 +243,40 @@ def test_true_score_ranking_and_watchlist_order(temp_storage, base_config):
 def test_drawdown_exit_functional(temp_storage, base_config):
     # Verify drawdown triggers EXIT when below -8%
     broker = MockBroker()
-    
+
     spy_pos = type("P", (), {"symbol": "SPY", "qty": 10.0, "avg_entry_price": 100.0, "current_price": 90.0})()
     broker.positions = [spy_pos]
     broker.price = 90.0
-    
+
     service = TradingService(base_config, temp_storage, broker, "run-1")
-    
+
     with patch("app.service.evaluate_symbol", wraps=evaluate_symbol) as mock_eval:
         service.scan()
-        
+
         # Verify it was called with position_drawdown_pct=-0.10
         called_args = mock_eval.call_args_list
         spy_call = next(c for c in called_args if c[0][0] == "SPY")
         assert spy_call[1]["position_drawdown_pct"] == -0.10
-        
+
         spy_signal = temp_storage.fetch_all("SELECT action, reason FROM signals WHERE symbol='SPY'")[0]
         assert spy_signal["action"] == "EXIT"
         assert "stop drawdown reached" in spy_signal["reason"]
-        
+
         qqq_signal = temp_storage.fetch_all("SELECT action FROM signals WHERE symbol='QQQ'")[0]
         assert qqq_signal["action"] != "EXIT"
 
 def test_exit_priority_suppresses_buys(temp_storage, base_config):
     # Verify that if any exit candidate exists, buys are suppressed
     broker = MockBroker()
-    
+
     spy_pos = type("P", (), {"symbol": "SPY", "qty": 10.0, "avg_entry_price": 100.0, "current_price": 90.0})()
     broker.positions = [spy_pos]
     broker.price = 90.0
-    
+
     service = TradingService(base_config, temp_storage, broker, "run-1")
     service.telegram = MagicMock()
     service.telegram.is_available.return_value = True
-    
+
     with patch("app.service.evaluate_symbol") as mock_eval:
         def side_effect(symbol, *args, **kwargs):
             if symbol == "SPY":
@@ -286,14 +286,14 @@ def test_exit_priority_suppresses_buys(temp_storage, base_config):
             else:
                 return Signal("HOLD", None, symbol, "no trend", 0.0, {"volatility_20": 0.1})
         mock_eval.side_effect = side_effect
-        
+
         service.scan()
-    
+
     qqq_mem = temp_storage.fetch_all("SELECT proposal_allowed, no_action_reason, candidate_suppression_reason, exit_priority_applied FROM market_memory WHERE symbol='QQQ'")[0]
     assert qqq_mem["proposal_allowed"] == 0
     assert qqq_mem["candidate_suppression_reason"] == "suppressed_due_to_exit_priority"
     assert qqq_mem["exit_priority_applied"] == 1
-    
+
     spy_mem = temp_storage.fetch_all("SELECT proposal_allowed, exit_priority_applied FROM market_memory WHERE symbol='SPY'")[0]
     assert spy_mem["proposal_allowed"] == 1
     assert spy_mem["exit_priority_applied"] == 1
@@ -304,18 +304,18 @@ def test_gpt_exit_explanation_timeout_fallback(temp_storage, base_config):
     spy_pos = type("P", (), {"symbol": "SPY", "qty": 10.0, "avg_entry_price": 100.0, "current_price": 90.0})()
     broker.positions = [spy_pos]
     broker.price = 90.0
-    
+
     service = TradingService(base_config, temp_storage, broker, "run-1")
     service.telegram = MagicMock()
     service.telegram.is_available.return_value = True
-    
+
     # Mock AIReviewer.review to time out
     service.ai.review = MagicMock(side_effect=TimeoutError("GPT timed out"))
-    
+
     with patch("app.service.evaluate_symbol") as mock_eval:
         mock_eval.return_value = Signal("EXIT", "sell", "SPY", "stop drawdown reached", 0.8, {"volatility_20": 0.1})
         service.scan()
-    
+
     spy_prop = temp_storage.fetch_all("SELECT gpt_exit_explanation_status, gpt_exit_confidence FROM trade_proposals WHERE symbol='SPY'")[0]
     assert spy_prop["gpt_exit_explanation_status"] == "Not available; using rule-based exit reason"
     assert spy_prop["gpt_exit_confidence"] is None or spy_prop["gpt_exit_confidence"] == "Not called"
@@ -338,41 +338,49 @@ def test_setup_fingerprint_cooldown_and_revival(temp_storage, base_config):
         "supports_system_score": "yes",
         "reason": "Test"
     })
-    
+
     # Mock compute_setup_key to return a static setup key so score delta revival can trigger
     service._compute_setup_key = MagicMock(return_value="SPY:buy:ENTRY:below_50:above_200:normal:score_80")
-    
+
     # Mock _calculate_asset_selection_score to return different scores for Run 1 vs Run 3
     def mock_calc(symbol, *args, **kwargs):
         if service.run_id == "run-1" or service.run_id == "run-2":
             return 50.0
         return 85.0
     service._calculate_asset_selection_score = mock_calc
-    
+
     with patch("app.service.evaluate_symbol") as mock_eval:
-        mock_eval.return_value = Signal("ENTRY", "buy", "SPY", "trend up", 0.8, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.30})
-        
+        def side_effect(sym, *args, **kwargs):
+            if sym == "SPY":
+                return Signal("ENTRY", "buy", "SPY", "trend up", 0.8, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.30})
+            return Signal("HOLD", None, sym, "not SPY", 0.0, {})
+        mock_eval.side_effect = side_effect
+
         service.scan()
-        
+
         prop_1 = temp_storage.fetch_all("SELECT id, setup_key, status FROM trade_proposals WHERE symbol='SPY'")[0]
         setup_key = prop_1["setup_key"]
-        
+
         # Mark the first proposal as approved and set it to 10 minutes ago so it enters cooldown and is not competing
         created_at_time = datetime.now(UTC) - timedelta(minutes=10)
         temp_storage.execute("UPDATE trade_proposals SET status='approved', created_at=? WHERE id=?", (created_at_time.isoformat(), prop_1["id"]))
-        
+
         service.run_id = "run-2"
         service.scan()
-        
+
         mem_2 = temp_storage.fetch_all("SELECT dedupe_status, dedupe_reason, cooldown_applied FROM market_memory WHERE symbol='SPY' AND run_id='run-2'")[0]
         assert mem_2["cooldown_applied"] == 1
         assert mem_2["dedupe_status"] == "suppressed"
-        
+
         # Revival
-        mock_eval.return_value = Signal("ENTRY", "buy", "SPY", "trend up", 0.99, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.10})
+        def side_effect_3(sym, *args, **kwargs):
+            if sym == "SPY":
+                return Signal("ENTRY", "buy", "SPY", "trend up", 0.99, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.10})
+            return Signal("HOLD", None, sym, "not SPY", 0.0, {})
+        mock_eval.side_effect = side_effect_3
         service.run_id = "run-3"
         service.scan()
-        
+
         mem_3 = temp_storage.fetch_all("SELECT dedupe_status, revival_reason, cooldown_applied FROM market_memory WHERE symbol='SPY' AND run_id='run-3'")[0]
         assert mem_3["cooldown_applied"] == 0
         assert mem_3["dedupe_status"] == "allowed"
