@@ -167,32 +167,40 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     - **35%–45%**: High volatility; receives watch-only score (5/15) and blocks new entries (watch-only)
     - **Above 45% or missing/invalid**: Extreme volatility/missing data; receives 0/15 points and hard blocks new entries
   - Position-reducing exits and risk controls are exempt from volatility restrictions.
-- **State-Based Proposal Deduplication**:
-  - To prevent alert spam, new proposals are blocked if an active pending proposal for the same symbol + side exists, or if a similar proposal was generated within the last 60 minutes.
-  - The 60-minute cooldown is bypassed only if:
-    - It is a position-reducing exit (and a real position exists), or
-    - The Trade Decision Score improves by $\ge 10$ points compared to the last proposal.
-  - Deduplication actions are tracked in the database and audit events, and do not bypass approvals.
+- **Setup-Based Proposal Deduplication**:
+  - To prevent alert spam, proposals are deduplicated using a stable setup fingerprint key computed from: `symbol`, `side`, `action`, `above_50`, `above_200`, `volatility_regime`, and `score_band`.
+  - Same setup key within cooldown = suppress. Different setup key = eligible.
+  - Active pending proposals for the same symbol + side immediately block duplicates.
+  - Cooldown durations vary by status: `rejected` proposals trigger a 120-minute cooldown, while `expired`, `approved`, and `superseded` proposals trigger a 60-minute cooldown.
+  - Competing approved/submitted BUY proposals block new BUYs for the same symbol.
+  - Cooldown revival occurs if:
+    - The Trade Decision Score improves by >= 10.0 points.
+    - The volatility regime improves (e.g., `extreme` -> `high`, `high` -> `elevated`, `elevated` -> `normal`).
+    - Position exits bypass buy cooldowns.
+  - Revival reasons are displayed clearly in Telegram notifications.
+- **Exit Prioritization**:
+  - EXIT/reduce-risk candidates are processed first in every scan cycle.
+  - If any EXIT candidates exist, new BUY proposals are suppressed with the reason `suppressed_due_to_exit_priority`.
+  - Exits bypass the limits on new/pending buy proposals, buy cooldowns, and mandatory buy GPT review.
 - **Simultaneous BUY Limits & Candidate Ranking**:
   - The system enforces configuration constraints to limit BUY proposals:
     - `max_new_buy_proposals_per_cycle`: Limits how many new BUY proposals can be sent in a single scan cycle (default: 1).
     - `max_pending_buy_proposals`: Limits the total number of simultaneous pending BUY proposals (default: 1).
-    - `allow_multiple_exit_proposals`: Allows exit/reduce-risk proposals to bypass these limits (default: true).
-  - If multiple BUY candidates qualify, they are sorted and ranked. Only the best candidate is proposed; others are suppressed and logged as `suppressed_by_candidate_limit`.
-  - The sorting and tie-breaking order is:
+  - Watchlist position is called `Watchlist order` and is not labeled as market rank.
+  - True ranking among active watchlist candidates is calculated based on the Trade Decision Score (score sort key) and labeled as `Score rank`.
+  - The proposal message displays both `Score rank` and `Eligible proposal rank`.
+  - Ties/ranking order follows:
     1. Higher Trade Decision Score
     2. Higher Asset Selection Score
-    3. Better symbol watchlist rank
-    4. Lower volatility regime (Normal -> Too Quiet -> Elevated -> High -> Extreme)
-    5. Stronger price movement (Price Change %)
-    6. Stronger session movement (Session Change %)
-    7. Stable deterministic symbol order (alphabetical fallback)
-- **GPT-Required Gating for BUY Proposals**:
-  - By default, `require_gpt_review_for_buy_proposals` is set to `true` for BUY proposals (exits/sells can bypass).
-  - If score $\ge 65$ but GPT review is unavailable/throttled:
-    - The proposal is deferred and logged in Market Memory as `deferred_ai_review_unavailable`. No pending proposal or Telegram message is created, and no order can be placed.
-  - If rules explicitly allow rule-only proposals (`require_gpt_review_for_buy_proposals: false`), the proposal clearly contains the caution warning:
-    `Rule-based only. AI review was not available. Treat with extra caution.`
+    3. Better symbol watchlist order
+    4. Lower volatility regime
+    5. Price Change %
+    6. Session Change %
+    7. Stable alphabetical symbol fallback
+- **GPT Reviews and Timeout Explanations**:
+  - BUY Proposals: GPT review is required by default. Missing/throttled GPT review defers the buy proposal.
+  - EXIT Proposals: GPT explanation is optional and attempted with a 3-second timeout limit. If GPT is slow or unavailable, the exit proposal immediately falls back to rule-based explanation without delay. GPT cannot decide or block a deterministic exit.
+  - structured fields are stored and format message shows plain English descriptions of the reviews.
 - **Dynamic Expiry Rules**:
   - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
   - Base values: Normal buy/sell is 15 minutes, exits/sells are 10 minutes. High volatility limits base to 5 minutes, and low volatility extends base to 20 minutes.
@@ -258,18 +266,27 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - Verified via `pytest`.
 
 ## 15. Launchd / Scheduling Status
-**Installed and loaded.**
-- **Label**: `com.elijah.tradingagent`
-- **Schedule**: Every 10 minutes (`StartInterval`: 600 seconds)
-- **Command Run**: `/Users/elijahang/Projects/TradingAgent/scripts/run_once.sh`
-- **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
-- **Stdout Log**: `logs/runtime/launchd.out`
-- **Stderr Log**: `logs/errors/launchd.err`
+
+The system is configured with two separate scheduled jobs:
+1. **Scanner (`com.elijah.tradingagent`)**:
+   - **Schedule**: Every 10 minutes (600 seconds)
+   - **Command**: `scripts/run_once.sh`
+   - **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
+   - **Stdout/Stderr Logs**: `logs/runtime/launchd.out` and `logs/errors/launchd.err`
+   - **Behavior**: Runs the full scan loop (reconciliation + rule-based evaluation + scoring + proposal creation + optional AI review). Telegram update polling is completely disabled for the scanner (`market_scan_processes_telegram_updates: false`).
+
+2. **Telegram listener (`com.elijah.tradingagent.telegram`)**:
+   - **Schedule**: Constantly kept alive in the background
+   - **Command**: `scripts/run_telegram_listener.sh`
+   - **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
+   - **Stdout/Stderr Logs**: `logs/runtime/listener.out` and `logs/errors/listener.err`
+   - **Behavior**: Runs the fast Telegram listener loop. Polls Telegram for replies every 30 seconds. Implements bootstrap protection to ignore updates queued before startup or older than 2 minutes. This is the sole polling owner for Telegram updates to prevent update consumption races.
+
 - **How to Check Status**: Run `launchctl list | grep tradingagent`
-- **How to Stop/Disable Agent**: Run `./scripts/stop_agent.sh` (or `touch config/KILL_SWITCH`)
+- **How to Stop/Disable**: Run `./scripts/stop_agent.sh` (or `touch config/KILL_SWITCH`)
 - **How to Uninstall**: Run `./scripts/uninstall_launchd.sh`
-- **How to Run Manually**: Run `./scripts/run_once.sh`
-- **Behavior**: Scheduled runs are observation and scoring-first. GPT and Telegram calls are throttled and not triggered every 10 minutes by default. A Telegram approval response is strictly required before order execution, and live trading remains disabled.
+- **Manual Scan**: Run `./scripts/run_once.sh`
+- **Manual Listener**: Run `PYTHONPATH=. .venv/bin/python -m app.main --mode listener`
 - **Reconciliation**: Each passing cycle reads existing Alpaca order/account/position state and reconciles SQLite before scanning. Reconciliation has no submission or retry operation.
 - **Lock Recovery**: `run_once.sh` records PID and epoch time. Active/recent locks are preserved; only a dead owner older than the grace period is atomically recovered and audited.
 - **macOS Sandbox Note**: The project has been relocated to `/Users/elijahang/Projects/TradingAgent` to completely bypass the macOS TCC/Sandbox restrictions on `~/Desktop`, ensuring launchd runs execute successfully without requiring system-wide Full Disk Access configurations.

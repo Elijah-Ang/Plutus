@@ -17,7 +17,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "ml_predictions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, model_version TEXT, prediction TEXT, probability REAL, payload TEXT, created_at TEXT",
     "risk_checks": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, stage TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT",
     "ai_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, summary TEXT, risks TEXT, caution_level TEXT, payload TEXT, created_at TEXT",
-    "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT",
+    "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT",
     "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
     "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, created_at TEXT, updated_at TEXT",
     "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT",
@@ -31,7 +31,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
     "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
-    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL, candidate_suppression_reason TEXT, deferred_ai_review_reason TEXT",
+    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL, candidate_suppression_reason TEXT, deferred_ai_review_reason TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT",
     "telegram_digests": "id INTEGER PRIMARY KEY, run_id TEXT, window_start TEXT, window_end TEXT, sent_at TEXT, symbols TEXT, summary_text TEXT, status TEXT",
 }
 
@@ -84,6 +84,31 @@ class Storage:
             if "ai_caution" not in cols:
                 conn.execute("ALTER TABLE trade_proposals ADD COLUMN ai_caution TEXT")
                 
+            new_cols = {
+                "true_score_rank": "INTEGER",
+                "watchlist_order": "INTEGER",
+                "setup_key": "TEXT",
+                "cooldown_applied": "INTEGER",
+                "cooldown_remaining_minutes": "REAL",
+                "cooldown_reason": "TEXT",
+                "revival_reason": "TEXT",
+                "last_proposal_status": "TEXT",
+                "score_delta": "REAL",
+                "volatility_regime_change": "TEXT",
+                "exit_priority_applied": "INTEGER",
+                "exit_trigger_reason": "TEXT",
+                "position_drawdown_pct": "REAL",
+                "average_entry_price": "REAL",
+                "latest_position_price": "REAL",
+                "gpt_exit_explanation_status": "TEXT",
+                "gpt_exit_confidence": "TEXT",
+                "gpt_exit_caution": "TEXT",
+                "final_proposal_message_category": "TEXT"
+            }
+            for col_name, col_type in new_cols.items():
+                if col_name not in cols:
+                    conn.execute(f"ALTER TABLE trade_proposals ADD COLUMN {col_name} {col_type}")
+                
             cursor = conn.execute("PRAGMA table_info(approvals)")
             cols = [row["name"] for row in cursor.fetchall()]
             if "reply_to_message_id" not in cols:
@@ -116,51 +141,54 @@ class Storage:
                 conn.execute("ALTER TABLE approvals ADD COLUMN final_block_reason TEXT")
                 
             cursor = conn.execute("PRAGMA table_info(market_memory)")
-            cols = [row["name"] for row in cursor.fetchall()]
-            if "market_profile" not in cols:
+            cols_mem = [row["name"] for row in cursor.fetchall()]
+            if "market_profile" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN market_profile TEXT")
-            if "asset_score" not in cols:
+            if "asset_score" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN asset_score REAL")
-            if "asset_classification" not in cols:
+            if "asset_classification" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN asset_classification TEXT")
-            if "symbol_rank" not in cols:
+            if "symbol_rank" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN symbol_rank INTEGER")
-            if "proposal_generated" not in cols:
+            if "proposal_generated" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN proposal_generated INTEGER")
-            if "no_action_reason" not in cols:
+            if "no_action_reason" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN no_action_reason TEXT")
-            if "asset_selection_score" not in cols:
+            if "asset_selection_score" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN asset_selection_score REAL")
-            if "trade_decision_score" not in cols:
+            if "trade_decision_score" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN trade_decision_score REAL")
-            if "system_confidence" not in cols:
+            if "system_confidence" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN system_confidence TEXT")
-            if "gpt_confidence" not in cols:
+            if "gpt_confidence" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN gpt_confidence TEXT")
-            if "gpt_caution" not in cols:
+            if "gpt_caution" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN gpt_caution TEXT")
-            if "expiry_minutes" not in cols:
+            if "expiry_minutes" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN expiry_minutes INTEGER")
-            if "expires_at_sgt" not in cols:
+            if "expires_at_sgt" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN expires_at_sgt TEXT")
-            if "main_risk" not in cols:
+            if "main_risk" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN main_risk TEXT")
-            if "volatility_regime" not in cols:
+            if "volatility_regime" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_regime TEXT")
-            if "volatility_score_contribution" not in cols:
+            if "volatility_score_contribution" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_score_contribution REAL")
-            if "volatility_gate_result" not in cols:
+            if "volatility_gate_result" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN volatility_gate_result TEXT")
-            if "dedupe_status" not in cols:
+            if "dedupe_status" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN dedupe_status TEXT")
-            if "dedupe_reason" not in cols:
+            if "dedupe_reason" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN dedupe_reason TEXT")
-            if "paper_size_adjustment" not in cols:
+            if "paper_size_adjustment" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN paper_size_adjustment REAL")
-            if "candidate_suppression_reason" not in cols:
+            if "candidate_suppression_reason" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN candidate_suppression_reason TEXT")
-            if "deferred_ai_review_reason" not in cols:
+            if "deferred_ai_review_reason" not in cols_mem:
                 conn.execute("ALTER TABLE market_memory ADD COLUMN deferred_ai_review_reason TEXT")
+            for col_name, col_type in new_cols.items():
+                if col_name not in cols_mem:
+                    conn.execute(f"ALTER TABLE market_memory ADD COLUMN {col_name} {col_type}")
 
     def writable(self) -> bool:
         try:

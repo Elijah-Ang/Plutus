@@ -203,8 +203,8 @@ def test_state_based_proposal_deduplication(temp_storage):
     temp_storage.execute("DELETE FROM market_memory")
     created_at = now - timedelta(minutes=10)
     temp_storage.execute(
-        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("p2", "r1", "s2", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 95.0}))
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("p2", "r1", "s2", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 95.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
     
     run_scan_with_custom_signal("ENTRY", "buy", 75)
@@ -217,12 +217,12 @@ def test_state_based_proposal_deduplication(temp_storage):
     temp_storage.execute("DELETE FROM trade_proposals")
     temp_storage.execute("DELETE FROM market_memory")
     temp_storage.execute(
-        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("p3", "r1", "s3", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 70}))
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("p3", "r1", "s3", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 70.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
     
-    # Run scan which will result in score 100
-    run_scan_with_custom_signal("ENTRY", "buy", 100)
+    # Run scan which will result in score 80 (delta = 10 from 70)
+    run_scan_with_custom_signal("ENTRY", "buy", 80)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
     assert memory["dedupe_status"] == "allowed"
     assert "meaningful score improvement" in memory["dedupe_reason"]
@@ -232,15 +232,15 @@ def test_state_based_proposal_deduplication(temp_storage):
     temp_storage.execute("DELETE FROM trade_proposals")
     temp_storage.execute("DELETE FROM market_memory")
     temp_storage.execute(
-        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("p4", "r1", "s4", "SPY", "sell", 5, "approved", (now - timedelta(minutes=5)).isoformat(), now.isoformat(), "rule_based_v1", json.dumps({"score": 95.0}))
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("p4", "r1", "s4", "SPY", "sell", 5, "approved", (now - timedelta(minutes=5)).isoformat(), now.isoformat(), "rule_based_v1", json.dumps({"score": 95.0}), "SPY:sell:EXIT:below_50:above_200:normal:score_90")
     )
     broker.positions = [type("Pos", (), {"symbol": "SPY", "qty": 10, "market_value": 5000})()]
     
     run_scan_with_custom_signal("EXIT", "sell", 70)
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY' ORDER BY created_at DESC LIMIT 1")[0]
     assert memory["dedupe_status"] == "allowed"
-    assert "exit/reduce-risk action allowed" in memory["dedupe_reason"]
+    assert "exit/reduce-risk action" in memory["dedupe_reason"]
     assert memory["proposal_generated"] == 1
 
 

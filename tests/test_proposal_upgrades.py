@@ -133,7 +133,8 @@ def test_telegram_proposal_message_content():
         "classification": "Moderate paper setup",
         "asset_score": 74.0,
         "asset_classification": "Moderate watch candidate",
-        "symbol_rank": 1,
+        "watchlist_order": 1,
+        "true_score_rank": 1,
         "total_active_symbols": 4,
         "price_change_pct": 0.18,
         "session_change_pct": 0.72,
@@ -157,7 +158,8 @@ def test_telegram_proposal_message_content():
     assert "Amount: $1" in msg
     assert "Confidence: Moderate" in msg
     assert "Trade score: 68/100" in msg
-    assert "Rank: #1 of 4 active ETFs" in msg
+    assert "Watchlist order: #1 of 4" in msg
+    assert "Score rank: #1 of 4 active ETFs" in msg
     assert "Since last check: +0.18%" in msg
     assert "Since market open: +0.72%" in msg
     assert "Main risk:\nVolatility is still slightly elevated." in msg

@@ -121,7 +121,8 @@ def test_proposal_message_ranking_and_ai_wording():
         "side": "buy",
         "notional": 5.0,
         "score": 85.0,
-        "symbol_rank": 3,
+        "watchlist_order": 3,
+        "true_score_rank": 3,
         "total_active_symbols": 4,
         "proposal_eligible_rank": 1,
         "selection_reason": "Selected because higher-ranked candidates were recently proposed and are still in cooldown.",
@@ -135,8 +136,9 @@ def test_proposal_message_ranking_and_ai_wording():
     }
     
     msg = format_proposal_message(proposal, config)
-    assert "Rank: #3 of 4 active ETFs (Market rank)" in msg
-    assert "Proposal rank: #1 currently eligible candidate" in msg
+    assert "Watchlist order: #3 of 4" in msg
+    assert "Score rank: #3 of 4 active ETFs" in msg
+    assert "Eligible proposal rank: #1 currently eligible candidate" in msg
     assert "Selection reason: Selected because higher-ranked candidates were recently proposed and are still in cooldown." in msg
     assert "AI review: Completed" in msg
     assert "AI confidence: High" in msg
@@ -149,7 +151,8 @@ def test_proposal_message_ranking_and_ai_wording():
         "side": "buy",
         "notional": 5.0,
         "score": 85.0,
-        "symbol_rank": 1,
+        "watchlist_order": 1,
+        "true_score_rank": 1,
         "total_active_symbols": 4,
         "proposal_eligible_rank": 1,
         "selection_reason": "Selected because it was the strongest eligible candidate.",
@@ -158,8 +161,9 @@ def test_proposal_message_ranking_and_ai_wording():
         "review": None
     }
     msg_no_ai = format_proposal_message(proposal_no_ai, config)
-    assert "Rank: #1 of 4 active ETFs (Market rank)" in msg_no_ai
-    assert "Proposal rank: #1 currently eligible candidate" in msg_no_ai
+    assert "Watchlist order: #1 of 4" in msg_no_ai
+    assert "Score rank: #1 of 4 active ETFs" in msg_no_ai
+    assert "Eligible proposal rank: #1 currently eligible candidate" in msg_no_ai
     assert "Selection reason: Selected because it was the strongest eligible candidate." in msg_no_ai
     assert "AI review: Not available" in msg_no_ai
     assert "Rule-based only. AI review was not available. Treat with extra caution." in msg_no_ai
