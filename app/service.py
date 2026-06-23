@@ -1309,24 +1309,42 @@ class TradingService:
                             (symbol,)
                         )
                         if not existing_proposals:
-                            emergency_exit_triggered = 1
-                            emergency_exit_trigger_reason = hard_trigger_reason
-                            emergency_exit_hard_trigger = hard_trigger_reason
-                            
-                            if total_score >= 95 or position_drawdown_pct <= -0.12:
-                                emergency_exit_mode = "extreme"
-                                emergency_exit_wait_seconds = 0
-                            elif sleep_mode_active:
-                                emergency_exit_mode = "sleep"
-                                emergency_exit_wait_seconds = 15
-                            else:
-                                emergency_exit_mode = "normal"
-                                emergency_exit_wait_seconds = 60
+                            if not avg_entry_price or avg_entry_price <= 0:
+                                emergency_exit_triggered = 1
+                                emergency_exit_trigger_reason = "drawdown could not be reliably calculated"
+                                emergency_exit_hard_trigger = hard_trigger_reason
+                                emergency_exit_mode = "blocked"
+                                emergency_exit_block_reason = "emergency_drawdown_unavailable"
+                                emergency_exit_final_decision = "blocked"
                                 
-                            due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
-                            emergency_exit_auto_execute_due_at = due_at.isoformat()
-                            
-                            signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
+                                self.telegram.send_message(
+                                    f"Emergency exit was blocked because position drawdown could not be reliably calculated. No order was placed."
+                                )
+                                self.storage.audit(self.run_id, "emergency_exit_blocked_drawdown_unavailable", {
+                                    "symbol": symbol,
+                                    "score": total_score,
+                                    "reason": "missing entry price"
+                                })
+                                signal = dataclasses.replace(signal, action="EXIT", side="sell", reason="Emergency exit blocked: drawdown could not be reliably calculated")
+                            else:
+                                emergency_exit_triggered = 1
+                                emergency_exit_trigger_reason = hard_trigger_reason
+                                emergency_exit_hard_trigger = hard_trigger_reason
+                                
+                                if total_score >= 95 or position_drawdown_pct <= -0.12:
+                                    emergency_exit_mode = "extreme"
+                                    emergency_exit_wait_seconds = 0
+                                elif sleep_mode_active:
+                                    emergency_exit_mode = "sleep"
+                                    emergency_exit_wait_seconds = 15
+                                else:
+                                    emergency_exit_mode = "normal"
+                                    emergency_exit_wait_seconds = 60
+                                    
+                                due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
+                                emergency_exit_auto_execute_due_at = due_at.isoformat()
+                                
+                                signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
                 
                 exit_trigger_reason = None
                 if signal.action == "EXIT" and has_position:
@@ -2047,7 +2065,11 @@ class TradingService:
                                         no_action_reason = "proposal generated"
                                         any_generated = True
                                         
-                                        if emergency_exit_mode == "extreme":
+                                        if emergency_exit_mode == "blocked":
+                                            proposal["status"] = "blocked"
+                                            proposal["emergency_exit_block_reason"] = "emergency_drawdown_unavailable"
+                                            proposal["emergency_exit_final_decision"] = "blocked"
+                                        elif emergency_exit_mode == "extreme":
                                             success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
                                             if success:
                                                 emergency_exit_final_decision = "submitted"

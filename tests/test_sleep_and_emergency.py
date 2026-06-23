@@ -423,3 +423,95 @@ def test_revalidate_and_execute_emergency_exit(temp_storage, base_config):
     success, desc = service.revalidate_and_execute_emergency_exit(proposal)
     assert success is False
     assert "live" in desc
+
+
+def test_emergency_exit_missing_entry_price(temp_storage, base_config):
+    broker = MockBroker()
+    service = TradingService(base_config, temp_storage, broker, "test_run_id")
+    service.telegram = MockTelegramBot()
+
+    # Active paper position in broker with missing entry price (avg_entry_price = 0/None)
+    broker.price = 85.0
+    broker.positions = [type("Pos", (), {"symbol": "SPY", "qty": 10, "avg_entry_price": 0.0, "current_price": 85.0})()]
+
+    # Make the broker clock show < 30 minutes to close -> 10 points near close
+    broker.clock.timestamp = datetime.now(UTC)
+    broker.clock.next_close = broker.clock.timestamp + timedelta(minutes=15)
+
+    def mock_eval(*args, **kwargs):
+        return Signal("HOLD", None, "SPY", "No signal", 0.0, {"volatility_20": 0.48})
+
+    mock_features = pd.DataFrame([{
+        "close": 85.0,
+        "ma_50": 100.0,
+        "ma_200": 105.0
+    }])
+
+    # 1. Missing entry price + no fills -> blocked, no order submitted, audit event created
+    with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
+        service.scan()
+        
+        # Verify proposal created is blocked
+        props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
+        assert len(props) == 1
+        assert props[0]["status"] == "blocked"
+        assert props[0]["emergency_exit_block_reason"] == "emergency_drawdown_unavailable"
+        assert props[0]["emergency_exit_final_decision"] == "blocked"
+        
+        # revalidate_and_execute_emergency_exit should NOT be called
+        mock_exec.assert_not_called()
+        
+        # Alert message should be sent
+        assert any("drawdown could not be reliably calculated" in m[0] for m in service.telegram.sent_messages)
+        
+        # Audit event created
+        audits = temp_storage.fetch_all("SELECT * FROM audit_events WHERE event_type='emergency_exit_blocked_drawdown_unavailable'")
+        assert len(audits) == 1
+
+    # 2. Reliable fills fallback works
+    temp_storage.execute("DELETE FROM trade_proposals")
+    temp_storage.execute("DELETE FROM audit_events")
+    service.telegram.sent_messages.clear()
+    
+    # Insert a buy fill price of 100.0
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,qty,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("order123", "test_run_id", "prop123", "b123", "c123", "SPY", "buy", 10.0, "filled", datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at) VALUES(?,?,?,?,?)",
+        ("test_run_id", "order123", 10.0, 100.0, datetime.now(UTC).isoformat())
+    )
+
+    with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
+        service.scan()
+        
+        # Since avg_entry_price fallback found (100.0) -> drawdown is calculated -> triggers extreme auto-exit
+        props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
+        assert len(props) == 1
+        assert props[0]["status"] == "approved"
+        assert props[0]["emergency_exit_mode"] == "extreme"
+        
+        mock_exec.assert_called_once()
+        assert any("EXTREME EMERGENCY EXIT" in m[0] for m in service.telegram.sent_messages)
+
+    # 3. Broker average entry price is preferred over fills fallback
+    temp_storage.execute("DELETE FROM trade_proposals")
+    service.telegram.sent_messages.clear()
+    
+    # Set broker position avg_entry_price to 120.0 (fills price is 100.0)
+    broker.price = 114.0 # drawdown (114 - 120)/120 = -5% (not triggering extreme mode exit drawdown <= -12%)
+    broker.positions = [type("Pos", (), {"symbol": "SPY", "qty": 10, "avg_entry_price": 120.0, "current_price": 114.0})()]
+    mock_features_pref = pd.DataFrame([{
+        "close": 114.0,
+        "ma_50": 120.0,
+        "ma_200": 125.0
+    }])
+
+    with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features_pref), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
+        service.scan()
+        
+        # Verify that since avg_entry_price of 120.0 is used (preferred over fills 100.0),
+        # drawdown is -5% which does not match any hard triggers -> no emergency exit triggered!
+        props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
+        assert len(props) == 0
