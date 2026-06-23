@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.service import TradingService
 from app.storage import Storage
+from app.risk_engine import RiskEngine
 
 
 class BatchTelegram:
@@ -289,3 +290,70 @@ def test_yes_all_blocked_outside_paper_mode(tmp_path):
     assert handled is True
     assert "YES ALL is blocked" in service.telegram.messages[-1]
     assert {r["status"] for r in storage.fetch_all("SELECT status FROM trade_proposals")} == {"pending"}
+
+
+def risk_proposal() -> dict:
+    now = datetime.now(UTC)
+    return {
+        "symbol": "SPY",
+        "side": "buy",
+        "action": "entry",
+        "latest_price": 100.0,
+        "price_at": now.isoformat(),
+        "historical_bars": 250,
+        "volume": 10000,
+        "price_gap_pct": 0,
+        "notional": 5.0,
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        "strategy_version": "rule_based_v1",
+        "reason": "test",
+        "order_type": "market",
+        "asset_class": "equity",
+    }
+
+
+def risk_context() -> dict:
+    return {
+        "power_connected": True,
+        "internet_available": True,
+        "database_writable": True,
+        "broker_available": True,
+        "telegram_available": True,
+        "market_open": True,
+        "kill_switch": False,
+        "open_positions": 99,
+        "buy_trades_today": 99,
+        "duplicate_order": False,
+        "same_symbol_position": False,
+        "uses_margin": False,
+        "daily_loss": 0,
+        "weekly_loss": 0,
+        "buying_power": 10000,
+        "proposed_total_exposure_pct": 1.0,
+        "proposed_symbol_exposure_pct": 1.0,
+        "proposed_cluster_positions_count": 1,
+        "proposed_cluster_exposure_pct": 1.0,
+        "approval_valid": True,
+    }
+
+
+def test_risk_budgeted_mode_ignores_fixed_position_and_daily_buy_count_caps():
+    cfg = config()
+    cfg["portfolio_behavior"]["max_open_positions"] = 1
+    cfg["portfolio_behavior"]["max_new_buy_orders_per_day"] = 1
+    decision = RiskEngine(cfg).evaluate(risk_proposal(), risk_context())
+
+    assert decision.passed
+
+
+def test_legacy_mode_still_enforces_fixed_position_and_daily_buy_count_caps():
+    cfg = config()
+    cfg.pop("portfolio_execution_mode")
+    cfg["portfolio_behavior"]["max_open_positions"] = 1
+    cfg["portfolio_behavior"]["max_new_buy_orders_per_day"] = 1
+    decision = RiskEngine(cfg).evaluate(risk_proposal(), risk_context())
+
+    assert not decision.passed
+    assert "open-position limit" in decision.reasons
+    assert "daily buy order limit" in decision.reasons

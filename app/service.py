@@ -1938,9 +1938,10 @@ class TradingService:
 
                 port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
                 safety_ok = True
-                if port_context.get("duplicate_order") or port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
+                risk_budgeted_mode = self._ranked_batch_mode_enabled()
+                if port_context.get("duplicate_order") or (not risk_budgeted_mode and port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1)):
                     safety_ok = False
-                if signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
+                if not risk_budgeted_mode and signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
                     safety_ok = False
                 score_safety = 15.0 if safety_ok else 0.0
 

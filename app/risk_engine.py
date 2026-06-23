@@ -72,12 +72,19 @@ class RiskEngine:
         positions = int(context.get("open_positions", 0))
         is_entry = str(proposal.get("action", "entry")) in {"entry", "add"}
         is_add = str(proposal.get("action", "entry")) == "add" or bool(proposal.get("is_add", False))
+        risk_budgeted_mode = self.config.get("portfolio_execution_mode") == "risk_budgeted"
 
         max_pos = self.config.get("portfolio_behavior", {}).get("max_open_positions", 3)
-        check("max_positions", not is_entry or (is_add or positions < max_pos), "open-position limit")
+        if risk_budgeted_mode or max_pos is None:
+            check("max_positions", True, "risk-budgeted mode uses exposure and open-risk limits instead of fixed open-position count")
+        else:
+            check("max_positions", not is_entry or (is_add or positions < max_pos), "open-position limit")
 
         max_buys_day = self.config.get("portfolio_behavior", {}).get("max_new_buy_orders_per_day", 3)
-        check("max_buy_trades_today", not is_entry or int(context.get("buy_trades_today", 0)) < max_buys_day, "daily buy order limit")
+        if risk_budgeted_mode or max_buys_day is None:
+            check("max_buy_trades_today", True, "risk-budgeted mode uses daily loss and portfolio risk instead of fixed daily buy count")
+        else:
+            check("max_buy_trades_today", not is_entry or int(context.get("buy_trades_today", 0)) < max_buys_day, "daily buy order limit")
 
         # Portfolio Exposure caps
         max_total_exposure = self.config.get("portfolio_behavior", {}).get("max_total_portfolio_exposure_pct", 6.0)
@@ -118,11 +125,11 @@ class RiskEngine:
             check("allow_add_to_existing_position", False, "adding to existing position is disabled")
 
         block_any_pos = self.risk.get("block_new_buys_when_any_position_open", True)
-        if block_any_pos and is_entry and not is_add and positions > 0:
+        if block_any_pos and not risk_budgeted_mode and is_entry and not is_add and positions > 0:
             check("block_new_buys_when_any_position_open", False, "new buys blocked when any position is open")
 
         block_buy_today = self.risk.get("block_new_buys_after_buy_order_submitted_today", True)
-        if block_buy_today and is_entry and not is_add and context.get("buy_trades_today", 0) > 0:
+        if block_buy_today and not risk_budgeted_mode and is_entry and not is_add and context.get("buy_trades_today", 0) > 0:
             check("block_new_buys_after_buy_order_submitted_today", False, "new buys blocked since a buy order was already submitted today")
 
         block_same_rebuy = self.risk.get("block_same_symbol_rebuy_while_position_open", True)

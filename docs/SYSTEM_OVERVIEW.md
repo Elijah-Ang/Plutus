@@ -185,7 +185,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
 - **Risk-Budgeted Ranked BUY/ADD Proposals**:
   - The active execution mode is `portfolio_execution_mode: risk_budgeted` with `proposal_mode.type: ranked_batch`.
   - BUY/ADD candidates are ranked as a full opportunity set, then sized and filtered by deterministic risk budget rather than fixed proposal-count caps.
-  - Legacy fixed proposal-count fields remain only for non-risk-budgeted configurations. In risk-budgeted mode, `execution_limits.max_new_buy_proposals_per_cycle`, `max_pending_buy_proposals`, and `max_new_buy_orders_per_day` are `null`.
+  - Legacy fixed proposal/trade/position-count fields remain only for non-risk-budgeted configurations. In risk-budgeted mode, `execution_limits.max_new_buy_proposals_per_cycle`, `max_pending_buy_proposals`, and `max_new_buy_orders_per_day` are `null`, and legacy `portfolio_behavior.max_open_positions` / `max_new_buy_orders_per_day` checks yield to exposure and open-risk limits.
   - The primary limiting controls are per-trade risk, open portfolio risk, daily realized loss, total exposure, single-symbol exposure, cluster exposure, paper buying power, stop distance, sleep mode, cooldown/dedupe, GPT availability when required, and final revalidation.
   - SELL/EXIT proposals are not blocked by BUY risk-budget caps when they reduce risk. Emergency exits remain paper-only and final-revalidated.
   - If multiple candidates pass, one Telegram ranked opportunity set is sent. Each candidate has an internal proposal ID and batch candidate row.
