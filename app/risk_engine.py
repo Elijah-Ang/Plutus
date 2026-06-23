@@ -78,6 +78,23 @@ class RiskEngine:
         check("notional", isinstance(notional, (int, float)) and 0 < notional <= limit, "notional must be positive and within limit")
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
         check("duplicate_position", not (is_entry and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
+
+        # Explicit Guardrails
+        allow_add = self.risk.get("allow_add_to_existing_position", False)
+        if not allow_add and is_entry and context.get("same_symbol_position", False):
+            check("allow_add_to_existing_position", False, "adding to existing position is disabled")
+
+        block_any_pos = self.risk.get("block_new_buys_when_any_position_open", True)
+        if block_any_pos and is_entry and positions > 0:
+            check("block_new_buys_when_any_position_open", False, "new buys blocked when any position is open")
+
+        block_buy_today = self.risk.get("block_new_buys_after_buy_order_submitted_today", True)
+        if block_buy_today and is_entry and context.get("buy_trades_today", 0) > 0:
+            check("block_new_buys_after_buy_order_submitted_today", False, "new buys blocked since a buy order was already submitted today")
+
+        block_same_rebuy = self.risk.get("block_same_symbol_rebuy_while_position_open", True)
+        if block_same_rebuy and is_entry and context.get("same_symbol_position", False):
+            check("block_same_symbol_rebuy_while_position_open", False, "same symbol rebuy is blocked while position is open")
         uses_margin = context.get("uses_margin")
         check("margin_state_known", isinstance(uses_margin, bool), "margin-use state must be authoritative")
         check("margin", uses_margin is False or self.risk.get("allow_margin", False), "margin use must be disabled")

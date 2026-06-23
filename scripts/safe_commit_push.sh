@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "=== Step 1: Running unit tests ==="
-if ! "$ROOT/.venv/bin/pytest"; then
+if ! PYTHONPATH="$ROOT" "$ROOT/.venv/bin/pytest"; then
     echo "ERROR: Unit tests failed. Aborting commit." >&2
     exit 1
 fi

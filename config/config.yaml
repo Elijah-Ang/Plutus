@@ -95,6 +95,10 @@ risk:
   max_trade_notional_live: 5
   max_trades_per_day: 1
   max_open_positions: 1
+  allow_add_to_existing_position: false
+  block_new_buys_when_any_position_open: true
+  block_new_buys_after_buy_order_submitted_today: true
+  block_same_symbol_rebuy_while_position_open: true
   allow_margin: false
   allow_shorting: false
   allow_options: false

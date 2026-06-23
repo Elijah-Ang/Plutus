@@ -10,8 +10,17 @@ from .broker_alpaca import AlpacaBroker
 from .logging_config import configure_logging
 from .preflight import run_preflight
 from .storage import Storage
+import sys
+import traceback
 from .service import TradingService
-from .utils import PROJECT_ROOT, load_config, redact
+from .utils import PROJECT_ROOT, load_config, redact, redact_sensitive_url
+
+def redacting_excepthook(type, value, tb):
+    tb_lines = traceback.format_exception(type, value, tb)
+    sanitized_tb = "".join(tb_lines)
+    sys.stderr.write(redact_sensitive_url(sanitized_tb))
+
+sys.excepthook = redacting_excepthook
 
 
 def run_once(config_path: str | Path | None = None) -> int:

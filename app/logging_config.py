@@ -4,7 +4,13 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from .utils import PROJECT_ROOT
+from .utils import PROJECT_ROOT, redact_sensitive_url
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return redact_sensitive_url(formatted)
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
@@ -16,7 +22,7 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(level)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     for path, handler_level, backups in [
         (log_dir / "agent.log", level, 30),
         (error_dir / "errors.log", logging.ERROR, 180),

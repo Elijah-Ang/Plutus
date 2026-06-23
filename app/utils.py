@@ -442,3 +442,14 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
     return "\n".join(msg_parts)
 
 
+def redact_sensitive_url(text: str) -> str:
+    import re
+    if not isinstance(text, str):
+        text = str(text)
+    # Redact Telegram bot token, e.g. bot12345:abc-XYZ
+    text = re.sub(r"bot[0-9]+:[A-Za-z0-9_-]+", "bot<redacted_token>", text)
+    # Also handle full api.telegram.org/bot... URLs
+    text = re.sub(r"api\.telegram\.org/bot[^/ \'\"]+", "api.telegram.org/bot<redacted_token>", text)
+    # Redact credentials/tokens in query parameters if any
+    text = re.sub(r"token=[A-Za-z0-9_-]+", "token=<redacted>", text)
+    return text

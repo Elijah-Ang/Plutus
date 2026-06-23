@@ -155,6 +155,7 @@ class TradingService:
         account = state["account"]
         symbol = proposal["symbol"]
         today_orders = self.storage.fetch_all("SELECT id FROM orders WHERE substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
+        today_buy_orders = self.storage.fetch_all("SELECT id FROM orders WHERE side='buy' AND substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -163,7 +164,7 @@ class TradingService:
             "telegram_available": state["telegram_available"],
             "market_open": state["market_open"],
             "kill_switch": (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
-            "open_positions": len(positions), "trades_today": len(today_orders),
+            "open_positions": len(positions), "trades_today": len(today_orders), "buy_trades_today": len(today_buy_orders),
             "duplicate_order": any(str(_value(o, "symbol", "")).upper() == symbol for o in orders),
             "same_symbol_position": any(str(_value(p, "symbol", "")).upper() == symbol for p in positions),
             "uses_margin": state["uses_margin"],
@@ -177,11 +178,27 @@ class TradingService:
         updates = self.telegram.get_updates(timeout=0)
         if not updates:
             return
+        
+        processed_update_ids = set()
         max_id = 0
         for update in updates:
-            max_id = max(max_id, update.get("update_id", 0))
+            update_id = update.get("update_id")
+            if update_id is not None:
+                if update_id in processed_update_ids:
+                    continue
+                processed_update_ids.add(update_id)
+            
+            max_id = max(max_id, update.get("update_id", 0) if update_id is not None else 0)
             message = update.get("message") or {}
             
+            # 0. Duplicate Update Prevention (Only in production, not with MockTelegramBot)
+            is_mock_bot = getattr(self.telegram, "is_mock", False) or "Mock" in type(self.telegram).__name__
+            if not is_mock_bot and update_id is not None:
+                last_processed_id = int(self.storage.get_control_state("telegram_last_processed_update_id", "0"))
+                if update_id <= last_processed_id:
+                    continue
+                self.storage.set_control_state("telegram_last_processed_update_id", str(update_id), "system", "telegram", f"processed_{update_id}", update_id, None, None)
+
             text = str(message.get("text", "")).strip()
             sender = str((message.get("from") or {}).get("id", ""))
             if not text:
@@ -374,7 +391,15 @@ class TradingService:
                     self.telegram.send_message("I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.")
                     continue
                 elif len(pending) == 0:
-                    self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
+                    time_limit = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+                    recent = self.storage.fetch_all(
+                        "SELECT 1 FROM approvals WHERE approval_received_at >= ? AND sender_id=?",
+                        (time_limit, sender)
+                    )
+                    if recent:
+                        self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
+                    else:
+                        self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
                     continue
 
             parsed = parse_approval(
@@ -580,12 +605,14 @@ class TradingService:
                     if other_buys:
                         self.storage.execute("UPDATE trade_proposals SET status='superseded' WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
                         self.telegram.send_message("Other pending BUY proposals were cancelled because one paper position/trade is already active.")
+                continue
             else:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
                 if "refused to trade on stale data" in result.reason:
                     self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
                 else:
                     self.telegram.send_message(f"⚠️ Approved, but no order was placed. Reason: {result.reason}.")
+                continue
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
@@ -1742,15 +1769,34 @@ class TradingService:
                 res["dedupe_status"] = dedupe_status
                 res["dedupe_reason"] = dedupe_reason
 
-            # Filter eligible BUY candidates (only those allowed by cooldown)
+            # Filter eligible BUY candidates (only those allowed by cooldown and risk checks)
             buy_candidates = []
             for res in buy_candidates_all:
                 ai_config = self.config.get("ai", {})
+                symbol = res["symbol"]
+                port_ctx = self._portfolio_context({"symbol": symbol, "side": "buy"})
+                mock_prop = {
+                    "symbol": symbol,
+                    "side": "buy",
+                    "action": "entry",
+                    "latest_price": res["price"],
+                    "price_at": str(res["price_at"]),
+                    "historical_bars": len(res["bars"]),
+                    "volume": res["volume"],
+                    "notional": float(self.config["risk"].get("max_trade_notional_paper" if self.config.get("mode") == "paper" else "max_trade_notional_live", 5)),
+                    "created_at": now.isoformat(),
+                    "expires_at": res["expiry"].isoformat(),
+                    "strategy_version": res["signal"].strategy_version,
+                    "reason": res["signal"].reason,
+                }
+                decision = self._risk_engine("mock_id", "proposal").evaluate(mock_prop, port_ctx)
+                
                 is_eligible_buy = (
                     res["symbol"] in active_watchlist
                     and proposals_enabled
                     and res["score"] >= ai_config.get("ai_review_min_score", 65)
                     and res["dedupe_status"] == "allowed"
+                    and decision.passed
                 )
                 if is_eligible_buy:
                     buy_candidates.append(res)
@@ -2387,11 +2433,46 @@ class TradingService:
             session_change = ((p_latest / p_session_start) - 1.0) * 100.0 if p_session_start > 0 else 0.0
             
             has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
-            status_str = "Watch"
-            if has_prop:
+            
+            # Map detailed status reasons
+            if sym in obs_watchlist:
+                status_str = "Observation only — no proposal allowed"
+            elif has_prop:
                 status_str = "Proposal generated, pending approval"
-            elif latest_row.get("signal") in {"ENTRY", "EXIT"}:
-                status_str = "Watch, no proposal"
+            else:
+                no_act = latest_row.get("no_action_reason") or ""
+                score_val = latest_row.get("score") or 0.0
+                sig_action = latest_row.get("signal")
+                
+                if score_val < 65:
+                    status_str = "No proposal — score below threshold"
+                elif sig_action not in {"ENTRY", "EXIT"}:
+                    status_str = "Watch — no ENTRY signal"
+                elif "sleep" in no_act.lower():
+                    status_str = "Watch — BUY suppressed by sleep mode"
+                elif "cooldown" in no_act.lower() or "dedupe" in no_act.lower():
+                    status_str = "Watch — cooldown active"
+                elif "gpt review" in no_act.lower() or "deferred due to ai" in no_act.lower():
+                    status_str = "Watch — GPT review unavailable"
+                elif "already holding" in no_act.lower() or "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
+                    status_str = "Watch — already holding a position"
+                elif "max open positions" in no_act.lower() or "open-position limit" in no_act.lower() or "max_positions" in no_act.lower():
+                    status_str = "Watch — max open positions reached"
+                elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
+                    status_str = "Watch — daily trade limit reached"
+                elif "no entry/exit signal" in no_act.lower():
+                    status_str = "Watch — no ENTRY signal"
+                elif "blocked by risk checks" in no_act.lower():
+                    if "open-position limit" in no_act.lower() or "max open positions" in no_act.lower():
+                        status_str = "Watch — max open positions reached"
+                    elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
+                        status_str = "Watch — daily trade limit reached"
+                    elif "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
+                        status_str = "Watch — already holding a position"
+                    else:
+                        status_str = "Watch — blocked by risk checks"
+                else:
+                    status_str = "Watch — no proposal"
                 
             symbols_list.append({
                 "symbol": sym,

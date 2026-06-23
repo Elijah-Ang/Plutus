@@ -22,12 +22,17 @@ class TelegramBot:
         self._health_ok = False
 
     def _request(self, method: str, payload: dict[str, Any] | None = None) -> Any:
-        response = requests.post(f"{self.base_url}/{method}", json=payload or {}, timeout=self.timeout)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError("Telegram API request failed")
-        return data.get("result")
+        try:
+            response = requests.post(f"{self.base_url}/{method}", json=payload or {}, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError("Telegram API request failed")
+            return data.get("result")
+        except Exception as e:
+            from .utils import redact_sensitive_url
+            msg = redact_sensitive_url(str(e))
+            raise RuntimeError(f"Telegram API request failed: {msg}") from None
 
     def send_message(self, text: str, chat_id: str | None = None) -> Any:
         target = chat_id or self.chat_id
