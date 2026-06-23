@@ -8,7 +8,7 @@ import pandas as pd
 from unittest.mock import MagicMock, patch
 
 from app.storage import Storage
-from app.service import TradingService
+from app.service import TradingService, _format_sleep_duration, _format_sleep_window
 from app.strategy_rule_based import Signal
 
 class MockClock:
@@ -209,6 +209,37 @@ def test_sleep_mode_toggle_and_expiry(temp_storage, base_config):
     assert len(audit_events) == 1
     assert any("Sleep mode OFF" in m[0] for m in service.telegram.sent_messages)
     assert any("Overnight summary" in m[0] for m in service.telegram.sent_messages)
+
+
+def test_wake_summary_same_day_sgt_window_and_duration():
+    start_time = "2026-06-23T05:46:48+00:00"
+    end_time = "2026-06-23T05:48:03.767779+00:00"
+
+    assert _format_sleep_window(start_time, end_time) == "Jun 23, 2026, 1:46 PM–1:48 PM SGT"
+    assert _format_sleep_duration(start_time, end_time) == "1 min 15 sec"
+
+
+def test_wake_summary_overnight_sgt_window():
+    start_time = "2026-06-23T15:30:00+00:00"
+    end_time = "2026-06-24T00:12:00+00:00"
+
+    assert _format_sleep_window(start_time, end_time) == "Jun 23, 2026, 11:30 PM–Jun 24, 2026, 8:12 AM SGT"
+
+
+def test_wake_summary_telegram_message_has_clean_sgt_formatting(temp_storage, base_config):
+    broker = MockBroker()
+    service = TradingService(base_config, temp_storage, broker, "test_run_id")
+    service.telegram = MockTelegramBot()
+
+    service.send_wake_summary("2026-06-23T05:46:48+00:00", "2026-06-23T05:48:03+00:00")
+
+    message = service.telegram.sent_messages[-1][0]
+    assert "Window: Jun 23, 2026, 1:46 PM–1:48 PM SGT" in message
+    assert "Duration: 1 min 15 sec" in message
+    assert "T05:46:48" not in message
+    assert "+00:00" not in message
+    assert "2026-06-23T" not in message
+
 
 def test_sleep_mode_buy_suppression(temp_storage, base_config):
     broker = MockBroker()

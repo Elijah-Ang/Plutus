@@ -36,17 +36,40 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"PK[A-Z0-9]{15,}"),
 )
 
+TELEGRAM_TEXT_KEYS = {"raw_message", "raw_command", "raw_command_redacted", "text"}
+TELEGRAM_ID_KEYS = {"sender_id", "updated_by", "telegram_user_id", "chat_id", "from_id"}
+SENSITIVE_KEY_PARTS = ("key", "secret", "token", "password", "account_id")
+
+
+def redact_report_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_lower = str(key).lower()
+            if key_lower in TELEGRAM_TEXT_KEYS:
+                redacted[key] = "[REDACTED TELEGRAM TEXT]"
+            elif key_lower in TELEGRAM_ID_KEYS or key_lower.endswith("_sender_id"):
+                redacted[key] = "[REDACTED ID]"
+            elif any(part in key_lower for part in SENSITIVE_KEY_PARTS):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact_report_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_report_payload(item) for item in value]
+    return redact(value)
+
 
 def redact_report_value(table: str, header: str, value: Any, include_raw_telegram: bool = False) -> Any:
-    if table == "approvals" and header == "raw_message" and not include_raw_telegram:
+    if header in TELEGRAM_TEXT_KEYS and not include_raw_telegram:
         return "[REDACTED TELEGRAM TEXT]"
-    if (table == "approvals" or table == "control_state") and header in ("sender_id", "updated_by"):
+    if header in TELEGRAM_ID_KEYS:
         return "[REDACTED ID]"
     if value is None:
         return None
     if header in {"payload", "values_json", "config_json", "detail", "risks"} and isinstance(value, str):
         try:
-            value = json_dumps(redact(json.loads(value)))
+            value = json_dumps(redact_report_payload(json.loads(value)))
         except (ValueError, TypeError):
             value = redact(value)
     if isinstance(value, str):

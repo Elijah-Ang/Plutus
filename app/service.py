@@ -11,11 +11,14 @@ import pandas as pd
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .ai_review import AIReviewer, deterministic_review
 from .capabilities import AUTO_EXECUTION_SUPPORTED
 
 logger = logging.getLogger("trading_agent")
+
+SGT = ZoneInfo("Asia/Singapore")
 
 from .approval_parser import parse_approval
 from .execution import Executor, ExecutionResult
@@ -31,6 +34,41 @@ from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, t
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default) if not isinstance(obj, dict) else obj.get(name, default)
+
+
+def _parse_datetime(value: str | datetime) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _format_sgt_time(value: datetime) -> str:
+    sgt_dt = value.astimezone(SGT)
+    hour = sgt_dt.hour % 12 or 12
+    return f"{hour}:{sgt_dt:%M %p}"
+
+
+def _format_sleep_window(start_time: str | datetime, end_time: str | datetime) -> str:
+    start_sgt = _parse_datetime(start_time).astimezone(SGT)
+    end_sgt = _parse_datetime(end_time).astimezone(SGT)
+    start_date = start_sgt.strftime("%b %d, %Y")
+    end_date = end_sgt.strftime("%b %d, %Y")
+    if start_sgt.date() == end_sgt.date():
+        return f"{start_date}, {_format_sgt_time(start_sgt)}–{_format_sgt_time(end_sgt)} SGT"
+    return f"{start_date}, {_format_sgt_time(start_sgt)}–{end_date}, {_format_sgt_time(end_sgt)} SGT"
+
+
+def _format_sleep_duration(start_time: str | datetime, end_time: str | datetime) -> str:
+    seconds = max(0, int((_parse_datetime(end_time) - _parse_datetime(start_time)).total_seconds()))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} hr" + ("" if hours == 1 else "s"))
+    if minutes:
+        parts.append(f"{minutes} min")
+    if secs or not parts:
+        parts.append(f"{secs} sec")
+    return " ".join(parts)
 
 
 class TradingService:
@@ -899,21 +937,15 @@ class TradingService:
             except Exception:
                 pass
                 
-        def format_iso_to_sgt(iso_str):
-            try:
-                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-                sgt_dt = dt.astimezone(timezone(timedelta(hours=8)))
-                return sgt_dt.strftime("%-I:%M %p SGT")
-            except Exception:
-                return iso_str
-                
-        window_str = f"{format_iso_to_sgt(start_time)}–{format_iso_to_sgt(end_time)}"
+        window_str = _format_sleep_window(start_time, end_time)
+        duration_str = _format_sleep_duration(start_time, end_time)
         has_events = (suppressed_buys > 0 or sell_alerts > 0 or emerg_triggered > 0 or orders_placed > 0)
         
         if not has_events:
             summary_msg = (
                 f"☀️ Sleep mode OFF — Overnight summary\n\n"
                 f"Window: {window_str}\n"
+                f"Duration: {duration_str}\n"
                 f"No emergency exits, no orders, no action needed."
             )
         else:
@@ -921,6 +953,7 @@ class TradingService:
             summary_msg = (
                 f"☀️ Sleep mode OFF — Overnight summary\n\n"
                 f"Window: {window_str}\n"
+                f"Duration: {duration_str}\n"
                 f"Suppressed BUY candidates: {suppressed_buys}\n"
                 f"Emergency exits: {emerg_triggered} triggered, {emerg_submitted} submitted, {emerg_blocked} blocked\n"
                 f"Orders placed: {orders_placed} paper sell\n"
