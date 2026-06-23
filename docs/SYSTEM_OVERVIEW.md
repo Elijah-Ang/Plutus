@@ -182,10 +182,14 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
   - EXIT/reduce-risk candidates are processed first in every scan cycle.
   - If any EXIT candidates exist, new BUY proposals are suppressed with the reason `suppressed_due_to_exit_priority`.
   - Exits bypass the limits on new/pending buy proposals, buy cooldowns, and mandatory buy GPT review.
-- **Simultaneous BUY Limits & Candidate Ranking**:
-  - The system enforces configuration constraints to limit BUY proposals:
-    - `max_new_buy_proposals_per_cycle`: Limits how many new BUY proposals can be sent in a single scan cycle (default: 1).
-    - `max_pending_buy_proposals`: Limits the total number of simultaneous pending BUY proposals (default: 1).
+- **Risk-Budgeted Ranked BUY/ADD Proposals**:
+  - The active execution mode is `portfolio_execution_mode: risk_budgeted` with `proposal_mode.type: ranked_batch`.
+  - BUY/ADD candidates are ranked as a full opportunity set, then sized and filtered by deterministic risk budget rather than fixed proposal-count caps.
+  - Legacy fixed proposal-count fields remain only for non-risk-budgeted configurations. In risk-budgeted mode, `execution_limits.max_new_buy_proposals_per_cycle`, `max_pending_buy_proposals`, and `max_new_buy_orders_per_day` are `null`.
+  - The primary limiting controls are per-trade risk, open portfolio risk, daily realized loss, total exposure, single-symbol exposure, cluster exposure, paper buying power, stop distance, sleep mode, cooldown/dedupe, GPT availability when required, and final revalidation.
+  - SELL/EXIT proposals are not blocked by BUY risk-budget caps when they reduce risk. Emergency exits remain paper-only and final-revalidated.
+  - If multiple candidates pass, one Telegram ranked opportunity set is sent. Each candidate has an internal proposal ID and batch candidate row.
+  - Supported batch replies are `yes SPY`, `no SPY`, `yes all`, and `no all`. `yes all` is paper-only and still runs final revalidation separately for each candidate. Plain `yes` is rejected as ambiguous when more than one candidate is pending.
   - Watchlist position is called `Watchlist order` and is not labeled as market rank.
   - True ranking among active watchlist candidates is calculated based on the Trade Decision Score (score sort key) and labeled as `Score rank`.
   - The proposal message displays both `Score rank` and `Eligible proposal rank`.
@@ -208,7 +212,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
   - Close proximity: If market close is near, the duration is truncated to close time (min 5).
   - Expiry notifications: If no yes/no reply is received before SGT expiry time, the proposal is marked as expired, a single natural language Telegram expiry notification is sent, and any execution attempt is blocked. Approved/rejected proposals do not send expiry notifications.
 - **Hardware/Env Gates**: Blocks trading if AC power is disconnected, internet is down, or database/broker is unreachable.
-- **Position Gates**: Enforces `max_open_positions` (default 1) and `max_trades_per_day` (default 1).
+- **Position/Risk Gates**: Enforces deterministic portfolio, symbol, cluster, buying-power, stale-data, and final approval gates. Risk-budgeted mode does not use fixed BUY proposal counts as the primary limiter.
 - **Drawdown Gates**: Stops trading if daily/weekly loss limits are breached.
 - **Expiry Gates**: Blocks execution if the proposal has expired.
 - **Live Trading & Auto-Execution**: Both are unsupported by code-level capability constants as well as disabled in configuration. YAML and Telegram cannot enable them. Normal operation requires Telegram approval and no reply means no order.
@@ -226,6 +230,13 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `ai_reviews`: Summaries and caution assessments from OpenAI.
 - `trade_proposals`: Pending, approved, rejected, or expired proposals.
 - `approvals`: Consumer records of Telegram replies (uniquely constraints prevent double-approvals).
+- `proposal_batches`: One Telegram ranked opportunity message containing one or more proposal candidates.
+- `proposal_batch_candidates`: Candidate-level batch state, including symbol, action, rank, Telegram message mapping, expiry, and pending/approved/rejected/blocked/submitted status.
+- `ranked_opportunity_sets`: Per-cycle ranked opportunity records for actionable and tracked candidates.
+- `risk_budget_snapshots`: Portfolio risk/exposure/buying-power snapshot used by ranked allocation.
+- `candidate_risk_budget_decisions`: Candidate-level pass/block decisions for per-trade risk, open risk, exposure, cluster, and buying-power checks.
+- `candidate_batch_allocations`: Raw, adjusted, risk-budget-adjusted, and final notional/share sizing per ranked candidate.
+- `approval_batch_actions`: Audit rows for `yes SYMBOL`, `no SYMBOL`, `yes all`, and `no all`.
 - `orders`: Records of submitted broker orders.
 - `fills`: Historical fill data from broker executions.
 - `positions`: Tracked positions from the broker.
@@ -453,9 +464,10 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Shadow trades**: Shadow records are measurement-only. They do not create broker orders, do not create actionable Telegram proposals, and do not alter broker state.
 - **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives once enough future bars exist.
 - **Dynamic sizing**: Initial BUY proposals use `position_sizing` rules: score multiplier, volatility multiplier, risk budget, ATR/technical stop distance, min/max paper notional, single-symbol exposure cap, total exposure cap, and cluster exposure cap. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
-- **Portfolio exposure controls**: `portfolio_behavior` and `portfolio_optimizer` cap open positions, buy orders per day, pending/new BUY proposals, single-symbol exposure, total exposure, same-cluster positions, and same-cluster exposure. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.
+- **Portfolio exposure controls**: `portfolio_behavior`, `portfolio_optimizer`, and `risk_budget` cap single-symbol exposure, total exposure, open risk, same-cluster exposure, and paper buying power use. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.
 - **Add-to-winner**: `add_to_position` permits add-on BUY proposals only when an existing paper position is profitable, the setup score is strong enough, the setup improves, add counts remain within limits, exposure caps pass, and no exit/emergency warning blocks the add. Averaging down is blocked.
 - **Final revalidation**: Approved BUY/ADD orders still refresh price, re-evaluate size and exposure, check market/broker/database/Telegram/internet/paper-mode state, and can block after approval. `YES` means permission to attempt after final safety checks, not guaranteed order.
+- **Ranked proposal batching**: Actionable BUY/ADD candidates are grouped into one paper opportunity-set message. Observation-only, sleep-suppressed, cooldown, GPT-unavailable, exposure-blocked, and risk-budget-blocked setups remain tracked through Performance Lab and batch/ranking tables but are not actionable.
 
 ## 28. Telegram Market Digest
 - **Purpose**: Sends a 30-minute informational digest to the user during active US regular trading hours (9:30 PM to 4:00 AM SGT, or based on the broker's clock is_open API) summarizing recent telemetry.

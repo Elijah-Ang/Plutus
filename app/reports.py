@@ -38,6 +38,13 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Portfolio Exposure", "portfolio_exposure_snapshots"),
     ("Position Sizing Decisions", "position_sizing_decisions"),
     ("Candidate Ranking Decisions", "candidate_rankings"),
+    ("Ranked Opportunity Sets", "ranked_opportunity_sets"),
+    ("Proposal Batches", "proposal_batches"),
+    ("Batch Candidates", "proposal_batch_candidates"),
+    ("Risk Budget Decisions", "candidate_risk_budget_decisions"),
+    ("Batch Approval Actions", "approval_batch_actions"),
+    ("Candidate Allocation Decisions", "candidate_batch_allocations"),
+    ("Risk Budget Snapshots", "risk_budget_snapshots"),
 ]
 
 

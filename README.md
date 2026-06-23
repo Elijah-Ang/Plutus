@@ -32,8 +32,9 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 - **GitHub Remote**: Plutus points to `git@github.com:Elijah-Ang/Plutus.git`. Run `scripts/safe_commit_push.sh` to safely run tests, scan for secrets, and commit changes.
 - **10-Minute Telemetry**: Scheduled launchd runs observation cycles every 10 minutes to calculate deterministic scores (0-100), log snapshots to `market_memory`, and compare short-term trends without spamming Telegram or calling GPT.
 - **Performance Lab**: Every meaningful setup can be recorded as an actual or shadow opportunity, with forward outcome tracking for actual-vs-shadow review.
+- **Risk-Budgeted Ranked Proposals**: BUY/ADD opportunities are ranked as a batch, sized by stop distance and portfolio risk, and constrained by open risk, exposure, cluster, and paper buying power instead of fixed proposal-count caps.
 - **Dynamic Paper Sizing**: BUY proposals use deterministic score, volatility, stop distance, and portfolio exposure caps instead of a fixed `$5` amount.
-- **Portfolio Controls**: Paper BUY proposals are constrained by max open positions, buy-order/day limits, single-symbol exposure, total exposure, and correlated ETF cluster exposure.
+- **Portfolio Controls**: Paper BUY proposals are constrained by per-trade risk, open portfolio risk, single-symbol exposure, total exposure, correlated ETF cluster exposure, and available paper buying power.
 - **Add-to-Winner Rules**: Add-on BUY proposals are allowed only for profitable positions with stronger setups; averaging down is blocked.
 - **GPT Throttling**: GPT calls are limited by daily caps (10/day), score thresholds (>= 65), and minimum time intervals (30 minutes).
 
@@ -41,6 +42,7 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 
 - Live trading is not supported by this build and cannot be enabled through YAML or Telegram.
 - Auto-execution is not supported; every normal order requires an authorized Telegram approval.
+- Ranked batches support `yes SYMBOL`, `no SYMBOL`, `yes all`, and `no all`; `yes all` is paper-only and still final-revalidates each candidate separately.
 - Final risk validation uses current broker/account loss and margin state plus live internet, Telegram, broker, and database checks. Unknown state blocks execution.
 - Each cycle reconciles existing local orders/fills from Alpaca using broker/client order IDs without resubmitting anything.
 - Excel reports redact Telegram text, sender IDs, and sensitive payload fields by default.

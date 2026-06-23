@@ -374,6 +374,18 @@ class TradingService:
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
 
+            batch_match = re.fullmatch(r"(yes|approve|approved|no|reject|rejected)(?:\s+(all|[a-z.]{1,10}))", " ".join(text.lower().strip().split()))
+            if batch_match:
+                handled = self._handle_batch_approval_command(
+                    raw_text=text,
+                    sender=str(sender),
+                    action_word=batch_match.group(1),
+                    target=batch_match.group(2),
+                    reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
+                )
+                if handled:
+                    continue
+
             # Determine targeting method
             targeting_method = None
             if reply_to_message_id is not None:
@@ -725,6 +737,239 @@ class TradingService:
                 self.storage.execute("UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=? WHERE id=?", (err_reason, proposal_id))
                 self.telegram.send_message(f"⚠️ Emergency exit was blocked. Reason: {err_reason}. No order was placed.")
                 self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason})
+
+    def _update_batch_status(self, batch_id: str) -> None:
+        rows = self.storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE batch_id=?", (batch_id,))
+        statuses = {r["candidate_status"] for r in rows}
+        if not rows:
+            return
+        if statuses <= {"approved", "rejected", "expired", "blocked", "submitted"}:
+            status = "completed"
+        elif any(s in statuses for s in ("approved", "rejected", "blocked", "submitted")):
+            status = "partially_approved"
+        else:
+            status = "pending"
+        self.storage.execute("UPDATE proposal_batches SET status=? WHERE id=?", (status, batch_id))
+
+    def _handle_batch_approval_command(
+        self,
+        raw_text: str,
+        sender: str,
+        action_word: str,
+        target: str,
+        reply_to_message_id: str | None,
+    ) -> bool:
+        if not self._ranked_batch_mode_enabled():
+            return False
+        if not self.telegram.is_authorized(sender):
+            return True
+
+        action = "approve" if action_word in {"yes", "approve", "approved"} else "reject"
+        batch_filter = ""
+        params: list[Any] = []
+        if reply_to_message_id is not None:
+            batch_filter = " AND b.telegram_message_id=?"
+            params.append(reply_to_message_id)
+        rows = self.storage.fetch_all(
+            f"""
+            SELECT c.*, b.status AS batch_status
+            FROM proposal_batch_candidates c
+            JOIN proposal_batches b ON b.id=c.batch_id
+            WHERE c.candidate_status='pending'
+              AND b.status IN ('pending','partially_approved')
+              AND c.expires_at>?
+              {batch_filter}
+            ORDER BY c.rank
+            """,
+            (iso_now(), *params),
+        )
+        if not rows:
+            return False
+
+        target_upper = target.upper()
+        if target_upper != "ALL":
+            rows = [r for r in rows if str(r["candidate_symbol"]).upper() == target_upper]
+
+        if not rows:
+            self.telegram.send_message("I did not take any action because I could not match that symbol to a pending batch candidate.")
+            return True
+        if target_upper == "ALL" and action == "approve":
+            if self.config.get("mode") != "paper" or self.config.get("proposal_mode", {}).get("allow_yes_all_for_paper") is not True:
+                self.telegram.send_message("YES ALL is blocked because it is only allowed in paper ranked-batch mode.")
+                return True
+            self.telegram.send_message(
+                f"✅ Received: YES ALL for {len(rows)} paper candidates. I will run final safety checks separately for each. No order will be placed for any candidate that fails final checks."
+            )
+        elif target_upper == "ALL" and action == "reject":
+            self.telegram.send_message(f"❌ Received: NO ALL for {len(rows)} paper candidates. All pending batch candidates will be rejected.")
+
+        for row in rows:
+            batch_id = row["batch_id"]
+            proposal_id = row["proposal_id"]
+            symbol = row["candidate_symbol"]
+            self.storage.execute(
+                "INSERT INTO approval_batch_actions(id,run_id,batch_id,proposal_id,sender_id,raw_message,action,status,created_at,detail) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), self.run_id, batch_id, proposal_id, sender, raw_text, action, "received", iso_now(), json_dumps({"target": target_upper})),
+            )
+            if action == "reject":
+                self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (proposal_id,))
+                self.storage.execute("UPDATE proposal_batch_candidates SET candidate_status='rejected' WHERE proposal_id=?", (proposal_id,))
+                proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
+                if proposal_rows:
+                    self._create_shadow_trade_from_proposal(proposal_rows[0], "rejected_by_user")
+                if target_upper != "ALL":
+                    self.telegram.send_message(f"❌ Received: NO for {symbol} paper candidate. Candidate rejected. No order will be placed.")
+            else:
+                if target_upper != "ALL":
+                    self.telegram.send_message(f"✅ Received: YES for {symbol} paper buy candidate. I will run final safety checks now.")
+                submitted, status, reason = self._approve_batch_candidate(proposal_id, sender, raw_text, row)
+                self.storage.execute(
+                    "UPDATE proposal_batch_candidates SET candidate_status=? WHERE proposal_id=?",
+                    ("submitted" if submitted else "blocked", proposal_id),
+                )
+                self.storage.execute(
+                    "UPDATE approval_batch_actions SET status=?, detail=? WHERE proposal_id=? AND batch_id=?",
+                    (status, json_dumps({"reason": reason}), proposal_id, batch_id),
+                )
+            self._update_batch_status(batch_id)
+        return True
+
+    def _approve_batch_candidate(self, proposal_id: str, sender: str, raw_text: str, batch_row: dict[str, Any]) -> tuple[bool, str, str | None]:
+        rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=? AND status='pending'", (proposal_id,))
+        if not rows:
+            self.telegram.send_message("I did not take any action because this candidate was already handled earlier.")
+            return False, "already_handled", "candidate already handled"
+
+        row = rows[0]
+        approval_id = str(uuid.uuid4())
+        approval_received_at = iso_now()
+        self.storage.execute(
+            "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                approval_id, self.run_id, proposal_id, sender, raw_text, "approve", 1, "accepted", iso_now(),
+                str(batch_row.get("telegram_message_id") or "") or None, "batch", "received", approval_received_at
+            ),
+        )
+
+        if not self.storage.consume_approval(proposal_id, approval_id):
+            self.telegram.send_message("I did not take any action because this candidate was already handled earlier.")
+            return False, "already_handled", "candidate already handled"
+
+        prop_symbol = row.get("symbol", "")
+        prop_side = row.get("side", "").lower()
+        proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
+        final_revalidation_started_at = iso_now()
+        block_reason = None
+        refreshed_price_val = None
+        refreshed_price_at = None
+        price_refreshed_at = None
+        refreshed_price_age_seconds = None
+        price_move_bps_since_proposal = None
+        now_dt = datetime.now(UTC)
+
+        if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
+            block_reason = "not in paper mode / live enabled"
+        elif (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+            block_reason = "kill switch active"
+        elif not self.storage.writable():
+            block_reason = "database is not writable"
+        elif prop_side == "buy" and self.storage.get_control_state("sleep_mode", "off") == "on":
+            block_reason = "sleep mode is active"
+
+        telegram_cfg = self.config.get("telegram", {})
+        refresh_required = telegram_cfg.get("approval_price_refresh_required", True)
+        max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 60)
+        max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
+
+        if block_reason is None and self.broker is not None:
+            try:
+                trade = self.broker.get_latest_price(prop_symbol)
+                refreshed_price_val = float(_value(trade, "price", 0) or 0)
+                refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
+                if refreshed_price_at:
+                    price_refreshed_at = refreshed_price_at.isoformat()
+                    refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
+            except Exception as e:
+                logger.warning("Failed to refresh price for batch candidate %s: %s", prop_symbol, e)
+
+        market_open = False
+        if block_reason is None and self.broker is not None:
+            try:
+                market_open = self.broker.is_market_open()
+            except Exception:
+                market_open = False
+
+        proposal_price = proposal.get("latest_price") or row.get("current_price")
+        if block_reason is None:
+            if refresh_required:
+                if refreshed_price_val is None or refreshed_price_val <= 0:
+                    block_reason = "Price refresh failed or price is unavailable"
+                elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
+                    block_reason = "The proposal price is no longer fresh, so the system refused to trade on stale data. A new proposal is required."
+                elif not market_open:
+                    block_reason = "Market is closed"
+                elif proposal_price is not None and float(proposal_price) > 0:
+                    price_move_bps_since_proposal = (abs(refreshed_price_val - float(proposal_price)) / float(proposal_price)) * 10000
+                    if price_move_bps_since_proposal > max_price_move_bps:
+                        block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {max_price_move_bps} bps)"
+            elif not market_open:
+                block_reason = "Market is closed"
+
+        if block_reason:
+            result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
+        else:
+            try:
+                state = self._authoritative_runtime_state(force=True)
+                snapshot_fresh = self._get_exposure_snapshot(state["positions"], state["account"])
+                if refreshed_price_val is not None:
+                    proposal["latest_price"] = refreshed_price_val
+                if refreshed_price_at is not None:
+                    proposal["price_at"] = refreshed_price_at.isoformat()
+                if self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
+                    bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
+                    size_dict = self._calculate_dynamic_size(
+                        prop_symbol,
+                        float(proposal.get("score", 70.0) or 70.0),
+                        proposal.get("volatility_regime", "normal"),
+                        float(refreshed_price_val or proposal.get("latest_price") or 0.0),
+                        bars_fresh,
+                        snapshot_fresh,
+                        is_add=proposal.get("action") == "add" or bool(proposal.get("is_add", False)),
+                    )
+                    proposal["notional"] = size_dict["final_notional"]
+                    proposal["qty"] = size_dict["suggested_shares"]
+                context = self._portfolio_context(proposal, approval_valid=True)
+                result = Executor(self.broker, self._risk_engine(proposal_id, "final")).execute(proposal, context)
+            except Exception as e:
+                result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=str(e))
+
+        final_revalidation_completed_at = iso_now()
+        self.storage.execute(
+            "UPDATE approvals SET final_revalidation_started_at=?, final_revalidation_completed_at=?, price_refreshed_at=?, refreshed_price=?, refreshed_price_age_seconds=?, price_move_bps_since_proposal=?, final_order_decision=?, final_block_reason=? WHERE id=?",
+            (
+                final_revalidation_started_at, final_revalidation_completed_at, price_refreshed_at,
+                refreshed_price_val, refreshed_price_age_seconds, price_move_bps_since_proposal,
+                "submitted" if result.submitted else "blocked", result.reason if not result.submitted else None,
+                approval_id,
+            ),
+        )
+        self.storage.execute(
+            "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()), self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None,
+                result.client_order_id, proposal.get("symbol", prop_symbol), proposal.get("side", prop_side),
+                proposal.get("notional"), proposal.get("qty"), result.status,
+                json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()
+            ),
+        )
+        if result.submitted:
+            self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
+            self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${float(proposal.get('notional') or 0.0):.0f}. Mode: paper only.")
+            return True, "submitted", None
+
+        self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
+        self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
+        return False, "blocked", result.reason
 
     def _should_auto_execute(self, proposal: dict[str, Any]) -> bool:
         # Quarantined: YAML cannot enable this unsupported capability.
@@ -2033,8 +2278,10 @@ class TradingService:
                 res["dedupe_status"] = dedupe_status
                 res["dedupe_reason"] = dedupe_reason
 
-            # Filter eligible BUY candidates (only those allowed by cooldown and risk checks)
+            # Filter BUY candidates. Risk-budgeted mode also keeps meaningful
+            # pre-proposal risk blocks for measurement/ranking rows.
             buy_candidates = []
+            batch_mode_enabled = self._ranked_batch_mode_enabled()
             for res in buy_candidates_all:
                 ai_config = self.config.get("ai", {})
                 symbol = res["symbol"]
@@ -2061,42 +2308,53 @@ class TradingService:
                 }
                 decision = self._risk_engine("mock_id", "proposal").evaluate(mock_prop, port_ctx)
 
-                is_eligible_buy = (
+                is_meaningful_buy = (
                     res["symbol"] in active_watchlist
                     and proposals_enabled
                     and res["score"] >= ai_config.get("ai_review_min_score", 65)
                     and res["dedupe_status"] == "allowed"
-                    and decision.passed
                 )
-                if is_eligible_buy:
+                if is_meaningful_buy and decision.passed:
+                    buy_candidates.append(res)
+                elif batch_mode_enabled and is_meaningful_buy:
+                    res["preproposal_block_reason"] = "; ".join(decision.reasons) or "pre-proposal risk check failed"
                     buy_candidates.append(res)
 
             buy_candidates = self._rank_candidates(buy_candidates, snapshot)
 
-            risk_cfg = self.config.get("risk", {})
-            portfolio_behavior_cfg = self.config.get("portfolio_behavior", {})
-            max_new_buy_per_cycle = portfolio_behavior_cfg.get(
-                "max_new_buy_proposals_per_cycle",
-                risk_cfg.get("max_new_buy_proposals_per_cycle", 1),
-            )
-            max_pending_buy = portfolio_behavior_cfg.get(
-                "max_pending_buy_proposals",
-                risk_cfg.get("max_pending_buy_proposals", 1),
-            )
-            pending_in_db = self.storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='buy' AND status='pending'")[0]["cnt"]
-            allowed_new_buys = max(0, min(max_new_buy_per_cycle, max_pending_buy - pending_in_db))
-
-            allowed_buy_symbols = {c["symbol"] for c in buy_candidates[:allowed_new_buys]}
-            suppressed_buy_symbols = {c["symbol"] for c in buy_candidates[allowed_new_buys:]}
+            risk_snapshot = self._record_risk_budget_snapshot(snapshot, account, now)
+            ranked_budget_reasons: dict[str, str] = {}
+            if batch_mode_enabled:
+                allowed_buy_symbols, ranked_budget_reasons = self._apply_risk_budget_to_ranked_candidates(
+                    buy_candidates, snapshot, account, now
+                )
+                suppressed_buy_symbols = {c["symbol"] for c in buy_candidates if c["symbol"] not in allowed_buy_symbols}
+            else:
+                risk_cfg = self.config.get("risk", {})
+                portfolio_behavior_cfg = self.config.get("portfolio_behavior", {})
+                max_new_buy_per_cycle = portfolio_behavior_cfg.get(
+                    "max_new_buy_proposals_per_cycle",
+                    risk_cfg.get("max_new_buy_proposals_per_cycle", 1),
+                )
+                max_pending_buy = portfolio_behavior_cfg.get(
+                    "max_pending_buy_proposals",
+                    risk_cfg.get("max_pending_buy_proposals", 1),
+                )
+                pending_in_db = self.storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='buy' AND status='pending'")[0]["cnt"]
+                allowed_new_buys = max(0, min(max_new_buy_per_cycle, max_pending_buy - pending_in_db))
+                allowed_buy_symbols = {c["symbol"] for c in buy_candidates[:allowed_new_buys]}
+                suppressed_buy_symbols = {c["symbol"] for c in buy_candidates[allowed_new_buys:]}
 
             # Record rankings in candidate_rankings table
             for c in buy_candidates:
                 reason_selected = None
                 reason_not_selected = None
                 if c["symbol"] in allowed_buy_symbols:
-                    reason_selected = c.get("selection_reason") or "Top ranked candidate passing exposure/risk limits"
+                    reason_selected = ranked_budget_reasons.get(c["symbol"]) or c.get("selection_reason") or "Top ranked candidate passing exposure/risk limits"
                 else:
-                    if c["symbol"] in suppressed_buy_symbols:
+                    if batch_mode_enabled and c["symbol"] in suppressed_buy_symbols:
+                        reason_not_selected = ranked_budget_reasons.get(c["symbol"]) or "blocked by risk budget"
+                    elif c["symbol"] in suppressed_buy_symbols:
                         reason_not_selected = "suppressed due to simultaneous candidate limits"
                     else:
                         reason_not_selected = c.get("no_action_reason") or "Did not meet ranking criteria or limits"
@@ -2117,6 +2375,7 @@ class TradingService:
                 )
 
             any_generated = False
+            batch_proposals: list[dict[str, Any]] = []
 
             # Sort profile_results: EXITS first, then BUYS, then HOLDS
             def scan_processing_order(r):
@@ -2247,8 +2506,8 @@ class TradingService:
                     elif is_buy and candidate_suppression_reason == "suppressed_due_to_exit_priority":
                         pass # Reason already set
                     elif is_buy and symbol in suppressed_buy_symbols:
-                        no_action_reason = "suppressed due to simultaneous candidate limits"
-                        candidate_suppression_reason = "suppressed_by_candidate_limit"
+                        no_action_reason = ranked_budget_reasons.get(symbol) if batch_mode_enabled else "suppressed due to simultaneous candidate limits"
+                        candidate_suppression_reason = "blocked_by_risk_budget" if batch_mode_enabled else "suppressed_by_candidate_limit"
                     elif symbol not in active_watchlist:
                         no_action_reason = "symbol not in active watchlist"
                     elif not proposals_enabled:
@@ -2270,11 +2529,11 @@ class TradingService:
                         if is_buy and symbol in suppressed_buy_symbols:
                             proposal_allowed = False
                             dedupe_status = "suppressed"
-                            dedupe_reason = "suppressed due to simultaneous candidate limits"
-                            no_action_reason = "suppressed due to simultaneous candidate limits"
-                            candidate_suppression_reason = "suppressed_by_candidate_limit"
+                            dedupe_reason = ranked_budget_reasons.get(symbol) if batch_mode_enabled else "suppressed due to simultaneous candidate limits"
+                            no_action_reason = dedupe_reason
+                            candidate_suppression_reason = "blocked_by_risk_budget" if batch_mode_enabled else "suppressed_by_candidate_limit"
                             self.storage.audit(self.run_id, "proposal_suppressed", {
-                                "symbol": symbol, "reason": "suppressed_by_candidate_limit", "score": score
+                                "symbol": symbol, "reason": candidate_suppression_reason, "score": score
                             })
                         else:
                             proposal_id = str(uuid.uuid4())
@@ -2677,9 +2936,15 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
 
-                res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
-                if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                    self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
+                if batch_mode_enabled and is_buy and proposal.get("status", "pending") == "pending":
+                    batch_proposals.append(proposal)
+                else:
+                    res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
+                    if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                        self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
+
+            if batch_mode_enabled:
+                self._send_ranked_batch_if_needed(batch_proposals, buy_candidates, risk_snapshot)
 
             if profile_results:
                 best_watch_res = profile_results[0]
@@ -3251,6 +3516,267 @@ class TradingService:
             c["final_candidate_rank"] = idx + 1
 
         return ranked
+
+    def _ranked_batch_mode_enabled(self) -> bool:
+        return (
+            self.config.get("portfolio_execution_mode") == "risk_budgeted"
+            and self.config.get("proposal_mode", {}).get("type") == "ranked_batch"
+        )
+
+    def _risk_budget_cfg(self) -> dict[str, Any]:
+        rb = self.config.get("risk_budget", {})
+        pb = self.config.get("portfolio_behavior", {})
+        sizing = self.config.get("position_sizing", {})
+        optimizer = self.config.get("portfolio_optimizer", {})
+        return {
+            "risk_per_trade_pct": float(rb.get("risk_per_trade_pct", sizing.get("risk_per_trade_pct", 0.05))),
+            "max_open_risk_pct": float(rb.get("max_open_risk_pct", 0.30)),
+            "max_daily_realized_loss_pct": float(rb.get("max_daily_realized_loss_pct", 0.25)),
+            "max_total_portfolio_exposure_pct": float(rb.get("max_total_portfolio_exposure_pct", pb.get("max_total_portfolio_exposure_pct", 6.0))),
+            "max_single_symbol_exposure_pct": float(rb.get("max_single_symbol_exposure_pct", pb.get("max_single_symbol_exposure_pct", 2.5))),
+            "max_cluster_exposure_pct": float(rb.get("max_cluster_exposure_pct", optimizer.get("max_same_cluster_exposure_pct", pb.get("max_correlated_us_equity_exposure_pct", 5.0)))),
+            "min_notional": float(sizing.get("min_paper_notional", 5.0)),
+        }
+
+    def _buying_power(self, account: Any) -> float:
+        return float(_value(account, "buying_power", _value(account, "cash", 0.0)) or 0.0)
+
+    def _record_risk_budget_snapshot(self, snapshot: dict[str, Any], account: Any, now: datetime) -> dict[str, Any]:
+        cfg = self._risk_budget_cfg()
+        buying_power = self._buying_power(account)
+        row = {
+            "total_exposure_pct": float(snapshot.get("total_exposure_pct", 0.0) or 0.0),
+            "open_risk_pct": 0.0,
+            "daily_realized_loss_pct": 0.0,
+            "max_open_risk_pct": cfg["max_open_risk_pct"],
+            "buying_power": buying_power,
+        }
+        self.storage.execute(
+            "INSERT INTO risk_budget_snapshots(id,run_id,timestamp,total_exposure_pct,open_risk_pct,daily_realized_loss_pct,max_open_risk_pct,buying_power,payload) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()), self.run_id, now.isoformat(), row["total_exposure_pct"], row["open_risk_pct"],
+                row["daily_realized_loss_pct"], row["max_open_risk_pct"], buying_power, json_dumps(row)
+            ),
+        )
+        return row
+
+    def _apply_risk_budget_to_ranked_candidates(
+        self,
+        ranked_candidates: list[dict[str, Any]],
+        snapshot: dict[str, Any],
+        account: Any,
+        now: datetime,
+    ) -> tuple[set[str], dict[str, str]]:
+        if not ranked_candidates:
+            return set(), {}
+
+        cfg = self._risk_budget_cfg()
+        equity = float(snapshot.get("portfolio_equity", 10000.0) or 10000.0)
+        if equity <= 0:
+            equity = 10000.0
+        buying_power_remaining = self._buying_power(account)
+        total_exposure_after = float(snapshot.get("total_exposure_pct", 0.0) or 0.0)
+        single_after = dict(snapshot.get("single_exposures", {}) or {})
+        cluster_after = dict(snapshot.get("cluster_exposures", {}) or {})
+        open_risk_after = 0.0
+        allowed: set[str] = set()
+        reasons: dict[str, str] = {}
+
+        for candidate in ranked_candidates:
+            symbol = str(candidate["symbol"]).upper()
+            rank = int(candidate.get("final_candidate_rank") or 0)
+            raw_notional = float(candidate.get("final_notional", 0.0) or 0.0)
+            price = float(candidate.get("price", candidate.get("latest_price", 0.0)) or 0.0)
+            stop_distance_pct = float(candidate.get("stop_distance_pct", 8.0) or 8.0)
+            if stop_distance_pct <= 0:
+                stop_distance_pct = 8.0
+
+            cap_reason = None
+            reduction_reason = None
+            final_notional = max(0.0, raw_notional)
+
+            current_symbol_pct = float(single_after.get(symbol, 0.0) or 0.0)
+            cluster_name = self._get_symbol_cluster(symbol)
+            current_cluster_pct = float(cluster_after.get(cluster_name or "", 0.0) or 0.0)
+
+            def pct_to_notional(remaining_pct: float) -> float:
+                return max(0.0, equity * remaining_pct / 100)
+
+            limits = [
+                (pct_to_notional(cfg["max_total_portfolio_exposure_pct"] - total_exposure_after), "portfolio exposure budget"),
+                (pct_to_notional(cfg["max_single_symbol_exposure_pct"] - current_symbol_pct), "single-symbol exposure budget"),
+                (pct_to_notional(cfg["max_cluster_exposure_pct"] - current_cluster_pct), "cluster exposure budget"),
+                (buying_power_remaining, "paper buying power"),
+            ]
+            per_trade_risk_cap_notional = pct_to_notional(cfg["risk_per_trade_pct"]) / (stop_distance_pct / 100)
+            limits.append((per_trade_risk_cap_notional, "per-trade risk budget"))
+            remaining_open_risk_pct = cfg["max_open_risk_pct"] - open_risk_after
+            risk_cap_notional = pct_to_notional(remaining_open_risk_pct) / (stop_distance_pct / 100)
+            limits.append((risk_cap_notional, "open risk budget"))
+
+            for limit_value, reason in limits:
+                if final_notional > limit_value:
+                    final_notional = max(0.0, limit_value)
+                    reduction_reason = reason
+
+            risk_pct = (final_notional * (stop_distance_pct / 100) / equity) * 100 if equity else 0.0
+            exposure_pct = (final_notional / equity) * 100 if equity else 0.0
+            total_after_candidate = total_exposure_after + exposure_pct
+            single_after_candidate = current_symbol_pct + exposure_pct
+            cluster_after_candidate = current_cluster_pct + exposure_pct
+            open_risk_after_candidate = open_risk_after + risk_pct
+
+            passed = True
+            if candidate.get("preproposal_block_reason"):
+                passed = False
+                cap_reason = f"not actionable - pre-proposal risk check failed: {candidate['preproposal_block_reason']}"
+            elif raw_notional <= 0 or price <= 0:
+                passed = False
+                cap_reason = "not actionable - no valid size or price"
+            elif final_notional < cfg["min_notional"]:
+                passed = False
+                cap_reason = "not actionable - insufficient risk budget after higher-ranked candidates"
+            elif risk_pct > cfg["risk_per_trade_pct"]:
+                passed = False
+                cap_reason = "not actionable - per-trade risk budget exceeded"
+            elif total_after_candidate > cfg["max_total_portfolio_exposure_pct"] + 1e-9:
+                passed = False
+                cap_reason = "not actionable - portfolio exposure budget exceeded"
+            elif single_after_candidate > cfg["max_single_symbol_exposure_pct"] + 1e-9:
+                passed = False
+                cap_reason = "not actionable - single-symbol exposure budget exceeded"
+            elif cluster_after_candidate > cfg["max_cluster_exposure_pct"] + 1e-9:
+                passed = False
+                cap_reason = "not actionable - cluster exposure budget exceeded"
+            elif final_notional > buying_power_remaining:
+                passed = False
+                cap_reason = "not actionable - insufficient paper buying power"
+
+            if passed:
+                allowed.add(symbol)
+                reasons[symbol] = "passes ranked risk budget and exposure checks"
+                candidate["final_notional"] = final_notional
+                candidate["suggested_shares"] = final_notional / price if price > 0 else 0.0
+                candidate["risk_budget_block_reason"] = None
+                total_exposure_after = total_after_candidate
+                single_after[symbol] = single_after_candidate
+                if cluster_name:
+                    cluster_after[cluster_name] = cluster_after_candidate
+                open_risk_after = open_risk_after_candidate
+                buying_power_remaining -= final_notional
+            else:
+                reasons[symbol] = cap_reason or reduction_reason or "not actionable - risk budget blocked"
+                candidate["risk_budget_block_reason"] = reasons[symbol]
+
+            self.storage.execute(
+                "INSERT INTO candidate_batch_allocations(id,run_id,batch_id,proposal_id,symbol,rank,raw_suggested_notional,adjusted_suggested_notional,risk_budget_adjusted_notional,final_suggested_notional,final_suggested_shares,cap_reason,reduction_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()), self.run_id, None, None, symbol, rank, raw_notional, raw_notional,
+                    final_notional, final_notional, final_notional / price if price > 0 else 0.0,
+                    cap_reason, reduction_reason, now.isoformat()
+                ),
+            )
+            self.storage.execute(
+                "INSERT INTO candidate_risk_budget_decisions(id,run_id,batch_id,proposal_id,symbol,timestamp,risk_per_trade_pct,open_risk_after_pct,max_open_risk_pct,total_exposure_after_pct,single_symbol_exposure_after_pct,cluster_exposure_after_pct,buying_power,passed,block_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()), self.run_id, None, None, symbol, now.isoformat(), cfg["risk_per_trade_pct"],
+                    open_risk_after_candidate, cfg["max_open_risk_pct"], total_after_candidate,
+                    single_after_candidate, cluster_after_candidate, buying_power_remaining, int(passed),
+                    None if passed else reasons[symbol]
+                ),
+            )
+            self.storage.execute(
+                "INSERT INTO ranked_opportunity_sets(id,run_id,batch_id,timestamp,symbol,rank,actionable,reason,score,suggested_notional,suggested_shares,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()), self.run_id, None, now.isoformat(), symbol, rank, int(passed),
+                    reasons[symbol], candidate.get("score"), final_notional,
+                    final_notional / price if price > 0 else 0.0, json_dumps(candidate)
+                ),
+            )
+
+        return allowed, reasons
+
+    def _format_ranked_batch_message(
+        self,
+        proposals: list[dict[str, Any]],
+        tracked_candidates: list[dict[str, Any]],
+        risk_snapshot: dict[str, Any],
+    ) -> str:
+        lines = [
+            "📊 Paper trade opportunity set",
+            "Portfolio room:",
+            f"- Total exposure after proposed trades: {risk_snapshot.get('total_exposure_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
+            f"- Open risk after proposed trades: {risk_snapshot.get('open_risk_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
+            f"- Available paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f}",
+            "Actionable:",
+        ]
+        for idx, proposal in enumerate(proposals, start=1):
+            action_word = "Add" if proposal.get("action") == "add" else ("Sell" if proposal.get("side") == "sell" else "Buy")
+            qty = float(proposal.get("qty") or 0.0)
+            lines.extend([
+                f"{idx}. {action_word} {proposal['symbol']} - ${float(proposal.get('notional') or 0.0):.2f} / approx. {qty:.6f} shares",
+                f"   Score: {float(proposal.get('score') or 0.0):.0f}",
+                "   Risk: normal",
+                "   Portfolio fit: passes risk budget",
+                f"   Reason: {proposal.get('selection_reason') or proposal.get('reason') or 'ranked actionable setup'}",
+            ])
+        if not proposals:
+            lines.append("None")
+
+        tracked = [c for c in tracked_candidates if str(c.get("symbol", "")).upper() not in {str(p.get("symbol", "")).upper() for p in proposals}]
+        if tracked:
+            lines.append("Not actionable but tracked:")
+            for idx, candidate in enumerate(tracked, start=len(proposals) + 1):
+                lines.append(f"{idx}. {candidate['symbol']} - blocked")
+                lines.append(f"   Reason: {candidate.get('risk_budget_block_reason') or candidate.get('no_action_reason') or 'not actionable but recorded'}")
+
+        symbols = [str(p["symbol"]).upper() for p in proposals]
+        lines.extend(["Reply:"])
+        for sym in symbols:
+            lines.append(f"yes {sym} = approve {sym} only")
+        if symbols:
+            lines.append("yes all = approve all actionable candidates after final checks")
+        for sym in symbols:
+            lines.append(f"no {sym} = reject {sym}")
+        if symbols:
+            lines.append("no all = reject all actionable candidates")
+            lines.append("Plain yes is ambiguous when more than one candidate is pending.")
+        return "\n".join(lines)
+
+    def _send_ranked_batch_if_needed(
+        self,
+        proposals: list[dict[str, Any]],
+        tracked_candidates: list[dict[str, Any]],
+        risk_snapshot: dict[str, Any],
+    ) -> None:
+        if not proposals:
+            return
+        batch_id = str(uuid.uuid4())
+        expires_at = min(str(p.get("expires_at")) for p in proposals)
+        self.storage.execute(
+            "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?)",
+            (batch_id, self.run_id, None, "pending", iso_now(), expires_at, json_dumps({"proposal_ids": [p["id"] for p in proposals]})),
+        )
+        for idx, proposal in enumerate(proposals, start=1):
+            self.storage.execute(
+                "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()), batch_id, proposal["id"], None, proposal["symbol"], proposal["side"],
+                    proposal.get("action") or proposal["side"], "pending", idx,
+                    proposal.get("selection_reason") or proposal.get("reason"), iso_now(), proposal.get("expires_at"),
+                    json_dumps(proposal)
+                ),
+            )
+        message = self._format_ranked_batch_message(proposals, tracked_candidates, risk_snapshot)
+        res_tg = self.telegram.send_message(message)
+        if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+            msg_id = str(res_tg["message_id"])
+            self.storage.execute("UPDATE proposal_batches SET telegram_message_id=? WHERE id=?", (msg_id, batch_id))
+            self.storage.execute("UPDATE proposal_batch_candidates SET telegram_message_id=? WHERE batch_id=?", (msg_id, batch_id))
+            self.storage.execute(
+                f"UPDATE trade_proposals SET telegram_message_id=? WHERE id IN ({','.join(['?'] * len(proposals))})",
+                (msg_id, *[p["id"] for p in proposals]),
+            )
 
     def _run_performance_lab(self, profile_results: list[dict[str, Any]], active_watchlist: list[str], positions: list[Any], now: datetime, snapshot: dict[str, Any]) -> None:
         qualified_setups_cnt = 0

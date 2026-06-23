@@ -63,6 +63,30 @@ paper_auto_require_no_open_orders: true
 paper_auto_require_final_revalidation: true
 paper_auto_notify_after_execution: true
 
+portfolio_execution_mode: risk_budgeted
+proposal_mode:
+  type: ranked_batch
+  send_all_actionable_candidates: true
+  combine_candidates_into_one_message: true
+  require_individual_approval_per_trade: true
+  allow_yes_all_for_paper: true
+  yes_all_requires_each_trade_final_revalidation: true
+
+execution_limits:
+  max_new_buy_orders_per_day: null
+  max_new_buy_proposals_per_cycle: null
+  max_pending_buy_proposals: null
+
+risk_budget:
+  risk_per_trade_pct: 0.05
+  max_open_risk_pct: 0.30
+  max_daily_realized_loss_pct: 0.25
+  max_total_portfolio_exposure_pct: 6.0
+  max_single_symbol_exposure_pct: 2.5
+  max_cluster_exposure_pct: 5.0
+  max_adds_only_if_profitable: true
+  block_averaging_down: true
+
 telegram:
   approval_enabled: true
   proposal_expiry_minutes: 15
