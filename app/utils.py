@@ -474,6 +474,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
     )
 
+    exit_first_blocker = digest_data.get("exit_first_blocker")
+    if exit_first_blocker:
+        msg_parts.append(f"Exit-first blocker: {exit_first_blocker}\n")
+
     msg_parts.append(f"Summary: {digest_data.get('summary', '')}\n")
 
     if actions.get('proposals', 0) > 0:

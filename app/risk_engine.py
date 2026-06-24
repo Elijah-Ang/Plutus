@@ -102,7 +102,8 @@ class RiskEngine:
         # Warning / Exit pending controls
         block_if_exit_pending = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_exit_pending", True)
         if block_if_exit_pending and is_entry and context.get("exit_pending", False):
-            check("block_new_buy_if_exit_pending", False, "new buy blocked because an exit is pending")
+            exit_reason = context.get("exit_pending_reason") or "an exit is pending"
+            check("block_new_buy_if_exit_pending", False, f"new buy blocked because {exit_reason}")
 
         block_if_emergency_exit_score_above = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_emergency_exit_score_above", 40)
         if is_entry and context.get("max_emergency_exit_score", 0.0) > block_if_emergency_exit_score_above:

@@ -148,6 +148,103 @@ class TradingService:
         self._context_cache = (now, state)
         return state
 
+    def _exit_blocker_context(self, broker_orders: list[Any] | None = None) -> dict[str, Any]:
+        open_sell_orders = []
+        for order in broker_orders or []:
+            side = str(_value(order, "side", "")).lower()
+            status = str(_value(order, "status", "")).lower()
+            if side == "sell" and status not in {"filled", "canceled", "cancelled", "expired", "rejected"}:
+                open_sell_orders.append(order)
+        if open_sell_orders:
+            order = open_sell_orders[0]
+            symbol = str(_value(order, "symbol", "")).upper()
+            return {
+                "active": True,
+                "symbol": symbol,
+                "reason": f"{symbol} SELL order open",
+                "status": str(_value(order, "status", "open")),
+                "source": "broker_open_order",
+                "stale": False,
+            }
+
+        now_iso = iso_now()
+        active_rows = self.storage.fetch_all(
+            """
+            SELECT id, symbol, status, created_at, expires_at, emergency_exit_triggered,
+                   emergency_exit_score, emergency_exit_trigger_reason, exit_trigger_reason
+            FROM trade_proposals
+            WHERE side='sell'
+              AND status='pending'
+              AND expires_at>?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (now_iso,),
+        )
+        if active_rows:
+            row = active_rows[0]
+            symbol = str(row["symbol"]).upper()
+            if row.get("emergency_exit_triggered") == 1:
+                reason = f"{symbol} emergency exit review active"
+            else:
+                reason = f"{symbol} EXIT proposal pending"
+            return {
+                "active": True,
+                "symbol": symbol,
+                "reason": reason,
+                "status": row["status"],
+                "source": "trade_proposals",
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "emergency_exit_score": row.get("emergency_exit_score"),
+                "stale": False,
+            }
+
+        stale_rows = self.storage.fetch_all(
+            """
+            SELECT id, symbol, status, created_at, expires_at
+            FROM trade_proposals
+            WHERE side='sell'
+              AND status IN ('pending','approved','submitted')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        if stale_rows:
+            row = stale_rows[0]
+            symbol = str(row["symbol"]).upper()
+            return {
+                "active": False,
+                "symbol": symbol,
+                "reason": f"stale {symbol} exit flag ignored",
+                "status": row["status"],
+                "source": "trade_proposals",
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "stale": True,
+            }
+
+        return {"active": False, "symbol": None, "reason": None, "status": None, "source": None, "stale": False}
+
+    def _exit_blocker_label_from_reason(self, no_action_reason: str) -> str:
+        no_act = no_action_reason or ""
+        lower = no_act.lower()
+        match = re.search(r"new buy blocked because\s+(.+?)(?:;|$)", no_act, flags=re.IGNORECASE)
+        if match:
+            detail = match.group(1).strip()
+            if detail == "an exit is pending":
+                blocker = self._exit_blocker_context()
+                if blocker.get("stale"):
+                    return blocker.get("reason") or "stale pending-exit flag detected; needs cleanup"
+                return blocker.get("reason") or "portfolio exit-first rule active"
+            return detail[0].upper() + detail[1:] if detail else "portfolio exit-first rule active"
+        if "block_new_buy_if_exit_pending" in lower or "exit is pending" in lower:
+            blocker = self._exit_blocker_context()
+            if blocker.get("stale"):
+                return blocker.get("reason") or "stale pending-exit flag detected; needs cleanup"
+            return blocker.get("reason") or "portfolio exit-first rule active"
+        return "portfolio exit-first rule active"
+
     def _portfolio_context(self, proposal: dict[str, Any], approval_valid: bool = False) -> dict[str, Any]:
         state = self._authoritative_runtime_state(force=approval_valid)
         positions = state["positions"]
@@ -181,11 +278,8 @@ class TradingService:
             proposed_cluster_positions_count = current_cluster_count + (0 if has_symbol_pos else 1)
             proposed_cluster_exposure_pct = current_cluster_exposure + proposal_notional_pct
 
-        # exit_pending
-        pending_exits = self.storage.fetch_all(
-            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='sell' AND status IN ('pending', 'approved', 'submitted')"
-        )
-        exit_pending = (pending_exits[0]["cnt"] > 0) if pending_exits else False
+        exit_blocker = self._exit_blocker_context(orders)
+        exit_pending = bool(exit_blocker.get("active"))
 
         # max_emergency_exit_score
         max_emergency_exit_score = 0.0
@@ -223,6 +317,10 @@ class TradingService:
             "proposed_cluster_positions_count": proposed_cluster_positions_count,
             "proposed_cluster_exposure_pct": proposed_cluster_exposure_pct,
             "exit_pending": exit_pending,
+            "exit_pending_symbol": exit_blocker.get("symbol"),
+            "exit_pending_reason": exit_blocker.get("reason"),
+            "exit_pending_status": exit_blocker.get("status"),
+            "exit_pending_stale": bool(exit_blocker.get("stale")),
             "max_emergency_exit_score": max_emergency_exit_score,
         }
 
@@ -3039,6 +3137,13 @@ class TradingService:
             return
 
         symbols_list = []
+        score_threshold = self.config.get("ai", {}).get("ai_review_min_score", 65)
+        high_score_symbols: set[str] = set()
+        proposal_blocked_symbols: set[str] = set()
+        observation_high_symbols: set[str] = set()
+        no_entry_high_symbols: set[str] = set()
+        exit_blocked_symbols: set[str] = set()
+        exit_blocker_labels: set[str] = set()
         for sym, s_rows in symbol_rows.items():
             first_row = s_rows[0]
             latest_row = s_rows[-1]
@@ -3050,49 +3155,78 @@ class TradingService:
             session_change = ((p_latest / p_session_start) - 1.0) * 100.0 if p_session_start > 0 else 0.0
 
             has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
+            latest_score = latest_row.get("score") or 0.0
+            latest_signal = latest_row.get("signal")
+            if latest_score >= score_threshold:
+                high_score_symbols.add(sym)
 
             # Map detailed status reasons
             if sym in obs_watchlist:
                 status_str = "Observation only — no proposal allowed"
+                if latest_score >= score_threshold:
+                    observation_high_symbols.add(sym)
             elif has_prop:
                 status_str = "Proposal generated, pending approval"
             else:
                 no_act = latest_row.get("no_action_reason") or ""
-                score_val = latest_row.get("score") or 0.0
-                sig_action = latest_row.get("signal")
+                score_val = latest_score
+                sig_action = latest_signal
 
-                if score_val < 65:
+                if score_val < score_threshold:
                     status_str = "No proposal — score below threshold"
                 elif sig_action not in {"ENTRY", "EXIT"}:
                     status_str = "Watch — no ENTRY signal"
+                    no_entry_high_symbols.add(sym)
                 elif "sleep" in no_act.lower():
                     status_str = "Watch — BUY suppressed by sleep mode"
+                    proposal_blocked_symbols.add(sym)
                 elif "cooldown" in no_act.lower() or "dedupe" in no_act.lower():
                     status_str = "Watch — cooldown active"
+                    proposal_blocked_symbols.add(sym)
                 elif "gpt review" in no_act.lower() or "deferred due to ai" in no_act.lower():
                     status_str = "Watch — GPT review unavailable"
+                    proposal_blocked_symbols.add(sym)
                 elif "already holding" in no_act.lower() or "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
                     status_str = "Watch — already holding a position"
+                    proposal_blocked_symbols.add(sym)
                 elif "total portfolio exposure" in no_act.lower() or "portfolio_total_exposure" in no_act.lower():
                     status_str = "Watch — total portfolio exposure cap reached"
+                    proposal_blocked_symbols.add(sym)
                 elif "single symbol exposure" in no_act.lower() or "portfolio_single_symbol_exposure" in no_act.lower():
                     status_str = "Watch — single symbol exposure cap reached"
+                    proposal_blocked_symbols.add(sym)
                 elif "cluster positions limit" in no_act.lower() or "portfolio_cluster_positions_limit" in no_act.lower():
                     status_str = "Watch — same cluster positions limit reached"
+                    proposal_blocked_symbols.add(sym)
                 elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
                     status_str = "Watch — same cluster exposure limit reached"
-                elif "exit is pending" in no_act.lower() or "block_new_buy_if_exit_pending" in no_act.lower():
-                    status_str = "Watch — new buy blocked due to pending exit"
+                    proposal_blocked_symbols.add(sym)
+                elif (
+                    "exit is pending" in no_act.lower()
+                    or "exit proposal pending" in no_act.lower()
+                    or "new buy blocked because" in no_act.lower() and "exit" in no_act.lower()
+                    or "block_new_buy_if_exit_pending" in no_act.lower()
+                ):
+                    blocker_label = self._exit_blocker_label_from_reason(no_act)
+                    status_str = f"Watch — New buy blocked — {blocker_label}"
+                    proposal_blocked_symbols.add(sym)
+                    exit_blocked_symbols.add(sym)
+                    exit_blocker_labels.add(blocker_label)
                 elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
                     status_str = "Watch — new buy blocked due to emergency exit risk"
+                    proposal_blocked_symbols.add(sym)
                 elif "pyramiding check failed" in no_act.lower() or "add_on_check_failed" in no_act.lower() or "position not sufficiently profitable" in no_act.lower() or "cannot average down" in no_act.lower():
                     status_str = "Watch — pyramiding check failed"
+                    proposal_blocked_symbols.add(sym)
                 elif "max open positions" in no_act.lower() or "open-position limit" in no_act.lower() or "max_positions" in no_act.lower():
                     status_str = "Watch — max open positions reached"
+                    proposal_blocked_symbols.add(sym)
                 elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
                     status_str = "Watch — daily trade limit reached"
+                    proposal_blocked_symbols.add(sym)
                 elif "no entry/exit signal" in no_act.lower():
                     status_str = "Watch — no ENTRY signal"
+                    no_entry_high_symbols.add(sym)
                 elif "blocked by risk checks" in no_act.lower():
                     if "open-position limit" in no_act.lower() or "max open positions" in no_act.lower():
                         status_str = "Watch — max open positions reached"
@@ -3108,12 +3242,21 @@ class TradingService:
                         status_str = "Watch — same cluster positions limit reached"
                     elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
                         status_str = "Watch — same cluster exposure limit reached"
-                    elif "exit is pending" in no_act.lower() or "block_new_buy_if_exit_pending" in no_act.lower():
-                        status_str = "Watch — new buy blocked due to pending exit"
+                    elif (
+                        "exit is pending" in no_act.lower()
+                        or "exit proposal pending" in no_act.lower()
+                        or "new buy blocked because" in no_act.lower() and "exit" in no_act.lower()
+                        or "block_new_buy_if_exit_pending" in no_act.lower()
+                    ):
+                        blocker_label = self._exit_blocker_label_from_reason(no_act)
+                        status_str = f"Watch — New buy blocked — {blocker_label}"
+                        exit_blocked_symbols.add(sym)
+                        exit_blocker_labels.add(blocker_label)
                     elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
                         status_str = "Watch — new buy blocked due to emergency exit risk"
                     else:
                         status_str = "Watch — blocked by risk checks"
+                    proposal_blocked_symbols.add(sym)
                 else:
                     status_str = "Watch — no proposal"
 
@@ -3155,6 +3298,9 @@ class TradingService:
         )
         expired_cnt = expired[0]["cnt"] if expired else 0
 
+        def fmt_syms(items: set[str]) -> str:
+            return ", ".join(sorted(items))
+
         if prop_cnt > 0:
             pending_rows = self.storage.fetch_all(
                 "SELECT symbol, side FROM trade_proposals WHERE created_at >= ? AND status='pending'",
@@ -3165,8 +3311,25 @@ class TradingService:
                 summary_str = f"{strongest['symbol']} is strongest, pending proposal for {syms_p}."
             else:
                 summary_str = f"Setup triggered action for {strongest['symbol']} during the window."
+        elif exit_blocked_symbols:
+            blocker = "; ".join(sorted(exit_blocker_labels)) or "portfolio exit-first rule"
+            summary_str = (
+                f"{strongest['symbol']} was strongest and {fmt_syms(high_score_symbols)} crossed score threshold, "
+                f"but no actionable proposal was sent because {fmt_syms(exit_blocked_symbols)} were blocked by the exit-first rule: {blocker}."
+            )
+        elif high_score_symbols and proposal_blocked_symbols:
+            summary_str = (
+                f"{strongest['symbol']} was strongest and {fmt_syms(high_score_symbols)} crossed score threshold, "
+                f"but no actionable proposal was sent because proposal gates blocked {fmt_syms(proposal_blocked_symbols)}."
+            )
+        elif no_entry_high_symbols:
+            summary_str = f"{fmt_syms(no_entry_high_symbols)} crossed score threshold but had no ENTRY signal."
+        elif observation_high_symbols:
+            summary_str = f"{fmt_syms(observation_high_symbols)} crossed score threshold but is observation-only."
+        elif high_score_symbols:
+            summary_str = f"{strongest['symbol']} crossed score threshold, but no actionable proposal was sent."
         else:
-            summary_str = f"{strongest['symbol']} is strongest, but no setup crossed the proposal threshold."
+            summary_str = "No setup crossed the score threshold."
 
         # Mention deferred candidates due to AI review unavailability
         deferred_rows = self.storage.fetch_all(
@@ -3191,6 +3354,7 @@ class TradingService:
                 "gpt_calls": gpt_calls,
                 "expired": expired_cnt
             },
+            "exit_first_blocker": "; ".join(sorted(exit_blocker_labels)),
             "summary": summary_str
         }
 

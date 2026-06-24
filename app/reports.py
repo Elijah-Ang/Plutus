@@ -25,6 +25,8 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Sleep Mode Events", "SELECT * FROM audit_events WHERE event_type IN ('sleep_mode_enabled', 'sleep_mode_disabled', 'sleep_mode_command_ignored_unauthorized', 'sleep_mode_command_ignored_old')"),
     ("Emergency Exit Events", "SELECT * FROM audit_events WHERE event_type IN ('emergency_exit_auto_timeout_reached', 'emergency_exit_submitted', 'emergency_exit_blocked', 'emergency_exit_cancelled_by_user', 'emergency_exit_approved_by_user')"),
     ("Emergency Exit Score Breakdown", "SELECT symbol, position_drawdown_pct, average_entry_price, latest_position_price, atr_value, adverse_move_atr, minutes_to_close, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, created_at FROM market_memory WHERE emergency_exit_score IS NOT NULL"),
+    ("Exit Blocker State", "SELECT symbol, side, status, created_at, expires_at, exit_trigger_reason, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason FROM trade_proposals WHERE side='sell' AND status IN ('pending','approved','submitted') ORDER BY created_at DESC"),
+    ("Exit Blocked BUY Candidates", "SELECT symbol, price, signal, score, no_action_reason, candidate_suppression_reason, exit_priority_applied, created_at FROM market_memory WHERE signal='ENTRY' AND lower(no_action_reason) LIKE '%exit%'"),
     ("Suppressed Sleep BUY Candidates", "SELECT symbol, price, signal, score, no_action_reason, candidate_suppression_reason, created_at FROM market_memory WHERE candidate_suppression_reason = 'suppressed_by_sleep_mode'"),
     ("Wake Summary Events", "SELECT * FROM audit_events WHERE event_type = 'wake_summary_sent'"),
     ("Performance Lab Summary", "performance_lab_summaries"),

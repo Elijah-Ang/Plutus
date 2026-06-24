@@ -475,6 +475,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
 - **Throttling Constraints**: Computes data from the last 30 minutes, requiring a minimum of 2 successful cycles logged in `market_memory`. It checks `telegram_digests` history to ensure it is sent at most once per 30 minutes.
 - **GPT Usage**: GPT is not used for digests by default (`telegram_digest_use_gpt: false`). It relies entirely on rules-based, logged sqlite data to construct summaries.
+- **Exit-first blockers**: If a current pending sell proposal or open broker sell order blocks new BUY proposals, the digest names the blocking symbol and reason (for example, `DIA EXIT proposal pending`). Expired or already-handled sell proposal rows are treated as stale audit state, are ignored for BUY blocking, and are exposed in Excel reporting instead of creating a misleading pending-exit warning.
 
 ## 29. Manual Telegram Sleep Mode
 - **Purpose**: Allows the user to put the trading agent into a silent "Sleep Mode" via Telegram commands (e.g. `/sleep`, `sleep mode on`).
