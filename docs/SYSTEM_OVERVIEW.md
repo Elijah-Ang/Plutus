@@ -494,10 +494,13 @@ To support the bot's current 10-minute schedule during trading hours:
 ## 28. Telegram Market Digest
 - **Purpose**: Sends a 30-minute informational digest to the user during active US regular trading hours (9:30 PM to 4:00 AM SGT, or based on the broker's clock is_open API) summarizing recent telemetry.
 - **Informational Only**: Unlike trade proposal messages, the digest is strictly informational. It does not ask for user approval, does not create trade proposals in the database, and does not place or execute broker orders.
-- **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
+- **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, fills, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
 - **Throttling Constraints**: Computes data from the last 30 minutes, requiring a minimum of 2 successful cycles logged in `market_memory`. It checks `telegram_digests` history to ensure it is sent at most once per 30 minutes.
 - **GPT Usage**: GPT is not used for digests by default (`telegram_digest_use_gpt: false`). It relies entirely on rules-based, logged sqlite data to construct summaries.
 - **Exit-first blockers**: If a current pending sell proposal or open broker sell order blocks new BUY proposals, the digest names the blocking symbol and reason (for example, `DIA EXIT proposal pending`). Expired or already-handled sell proposal rows are treated as stale audit state, are ignored for BUY blocking, and are exposed in Excel reporting instead of creating a misleading pending-exit warning.
+- **Status Priority**: Digest candidate statuses are resolved from the latest authoritative proposal, batch-candidate, order, and fill state before falling back to scan-time `market_memory`. A filled BUY therefore shows as filled, a submitted order shows as awaiting fill, an expired proposal shows as expired, and scan-only watch states are used only when no newer lifecycle state exists.
+- **Cluster wording**: Cluster blocks are described in user-facing terms such as `broad-market cluster limit reached` and include currently held symbols when available (for example, `DIA` and `IWM`) instead of generic gate language.
+- **Fill confirmations**: Broker reconciliation sends a one-shot paper fill confirmation to Telegram when it first sees a new fill for a submitted paper order. The notification is tracked on the `fills` row so repeated reconciliations do not resend it.
 
 ## 29. Manual Telegram Sleep Mode
 - **Purpose**: Allows the user to put the trading agent into a silent "Sleep Mode" via Telegram commands (e.g. `/sleep`, `sleep mode on`).

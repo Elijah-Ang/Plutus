@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import pytest
 from datetime import datetime, UTC, timezone, timedelta
@@ -104,6 +105,7 @@ def test_digest_wording_and_structure():
         "actions": {
             "proposals": 0,
             "orders": 0,
+            "fills": 0,
             "gpt_calls": 0,
             "expired": 0
         },
@@ -122,7 +124,7 @@ def test_digest_wording_and_structure():
     assert "Status: Watch, no proposal" in msg
     assert "Weakest: SPY — 17.5, No action suggested" in msg
     assert "Past 30 min actions:" in msg
-    assert "Proposals: 0 | Orders: 0 | GPT calls: 0 | Expired: 0" in msg
+    assert "Proposals: 0 | Orders: 0 | Fills: 0 | GPT calls: 0 | Expired: 0" in msg
     assert "Summary: QQQ is strongest, but no setup crossed the proposal threshold." in msg
     assert "No action needed." in msg
     assert "yes" not in msg.lower()
@@ -394,3 +396,206 @@ def test_digest_does_not_invent_pending_exit_from_low_warning(temp_storage):
     assert "Exit-first blocker:" not in msg
     assert "pending exit" not in msg.lower()
     assert "DIA crossed score threshold but had no ENTRY signal" in msg
+
+
+def test_digest_uses_authoritative_filled_state_over_stale_market_memory(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["IWM"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(minutes=5)).isoformat()
+    filled_at = (now - timedelta(minutes=1)).isoformat()
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "IWM", 298.878, 298.0, "ENTRY", 90.0, "Strong setup", 1, "proposal generated", created_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-iwm", "run1", "IWM", "buy", 15.0, "approved", created_at, (now + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"symbol": "IWM", "score": 90})),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-iwm", "run1", "prop-iwm", "broker-iwm", "client-iwm", "IWM", "buy", 15.0, 0.050175614, "filled", "{}", created_at, filled_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notified_at,fill_notification_status,fill_notification_error) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("run1", "order-iwm", 0.050175614, 298.878, filled_at, "{}", None, None, None),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Status: Approved and filled — IWM paper buy filled" in msg
+    assert "Proposal pending approval" not in msg
+    assert "Summary: IWM was approved and filled during this window." in msg
+    assert "Proposals: 1 | Orders: 1 | Fills: 1" in msg
+
+
+def test_digest_uses_authoritative_submitted_state_before_fill(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["SPY"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(minutes=4)).isoformat()
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 600.0, 599.0, "ENTRY", 88.0, "Strong setup", 1, "proposal generated", created_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-spy", "run1", "SPY", "buy", 10.0, "submitted", created_at, (now + timedelta(minutes=10)).isoformat(), "rule_based_v1", "{}"),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-spy", "run1", "prop-spy", "broker-spy", "client-spy", "SPY", "buy", 10.0, 0.013596, "submitted", "{}", created_at, created_at),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Status: Approved — order submitted, awaiting fill" in msg
+    assert "Proposal pending approval" not in msg
+    assert "Summary: SPY was approved and submitted during this window." in msg
+
+
+def test_digest_uses_authoritative_expired_state(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["XLV"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(minutes=8)).isoformat()
+    expired_at = (now - timedelta(minutes=2)).isoformat()
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "XLV", 140.0, 139.0, "ENTRY", 77.0, "Qualified setup", 1, "proposal generated", created_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-xlv", "run1", "XLV", "buy", 10.0, "expired", created_at, expired_at, "rule_based_v1", "{}"),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Status: Proposal expired — no order" in msg
+    assert "Expired with no order: XLV." in msg
+
+
+def test_digest_cluster_summary_names_held_symbols_without_duplicate_strongest(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["SPY", "DIA", "IWM", "XLE", "XLV", "XLY"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    broker = MockBroker()
+    broker.positions = [
+        type("Pos", (), {"symbol": "DIA", "qty": 0.01, "avg_entry_price": 500.0, "current_price": 505.0, "market_value": 5.05})(),
+        type("Pos", (), {"symbol": "IWM", "qty": 0.05, "avg_entry_price": 298.0, "current_price": 299.0, "market_value": 14.95})(),
+    ]
+    service = TradingService(config, temp_storage, broker, "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC).isoformat()
+
+    rows = [
+        ("SPY", 600.0, "ENTRY", 100.0, "Strongest setup", 0, "not actionable - pre-proposal risk check failed: same cluster positions limit"),
+        ("DIA", 505.0, "HOLD", 82.0, "Qualified watch", 0, "no entry/exit signal"),
+        ("IWM", 299.0, "HOLD", 81.0, "Qualified watch", 0, "no entry/exit signal"),
+        ("XLE", 95.0, "HOLD", 79.0, "Qualified watch", 0, "no entry/exit signal"),
+        ("XLV", 140.0, "HOLD", 78.0, "Qualified watch", 0, "no entry/exit signal"),
+        ("XLY", 180.0, "HOLD", 77.0, "Qualified watch", 0, "no entry/exit signal"),
+    ]
+    for symbol, price, signal, score, classification, proposal_generated, no_action_reason in rows:
+        temp_storage.execute(
+            "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("run1", "us_equities", symbol, price, price, signal, score, classification, proposal_generated, no_action_reason, now),
+        )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Status: Watch — broad-market cluster limit reached: existing DIA and IWM positions" in msg
+    assert "Summary: SPY scored highest, but it was blocked by the broad-market cluster limit because DIA and IWM are already held." in msg
+    assert "SPY was strongest and DIA, IWM, SPY" not in msg

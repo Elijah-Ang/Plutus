@@ -507,7 +507,7 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
     actions = digest_data.get("actions", {})
     msg_parts.append(
         f"Past 30 min actions:\n"
-        f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
+        f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | Fills: {actions.get('fills', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
     )
 
     exit_first_blocker = digest_data.get("exit_first_blocker")

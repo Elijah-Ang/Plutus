@@ -427,9 +427,9 @@ def test_proposal_conflict_supersedes_others(temp_storage, mock_config):
     
     service.process_telegram()
 
-    # Verify SPY is approved and submitted
+    # Verify SPY advanced to submitted after approval + order submission
     spy_status = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id='prop-spy'")[0]["status"]
-    assert spy_status == "approved"
+    assert spy_status == "submitted"
 
     # Verify DIA is superseded
     dia_status = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id='prop-dia'")[0]["status"]

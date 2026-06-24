@@ -1440,6 +1440,7 @@ class TradingService:
 
             if result.submitted:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
+                self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (parsed.proposal_id,))
                 self._mark_position_management_proposal_handled(proposal, "submitted")
                 notional_val = proposal.get("notional", 5)
                 qty_val = proposal.get("qty")
@@ -1457,6 +1458,7 @@ class TradingService:
                 continue
             else:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
+                self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (parsed.proposal_id,))
                 if "refused to trade on stale data" in result.reason:
                     self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
                 else:
@@ -1781,6 +1783,7 @@ class TradingService:
         self.storage.upsert_actual_trade_outcome_for_order(order_id)
         if result.submitted:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
+            self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
             self._mark_position_management_proposal_handled(proposal, "submitted")
             if prop_side == "buy":
                 self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${float(proposal.get('notional') or 0.0):.0f}. Mode: paper only.")
@@ -1791,6 +1794,7 @@ class TradingService:
             return True, "submitted", None
 
         self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
+        self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (proposal_id,))
         self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
         return False, "blocked", result.reason
 
@@ -3936,14 +3940,14 @@ class TradingService:
         if not symbol_rows:
             return
 
+        try:
+            current_positions = list(self.broker.get_positions())
+        except Exception:
+            current_positions = []
+        cluster_holdings = self._cluster_holdings(current_positions)
+
         symbols_list = []
         score_threshold = self.config.get("ai", {}).get("ai_review_min_score", 65)
-        high_score_symbols: set[str] = set()
-        proposal_blocked_symbols: set[str] = set()
-        observation_high_symbols: set[str] = set()
-        no_entry_high_symbols: set[str] = set()
-        exit_blocked_symbols: set[str] = set()
-        exit_blocker_labels: set[str] = set()
         for sym, s_rows in symbol_rows.items():
             first_row = s_rows[0]
             latest_row = s_rows[-1]
@@ -3957,108 +3961,17 @@ class TradingService:
             has_prop = any(bool(r.get("proposal_generated")) for r in s_rows)
             latest_score = latest_row.get("score") or 0.0
             latest_signal = latest_row.get("signal")
-            if latest_score >= score_threshold:
-                high_score_symbols.add(sym)
-
-            # Map detailed status reasons
-            if sym in obs_watchlist:
-                status_str = "Observation only — no proposal allowed"
-                if latest_score >= score_threshold:
-                    observation_high_symbols.add(sym)
+            authoritative = self._digest_authoritative_state(sym, window_start_iso, now.isoformat())
+            if authoritative:
+                status_info = {
+                    "status": authoritative["status"],
+                    "event": authoritative["event"],
+                    "high_score": latest_score >= score_threshold,
+                }
             elif has_prop:
-                status_str = "Proposal generated, pending approval"
+                status_info = {"status": "Proposal pending approval", "event": "pending_approval", "high_score": latest_score >= score_threshold}
             else:
-                no_act = latest_row.get("no_action_reason") or ""
-                score_val = latest_score
-                sig_action = latest_signal
-
-                if score_val < score_threshold:
-                    status_str = "No proposal — score below threshold"
-                elif sig_action not in {"ENTRY", "EXIT"}:
-                    status_str = "Watch — no ENTRY signal"
-                    no_entry_high_symbols.add(sym)
-                elif "sleep" in no_act.lower():
-                    status_str = "Watch — BUY suppressed by sleep mode"
-                    proposal_blocked_symbols.add(sym)
-                elif "cooldown" in no_act.lower() or "dedupe" in no_act.lower():
-                    status_str = "Watch — cooldown active"
-                    proposal_blocked_symbols.add(sym)
-                elif "gpt review" in no_act.lower() or "deferred due to ai" in no_act.lower():
-                    status_str = "Watch — GPT review unavailable"
-                    proposal_blocked_symbols.add(sym)
-                elif "already holding" in no_act.lower() or "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
-                    status_str = "Watch — already holding a position"
-                    proposal_blocked_symbols.add(sym)
-                elif "total portfolio exposure" in no_act.lower() or "portfolio_total_exposure" in no_act.lower():
-                    status_str = "Watch — total portfolio exposure cap reached"
-                    proposal_blocked_symbols.add(sym)
-                elif "single symbol exposure" in no_act.lower() or "portfolio_single_symbol_exposure" in no_act.lower():
-                    status_str = "Watch — single symbol exposure cap reached"
-                    proposal_blocked_symbols.add(sym)
-                elif "cluster positions limit" in no_act.lower() or "portfolio_cluster_positions_limit" in no_act.lower():
-                    status_str = "Watch — same cluster positions limit reached"
-                    proposal_blocked_symbols.add(sym)
-                elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
-                    status_str = "Watch — same cluster exposure limit reached"
-                    proposal_blocked_symbols.add(sym)
-                elif (
-                    "exit is pending" in no_act.lower()
-                    or "exit proposal pending" in no_act.lower()
-                    or "new buy blocked because" in no_act.lower() and "exit" in no_act.lower()
-                    or "block_new_buy_if_exit_pending" in no_act.lower()
-                ):
-                    blocker_label = self._exit_blocker_label_from_reason(no_act)
-                    status_str = f"Watch — New buy blocked — {blocker_label}"
-                    proposal_blocked_symbols.add(sym)
-                    exit_blocked_symbols.add(sym)
-                    exit_blocker_labels.add(blocker_label)
-                elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
-                    status_str = "Watch — new buy blocked due to emergency exit risk"
-                    proposal_blocked_symbols.add(sym)
-                elif "pyramiding check failed" in no_act.lower() or "add_on_check_failed" in no_act.lower() or "position not sufficiently profitable" in no_act.lower() or "cannot average down" in no_act.lower():
-                    status_str = "Watch — pyramiding check failed"
-                    proposal_blocked_symbols.add(sym)
-                elif "max open positions" in no_act.lower() or "open-position limit" in no_act.lower() or "max_positions" in no_act.lower():
-                    status_str = "Watch — max open positions reached"
-                    proposal_blocked_symbols.add(sym)
-                elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
-                    status_str = "Watch — daily trade limit reached"
-                    proposal_blocked_symbols.add(sym)
-                elif "no entry/exit signal" in no_act.lower():
-                    status_str = "Watch — no ENTRY signal"
-                    no_entry_high_symbols.add(sym)
-                elif "blocked by risk checks" in no_act.lower():
-                    if "open-position limit" in no_act.lower() or "max open positions" in no_act.lower():
-                        status_str = "Watch — max open positions reached"
-                    elif "daily trade limit" in no_act.lower() or "max_trades" in no_act.lower():
-                        status_str = "Watch — daily trade limit reached"
-                    elif "adding to existing" in no_act.lower() or "duplicate symbol position" in no_act.lower():
-                        status_str = "Watch — already holding a position"
-                    elif "total portfolio exposure" in no_act.lower() or "portfolio_total_exposure" in no_act.lower():
-                        status_str = "Watch — total portfolio exposure cap reached"
-                    elif "single symbol exposure" in no_act.lower() or "portfolio_single_symbol_exposure" in no_act.lower():
-                        status_str = "Watch — single symbol exposure cap reached"
-                    elif "cluster positions limit" in no_act.lower() or "portfolio_cluster_positions_limit" in no_act.lower():
-                        status_str = "Watch — same cluster positions limit reached"
-                    elif "cluster exposure limit" in no_act.lower() or "portfolio_cluster_exposure_limit" in no_act.lower():
-                        status_str = "Watch — same cluster exposure limit reached"
-                    elif (
-                        "exit is pending" in no_act.lower()
-                        or "exit proposal pending" in no_act.lower()
-                        or "new buy blocked because" in no_act.lower() and "exit" in no_act.lower()
-                        or "block_new_buy_if_exit_pending" in no_act.lower()
-                    ):
-                        blocker_label = self._exit_blocker_label_from_reason(no_act)
-                        status_str = f"Watch — New buy blocked — {blocker_label}"
-                        exit_blocked_symbols.add(sym)
-                        exit_blocker_labels.add(blocker_label)
-                    elif "emergency exit score is" in no_act.lower() or "block_new_buy_if_emergency_exit_score_above" in no_act.lower():
-                        status_str = "Watch — new buy blocked due to emergency exit risk"
-                    else:
-                        status_str = "Watch — blocked by risk checks"
-                    proposal_blocked_symbols.add(sym)
-                else:
-                    status_str = "Watch — no proposal"
+                status_info = self._digest_market_memory_status(sym, latest_row, set(obs_watchlist), cluster_holdings)
 
             symbols_list.append({
                 "symbol": sym,
@@ -4067,7 +3980,12 @@ class TradingService:
                 "asset_score": latest_row.get("asset_score"),
                 "price_change_30m": change_30m,
                 "session_change": session_change,
-                "status": status_str
+                "status": status_info["status"],
+                "_event": status_info.get("event"),
+                "_high_score": status_info.get("high_score", False),
+                "_cluster_name": status_info.get("cluster_name"),
+                "_held_symbols": status_info.get("held_symbols", []),
+                "_blocker": status_info.get("blocker"),
             })
 
         symbols_list.sort(key=lambda x: x["trade_score"] if x["trade_score"] is not None else -1, reverse=True)
@@ -4090,6 +4008,12 @@ class TradingService:
         )
         order_cnt = orders[0]["cnt"] if orders else 0
 
+        fills = self.storage.fetch_all(
+            "SELECT COUNT(*) as cnt FROM fills WHERE filled_at >= ?",
+            (window_start_iso,)
+        )
+        fill_cnt = fills[0]["cnt"] if fills else 0
+
         gpt_calls = sum(bool(r.get("gpt_called")) for r in rows)
 
         expired = self.storage.fetch_all(
@@ -4098,38 +4022,7 @@ class TradingService:
         )
         expired_cnt = expired[0]["cnt"] if expired else 0
 
-        def fmt_syms(items: set[str]) -> str:
-            return ", ".join(sorted(items))
-
-        if prop_cnt > 0:
-            pending_rows = self.storage.fetch_all(
-                "SELECT symbol, side FROM trade_proposals WHERE created_at >= ? AND status='pending'",
-                (window_start_iso,)
-            )
-            if pending_rows:
-                syms_p = ", ".join(f"{r['side'].upper()} {r['symbol']}" for r in pending_rows)
-                summary_str = f"{strongest['symbol']} is strongest, pending proposal for {syms_p}."
-            else:
-                summary_str = f"Setup triggered action for {strongest['symbol']} during the window."
-        elif exit_blocked_symbols:
-            blocker = "; ".join(sorted(exit_blocker_labels)) or "portfolio exit-first rule"
-            summary_str = (
-                f"{strongest['symbol']} was strongest and {fmt_syms(high_score_symbols)} crossed score threshold, "
-                f"but no actionable proposal was sent because {fmt_syms(exit_blocked_symbols)} were blocked by the exit-first rule: {blocker}."
-            )
-        elif high_score_symbols and proposal_blocked_symbols:
-            summary_str = (
-                f"{strongest['symbol']} was strongest and {fmt_syms(high_score_symbols)} crossed score threshold, "
-                f"but no actionable proposal was sent because proposal gates blocked {fmt_syms(proposal_blocked_symbols)}."
-            )
-        elif no_entry_high_symbols:
-            summary_str = f"{fmt_syms(no_entry_high_symbols)} crossed score threshold but had no ENTRY signal."
-        elif observation_high_symbols:
-            summary_str = f"{fmt_syms(observation_high_symbols)} crossed score threshold but is observation-only."
-        elif high_score_symbols:
-            summary_str = f"{strongest['symbol']} crossed score threshold, but no actionable proposal was sent."
-        else:
-            summary_str = "No setup crossed the score threshold."
+        summary_str = self._build_digest_summary(strongest, symbols_list)
 
         # Mention deferred candidates due to AI review unavailability
         deferred_rows = self.storage.fetch_all(
@@ -4151,10 +4044,11 @@ class TradingService:
             "actions": {
                 "proposals": prop_cnt,
                 "orders": order_cnt,
+                "fills": fill_cnt,
                 "gpt_calls": gpt_calls,
                 "expired": expired_cnt
             },
-            "exit_first_blocker": "; ".join(sorted(exit_blocker_labels)),
+            "exit_first_blocker": "; ".join(sorted({x.get("_blocker") for x in symbols_list if x.get("_blocker")} - {None})),
             "summary": summary_str
         }
 
@@ -4168,7 +4062,7 @@ class TradingService:
             status = "error"
             self.storage.record_check(self.run_id, "digest_send", False, str(e), stage="digest")
 
-        symbols_str = ", ".join(x["symbol"] for x in top_watched)
+        symbols_str = ", ".join(f"{x['symbol']}:{x['status']}" for x in top_watched)
         self.storage.execute(
             "INSERT INTO telegram_digests(run_id,window_start,window_end,sent_at,symbols,summary_text,status) VALUES(?,?,?,?,?,?,?)",
             (self.run_id, window_start_iso, now.isoformat(), now.isoformat(), symbols_str, summary_str, status)
@@ -4177,7 +4071,7 @@ class TradingService:
 
     def run_cycle(self) -> None:
         self._update_forward_outcomes()
-        BrokerReconciler(self.broker, self.storage, self.run_id).reconcile()
+        BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
         self._context_cache = None
@@ -4216,6 +4110,7 @@ class TradingService:
         single_exposures = {}
         cluster_values = {}
         cluster_counts = {}
+        cluster_symbols: dict[str, list[str]] = {}
 
         clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})
         if not clusters:
@@ -4229,6 +4124,7 @@ class TradingService:
         for c in clusters:
             cluster_values[c] = 0.0
             cluster_counts[c] = 0
+            cluster_symbols[c] = []
 
         for pos in positions:
             sym = str(_value(pos, "symbol", "")).upper()
@@ -4242,6 +4138,8 @@ class TradingService:
             if c_name:
                 cluster_values[c_name] += val
                 cluster_counts[c_name] += 1
+                if sym not in cluster_symbols[c_name]:
+                    cluster_symbols[c_name].append(sym)
 
         cluster_exposures = {}
         for c in cluster_values:
@@ -4254,6 +4152,7 @@ class TradingService:
             "single_exposures": single_exposures,
             "cluster_exposures": cluster_exposures,
             "cluster_counts": cluster_counts,
+            "cluster_symbols": cluster_symbols,
         }
 
     def _calculate_dynamic_size(self, symbol: str, score: float, volatility_regime: str, price: float, bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False) -> dict[str, Any]:
@@ -4489,6 +4388,222 @@ class TradingService:
             and self.config.get("proposal_mode", {}).get("type") == "ranked_batch"
         )
 
+    def _digest_display_cluster_name(self, cluster_name: str | None) -> str:
+        labels = {
+            "us_broad_market": "broad-market",
+            "us_growth_tech": "growth-tech",
+            "defensive_healthcare": "defensive-healthcare",
+            "financials": "financials",
+            "energy": "energy",
+        }
+        if not cluster_name:
+            return "same-cluster"
+        return labels.get(cluster_name, cluster_name.replace("_", " "))
+
+    def _cluster_holdings(self, positions: list[Any]) -> dict[str, list[str]]:
+        holdings: dict[str, list[str]] = {}
+        for pos in positions:
+            symbol = str(_value(pos, "symbol", "")).upper()
+            cluster_name = self._get_symbol_cluster(symbol)
+            if not cluster_name:
+                continue
+            holdings.setdefault(cluster_name, [])
+            if symbol not in holdings[cluster_name]:
+                holdings[cluster_name].append(symbol)
+        return holdings
+
+    def _digest_authoritative_state(self, symbol: str, window_start_iso: str, window_end_iso: str) -> dict[str, Any] | None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT tp.id AS proposal_id, tp.status AS proposal_status, tp.side, tp.created_at AS proposal_created_at, tp.expires_at,
+                   pbc.id AS candidate_id, pbc.candidate_status, pb.id AS batch_id, pb.status AS batch_status,
+                   o.id AS order_id, o.status AS order_status, o.created_at AS order_created_at, o.updated_at AS order_updated_at,
+                   f.id AS fill_id, f.qty AS fill_qty, f.price AS fill_price, f.filled_at
+            FROM trade_proposals tp
+            LEFT JOIN proposal_batch_candidates pbc ON pbc.proposal_id=tp.id
+            LEFT JOIN proposal_batches pb ON pb.id=pbc.batch_id
+            LEFT JOIN orders o ON o.proposal_id=tp.id
+            LEFT JOIN fills f ON f.order_id=o.id
+            WHERE tp.symbol=? AND tp.created_at <= ?
+            ORDER BY COALESCE(f.filled_at, o.updated_at, o.created_at, tp.expires_at, tp.created_at) DESC
+            LIMIT 10
+            """,
+            (symbol, window_end_iso),
+        )
+        if not rows:
+            return None
+
+        def in_window(value: Any) -> bool:
+            if not value:
+                return False
+            dt = _parse_datetime(value)
+            if dt is None:
+                return False
+            return window_start_iso <= dt.isoformat() <= window_end_iso
+
+        for row in rows:
+            order_status = str(row.get("order_status") or "").lower()
+            proposal_status = str(row.get("proposal_status") or "").lower()
+            candidate_status = str(row.get("candidate_status") or "").lower()
+
+            if row.get("fill_id") and in_window(row.get("filled_at")):
+                if order_status == "filled":
+                    return {"status": f"Approved and filled — {symbol} paper buy filled", "event": "filled", **row}
+                if order_status == "partially_filled":
+                    return {"status": f"Approved — {symbol} order partially filled", "event": "partially_filled", **row}
+
+            if row.get("order_id") and (
+                in_window(row.get("order_created_at")) or in_window(row.get("order_updated_at")) or in_window(row.get("proposal_created_at"))
+            ):
+                if order_status in {"submitted", "new", "accepted", "pending_new"} or candidate_status == "submitted" or proposal_status == "submitted":
+                    return {"status": "Approved — order submitted, awaiting fill", "event": "submitted", **row}
+                if order_status == "rejected":
+                    return {"status": "Order rejected — no fill", "event": "rejected", **row}
+                if order_status in {"canceled", "cancelled"}:
+                    return {"status": "Order canceled — no fill", "event": "canceled", **row}
+                if order_status == "blocked":
+                    return {"status": "Proposal blocked by final validation", "event": "blocked", **row}
+
+            if proposal_status == "pending" or candidate_status == "pending":
+                if in_window(row.get("proposal_created_at")) or in_window(row.get("expires_at")):
+                    return {"status": "Proposal pending approval", "event": "pending_approval", **row}
+            if proposal_status == "expired" or candidate_status == "expired":
+                if in_window(row.get("expires_at")) or in_window(row.get("proposal_created_at")):
+                    return {"status": "Proposal expired — no order", "event": "expired", **row}
+            if proposal_status == "rejected" or candidate_status == "rejected":
+                if in_window(row.get("proposal_created_at")) or in_window(row.get("expires_at")):
+                    return {"status": "Proposal rejected — no order", "event": "rejected", **row}
+            if proposal_status == "blocked" or candidate_status == "blocked":
+                if in_window(row.get("proposal_created_at")) or in_window(row.get("order_updated_at")):
+                    return {"status": "Proposal blocked by final validation", "event": "blocked", **row}
+
+        return None
+
+    def _digest_market_memory_status(
+        self,
+        symbol: str,
+        latest_row: dict[str, Any],
+        obs_watchlist: set[str],
+        cluster_holdings: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        latest_score = latest_row.get("score") or 0.0
+        latest_signal = latest_row.get("signal")
+        no_action_reason = latest_row.get("no_action_reason") or ""
+        no_act = no_action_reason.lower()
+        score_threshold = self.config.get("ai", {}).get("ai_review_min_score", 65)
+        cluster_name = self._get_symbol_cluster(symbol)
+        held_symbols = [s for s in cluster_holdings.get(cluster_name or "", []) if s != symbol]
+        cluster_display = self._digest_display_cluster_name(cluster_name)
+
+        if symbol in obs_watchlist:
+            return {
+                "status": "Observation only — no proposal allowed",
+                "event": "observation_only",
+                "high_score": latest_score >= score_threshold,
+            }
+        if latest_score < score_threshold:
+            return {"status": "No proposal — score below threshold", "event": "below_threshold", "high_score": False}
+        if latest_signal not in {"ENTRY", "EXIT"}:
+            return {"status": "Watch — no ENTRY signal", "event": "no_entry", "high_score": True}
+        if "sleep" in no_act:
+            return {"status": "Watch — BUY suppressed by sleep mode", "event": "sleep", "high_score": True}
+        if "cooldown" in no_act or "dedupe" in no_act:
+            return {"status": "Watch — cooldown active", "event": "cooldown", "high_score": True}
+        if "gpt review" in no_act or "deferred due to ai" in no_act:
+            return {"status": "Watch — GPT review unavailable", "event": "gpt_unavailable", "high_score": True}
+        if "total portfolio exposure" in no_act or "portfolio_total_exposure" in no_act:
+            return {"status": "Watch — total portfolio exposure cap reached", "event": "exposure_cap", "high_score": True}
+        if "single symbol exposure" in no_act or "portfolio_single_symbol_exposure" in no_act:
+            return {"status": "Watch — single-symbol exposure cap reached", "event": "single_symbol_cap", "high_score": True}
+        if "cluster positions limit" in no_act or "portfolio_cluster_positions_limit" in no_act:
+            if held_symbols:
+                status = f"Watch — {cluster_display} cluster limit reached: existing {' and '.join(held_symbols)} positions"
+            else:
+                status = f"Watch — {cluster_display} cluster limit reached"
+            return {
+                "status": status,
+                "event": "cluster_limit",
+                "cluster_name": cluster_display,
+                "held_symbols": held_symbols,
+                "high_score": True,
+            }
+        if "cluster exposure limit" in no_act or "portfolio_cluster_exposure_limit" in no_act:
+            return {
+                "status": f"Watch — {cluster_display} cluster exposure cap reached",
+                "event": "cluster_exposure",
+                "cluster_name": cluster_display,
+                "held_symbols": held_symbols,
+                "high_score": True,
+            }
+        if (
+            "exit is pending" in no_act
+            or "exit proposal pending" in no_act
+            or "new buy blocked because" in no_act and "exit" in no_act
+            or "block_new_buy_if_exit_pending" in no_act
+        ):
+            blocker_label = self._exit_blocker_label_from_reason(no_action_reason)
+            return {"status": f"Watch — New buy blocked — {blocker_label}", "event": "exit_blocked", "high_score": True, "blocker": blocker_label}
+        if "emergency exit score is" in no_act or "block_new_buy_if_emergency_exit_score_above" in no_act:
+            return {"status": "Watch — new buy blocked due to emergency exit risk", "event": "emergency_risk", "high_score": True}
+        if "pyramiding check failed" in no_act or "add_on_check_failed" in no_act or "position not sufficiently profitable" in no_act or "cannot average down" in no_act:
+            return {"status": "Watch — pyramiding check failed", "event": "pyramiding", "high_score": True}
+        if "no entry/exit signal" in no_act:
+            return {"status": "Watch — no ENTRY signal", "event": "no_entry", "high_score": True}
+        if "blocked by risk checks" in no_act:
+            return {"status": "Watch — blocked by risk checks", "event": "risk_blocked", "high_score": True}
+        return {"status": "Watch — no proposal", "event": "no_proposal", "high_score": True}
+
+    def _build_digest_summary(self, strongest: dict[str, Any], symbols_list: list[dict[str, Any]]) -> str:
+        filled_syms = [x["symbol"] for x in symbols_list if x.get("_event") == "filled"]
+        submitted_syms = [x["symbol"] for x in symbols_list if x.get("_event") == "submitted"]
+        expired_syms = [x["symbol"] for x in symbols_list if x.get("_event") == "expired"]
+        pending_syms = [x["symbol"] for x in symbols_list if x.get("_event") == "pending_approval"]
+
+        parts: list[str] = []
+        if filled_syms:
+            parts.append(f"{', '.join(sorted(filled_syms))} was approved and filled during this window.")
+        elif submitted_syms:
+            parts.append(f"{', '.join(sorted(submitted_syms))} was approved and submitted during this window.")
+        elif pending_syms:
+            parts.append(f"Pending approval: {', '.join(sorted(pending_syms))}.")
+
+        strongest_event = strongest.get("_event")
+        if strongest_event == "cluster_limit":
+            held_symbols = strongest.get("_held_symbols") or []
+            cluster_name = strongest.get("_cluster_name") or "same-cluster"
+            if held_symbols:
+                parts.append(
+                    f"{strongest['symbol']} scored highest, but it was blocked by the {cluster_name} cluster limit because {' and '.join(held_symbols)} are already held."
+                )
+            else:
+                parts.append(f"{strongest['symbol']} scored highest, but it was blocked by the {cluster_name} cluster limit.")
+        elif strongest_event == "cluster_exposure":
+            parts.append(f"{strongest['symbol']} scored highest, but it was blocked because cluster exposure would exceed the configured limit.")
+        elif strongest_event == "exposure_cap":
+            parts.append(f"{strongest['symbol']} scored highest, but it was blocked because total portfolio exposure would exceed the configured limit.")
+        elif strongest_event == "observation_only":
+            parts.append(f"{strongest['symbol']} crossed score threshold but is observation-only, so no proposal is allowed.")
+        elif strongest_event == "no_entry":
+            parts.append(f"{strongest['symbol']} crossed score threshold but had no ENTRY signal.")
+        elif strongest_event == "pending_approval" and not parts:
+            parts.append(f"{strongest['symbol']} has an active proposal pending approval.")
+
+        if expired_syms:
+            parts.append(f"Expired with no order: {', '.join(sorted(expired_syms))}.")
+
+        if not parts:
+            high_score_watch = [x["symbol"] for x in symbols_list if x.get("_high_score")]
+            if high_score_watch:
+                strongest_name = strongest["symbol"]
+                others = [s for s in sorted(high_score_watch) if s != strongest_name]
+                if others:
+                    parts.append(f"{strongest_name} scored highest, while {', '.join(others)} also crossed the score threshold.")
+                else:
+                    parts.append(f"{strongest_name} crossed the score threshold.")
+            else:
+                parts.append("No setup crossed the score threshold.")
+        return " ".join(parts)
+
     def _risk_budget_cfg(self) -> dict[str, Any]:
         rb = self.config.get("risk_budget", {})
         pb = self.config.get("portfolio_behavior", {})
@@ -4643,12 +4758,17 @@ class TradingService:
                 ),
             )
             self.storage.execute(
-                "INSERT INTO candidate_risk_budget_decisions(id,run_id,batch_id,proposal_id,symbol,timestamp,risk_per_trade_pct,open_risk_after_pct,max_open_risk_pct,total_exposure_after_pct,single_symbol_exposure_after_pct,cluster_exposure_after_pct,buying_power,passed,block_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO candidate_risk_budget_decisions(id,run_id,batch_id,candidate_id,proposal_id,order_id,broker_order_id,fill_id,symbol,timestamp,risk_per_trade_pct,open_risk_after_pct,max_open_risk_pct,total_exposure_after_pct,single_symbol_exposure_after_pct,cluster_exposure_after_pct,buying_power,passed,block_reason,cluster_name,cluster_held_symbols,cluster_positions_count_after,max_cluster_positions,max_cluster_exposure_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    str(uuid.uuid4()), self.run_id, None, None, symbol, now.isoformat(), cfg["risk_per_trade_pct"],
+                    str(uuid.uuid4()), self.run_id, None, None, None, None, None, None, symbol, now.isoformat(), cfg["risk_per_trade_pct"],
                     open_risk_after_candidate, cfg["max_open_risk_pct"], total_after_candidate,
                     single_after_candidate, cluster_after_candidate, buying_power_remaining, int(passed),
-                    None if passed else reasons[symbol]
+                    None if passed else reasons[symbol],
+                    cluster_name,
+                    json_dumps(sorted(snapshot.get("cluster_symbols", {}).get(cluster_name or "", []))) if cluster_name else None,
+                    int(snapshot.get("cluster_counts", {}).get(cluster_name or "", 0)) + (1 if cluster_name else 0),
+                    int(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_positions", 2)),
+                    float(cfg["max_cluster_exposure_pct"]),
                 ),
             )
             self.storage.execute(

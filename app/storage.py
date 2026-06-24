@@ -20,7 +20,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
     "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
     "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, created_at TEXT, updated_at TEXT",
-    "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT",
+    "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT, fill_notified_at TEXT, fill_notification_status TEXT, fill_notification_error TEXT",
     "positions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, qty REAL, market_value REAL, unrealized_pl REAL, payload TEXT, created_at TEXT",
     "cash_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, equity REAL, cash REAL, settled_cash REAL, realized_pl REAL, unrealized_pl REAL, created_at TEXT",
     "cashout_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, payload TEXT, created_at TEXT",
@@ -44,7 +44,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "performance_lab_summaries": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_qualified_setups INTEGER, total_shadow_trades INTEGER, total_actual_trades INTEGER",
     "proposal_batches": "id TEXT PRIMARY KEY, run_id TEXT, telegram_message_id TEXT, status TEXT, created_at TEXT, expires_at TEXT, expiry_notified INTEGER DEFAULT 0, payload TEXT",
     "proposal_batch_candidates": "id TEXT PRIMARY KEY, batch_id TEXT, proposal_id TEXT, telegram_message_id TEXT, candidate_symbol TEXT, candidate_side TEXT, candidate_action TEXT, candidate_status TEXT, rank INTEGER, reason TEXT, created_at TEXT, expires_at TEXT, expiry_notified INTEGER DEFAULT 0, payload TEXT",
-    "candidate_risk_budget_decisions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, symbol TEXT, timestamp TEXT, risk_per_trade_pct REAL, open_risk_after_pct REAL, max_open_risk_pct REAL, total_exposure_after_pct REAL, single_symbol_exposure_after_pct REAL, cluster_exposure_after_pct REAL, buying_power REAL, passed INTEGER, block_reason TEXT",
+    "candidate_risk_budget_decisions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, symbol TEXT, timestamp TEXT, risk_per_trade_pct REAL, open_risk_after_pct REAL, max_open_risk_pct REAL, total_exposure_after_pct REAL, single_symbol_exposure_after_pct REAL, cluster_exposure_after_pct REAL, buying_power REAL, passed INTEGER, block_reason TEXT, cluster_name TEXT, cluster_held_symbols TEXT, cluster_positions_count_after INTEGER, max_cluster_positions INTEGER, max_cluster_exposure_pct REAL",
     "candidate_batch_allocations": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, symbol TEXT, rank INTEGER, raw_suggested_notional REAL, adjusted_suggested_notional REAL, risk_budget_adjusted_notional REAL, final_suggested_notional REAL, final_suggested_shares REAL, cap_reason TEXT, reduction_reason TEXT, created_at TEXT",
     "approval_batch_actions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, action TEXT, status TEXT, created_at TEXT, detail TEXT",
     "risk_budget_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, open_risk_pct REAL, daily_realized_loss_pct REAL, max_open_risk_pct REAL, buying_power REAL, payload TEXT",
@@ -197,12 +197,26 @@ class Storage:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
             add_missing_columns(
+                "fills",
+                {
+                    "fill_notified_at": "TEXT",
+                    "fill_notification_status": "TEXT",
+                    "fill_notification_error": "TEXT",
+                },
+            )
+
+            add_missing_columns(
                 "candidate_risk_budget_decisions",
                 {
                     "candidate_id": "TEXT",
                     "order_id": "TEXT",
                     "broker_order_id": "TEXT",
                     "fill_id": "TEXT",
+                    "cluster_name": "TEXT",
+                    "cluster_held_symbols": "TEXT",
+                    "cluster_positions_count_after": "INTEGER",
+                    "max_cluster_positions": "INTEGER",
+                    "max_cluster_exposure_pct": "REAL",
                 },
             )
             add_missing_columns(

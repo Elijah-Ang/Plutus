@@ -425,7 +425,7 @@ def test_batch_exit_approval_allowed_during_sleep_mode(tmp_path):
     assert handled is True
     assert not any("Sleep mode is ON" in msg for msg in service.telegram.messages)
     assert service.broker.submitted and service.broker.submitted[0]["side"] == "sell"
-    assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "approved"
+    assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "submitted"
     assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "submitted"
 
 

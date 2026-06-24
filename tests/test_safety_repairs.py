@@ -24,6 +24,9 @@ class HealthyTelegram:
     def is_available(self, force=False):
         return True
 
+    def send_message(self, text, chat_id=None):
+        return {"message_id": 1}
+
 
 class AuthoritativeBroker:
     def __init__(self, *, weekly_loss=2.0, margin=False):
@@ -235,6 +238,57 @@ def test_unknown_reconciliation_never_resubmits(tmp_path):
     assert result.unknown == 1
     assert storage.fetch_all("SELECT status FROM orders WHERE id='local-1'")[0]["status"] == "pending_new"
     assert broker.submit_calls == 0
+
+
+class FillTelegram:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.messages = []
+
+    def send_message(self, text, chat_id=None):
+        if self.fail:
+            raise RuntimeError("telegram down")
+        self.messages.append(text)
+        return {"message_id": 1}
+
+
+def test_fill_notification_is_one_shot_and_idempotent(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    insert_local_order(storage)
+    telegram = FillTelegram()
+    broker = ReconcileBroker()
+
+    reconciler = BrokerReconciler(broker, storage, "run", telegram)
+    reconciler.reconcile()
+    reconciler.reconcile()
+
+    assert len(telegram.messages) == 1
+    assert "Paper order filled" in telegram.messages[0]
+    fill_row = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    assert fill_row["fill_notification_status"] == "sent"
+    assert fill_row["fill_notified_at"] is not None
+
+
+def test_fill_notification_retries_after_telegram_failure_without_duplicates(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    insert_local_order(storage)
+    broker = ReconcileBroker()
+
+    BrokerReconciler(broker, storage, "run", FillTelegram(fail=True)).reconcile()
+    pending = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    assert pending["fill_notification_status"] == "pending"
+    assert pending["fill_notified_at"] is None
+
+    telegram = FillTelegram()
+    BrokerReconciler(broker, storage, "run", telegram).reconcile()
+    BrokerReconciler(broker, storage, "run", telegram).reconcile()
+
+    assert len(telegram.messages) == 1
+    sent = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    assert sent["fill_notification_status"] == "sent"
+    assert sent["fill_notified_at"] is not None
 
 
 def test_auto_execution_is_hard_quarantined(tmp_path):
