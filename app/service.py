@@ -174,7 +174,7 @@ class TradingService:
                    emergency_exit_score, emergency_exit_trigger_reason, exit_trigger_reason
             FROM trade_proposals
             WHERE side='sell'
-              AND status='pending'
+              AND status IN ('pending','approved')
               AND expires_at>?
             ORDER BY created_at DESC
             LIMIT 1
@@ -200,12 +200,44 @@ class TradingService:
                 "stale": False,
             }
 
+        active_batch_rows = self.storage.fetch_all(
+            """
+            SELECT c.id, c.candidate_symbol, c.candidate_action, c.candidate_status, c.created_at, c.expires_at, b.id AS batch_id
+            FROM proposal_batch_candidates c
+            JOIN proposal_batches b ON b.id=c.batch_id
+            WHERE c.candidate_status='pending'
+              AND b.status IN ('pending','partially_approved')
+              AND c.expires_at>?
+              AND (
+                lower(c.candidate_side)='sell'
+                OR upper(c.candidate_action) IN ('SELL','EXIT')
+              )
+            ORDER BY c.created_at DESC
+            LIMIT 1
+            """,
+            (now_iso,),
+        )
+        if active_batch_rows:
+            row = active_batch_rows[0]
+            symbol = str(row["candidate_symbol"]).upper()
+            return {
+                "active": True,
+                "symbol": symbol,
+                "reason": f"{symbol} EXIT batch candidate pending",
+                "status": row["candidate_status"],
+                "source": "proposal_batch_candidates",
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "batch_id": row["batch_id"],
+                "stale": False,
+            }
+
         stale_rows = self.storage.fetch_all(
             """
             SELECT id, symbol, status, created_at, expires_at
             FROM trade_proposals
             WHERE side='sell'
-              AND status IN ('pending','approved','submitted')
+              AND status IN ('pending','approved','submitted','filled','blocked','expired','rejected','superseded','stale_resolved')
             ORDER BY created_at DESC
             LIMIT 1
             """
@@ -225,6 +257,19 @@ class TradingService:
             }
 
         return {"active": False, "symbol": None, "reason": None, "status": None, "source": None, "stale": False}
+
+    def _sleep_mode_active(self) -> bool:
+        try:
+            return int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
+        except (TypeError, ValueError):
+            return False
+
+    def _sleep_mode_blocks_approval(self, proposal: dict[str, Any]) -> bool:
+        side = str(proposal.get("side") or proposal.get("candidate_side") or "").lower()
+        action = str(proposal.get("action") or proposal.get("candidate_action") or "").lower()
+        risk_reducing = side == "sell" or action in {"sell", "exit"}
+        buy_or_add = side == "buy" or action in {"buy", "add", "entry"}
+        return self._sleep_mode_active() and buy_or_add and not risk_reducing
 
     def _exit_blocker_label_from_reason(self, no_action_reason: str) -> str:
         no_act = no_action_reason or ""
@@ -598,6 +643,18 @@ class TradingService:
             row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
             prop_symbol = row.get("symbol", "")
             prop_side = row.get("side", "").lower()
+            if parsed.action == "approve" and row.get("emergency_exit_triggered") != 1:
+                proposal_for_sleep_check = {**json.loads(row.get("payload") or "{}"), **row}
+                if self._sleep_mode_blocks_approval(proposal_for_sleep_check):
+                    msg = "Sleep mode is ON, so I did not process this BUY/ADD approval. Send awake first, then approve again if the proposal is still valid."
+                    self.telegram.send_message(msg)
+                    ack_sent = iso_now()
+                    delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
+                    self.storage.execute(
+                        "UPDATE approvals SET status=?, acknowledgement_status='blocked', acknowledgement_sent_at=?, acknowledgement_delay_seconds=?, final_order_decision='blocked', final_block_reason=? WHERE id=?",
+                        (f"sleep_blocked_{approval_id[:8]}", ack_sent, delay_sec, "sleep mode is active", approval_id),
+                    )
+                    continue
 
             if parsed.action == "reject":
                 if row.get("emergency_exit_triggered") == 1:
@@ -921,9 +978,10 @@ class TradingService:
                 if target_upper != "ALL":
                     self.telegram.send_message(f"✅ Received: YES for {symbol} paper buy candidate. I will run final safety checks now.")
                 submitted, status, reason = self._approve_batch_candidate(proposal_id, sender, raw_text, row)
+                candidate_status = "submitted" if submitted else ("pending" if status == "sleep_mode_active" else "blocked")
                 self.storage.execute(
                     "UPDATE proposal_batch_candidates SET candidate_status=? WHERE proposal_id=?",
-                    ("submitted" if submitted else "blocked", proposal_id),
+                    (candidate_status, proposal_id),
                 )
                 self.storage.execute(
                     "UPDATE approval_batch_actions SET status=?, detail=? WHERE proposal_id=? AND batch_id=?",
@@ -939,6 +997,11 @@ class TradingService:
             return False, "already_handled", "candidate already handled"
 
         row = rows[0]
+        if self._sleep_mode_blocks_approval({**json.loads(row.get("payload") or "{}"), **row}):
+            msg = "Sleep mode is ON, so I did not process this BUY/ADD approval. Send awake first, then approve again if the proposal is still valid."
+            self.telegram.send_message(msg)
+            return False, "sleep_mode_active", msg
+
         approval_id = str(uuid.uuid4())
         approval_received_at = iso_now()
         self.storage.execute(
@@ -971,8 +1034,6 @@ class TradingService:
             block_reason = "kill switch active"
         elif not self.storage.writable():
             block_reason = "database is not writable"
-        elif prop_side == "buy" and self.storage.get_control_state("sleep_mode", "off") == "on":
-            block_reason = "sleep mode is active"
 
         telegram_cfg = self.config.get("telegram", {})
         refresh_required = telegram_cfg.get("approval_price_refresh_required", True)

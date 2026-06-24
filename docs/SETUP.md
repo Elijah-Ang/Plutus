@@ -1,7 +1,7 @@
 # Setup
 
 1. Install Python 3.11 or newer and confirm with `python3 --version`.
-2. Run `cd /Users/elijahang/Documents/Trading/TradingAgent && ./scripts/setup_venv.sh`.
+2. Run `cd /Users/elijahang/Projects/TradingAgent && ./scripts/setup_venv.sh`.
 3. Review `config/config.yaml`. Keep `mode: paper`, `live_enabled: false`, and `explicit_live_confirmation: false`.
 4. Prefer Keychain: `./scripts/store_secret_keychain.sh ALPACA_API_KEY` (repeat for each supported secret). The runtime reads these `TradingAgent.NAME` Keychain entries directly. Alternatively, `cp .env.template .env`, restrict it with `chmod 600 .env`, and replace placeholders locally.
 5. Put non-secret Telegram user/chat IDs in `.env`; never enter account passwords.

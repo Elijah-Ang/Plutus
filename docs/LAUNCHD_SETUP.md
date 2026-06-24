@@ -1,6 +1,6 @@
 # launchd setup
 
-The plist schedules `scripts/start_agent.sh` every 600 seconds. The starter confirms AC power, prevents overlapping runs, activates the project venv, and writes stdout/stderr under `logs/`.
+The scanner plist schedules `scripts/run_once.sh` every 600 seconds. The starter confirms AC power, prevents overlapping runs, activates the project venv, and writes stdout/stderr under `logs/`.
 
 After manual testing, install the expanded plist without loading it:
 

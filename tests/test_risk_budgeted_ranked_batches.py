@@ -230,7 +230,7 @@ def test_ranked_batch_message_contains_symbol_specific_and_yes_all_instructions(
     assert "Plain yes is ambiguous" in message
 
 
-def insert_batch(storage: Storage, proposals: list[tuple[str, str]]) -> str:
+def insert_batch(storage: Storage, proposals: list[tuple[str, str] | tuple[str, str, str, str]]) -> str:
     now = datetime.now(UTC)
     expiry = (now + timedelta(minutes=10)).isoformat()
     batch_id = "batch-1"
@@ -238,12 +238,20 @@ def insert_batch(storage: Storage, proposals: list[tuple[str, str]]) -> str:
         "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?)",
         (batch_id, "run", "4242", "pending", now.isoformat(), expiry, "{}"),
     )
-    for idx, (proposal_id, symbol) in enumerate(proposals, start=1):
+    for idx, item in enumerate(proposals, start=1):
+        if len(item) == 2:
+            proposal_id, symbol = item
+            side = "buy"
+            action = "entry"
+            candidate_action = "BUY"
+        else:
+            proposal_id, symbol, side, action = item
+            candidate_action = "ADD" if action == "add" else ("EXIT" if action == "exit" else side.upper())
         payload = {
             "id": proposal_id,
             "symbol": symbol,
-            "side": "buy",
-            "action": "entry",
+            "side": side,
+            "action": action,
             "notional": 5.0,
             "qty": 0.05,
             "latest_price": 100.0,
@@ -260,11 +268,11 @@ def insert_batch(storage: Storage, proposals: list[tuple[str, str]]) -> str:
         }
         storage.execute(
             "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (proposal_id, "run", f"sig-{idx}", symbol, "buy", 5.0, "pending", now.isoformat(), expiry, "rule_based_v1", json.dumps(payload), "4242"),
+            (proposal_id, "run", f"sig-{idx}", symbol, side, 5.0, "pending", now.isoformat(), expiry, "rule_based_v1", json.dumps(payload), "4242"),
         )
         storage.execute(
             "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"cand-{idx}", batch_id, proposal_id, "4242", symbol, "buy", "BUY", "pending", idx, "ranked", now.isoformat(), expiry, json.dumps(payload)),
+            (f"cand-{idx}", batch_id, proposal_id, "4242", symbol, side, candidate_action, "pending", idx, "ranked", now.isoformat(), expiry, json.dumps(payload)),
         )
     return batch_id
 
@@ -290,6 +298,168 @@ def test_yes_all_blocked_outside_paper_mode(tmp_path):
     assert handled is True
     assert "YES ALL is blocked" in service.telegram.messages[-1]
     assert {r["status"] for r in storage.fetch_all("SELECT status FROM trade_proposals")} == {"pending"}
+
+
+def test_batch_buy_approval_blocked_when_sleep_mode_active(tmp_path):
+    service, storage = make_service(tmp_path)
+    storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
+    insert_batch(storage, [("p1", "SPY")])
+
+    handled = service._handle_batch_approval_command("yes SPY", "7777", "yes", "spy", "4242")
+
+    assert handled is True
+    assert "Sleep mode is ON" in service.telegram.messages[-1]
+    assert service.broker.submitted == []
+    assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "pending"
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "pending"
+    assert storage.fetch_all("SELECT COUNT(*) AS cnt FROM orders")[0]["cnt"] == 0
+
+
+def test_batch_add_approval_blocked_when_sleep_mode_active(tmp_path):
+    service, storage = make_service(tmp_path)
+    storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
+    insert_batch(storage, [("p1", "SPY", "buy", "add")])
+
+    handled = service._handle_batch_approval_command("yes SPY", "7777", "yes", "spy", "4242")
+
+    assert handled is True
+    assert "Sleep mode is ON" in service.telegram.messages[-1]
+    assert service.broker.submitted == []
+    assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "pending"
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "pending"
+
+
+def test_yes_all_blocks_buy_candidates_during_sleep_mode(tmp_path):
+    service, storage = make_service(tmp_path)
+    storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
+    insert_batch(storage, [("p1", "SPY"), ("p2", "IWM", "buy", "add")])
+
+    handled = service._handle_batch_approval_command("yes all", "7777", "yes", "all", "4242")
+
+    assert handled is True
+    assert any("YES ALL" in msg for msg in service.telegram.messages)
+    assert sum("Sleep mode is ON" in msg for msg in service.telegram.messages) == 2
+    assert service.broker.submitted == []
+    assert {r["status"] for r in storage.fetch_all("SELECT status FROM trade_proposals")} == {"pending"}
+    assert {r["candidate_status"] for r in storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates")} == {"pending"}
+
+
+def test_batch_exit_approval_allowed_during_sleep_mode(tmp_path):
+    service, storage = make_service(tmp_path)
+    storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
+    insert_batch(storage, [("p1", "SPY", "sell", "exit")])
+
+    handled = service._handle_batch_approval_command("yes SPY", "7777", "yes", "spy", "4242")
+
+    assert handled is True
+    assert not any("Sleep mode is ON" in msg for msg in service.telegram.messages)
+    assert service.broker.submitted and service.broker.submitted[0]["side"] == "sell"
+    assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "approved"
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "submitted"
+
+
+def insert_exit_proposal(storage: Storage, proposal_id: str, symbol: str, status: str, expires_at: str, emergency: int = 0) -> None:
+    now = datetime.now(UTC)
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,emergency_exit_triggered) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (proposal_id, "run", f"sig-{proposal_id}", symbol, "sell", 5.0, status, now.isoformat(), expires_at, "rule_based_v1", "{}", emergency),
+    )
+
+
+def test_stale_approved_expired_sell_proposal_does_not_block_buys(tmp_path):
+    service, storage = make_service(tmp_path)
+    expired = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    insert_exit_proposal(storage, "old-spy-exit", "SPY", "approved", expired)
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is False
+    assert blocker["stale"] is True
+    assert blocker["symbol"] == "SPY"
+    assert blocker["reason"] == "stale SPY exit flag ignored"
+
+
+def test_active_pending_exit_proposal_blocks_buys(tmp_path):
+    service, storage = make_service(tmp_path)
+    future = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    insert_exit_proposal(storage, "dia-exit", "DIA", "pending", future)
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is True
+    assert blocker["symbol"] == "DIA"
+    assert blocker["reason"] == "DIA EXIT proposal pending"
+
+
+def test_active_emergency_exit_review_blocks_buys(tmp_path):
+    service, storage = make_service(tmp_path)
+    future = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+    insert_exit_proposal(storage, "dia-emergency", "DIA", "pending", future, emergency=1)
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is True
+    assert blocker["symbol"] == "DIA"
+    assert blocker["reason"] == "DIA emergency exit review active"
+
+
+def test_expired_exit_proposal_does_not_block_buys(tmp_path):
+    service, storage = make_service(tmp_path)
+    expired = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    insert_exit_proposal(storage, "dia-expired", "DIA", "pending", expired)
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is False
+    assert blocker["stale"] is True
+    assert blocker["status"] == "pending"
+
+
+def test_submitted_and_filled_exit_proposals_do_not_block_buys(tmp_path):
+    for status in ("submitted", "filled"):
+        service, storage = make_service(tmp_path / status)
+        future = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+        insert_exit_proposal(storage, f"dia-{status}", "DIA", status, future)
+
+        blocker = service._exit_blocker_context([])
+
+        assert blocker["active"] is False
+        assert blocker["stale"] is True
+        assert blocker["status"] == status
+
+
+def test_pending_exit_batch_candidate_blocks_buys(tmp_path):
+    service, storage = make_service(tmp_path)
+    now = datetime.now(UTC)
+    expiry = (now + timedelta(minutes=10)).isoformat()
+    storage.execute(
+        "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?)",
+        ("batch-exit", "run", "4242", "pending", now.isoformat(), expiry, "{}"),
+    )
+    storage.execute(
+        "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("cand-exit", "batch-exit", "proposal-exit", "4242", "DIA", "sell", "EXIT", "pending", 1, "ranked", now.isoformat(), expiry, "{}"),
+    )
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is True
+    assert blocker["symbol"] == "DIA"
+    assert blocker["reason"] == "DIA EXIT batch candidate pending"
+
+
+def test_risk_context_does_not_block_buy_on_stale_exit(tmp_path):
+    service, storage = make_service(tmp_path)
+    expired = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    insert_exit_proposal(storage, "old-spy-exit", "SPY", "approved", expired)
+    proposal = risk_proposal()
+
+    context = service._portfolio_context(proposal)
+    decision = service._risk_engine("risk-test", "proposal").evaluate(proposal, context)
+
+    assert context["exit_pending"] is False
+    assert context["exit_pending_stale"] is True
+    assert not any("exit" in reason.lower() for reason in decision.reasons)
 
 
 def risk_proposal() -> dict:
