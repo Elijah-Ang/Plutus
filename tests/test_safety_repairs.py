@@ -121,6 +121,111 @@ def test_reconciliation_updates_order_and_inserts_fill_once(tmp_path):
     assert broker.submit_calls == 0
 
 
+def test_filled_batch_order_creates_actual_performance_outcome_and_links_rows(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            "proposal-1", "scan-run", "IWM", "buy", 15, "approved", now,
+            (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            '{"score":90,"asset_score":90,"latest_price":299.08,"reason":"ranked batch candidate"}',
+        ),
+    )
+    storage.execute(
+        "INSERT INTO proposal_batches(id,run_id,status,created_at,expires_at) VALUES(?,?,?,?,?)",
+        ("batch-1", "scan-run", "completed", now, (datetime.now(UTC) + timedelta(minutes=5)).isoformat()),
+    )
+    storage.execute(
+        "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("candidate-1", "batch-1", "proposal-1", "IWM", "buy", "entry", "submitted", 1, now, (datetime.now(UTC) + timedelta(minutes=5)).isoformat()),
+    )
+    storage.execute(
+        "INSERT INTO approval_batch_actions(id,run_id,batch_id,proposal_id,action,status,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("batch-action-1", "approval-run", "batch-1", "proposal-1", "approve", "submitted", now),
+    )
+    storage.execute(
+        "INSERT INTO approvals(id,run_id,proposal_id,parsed_action,authorized,status,created_at,consumed_at,proposal_targeting_method) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("approval-1", "approval-run", "proposal-1", "approve", 1, "consumed", now, now, "batch"),
+    )
+    storage.execute(
+        "INSERT INTO candidate_risk_budget_decisions(id,run_id,batch_id,candidate_id,proposal_id,symbol,timestamp,passed) VALUES(?,?,?,?,?,?,?,?)",
+        ("risk-1", "scan-run", "batch-1", "candidate-1", "proposal-1", "IWM", now, 1),
+    )
+    storage.execute(
+        "INSERT INTO position_sizing_decisions(id,run_id,symbol,timestamp,final_notional,suggested_shares,batch_id,candidate_id,proposal_id) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("size-1", "scan-run", "IWM", now, 15, 0.0501, "batch-1", "candidate-1", "proposal-1"),
+    )
+    storage.execute(
+        "INSERT INTO shadow_trades(id,run_id,symbol,side,would_have_entry_price,would_have_entry_time,would_have_notional,reason_not_executed,selected_actual_trade_this_cycle) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("shadow-1", "scan-run", "IWM", "buy", 299.08, now, 15, "suppressed", 0),
+    )
+    storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-1", "approval-run", "proposal-1", "broker-1", "client-1", "IWM", "buy", 15, "submitted", now, now),
+    )
+
+    broker = ReconcileBroker()
+    BrokerReconciler(broker, storage, "reconcile-run").reconcile()
+
+    actual = storage.fetch_all("SELECT * FROM trade_outcomes WHERE actual_or_shadow='actual'")
+    assert len(actual) == 1
+    row = actual[0]
+    assert row["trade_id"] == "order-1"
+    assert row["batch_id"] == "batch-1"
+    assert row["candidate_id"] == "candidate-1"
+    assert row["proposal_id"] == "proposal-1"
+    assert row["order_id"] == "order-1"
+    assert row["broker_order_id"] == "broker-1"
+    assert row["risk_budget_decision_id"] == "risk-1"
+    assert row["position_sizing_decision_id"] == "size-1"
+    assert row["approval_batch_action_id"] == "batch-action-1"
+    assert row["quantity"] == 2
+    assert row["entry_price"] == 10.5
+    assert row["outcome_status"] == "pending_forward_returns"
+    assert row["source"] == "ranked_batch_approval"
+    assert storage.fetch_all("SELECT selected_actual_trade_this_cycle, reason_not_executed FROM shadow_trades WHERE id='shadow-1'")[0] == {
+        "selected_actual_trade_this_cycle": 1,
+        "reason_not_executed": "executed_as_actual",
+    }
+    assert storage.fetch_all("SELECT order_id, broker_order_id, fill_id FROM candidate_risk_budget_decisions WHERE id='risk-1'")[0]["order_id"] == "order-1"
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE id='candidate-1'")[0]["candidate_status"] == "filled"
+    assert broker.submit_calls == 0
+
+
+def test_batch_candidate_creation_backfills_measurement_linkage(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("proposal-1", "scan-run", "SPY", "buy", 10, "pending", now, (datetime.now(UTC) + timedelta(minutes=5)).isoformat(), "{}"),
+    )
+    storage.execute(
+        "INSERT INTO candidate_risk_budget_decisions(id,run_id,symbol,timestamp,passed) VALUES(?,?,?,?,?)",
+        ("risk-1", "scan-run", "SPY", now, 1),
+    )
+    storage.execute(
+        "INSERT INTO position_sizing_decisions(id,run_id,symbol,timestamp,final_notional) VALUES(?,?,?,?,?)",
+        ("size-1", "scan-run", "SPY", now, 10),
+    )
+    storage.execute(
+        "INSERT INTO ranked_opportunity_sets(id,run_id,timestamp,symbol,rank,actionable) VALUES(?,?,?,?,?,?)",
+        ("rank-1", "scan-run", now, "SPY", 1, 1),
+    )
+
+    storage.link_batch_candidate_records("proposal-1", "batch-1", "candidate-1")
+
+    assert storage.fetch_all("SELECT batch_id,candidate_id,proposal_id FROM candidate_risk_budget_decisions WHERE id='risk-1'")[0] == {
+        "batch_id": "batch-1",
+        "candidate_id": "candidate-1",
+        "proposal_id": "proposal-1",
+    }
+    assert storage.fetch_all("SELECT batch_id,candidate_id,proposal_id FROM position_sizing_decisions WHERE id='size-1'")[0]["candidate_id"] == "candidate-1"
+    assert storage.fetch_all("SELECT batch_id,candidate_id,proposal_id FROM ranked_opportunity_sets WHERE id='rank-1'")[0]["proposal_id"] == "proposal-1"
+
+
 def test_unknown_reconciliation_never_resubmits(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()

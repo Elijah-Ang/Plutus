@@ -1767,15 +1767,18 @@ class TradingService:
                 approval_id,
             ),
         )
+        order_id = str(uuid.uuid4())
         self.storage.execute(
             "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                str(uuid.uuid4()), self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None,
+                order_id, self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None,
                 result.client_order_id, proposal.get("symbol", prop_symbol), proposal.get("side", prop_side),
                 proposal.get("notional"), proposal.get("qty"), result.status,
                 json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()
             ),
         )
+        self.storage.link_executed_order_records(order_id)
+        self.storage.upsert_actual_trade_outcome_for_order(order_id)
         if result.submitted:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
             self._mark_position_management_proposal_handled(proposal, "submitted")
@@ -4753,6 +4756,7 @@ class TradingService:
             (batch_id, self.run_id, None, "pending", iso_now(), expires_at, json_dumps({"proposal_ids": [p["id"] for p in proposals]}), 0),
         )
         for idx, proposal in enumerate(proposals, start=1):
+            candidate_id = str(uuid.uuid4())
             proposal["candidate_expires_at"] = proposal.get("expires_at")
             proposal["selection_reason"] = _normalize_ranked_candidate_reason(proposal.get("selection_reason") or proposal.get("reason"), idx)
             proposal["expires_at"] = expires_at
@@ -4768,12 +4772,13 @@ class TradingService:
             self.storage.execute(
                 "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload,expiry_notified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    str(uuid.uuid4()), batch_id, proposal["id"], None, proposal["symbol"], proposal["side"],
+                    candidate_id, batch_id, proposal["id"], None, proposal["symbol"], proposal["side"],
                     candidate_action, "pending", idx,
                     proposal.get("selection_reason") or proposal.get("reason"), iso_now(), expires_at,
                     json_dumps(proposal), 0
                 ),
             )
+            self.storage.link_batch_candidate_records(proposal["id"], batch_id, candidate_id)
         message = self._format_ranked_batch_message(proposals, tracked_candidates, risk_snapshot)
         res_tg = self.telegram.send_message(message)
         if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
@@ -4873,7 +4878,7 @@ class TradingService:
 
     def _update_forward_outcomes(self) -> None:
         now = datetime.now(UTC)
-        pending = self.storage.fetch_all("SELECT * FROM trade_outcomes WHERE outcome_status='pending'")
+        pending = self.storage.fetch_all("SELECT * FROM trade_outcomes WHERE outcome_status IN ('pending','pending_forward_returns')")
         if not pending:
             return
 

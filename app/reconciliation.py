@@ -100,6 +100,13 @@ class BrokerReconciler:
                     ),
                 )
                 fills_upserted += 1
+                self.storage.link_executed_order_records(local["id"])
+                self.storage.upsert_actual_trade_outcome_for_order(local["id"])
+                if remote_status == "filled":
+                    self.storage.execute(
+                        "UPDATE proposal_batch_candidates SET candidate_status='filled' WHERE proposal_id=? AND candidate_status='submitted'",
+                        (local.get("proposal_id"),),
+                    )
 
         self._snapshot_account_and_positions()
         result = ReconciliationResult(checked, updated, fills_upserted, unknown)

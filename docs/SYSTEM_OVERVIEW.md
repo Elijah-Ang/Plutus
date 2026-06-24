@@ -268,8 +268,8 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `telegram_digests`: History of 30-minute Telegram informational digests.
 - `trade_setups`: Performance Lab records for meaningful setups, including active/observation status, score, proposal eligibility, and no-proposal reason.
 - `shadow_trades`: Measurement-only trades for setups that were not actually executed. These never create broker orders or Telegram actionable proposals.
-- `trade_outcomes`: Forward-return, MAE/MFE, stop/target, and actual-vs-shadow outcome labels.
-- `position_sizing_decisions`: Deterministic paper sizing calculations and stop model inputs.
+- `trade_outcomes`: Forward-return, MAE/MFE, stop/target, and actual-vs-shadow outcome labels. Filled ranked-batch paper trades create an `actual` outcome row linked to batch, candidate, proposal, order, broker order, fill, risk-budget decision, sizing decision, approval, and matched shadow row when available.
+- `position_sizing_decisions`: Deterministic paper sizing calculations and stop model inputs. Ranked-batch rows are backfilled with batch, candidate, proposal, order, broker order, and fill IDs as those lifecycle records become available.
 - `portfolio_exposure_snapshots`: Total, symbol, and cluster exposure snapshots.
 - `candidate_rankings`: Final candidate ranking components and selection/non-selection reasons.
 - `add_on_opportunities`: Add-to-winner eligibility checks and block reasons.
@@ -482,6 +482,8 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Paper-only scope**: The upgrade changes proposal sizing, measurement, ranking, and reporting only. Live trading and live auto-execution remain unsupported and disabled.
 - **Performance Lab**: Meaningful setups are recorded even when no proposal is sent. Suppressed candidates, observation-only candidates, cooldown blocks, sleep-mode blocks, GPT deferrals, exposure blocks, rejected proposals, and expired proposals can become shadow trades for later analysis.
 - **Shadow trades**: Shadow records are measurement-only. They do not create broker orders, do not create actionable Telegram proposals, and do not alter broker state.
+- **Actual-vs-shadow lifecycle**: A ranked opportunity may first be measured as a shadow row while waiting for user approval. If the user approves the candidate and broker reconciliation confirms a fill, the system creates or updates an `actual` outcome row keyed by the order/fill and marks the matching shadow row as `executed_as_actual` instead of deleting it.
+- **Risk/sizing linkage**: Batch-candidate creation backfills `batch_id`, `candidate_id`, and `proposal_id` into ranked opportunity, risk-budget, allocation, and sizing rows. Fill reconciliation adds `order_id`, `broker_order_id`, and `fill_id` where applicable so reports can trace candidate -> risk/sizing -> approval -> order -> fill -> actual outcome.
 - **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives once enough future bars exist.
 - **Dynamic sizing**: Initial BUY proposals use `position_sizing` rules: score multiplier, volatility multiplier, risk budget, ATR/technical stop distance, min/max paper notional, single-symbol exposure cap, total exposure cap, and cluster exposure cap. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
 - **Portfolio exposure controls**: `portfolio_behavior`, `portfolio_optimizer`, and `risk_budget` cap single-symbol exposure, total exposure, open risk, same-cluster exposure, and paper buying power use. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.

@@ -36,19 +36,19 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "control_state": "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT, source TEXT, raw_command_redacted TEXT, telegram_update_id INTEGER, telegram_message_id INTEGER, telegram_message_timestamp INTEGER, processed_at TEXT",
     "trade_setups": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, side TEXT, action TEXT, setup_key TEXT, is_active INTEGER, price REAL, score REAL, asset_score REAL, volatility_regime TEXT, trend_state TEXT, gpt_status TEXT, proposal_eligible INTEGER, proposal_sent INTEGER, block_reason TEXT",
     "shadow_trades": "id TEXT PRIMARY KEY, run_id TEXT, setup_id TEXT, symbol TEXT, side TEXT, would_have_entry_price REAL, would_have_entry_time TEXT, would_have_notional REAL, would_have_shares REAL, would_have_stop_price REAL, would_have_stop_distance_pct REAL, reason_not_executed TEXT, score REAL, volatility_regime TEXT, gpt_confidence TEXT, gpt_caution TEXT, setup_key TEXT, portfolio_state_json TEXT, sleep_mode_active INTEGER, cooldown_state TEXT, selected_actual_trade_this_cycle INTEGER",
-    "trade_outcomes": "id TEXT PRIMARY KEY, trade_id TEXT, actual_or_shadow TEXT, symbol TEXT, entry_time TEXT, entry_price REAL, outcome_status TEXT, forward_return_1d REAL, forward_return_5d REAL, forward_return_20d REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, stop_hit INTEGER, target_reached INTEGER, add_on_improved INTEGER, beat_shadow_alternatives INTEGER, updated_at TEXT",
-    "position_sizing_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, portfolio_equity REAL, risk_budget REAL, stop_distance_dollars REAL, risk_based_shares REAL, score_adjusted_notional REAL, vol_adjusted_notional REAL, final_notional REAL, suggested_shares REAL, base_notional REAL, score_multiplier REAL, volatility_multiplier REAL, stop_model_used TEXT",
+    "trade_outcomes": "id TEXT PRIMARY KEY, trade_id TEXT, actual_or_shadow TEXT, symbol TEXT, entry_time TEXT, entry_price REAL, outcome_status TEXT, forward_return_1d REAL, forward_return_5d REAL, forward_return_20d REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, stop_hit INTEGER, target_reached INTEGER, add_on_improved INTEGER, beat_shadow_alternatives INTEGER, updated_at TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, shadow_trade_id TEXT, risk_budget_decision_id TEXT, position_sizing_decision_id TEXT, approval_id TEXT, approval_batch_action_id TEXT, quantity REAL, notional REAL, score REAL, asset_score REAL, trade_score REAL, setup_reason TEXT, source TEXT",
+    "position_sizing_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, portfolio_equity REAL, risk_budget REAL, stop_distance_dollars REAL, risk_based_shares REAL, score_adjusted_notional REAL, vol_adjusted_notional REAL, final_notional REAL, suggested_shares REAL, base_notional REAL, score_multiplier REAL, volatility_multiplier REAL, stop_model_used TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT",
     "portfolio_exposure_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, total_exposure_dollars REAL, single_symbol_exposure_json TEXT, cluster_exposure_json TEXT",
     "candidate_rankings": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, symbol TEXT, true_score_rank INTEGER, final_candidate_rank INTEGER, setup_quality_score REAL, portfolio_fit_score REAL, diversification_score REAL, sizing_score REAL, reason_selected TEXT, reason_not_selected TEXT",
     "add_on_opportunities": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, symbol TEXT, current_qty REAL, avg_entry_price REAL, current_price REAL, unrealized_gain_pct REAL, proposed_add_notional REAL, proposed_add_shares REAL, score REAL, score_improvement REAL, passed INTEGER, block_reasons TEXT",
     "performance_lab_summaries": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_qualified_setups INTEGER, total_shadow_trades INTEGER, total_actual_trades INTEGER",
     "proposal_batches": "id TEXT PRIMARY KEY, run_id TEXT, telegram_message_id TEXT, status TEXT, created_at TEXT, expires_at TEXT, expiry_notified INTEGER DEFAULT 0, payload TEXT",
     "proposal_batch_candidates": "id TEXT PRIMARY KEY, batch_id TEXT, proposal_id TEXT, telegram_message_id TEXT, candidate_symbol TEXT, candidate_side TEXT, candidate_action TEXT, candidate_status TEXT, rank INTEGER, reason TEXT, created_at TEXT, expires_at TEXT, expiry_notified INTEGER DEFAULT 0, payload TEXT",
-    "candidate_risk_budget_decisions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, symbol TEXT, timestamp TEXT, risk_per_trade_pct REAL, open_risk_after_pct REAL, max_open_risk_pct REAL, total_exposure_after_pct REAL, single_symbol_exposure_after_pct REAL, cluster_exposure_after_pct REAL, buying_power REAL, passed INTEGER, block_reason TEXT",
-    "candidate_batch_allocations": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, symbol TEXT, rank INTEGER, raw_suggested_notional REAL, adjusted_suggested_notional REAL, risk_budget_adjusted_notional REAL, final_suggested_notional REAL, final_suggested_shares REAL, cap_reason TEXT, reduction_reason TEXT, created_at TEXT",
+    "candidate_risk_budget_decisions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, symbol TEXT, timestamp TEXT, risk_per_trade_pct REAL, open_risk_after_pct REAL, max_open_risk_pct REAL, total_exposure_after_pct REAL, single_symbol_exposure_after_pct REAL, cluster_exposure_after_pct REAL, buying_power REAL, passed INTEGER, block_reason TEXT",
+    "candidate_batch_allocations": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, symbol TEXT, rank INTEGER, raw_suggested_notional REAL, adjusted_suggested_notional REAL, risk_budget_adjusted_notional REAL, final_suggested_notional REAL, final_suggested_shares REAL, cap_reason TEXT, reduction_reason TEXT, created_at TEXT",
     "approval_batch_actions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, action TEXT, status TEXT, created_at TEXT, detail TEXT",
     "risk_budget_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, open_risk_pct REAL, daily_realized_loss_pct REAL, max_open_risk_pct REAL, buying_power REAL, payload TEXT",
-    "ranked_opportunity_sets": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, timestamp TEXT, symbol TEXT, rank INTEGER, actionable INTEGER, reason TEXT, score REAL, suggested_notional REAL, suggested_shares REAL, payload TEXT",
+    "ranked_opportunity_sets": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, timestamp TEXT, symbol TEXT, rank INTEGER, actionable INTEGER, reason TEXT, score REAL, suggested_notional REAL, suggested_shares REAL, payload TEXT",
     "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
     "position_management_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, decision_type TEXT, priority INTEGER, action TEXT, reason TEXT, current_price REAL, avg_entry_price REAL, quantity REAL, unrealized_profit_pct REAL, highest_price_since_entry REAL, max_unrealized_profit_pct REAL, pullback_from_peak_pct REAL, profit_giveback_ratio REAL, current_r_multiple REAL, trailing_stop_price REAL, suggested_sell_fraction REAL, suggested_add_notional REAL, blocking_reasons TEXT, is_actionable INTEGER, dip_trap_classification TEXT, created_at TEXT, payload TEXT",
     "profit_exit_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, event_type TEXT, proposal_id TEXT, proposal_batch_id TEXT, sell_fraction REAL, estimated_shares REAL, estimated_notional REAL, current_gain_pct REAL, peak_gain_pct REAL, giveback_ratio REAL, r_multiple REAL, trailing_stop_price REAL, status TEXT, created_at TEXT, resolved_at TEXT",
@@ -189,6 +189,69 @@ class Storage:
             batch_candidate_cols = [row["name"] for row in cursor.fetchall()]
             if "expiry_notified" not in batch_candidate_cols:
                 conn.execute("ALTER TABLE proposal_batch_candidates ADD COLUMN expiry_notified INTEGER DEFAULT 0")
+
+            def add_missing_columns(table: str, column_defs: dict[str, str]) -> None:
+                existing = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                for column, definition in column_defs.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+            add_missing_columns(
+                "candidate_risk_budget_decisions",
+                {
+                    "candidate_id": "TEXT",
+                    "order_id": "TEXT",
+                    "broker_order_id": "TEXT",
+                    "fill_id": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "candidate_batch_allocations",
+                {
+                    "candidate_id": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "ranked_opportunity_sets",
+                {
+                    "candidate_id": "TEXT",
+                    "proposal_id": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "position_sizing_decisions",
+                {
+                    "batch_id": "TEXT",
+                    "candidate_id": "TEXT",
+                    "proposal_id": "TEXT",
+                    "order_id": "TEXT",
+                    "broker_order_id": "TEXT",
+                    "fill_id": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "trade_outcomes",
+                {
+                    "batch_id": "TEXT",
+                    "candidate_id": "TEXT",
+                    "proposal_id": "TEXT",
+                    "order_id": "TEXT",
+                    "broker_order_id": "TEXT",
+                    "fill_id": "TEXT",
+                    "shadow_trade_id": "TEXT",
+                    "risk_budget_decision_id": "TEXT",
+                    "position_sizing_decision_id": "TEXT",
+                    "approval_id": "TEXT",
+                    "approval_batch_action_id": "TEXT",
+                    "quantity": "REAL",
+                    "notional": "REAL",
+                    "score": "REAL",
+                    "asset_score": "REAL",
+                    "trade_score": "REAL",
+                    "setup_reason": "TEXT",
+                    "source": "TEXT",
+                },
+            )
                 
             cursor = conn.execute("PRAGMA table_info(market_memory)")
             cols_mem = [row["name"] for row in cursor.fetchall()]
@@ -318,3 +381,176 @@ class Storage:
             """,
             (key, value, iso_now(), updated_by, source, raw_command_redacted, update_id, message_id, message_ts, iso_now())
         )
+
+    def link_batch_candidate_records(self, proposal_id: str, batch_id: str, candidate_id: str) -> None:
+        """Attach late-created batch candidate IDs to earlier measurement rows."""
+        self.execute(
+            "UPDATE candidate_risk_budget_decisions SET batch_id=?, candidate_id=?, proposal_id=? WHERE proposal_id IS NULL AND symbol=(SELECT symbol FROM trade_proposals WHERE id=?) AND run_id=(SELECT run_id FROM trade_proposals WHERE id=?)",
+            (batch_id, candidate_id, proposal_id, proposal_id, proposal_id),
+        )
+        self.execute(
+            "UPDATE candidate_batch_allocations SET batch_id=?, candidate_id=?, proposal_id=? WHERE proposal_id IS NULL AND symbol=(SELECT symbol FROM trade_proposals WHERE id=?) AND run_id=(SELECT run_id FROM trade_proposals WHERE id=?)",
+            (batch_id, candidate_id, proposal_id, proposal_id, proposal_id),
+        )
+        self.execute(
+            "UPDATE ranked_opportunity_sets SET batch_id=?, candidate_id=?, proposal_id=? WHERE proposal_id IS NULL AND symbol=(SELECT symbol FROM trade_proposals WHERE id=?) AND run_id=(SELECT run_id FROM trade_proposals WHERE id=?)",
+            (batch_id, candidate_id, proposal_id, proposal_id, proposal_id),
+        )
+        self.execute(
+            "UPDATE position_sizing_decisions SET batch_id=?, candidate_id=?, proposal_id=? WHERE proposal_id IS NULL AND symbol=(SELECT symbol FROM trade_proposals WHERE id=?) AND run_id=(SELECT run_id FROM trade_proposals WHERE id=?)",
+            (batch_id, candidate_id, proposal_id, proposal_id, proposal_id),
+        )
+
+    def link_executed_order_records(self, order_id: str) -> None:
+        rows = self.fetch_all(
+            """
+            SELECT o.id AS order_id, o.proposal_id, o.broker_order_id, f.id AS fill_id,
+                   c.id AS candidate_id, c.batch_id
+            FROM orders o
+            LEFT JOIN fills f ON f.order_id=o.id
+            LEFT JOIN proposal_batch_candidates c ON c.proposal_id=o.proposal_id
+            WHERE o.id=?
+            """,
+            (order_id,),
+        )
+        if not rows:
+            return
+        row = rows[0]
+        params = (
+            row.get("order_id"),
+            row.get("broker_order_id"),
+            str(row.get("fill_id")) if row.get("fill_id") is not None else None,
+            row.get("proposal_id"),
+        )
+        self.execute(
+            "UPDATE candidate_risk_budget_decisions SET order_id=?, broker_order_id=?, fill_id=? WHERE proposal_id=?",
+            params,
+        )
+        self.execute(
+            "UPDATE position_sizing_decisions SET order_id=?, broker_order_id=?, fill_id=? WHERE proposal_id=?",
+            params,
+        )
+
+    def upsert_actual_trade_outcome_for_order(self, order_id: str, source: str = "ranked_batch_approval") -> str | None:
+        rows = self.fetch_all(
+            """
+            SELECT o.*, f.id AS fill_id, f.qty AS fill_qty, f.price AS fill_price, f.filled_at,
+                   p.run_id AS proposal_run_id, p.payload AS proposal_payload, p.created_at AS proposal_created_at,
+                   p.selection_reason, p.current_price,
+                   c.id AS candidate_id, c.batch_id,
+                   a.id AS approval_id,
+                   aba.id AS approval_batch_action_id,
+                   rb.id AS risk_budget_decision_id,
+                   ps.id AS position_sizing_decision_id,
+                   s.id AS shadow_trade_id
+            FROM orders o
+            LEFT JOIN fills f ON f.order_id=o.id
+            LEFT JOIN trade_proposals p ON p.id=o.proposal_id
+            LEFT JOIN proposal_batch_candidates c ON c.proposal_id=o.proposal_id
+            LEFT JOIN approvals a ON a.proposal_id=o.proposal_id AND a.status='consumed'
+            LEFT JOIN approval_batch_actions aba ON aba.proposal_id=o.proposal_id
+            LEFT JOIN candidate_risk_budget_decisions rb ON rb.proposal_id=o.proposal_id
+            LEFT JOIN position_sizing_decisions ps ON ps.proposal_id=o.proposal_id
+            LEFT JOIN shadow_trades s ON s.symbol=o.symbol AND s.run_id=p.run_id
+            WHERE o.id=?
+            ORDER BY f.id DESC, a.created_at DESC, aba.created_at DESC
+            LIMIT 1
+            """,
+            (order_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if str(row.get("status") or "").lower() not in {"filled", "partially_filled"}:
+            return None
+        payload: dict[str, Any] = {}
+        if row.get("proposal_payload"):
+            try:
+                import json
+
+                payload = json.loads(row["proposal_payload"])
+            except Exception:
+                payload = {}
+        entry_time = str(row.get("filled_at") or row.get("updated_at") or row.get("created_at") or iso_now())
+        entry_price = row.get("fill_price") or payload.get("latest_price") or row.get("current_price")
+        quantity = row.get("fill_qty") or row.get("qty")
+        notional = row.get("notional")
+        if notional is None and quantity is not None and entry_price is not None:
+            notional = float(quantity) * float(entry_price)
+        existing = self.fetch_all("SELECT id FROM trade_outcomes WHERE actual_or_shadow='actual' AND order_id=?", (order_id,))
+        outcome_id = existing[0]["id"] if existing else str(uuid.uuid4())
+        values = (
+            outcome_id,
+            order_id,
+            "actual",
+            row.get("symbol"),
+            entry_time,
+            entry_price,
+            "pending_forward_returns",
+            0,
+            0,
+            None,
+            None,
+            iso_now(),
+            row.get("batch_id"),
+            row.get("candidate_id"),
+            row.get("proposal_id"),
+            order_id,
+            row.get("broker_order_id"),
+            str(row.get("fill_id")) if row.get("fill_id") is not None else None,
+            row.get("shadow_trade_id"),
+            row.get("risk_budget_decision_id"),
+            row.get("position_sizing_decision_id"),
+            row.get("approval_id"),
+            row.get("approval_batch_action_id"),
+            quantity,
+            notional,
+            payload.get("score"),
+            payload.get("asset_score"),
+            payload.get("score"),
+            row.get("selection_reason") or payload.get("reason"),
+            source,
+        )
+        self.execute(
+            """
+            INSERT INTO trade_outcomes(
+                id, trade_id, actual_or_shadow, symbol, entry_time, entry_price, outcome_status,
+                stop_hit, target_reached, add_on_improved, beat_shadow_alternatives, updated_at,
+                batch_id, candidate_id, proposal_id, order_id, broker_order_id, fill_id,
+                shadow_trade_id, risk_budget_decision_id, position_sizing_decision_id,
+                approval_id, approval_batch_action_id, quantity, notional, score, asset_score,
+                trade_score, setup_reason, source
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                trade_id=excluded.trade_id,
+                entry_time=excluded.entry_time,
+                entry_price=excluded.entry_price,
+                outcome_status=excluded.outcome_status,
+                updated_at=excluded.updated_at,
+                batch_id=excluded.batch_id,
+                candidate_id=excluded.candidate_id,
+                proposal_id=excluded.proposal_id,
+                order_id=excluded.order_id,
+                broker_order_id=excluded.broker_order_id,
+                fill_id=excluded.fill_id,
+                shadow_trade_id=excluded.shadow_trade_id,
+                risk_budget_decision_id=excluded.risk_budget_decision_id,
+                position_sizing_decision_id=excluded.position_sizing_decision_id,
+                approval_id=excluded.approval_id,
+                approval_batch_action_id=excluded.approval_batch_action_id,
+                quantity=excluded.quantity,
+                notional=excluded.notional,
+                score=excluded.score,
+                asset_score=excluded.asset_score,
+                trade_score=excluded.trade_score,
+                setup_reason=excluded.setup_reason,
+                source=excluded.source
+            """,
+            values,
+        )
+        if row.get("shadow_trade_id"):
+            self.execute(
+                "UPDATE shadow_trades SET selected_actual_trade_this_cycle=1, reason_not_executed='executed_as_actual' WHERE id=?",
+                (row["shadow_trade_id"],),
+            )
+        return outcome_id
