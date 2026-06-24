@@ -22,3 +22,20 @@ def test_report_redacts_telegram_text_and_sender_ids_inside_json_detail():
     assert '"raw_command":"[REDACTED TELEGRAM TEXT]"' in redacted
     assert '"sender_id":"[REDACTED ID]"' in redacted
     assert '"updated_by":"[REDACTED ID]"' in redacted
+
+
+def test_export_redacts_control_state_last_command_value(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    storage.execute(
+        "INSERT INTO control_state(key, value, updated_by, source, raw_command_redacted) VALUES(?,?,?,?,?)",
+        ("sleep_mode_last_command", "awake", "authorized_user_123", "telegram", "awake"),
+    )
+
+    path = export_excel(storage, {"mode": "paper"}, tmp_path / "report.xlsx")
+    workbook = load_workbook(path, read_only=True)
+    rows = list(workbook["Control State"].iter_rows(values_only=True))
+
+    assert rows[1][1] == "[REDACTED TELEGRAM TEXT]"
+    assert rows[1][3] == "[REDACTED ID]"
+    assert rows[1][5] == "[REDACTED TELEGRAM TEXT]"

@@ -25,6 +25,7 @@ from .execution import Executor, ExecutionResult
 from .internet import internet_available
 from .market_data import normalize_bars
 from .power import get_power_status
+from .position_management import PositionManagementDecision, PositionManagementEngine
 from .risk_engine import RiskCheck, RiskEngine, _dt
 from .reconciliation import BrokerReconciler
 from .strategy_rule_based import evaluate_symbol
@@ -270,6 +271,188 @@ class TradingService:
         risk_reducing = side == "sell" or action in {"sell", "exit"}
         buy_or_add = side == "buy" or action in {"buy", "add", "entry"}
         return self._sleep_mode_active() and buy_or_add and not risk_reducing
+
+    def _position_management_state(self, symbol: str) -> dict[str, Any] | None:
+        rows = self.storage.fetch_all("SELECT * FROM position_management_state WHERE symbol=?", (symbol.upper(),))
+        return rows[0] if rows else None
+
+    def _initial_stop_for_position(self, symbol: str) -> float | None:
+        rows = self.storage.fetch_all(
+            "SELECT payload FROM trade_proposals WHERE symbol=? AND side='buy' AND status IN ('approved','submitted','filled') ORDER BY created_at ASC LIMIT 1",
+            (symbol.upper(),),
+        )
+        if not rows:
+            return None
+        try:
+            payload = json.loads(rows[0].get("payload") or "{}")
+            stop = payload.get("stop_price")
+            return float(stop) if stop is not None else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _record_position_management(self, decision: PositionManagementDecision, now: datetime, proposal_id: str | None = None) -> None:
+        symbol = decision.symbol.upper()
+        previous = self._position_management_state(symbol)
+        created_at = previous.get("created_at") if previous else now.isoformat()
+        highest_seen_at = previous.get("highest_price_seen_at") if previous else None
+        max_seen_at = previous.get("max_unrealized_profit_seen_at") if previous else None
+        if not previous or decision.highest_price_since_entry != previous.get("highest_price_since_entry"):
+            highest_seen_at = now.isoformat()
+        if not previous or decision.max_unrealized_profit_pct != previous.get("max_unrealized_profit_pct"):
+            max_seen_at = now.isoformat()
+
+        profit_active = int(bool(previous.get("profit_protection_active") if previous else 0))
+        cfg = self.config.get("position_management", {}).get("profit_protection", {})
+        if (
+            decision.max_unrealized_profit_pct is not None
+            and decision.max_unrealized_profit_pct >= float(cfg.get("fallback_activate_at_profit_pct", 2.0))
+        ):
+            profit_active = 1
+        profit_activated_at = previous.get("profit_protection_activated_at") if previous else None
+        if profit_active and not profit_activated_at:
+            profit_activated_at = now.isoformat()
+
+        level_hits = {
+            1: int(previous.get("take_profit_level_1_hit") or 0) if previous else 0,
+            2: int(previous.get("take_profit_level_2_hit") or 0) if previous else 0,
+            3: int(previous.get("take_profit_level_3_hit") or 0) if previous else 0,
+        }
+
+        self.storage.execute(
+            """
+            INSERT INTO position_management_state(
+                id,symbol,broker_position_id,avg_entry_price,quantity,highest_price_since_entry,highest_price_seen_at,
+                max_unrealized_profit_pct,max_unrealized_profit_seen_at,profit_protection_active,profit_protection_activated_at,
+                take_profit_level_1_hit,take_profit_level_2_hit,take_profit_level_3_hit,trailing_stop_price,last_decision_type,last_reason,updated_at,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                avg_entry_price=excluded.avg_entry_price,
+                quantity=excluded.quantity,
+                highest_price_since_entry=excluded.highest_price_since_entry,
+                highest_price_seen_at=excluded.highest_price_seen_at,
+                max_unrealized_profit_pct=excluded.max_unrealized_profit_pct,
+                max_unrealized_profit_seen_at=excluded.max_unrealized_profit_seen_at,
+                profit_protection_active=excluded.profit_protection_active,
+                profit_protection_activated_at=excluded.profit_protection_activated_at,
+                take_profit_level_1_hit=excluded.take_profit_level_1_hit,
+                take_profit_level_2_hit=excluded.take_profit_level_2_hit,
+                take_profit_level_3_hit=excluded.take_profit_level_3_hit,
+                trailing_stop_price=excluded.trailing_stop_price,
+                last_decision_type=excluded.last_decision_type,
+                last_reason=excluded.last_reason,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(uuid.uuid4()), symbol, symbol, decision.avg_entry_price, decision.quantity,
+                decision.highest_price_since_entry, highest_seen_at, decision.max_unrealized_profit_pct,
+                max_seen_at, profit_active, profit_activated_at, level_hits[1], level_hits[2], level_hits[3],
+                decision.trailing_stop_price, decision.decision_type, decision.reason, now.isoformat(), created_at,
+            ),
+        )
+        self.storage.execute(
+            """
+            INSERT INTO position_management_decisions(
+                id,run_id,symbol,decision_type,priority,action,reason,current_price,avg_entry_price,quantity,
+                unrealized_profit_pct,highest_price_since_entry,max_unrealized_profit_pct,pullback_from_peak_pct,
+                profit_giveback_ratio,current_r_multiple,trailing_stop_price,suggested_sell_fraction,
+                suggested_add_notional,blocking_reasons,is_actionable,dip_trap_classification,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid.uuid4()), self.run_id, symbol, decision.decision_type, decision.priority, decision.action,
+                decision.reason, decision.current_price, decision.avg_entry_price, decision.quantity,
+                decision.unrealized_profit_pct, decision.highest_price_since_entry, decision.max_unrealized_profit_pct,
+                decision.pullback_from_peak_pct, decision.profit_giveback_ratio, decision.current_r_multiple,
+                decision.trailing_stop_price, decision.suggested_sell_fraction, decision.suggested_add_notional,
+                "; ".join(decision.blocking_reasons), int(decision.is_actionable), decision.dip_trap_classification,
+                now.isoformat(), json_dumps(dataclasses.asdict(decision)),
+            ),
+        )
+        if decision.decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+            sell_fraction = decision.suggested_sell_fraction or 0.0
+            estimated_shares = decision.quantity * sell_fraction
+            estimated_notional = estimated_shares * decision.current_price
+            self.storage.execute(
+                """
+                INSERT INTO profit_exit_events(
+                    id,run_id,symbol,event_type,proposal_id,proposal_batch_id,sell_fraction,estimated_shares,
+                    estimated_notional,current_gain_pct,peak_gain_pct,giveback_ratio,r_multiple,trailing_stop_price,status,created_at,resolved_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(uuid.uuid4()), self.run_id, symbol, decision.decision_type, proposal_id, None,
+                    sell_fraction, estimated_shares, estimated_notional, decision.unrealized_profit_pct,
+                    decision.max_unrealized_profit_pct, decision.profit_giveback_ratio,
+                    decision.current_r_multiple, decision.trailing_stop_price,
+                    "proposal_created" if proposal_id else ("actionable" if decision.is_actionable else "tracked"),
+                    now.isoformat(), None,
+                ),
+            )
+
+    def _mark_position_management_proposal_handled(self, proposal_row: dict[str, Any], status: str) -> None:
+        try:
+            payload = json.loads(proposal_row.get("payload") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        proposal = {**payload, **proposal_row}
+        pm_type = proposal.get("position_management_decision_type")
+        if not pm_type:
+            return
+        symbol = str(proposal.get("symbol", "")).upper()
+        proposal_id = proposal.get("id")
+        resolved_at = iso_now()
+        if pm_type == "TAKE_PROFIT_PARTIAL":
+            pm_decision = proposal.get("position_management_decision") or {}
+            try:
+                level = int(pm_decision.get("take_profit_level") or 0)
+            except (TypeError, ValueError):
+                level = 0
+            if level in {1, 2, 3}:
+                column = f"take_profit_level_{level}_hit"
+                self.storage.execute(
+                    f"UPDATE position_management_state SET {column}=1, updated_at=? WHERE symbol=?",
+                    (resolved_at, symbol),
+                )
+        if pm_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+            self.storage.execute(
+                "UPDATE profit_exit_events SET status=?, resolved_at=? WHERE proposal_id=?",
+                (status, resolved_at, proposal_id),
+            )
+
+    def _final_revalidate_position_management(self, proposal: dict[str, Any], refreshed_price: float | None = None) -> str | None:
+        pm_type = proposal.get("position_management_decision_type")
+        if not pm_type:
+            return None
+        symbol = str(proposal.get("symbol", "")).upper()
+        side = str(proposal.get("side", "")).lower()
+        if side == "sell":
+            positions = self.broker.get_positions() if self.broker is not None else []
+            pos = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
+            if pos is None:
+                return "position no longer exists"
+            held_qty = float(_value(pos, "qty", 0.0) or 0.0)
+            sell_qty = float(proposal.get("qty") or 0.0)
+            if sell_qty <= 0 or sell_qty > held_qty + 1e-9:
+                return "sell quantity is invalid or exceeds held quantity"
+            price = float(refreshed_price or proposal.get("latest_price") or 0.0)
+            min_notional = float(self.config.get("position_management", {}).get("profit_taking", {}).get("minimum_notional_to_sell", 1.0))
+            if sell_qty * price < min_notional:
+                return "position-management sell is below minimum notional"
+            open_orders = self.broker.get_open_orders() if self.broker is not None else []
+            if any(str(_value(o, "symbol", "")).upper() == symbol for o in open_orders):
+                return "conflicting open order exists for symbol"
+        elif proposal.get("action") == "add":
+            positions = self.broker.get_positions() if self.broker is not None else []
+            pos = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
+            if pos is None:
+                return "position no longer exists"
+            avg_entry = float(_value(pos, "avg_entry_price", 0.0) or 0.0)
+            price = float(refreshed_price or proposal.get("latest_price") or 0.0)
+            if avg_entry <= 0 or price <= avg_entry:
+                return "healthy-pullback add would average down or lacks valid entry price"
+            if proposal.get("dip_trap_classification") != "healthy_pullback":
+                return "pullback is no longer classified as healthy"
+        return None
 
     def _exit_blocker_label_from_reason(self, no_action_reason: str) -> str:
         no_act = no_action_reason or ""
@@ -668,6 +851,7 @@ class TradingService:
                 # Create shadow trade for the rejected proposal
                 updated_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))
                 if updated_rows:
+                    self._mark_position_management_proposal_handled(updated_rows[0], "rejected")
                     self._create_shadow_trade_from_proposal(updated_rows[0], "rejected_by_user")
 
                 ack_sent = iso_now()
@@ -774,6 +958,8 @@ class TradingService:
                     block_reason = "Market is closed"
 
             proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
+            if block_reason is None:
+                block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
             if block_reason:
                 # Set up mock Executor result for blocked order
                 result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
@@ -841,6 +1027,7 @@ class TradingService:
 
             if result.submitted:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
+                self._mark_position_management_proposal_handled(proposal, "submitted")
                 notional_val = proposal.get("notional", 5)
                 qty_val = proposal.get("qty")
                 if prop_side == "buy":
@@ -971,12 +1158,14 @@ class TradingService:
                 self.storage.execute("UPDATE proposal_batch_candidates SET candidate_status='rejected' WHERE proposal_id=?", (proposal_id,))
                 proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
                 if proposal_rows:
+                    self._mark_position_management_proposal_handled(proposal_rows[0], "rejected")
                     self._create_shadow_trade_from_proposal(proposal_rows[0], "rejected_by_user")
                 if target_upper != "ALL":
                     self.telegram.send_message(f"❌ Received: NO for {symbol} paper candidate. Candidate rejected. No order will be placed.")
             else:
                 if target_upper != "ALL":
-                    self.telegram.send_message(f"✅ Received: YES for {symbol} paper buy candidate. I will run final safety checks now.")
+                    action_label = str(row.get("candidate_action") or row.get("candidate_side") or "candidate").lower().replace("_", " ")
+                    self.telegram.send_message(f"✅ Received: YES for {symbol} paper {action_label} candidate. I will run final safety checks now.")
                 submitted, status, reason = self._approve_batch_candidate(proposal_id, sender, raw_text, row)
                 candidate_status = "submitted" if submitted else ("pending" if status == "sleep_mode_active" else "blocked")
                 self.storage.execute(
@@ -1073,6 +1262,8 @@ class TradingService:
                         block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {max_price_move_bps} bps)"
             elif not market_open:
                 block_reason = "Market is closed"
+        if block_reason is None:
+            block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
 
         if block_reason:
             result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
@@ -1123,7 +1314,13 @@ class TradingService:
         )
         if result.submitted:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
-            self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${float(proposal.get('notional') or 0.0):.0f}. Mode: paper only.")
+            self._mark_position_management_proposal_handled(proposal, "submitted")
+            if prop_side == "buy":
+                self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${float(proposal.get('notional') or 0.0):.0f}. Mode: paper only.")
+            else:
+                qty_val = proposal.get("qty")
+                qty_str = f"{qty_val} shares" if qty_val is not None else f"${float(proposal.get('notional') or 0.0):.0f}"
+                self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {qty_str}. Mode: paper only.")
             return True, "submitted", None
 
         self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
@@ -1499,6 +1696,7 @@ class TradingService:
             expires_fmt = format_sgt(expires_at)
 
             # Create shadow trade for the expired proposal
+            self._mark_position_management_proposal_handled(row, "expired")
             self._create_shadow_trade_from_proposal(row, "expired: no response")
 
             msg = (
@@ -1959,6 +2157,7 @@ class TradingService:
                 is_add = False
                 unrealized_gain_pct = 0.0
                 add_block_reasons = []
+                add_score_improvement = 0.0
 
                 pyramiding_cfg = self.config.get("add_to_position", {})
                 if pyramiding_cfg.get("enabled", True) and has_position and signal.action != "EXIT" and not has_order:
@@ -2182,6 +2381,60 @@ class TradingService:
                         signal = dataclasses.replace(signal, action="HOLD", reason="Pyramiding check failed: " + "; ".join(add_block_reasons))
                         no_action_reason = "Pyramiding check failed: " + "; ".join(add_block_reasons)
 
+                position_management_decision = None
+                position_management_sell_fraction = None
+                position_management_sell_qty = None
+                position_management_add_notional = None
+                if has_position and self.config.get("position_management", {}).get("enabled", True):
+                    previous_pm_state = self._position_management_state(symbol)
+                    pm_engine = PositionManagementEngine(self.config).with_previous_state(previous_pm_state)
+                    normal_exit_signal = signal.action == "EXIT" and signal.side == "sell" and emergency_exit_triggered != 1
+                    position_management_decision = pm_engine.classify(
+                        symbol=symbol,
+                        current_price=price,
+                        avg_entry_price=float(avg_entry_price or 0.0),
+                        quantity=float(qty_held or 0.0),
+                        bars=bars,
+                        previous_state=previous_pm_state,
+                        initial_stop_price=self._initial_stop_for_position(symbol),
+                        trade_score=score,
+                        score_improvement=add_score_improvement,
+                        emergency_exit_score=emergency_exit_score,
+                        normal_exit_signal=normal_exit_signal,
+                        volatility_regime=volatility_regime,
+                        has_open_order=has_order,
+                        now=now,
+                    )
+                    self._record_position_management(position_management_decision, now)
+                    if position_management_decision.is_actionable and emergency_exit_triggered != 1:
+                        if position_management_decision.action == "sell":
+                            position_management_sell_fraction = position_management_decision.suggested_sell_fraction or 1.0
+                            position_management_sell_qty = min(float(qty_held or 0.0), float(qty_held or 0.0) * position_management_sell_fraction)
+                            decision_reason = position_management_decision.reason
+                            if position_management_decision.decision_type == "NORMAL_RISK_EXIT":
+                                decision_reason = signal.reason
+                            signal = dataclasses.replace(
+                                signal,
+                                action="EXIT",
+                                side="sell",
+                                reason=f"{position_management_decision.decision_type}: {decision_reason}",
+                            )
+                            exit_trigger_reason = decision_reason
+                            score = max(score, float(self.config.get("ai", {}).get("ai_review_min_score", 65)))
+                        elif position_management_decision.decision_type == "HEALTHY_PULLBACK_ADD":
+                            position_management_add_notional = position_management_decision.suggested_add_notional
+                            signal = dataclasses.replace(
+                                signal,
+                                action="ENTRY",
+                                side="buy",
+                                reason=position_management_decision.reason,
+                            )
+                            is_add = True
+                            final_notional = float(position_management_add_notional or final_notional)
+                            suggested_shares = final_notional / price if price > 0 else 0.0
+                            score = max(score, float(self.config.get("position_management", {}).get("healthy_pullback_add", {}).get("minimum_trade_score", 85)))
+                    classification = self._classify_trade_score(score)
+
                 system_confidence = "No action suggested"
                 if score >= 90:
                     system_confidence = "Very strong"
@@ -2270,6 +2523,11 @@ class TradingService:
                     "score_adjusted_notional": score_adjusted_notional,
                     "vol_adjusted_notional": vol_adjusted_notional,
                     "base_notional": base_notional,
+                    "position_management_decision": dataclasses.asdict(position_management_decision) if position_management_decision else None,
+                    "position_management_decision_type": position_management_decision.decision_type if position_management_decision else None,
+                    "position_management_sell_fraction": position_management_sell_fraction,
+                    "position_management_sell_qty": position_management_sell_qty,
+                    "position_management_add_notional": position_management_add_notional,
                 })
 
             # Populate watchlist order first
@@ -2573,6 +2831,9 @@ class TradingService:
                 asset_score = res["asset_score"]
                 asset_classification = res["asset_classification"]
                 has_position = res["has_position"]
+                pm_decision_payload = res.get("position_management_decision")
+                pm_decision_type = res.get("position_management_decision_type")
+                pm_sell_fraction = res.get("position_management_sell_fraction")
 
                 score_vol = res.get("score_vol", 0.0)
                 volatility_regime = res.get("volatility_regime", "unknown")
@@ -2728,7 +2989,9 @@ class TradingService:
 
                             # Size adjustment calculation from res
                             notional = res.get("final_notional", 5.0)
-                            qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else qty_held
+                            qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else (res.get("position_management_sell_qty") or qty_held)
+                            if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+                                notional = float(qty_val or 0.0) * price
 
                             stop_price = res.get("stop_price")
                             stop_distance_pct = res.get("stop_distance_pct")
@@ -2822,6 +3085,10 @@ class TradingService:
                                 "atr_value": atr_value,
                                 "adverse_move_atr": adverse_move_atr,
                                 "minutes_to_close": minutes_to_close,
+                                "position_management_decision_type": pm_decision_type,
+                                "position_management_decision": pm_decision_payload,
+                                "position_management_sell_fraction": pm_sell_fraction,
+                                "dip_trap_classification": (pm_decision_payload or {}).get("dip_trap_classification") if pm_decision_payload else None,
                                 "sleep_mode_active": 1 if sleep_mode_active else 0,
                                 "suppressed_by_sleep_mode": 1 if suppressed_by_sleep_mode else 0,
                                 "sleep_mode_reason": sleep_mode_reason,
@@ -3075,6 +3342,11 @@ class TradingService:
                         sleep_mode_ended_at
                     )
                 )
+                if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+                    self.storage.execute(
+                        "UPDATE profit_exit_events SET proposal_id=?, status='proposal_created' WHERE run_id=? AND symbol=? AND event_type=? AND proposal_id IS NULL",
+                        (proposal_id, self.run_id, symbol, pm_decision_type),
+                    )
 
                 if is_buy or (is_add and proposal_generated):
                     self.storage.execute(
@@ -3096,7 +3368,7 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
 
-                if batch_mode_enabled and is_buy and proposal.get("status", "pending") == "pending":
+                if batch_mode_enabled and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1 and (is_buy or is_exit):
                     batch_proposals.append(proposal)
                 else:
                     res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
@@ -3929,7 +4201,7 @@ class TradingService:
         risk_snapshot: dict[str, Any],
     ) -> str:
         lines = [
-            "📊 Paper trade opportunity set",
+            "📊 Paper position and trade opportunity set",
             "Portfolio room:",
             f"- Total exposure after proposed trades: {risk_snapshot.get('total_exposure_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
             f"- Open risk after proposed trades: {risk_snapshot.get('open_risk_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
@@ -3937,8 +4209,18 @@ class TradingService:
             "Actionable:",
         ]
         for idx, proposal in enumerate(proposals, start=1):
+            pm_type = proposal.get("position_management_decision_type")
             action_word = "Add" if proposal.get("action") == "add" else ("Sell" if proposal.get("side") == "sell" else "Buy")
+            if pm_type == "TAKE_PROFIT_PARTIAL":
+                action_word = "TAKE PROFIT"
+            elif pm_type == "PROFIT_PROTECT_EXIT":
+                action_word = "PROFIT PROTECT"
+            elif pm_type == "TRAILING_STOP_EXIT":
+                action_word = "TRAILING STOP"
+            elif pm_type == "HEALTHY_PULLBACK_ADD":
+                action_word = "ADD"
             qty = float(proposal.get("qty") or 0.0)
+            pm = proposal.get("position_management_decision") or {}
             lines.extend([
                 f"{idx}. {action_word} {proposal['symbol']} - ${float(proposal.get('notional') or 0.0):.2f} / approx. {qty:.6f} shares",
                 f"   Score: {float(proposal.get('score') or 0.0):.0f}",
@@ -3946,6 +4228,15 @@ class TradingService:
                 "   Portfolio fit: passes risk budget",
                 f"   Reason: {proposal.get('selection_reason') or proposal.get('reason') or 'ranked actionable setup'}",
             ])
+            if pm_type:
+                if pm_type == "HEALTHY_PULLBACK_ADD":
+                    lines.append("   Note: add-to-winner, not averaging down")
+                if pm.get("unrealized_profit_pct") is not None:
+                    lines.append(f"   Current gain: {float(pm['unrealized_profit_pct']):+.2f}%")
+                if pm.get("max_unrealized_profit_pct") is not None:
+                    lines.append(f"   Peak gain: {float(pm['max_unrealized_profit_pct']):+.2f}%")
+                if pm.get("profit_giveback_ratio") is not None:
+                    lines.append(f"   Profit giveback: {float(pm['profit_giveback_ratio']) * 100:.1f}%")
         if not proposals:
             lines.append("None")
 
@@ -3984,11 +4275,12 @@ class TradingService:
             (batch_id, self.run_id, None, "pending", iso_now(), expires_at, json_dumps({"proposal_ids": [p["id"] for p in proposals]})),
         )
         for idx, proposal in enumerate(proposals, start=1):
+            candidate_action = proposal.get("position_management_decision_type") or proposal.get("action") or proposal["side"]
             self.storage.execute(
                 "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(uuid.uuid4()), batch_id, proposal["id"], None, proposal["symbol"], proposal["side"],
-                    proposal.get("action") or proposal["side"], "pending", idx,
+                    candidate_action, "pending", idx,
                     proposal.get("selection_reason") or proposal.get("reason"), iso_now(), proposal.get("expires_at"),
                     json_dumps(proposal)
                 ),

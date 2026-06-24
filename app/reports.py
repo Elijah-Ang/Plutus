@@ -47,6 +47,12 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Batch Approval Actions", "approval_batch_actions"),
     ("Candidate Allocation Decisions", "candidate_batch_allocations"),
     ("Risk Budget Snapshots", "risk_budget_snapshots"),
+    ("Position Management State", "position_management_state"),
+    ("Position Management Decisions", "position_management_decisions"),
+    ("Profit Exit Events", "profit_exit_events"),
+    ("Healthy Pullback Adds", "SELECT * FROM position_management_decisions WHERE decision_type='HEALTHY_PULLBACK_ADD'"),
+    ("Profit Protection Events", "SELECT * FROM position_management_decisions WHERE decision_type='PROFIT_PROTECT_EXIT'"),
+    ("Trailing Stop Events", "SELECT * FROM position_management_decisions WHERE decision_type='TRAILING_STOP_EXIT'"),
 ]
 
 
@@ -108,7 +114,20 @@ def _write_rows(sheet: Any, rows: list[dict[str, Any]], table: str, include_raw_
         cell.font = Font(bold=True)
         cell.fill = PatternFill("solid", fgColor="D9EAF7")
     for row in rows:
-        sheet.append([redact_report_value(table, header, row.get(header), include_raw_telegram) for header in headers])
+        values = []
+        for header in headers:
+            value = row.get(header)
+            if (
+                table == "control_state"
+                and header == "value"
+                and str(row.get("key", "")).lower().endswith("last_command")
+                and not include_raw_telegram
+            ):
+                value = "[REDACTED TELEGRAM TEXT]"
+            else:
+                value = redact_report_value(table, header, value, include_raw_telegram)
+            values.append(value)
+        sheet.append(values)
     sheet.freeze_panes = "A2"
     for column in sheet.columns:
         width = min(50, max(len(str(cell.value or "")) for cell in column) + 2)

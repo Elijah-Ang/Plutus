@@ -181,6 +181,7 @@ def test_candidate_ranking(base_config, temp_storage):
     assert ranked[0]["final_candidate_rank"] == 1
 
 def test_pyramiding_eligibility(temp_storage, base_config):
+    base_config.setdefault("position_management", {})["enabled"] = False
     broker = MockBroker()
     # We hold SPY at avg_entry 95.0, current price is 100.0 (profitable!)
     broker.positions = [

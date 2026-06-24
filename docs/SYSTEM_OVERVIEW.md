@@ -62,6 +62,7 @@ The project follows a modular design with clear separation between:
 - [service.py](../app/service.py): Runs the cycle flow (polled Telegram parser -> strategy scanner -> proposal -> AI review).
 - [approval_parser.py](../app/approval_parser.py): Parses Telegram approvals and rejections (supports prefix matching, side, and symbol disambiguation).
 - [risk_engine.py](../app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
+- [position_management.py](../app/position_management.py): Deterministic position classifier for profit-taking, profit protection, trailing stops, and healthy-pullback add candidates. It returns decisions only and does not place orders.
 - [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
 - [reconciliation.py](../app/reconciliation.py): Read-only broker reconciliation that updates local order/fill/account/position records without submitting or retrying orders.
@@ -201,6 +202,13 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     5. Price Change %
     6. Session Change %
     7. Stable alphabetical symbol fallback
+- **Position Management Engine**:
+  - Existing held positions are classified each scanner cycle before unrelated new BUY opportunities are proposed.
+  - Decision priority is deterministic: `EMERGENCY_EXIT`, `NORMAL_RISK_EXIT`, `PROFIT_PROTECT_EXIT`, `TAKE_PROFIT_PARTIAL`, `TRAILING_STOP_EXIT`, `HEALTHY_PULLBACK_ADD`, then `HOLD`.
+  - The engine tracks high-water price, peak unrealized profit, pullback from peak, profit giveback, R-multiple when an initial stop is known, ATR-based trailing stop, and dip-vs-trap classification.
+  - TAKE_PROFIT / PROFIT_PROTECT / TRAILING_STOP proposals are normal paper sell proposals and require Telegram approval plus final revalidation. They reduce exposure and are not blocked by BUY exposure caps.
+  - HEALTHY_PULLBACK_ADD is allowed only for profitable positions with trend intact, acceptable giveback, low emergency risk, no exit/profit-protection warning, no open order conflict, and risk-budget room. It is explicitly blocked from averaging down.
+  - GPT may explain or caution on position-management proposals but cannot approve, execute, override risk, or bypass Telegram approval.
 - **GPT Reviews and Timeout Explanations**:
   - BUY Proposals: GPT review is required by default. Missing/throttled GPT review defers the buy proposal.
   - EXIT Proposals: GPT explanation is optional and attempted with a 3-second timeout limit. If GPT is slow or unavailable, the exit proposal immediately falls back to rule-based explanation without delay. GPT cannot decide or block a deterministic exit.
@@ -258,6 +266,9 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `portfolio_exposure_snapshots`: Total, symbol, and cluster exposure snapshots.
 - `candidate_rankings`: Final candidate ranking components and selection/non-selection reasons.
 - `add_on_opportunities`: Add-to-winner eligibility checks and block reasons.
+- `position_management_state`: Per-symbol high-water mark, trailing stop, profit-protection, and handled take-profit level state.
+- `position_management_decisions`: Per-cycle position-management classifications, metrics, actionability, and block reasons.
+- `profit_exit_events`: Lifecycle rows for take-profit, profit-protection, and trailing-stop proposals.
 - `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
 
 ## 13. Excel Reporting Flow
@@ -289,6 +300,8 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Portfolio Exposure**: Exposure snapshots by symbol and correlated ETF cluster.
 - **Position Sizing Decisions**: Dynamic sizing inputs and final notional/share decisions.
 - **Candidate Ranking Decisions**: Ranking components and selection reasons.
+- **Ranked Opportunity Sets**, **Proposal Batches**, **Batch Candidates**, **Risk Budget Decisions**, **Batch Approval Actions**, and **Candidate Allocation Decisions**: Ranked-batch proposal and risk-budget audit views.
+- **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
 ## 14. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).

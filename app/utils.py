@@ -136,22 +136,28 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     if side_lower == "buy":
         is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
         if is_add:
-            header = "📄 Paper trade ADD proposal\n\n"
+            pm_type = proposal.get("position_management_decision_type")
+            header = "📈 Paper add-to-winner proposal\n\n" if pm_type == "HEALTHY_PULLBACK_ADD" else "📄 Paper trade ADD proposal\n\n"
             action_line = f"Add to {symbol} — {mode_notice}\n"
 
             avg_entry = proposal.get("average_entry_price")
             current_drawdown = proposal.get("position_drawdown_pct")
+            pm = proposal.get("position_management_decision") or {}
 
             avg_entry_str = f"Current avg entry: ${avg_entry:.2f}\n" if avg_entry else ""
             drawdown_str = f"Current drawdown: {current_drawdown * 100:.2f}%\n" if current_drawdown is not None else ""
-            pos_stats = f"{avg_entry_str}{drawdown_str}"
+            gain_str = f"Current gain: {float(pm['unrealized_profit_pct']):+.2f}%\n" if pm.get("unrealized_profit_pct") is not None else ""
+            peak_str = f"Peak gain: {float(pm['max_unrealized_profit_pct']):+.2f}%\n" if pm.get("max_unrealized_profit_pct") is not None else ""
+            pullback_str = f"Pullback from peak: {float(pm['pullback_from_peak_pct']):.2f}%\n" if pm.get("pullback_from_peak_pct") is not None else ""
+            pos_stats = f"{avg_entry_str}{drawdown_str}{gain_str}{peak_str}{pullback_str}"
             if pos_stats:
                 pos_stats = f"Current position:\n{pos_stats}\n"
             else:
                 pos_stats = ""
 
             notional_adjustment_note = proposal.get("notional_adjustment_note", "")
-            amount_line = f"{pos_stats}Add amount: ${notional:.0f}{notional_adjustment_note}\n\n"
+            health_note = "This is a healthy pullback inside a winning position, not averaging down.\n" if pm_type == "HEALTHY_PULLBACK_ADD" else ""
+            amount_line = f"{pos_stats}{health_note}Add amount: ${notional:.0f}{notional_adjustment_note}\n\n"
         else:
             header = "📄 Paper trade proposal\n\n"
             action_line = f"Buy {symbol} — {mode_notice}\n"
@@ -309,6 +315,36 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
 
     else:
         # Sell / Exit proposal
+        pm_type = proposal.get("position_management_decision_type")
+        if pm_type:
+            pm = proposal.get("position_management_decision") or {}
+            title_map = {
+                "TAKE_PROFIT_PARTIAL": "💰 Paper profit-taking proposal",
+                "PROFIT_PROTECT_EXIT": "🛡️ Paper profit-protection proposal",
+                "TRAILING_STOP_EXIT": "📉 Paper trailing-stop exit proposal",
+            }
+            header = f"{title_map.get(pm_type, '📄 Paper position-management proposal')}: {symbol}\n"
+            current_gain = pm.get("unrealized_profit_pct")
+            peak_gain = pm.get("max_unrealized_profit_pct")
+            giveback = pm.get("profit_giveback_ratio")
+            r_mult = pm.get("current_r_multiple")
+            trailing_stop = pm.get("trailing_stop_price")
+            sell_fraction = proposal.get("position_management_sell_fraction") or pm.get("suggested_sell_fraction")
+            sell_pct = float(sell_fraction or 0.0) * 100.0
+            details = [
+                f"Current gain: {float(current_gain):+.2f}%" if current_gain is not None else None,
+                f"Peak gain: {float(peak_gain):+.2f}%" if peak_gain is not None else None,
+                f"R-multiple: {float(r_mult):+.2f}R" if r_mult is not None else None,
+                f"Profit giveback: {float(giveback) * 100:.1f}%" if giveback is not None else None,
+                f"Trailing stop: ${float(trailing_stop):.2f}" if trailing_stop is not None else None,
+                f"Suggested action: Sell {sell_pct:.0f}%" if sell_pct else "Suggested action: Sell partial position",
+                f"Estimated shares: {float(proposal.get('qty') or 0.0):.6f}",
+                f"Estimated notional: ${float(proposal.get('notional') or 0.0):.2f}",
+                f"Why:\n{proposal.get('reason') or pm.get('reason') or 'Position management rule triggered.'}",
+                "Reply:\nyes = approve\nno = reject\n\nNo reply = expires and no order is placed.\nyes means permission to attempt after final safety check.",
+            ]
+            return header + "\n".join(item for item in details if item)
+
         header = "📄 Paper sell proposal\n\n"
         action_line = f"Sell {symbol} — {mode_notice}\n"
         if qty is not None:

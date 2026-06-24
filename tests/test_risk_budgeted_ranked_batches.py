@@ -224,7 +224,7 @@ def test_ranked_batch_message_contains_symbol_specific_and_yes_all_instructions(
         [{"symbol": "XLV", "risk_budget_block_reason": "observation-only"}],
         {"total_exposure_pct": 4.8, "open_risk_pct": 0.22, "buying_power": 1000.0},
     )
-    assert "Paper trade opportunity set" in message
+    assert "Paper position and trade opportunity set" in message
     assert "yes SPY = approve SPY only" in message
     assert "yes all = approve all actionable candidates after final checks" in message
     assert "Plain yes is ambiguous" in message

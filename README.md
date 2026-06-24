@@ -33,6 +33,7 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 - **10-Minute Telemetry**: Scheduled launchd runs observation cycles every 10 minutes to calculate deterministic scores (0-100), log snapshots to `market_memory`, and compare short-term trends without spamming Telegram or calling GPT.
 - **Performance Lab**: Every meaningful setup can be recorded as an actual or shadow opportunity, with forward outcome tracking for actual-vs-shadow review.
 - **Risk-Budgeted Ranked Proposals**: BUY/ADD opportunities are ranked as a batch, sized by stop distance and portfolio risk, and constrained by open risk, exposure, cluster, and paper buying power instead of fixed proposal-count caps.
+- **Position Management Engine**: Existing paper positions are classified each cycle for profit-taking, profit protection, trailing stops, and healthy-pullback adds. Higher-priority risk/profit-protection exits override ADD logic.
 - **Dynamic Paper Sizing**: BUY proposals use deterministic score, volatility, stop distance, and portfolio exposure caps instead of a fixed `$5` amount.
 - **Portfolio Controls**: Paper BUY proposals are constrained by per-trade risk, open portfolio risk, single-symbol exposure, total exposure, correlated ETF cluster exposure, and available paper buying power.
 - **Add-to-Winner Rules**: Add-on BUY proposals are allowed only for profitable positions with stronger setups; averaging down is blocked.
