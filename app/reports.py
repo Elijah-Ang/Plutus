@@ -14,7 +14,7 @@ from .storage import Storage
 from .utils import PROJECT_ROOT, json_dumps, redact
 
 SHEETS: list[tuple[str, str | None]] = [
-    ("Summary Dashboard", None), ("Proposals", "trade_proposals"), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
+    ("Summary Dashboard", None), ("Proposals", "SELECT *, CASE WHEN status='pending' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 'active_pending' WHEN status='pending' THEN 'pending_expired' WHEN status='approved' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 'approved_unsubmitted' WHEN status='approved' THEN 'approved_historical' WHEN status='submitted' THEN 'submitted_historical' WHEN status='filled' THEN 'filled_historical' WHEN status='rejected' THEN 'rejected_historical' WHEN status='superseded' THEN 'superseded_historical' WHEN status='blocked' THEN 'blocked_historical' WHEN status='expired' THEN 'expired_historical' ELSE COALESCE(status, 'unknown') END AS proposal_runtime_state, CASE WHEN status='pending' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 1 ELSE 0 END AS active_pending_actionable FROM trade_proposals ORDER BY created_at DESC"), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
     ("Orders", "orders"), ("Fills", "fills"), ("Positions", "positions"), ("Signals", "signals"),
     ("Risk Checks", "risk_checks"), ("AI Reviews", "ai_reviews"), ("Approvals", "approvals"),
     ("Cash Management", "cashout_suggestions"), ("ML Shadow Metrics", "model_versions"),
@@ -65,6 +65,37 @@ SECRET_VALUE_PATTERNS = (
 TELEGRAM_TEXT_KEYS = {"raw_message", "raw_command", "raw_command_redacted", "text"}
 TELEGRAM_ID_KEYS = {"sender_id", "updated_by", "telegram_user_id", "chat_id", "from_id"}
 SENSITIVE_KEY_PARTS = ("key", "secret", "token", "password", "account_id")
+TEXT_BLOB_KEYS = {
+    "telegram_message",
+    "message_text",
+    "proposal_text",
+    "formatted_message",
+    "raw_message",
+    "raw_text",
+    "text",
+    "review_text",
+    "ai_review_text",
+    "gpt_response_text",
+    "approval_text",
+    "command_text",
+    "summary",
+    "reasoning_notes",
+    "main_risk",
+}
+JSON_LIKE_HEADERS = {
+    "payload",
+    "raw_payload",
+    "request_payload",
+    "response_payload",
+    "telegram_payload",
+    "values_json",
+    "config_json",
+    "detail",
+    "risks",
+    "portfolio_state_json",
+    "single_symbol_exposure_json",
+    "cluster_exposure_json",
+}
 
 
 def redact_report_payload(value: Any) -> Any:
@@ -74,6 +105,11 @@ def redact_report_payload(value: Any) -> Any:
             key_lower = str(key).lower()
             if key_lower in TELEGRAM_TEXT_KEYS:
                 redacted[key] = "[REDACTED TELEGRAM TEXT]"
+            elif key_lower in TEXT_BLOB_KEYS or "payload" in key_lower:
+                if isinstance(item, (dict, list)):
+                    redacted[key] = redact_report_payload(item)
+                else:
+                    redacted[key] = "[REDACTED TEXT]"
             elif key_lower in TELEGRAM_ID_KEYS or key_lower.endswith("_sender_id"):
                 redacted[key] = "[REDACTED ID]"
             elif any(part in key_lower for part in SENSITIVE_KEY_PARTS):
@@ -87,17 +123,20 @@ def redact_report_payload(value: Any) -> Any:
 
 
 def redact_report_value(table: str, header: str, value: Any, include_raw_telegram: bool = False) -> Any:
-    if header in TELEGRAM_TEXT_KEYS and not include_raw_telegram:
+    header_lower = str(header).lower()
+    if header_lower in TELEGRAM_TEXT_KEYS and not include_raw_telegram:
         return "[REDACTED TELEGRAM TEXT]"
-    if header in TELEGRAM_ID_KEYS:
+    if header_lower in TEXT_BLOB_KEYS and not include_raw_telegram:
+        return "[REDACTED TEXT]"
+    if header_lower in TELEGRAM_ID_KEYS:
         return "[REDACTED ID]"
     if value is None:
         return None
-    if header in {"payload", "values_json", "config_json", "detail", "risks", "portfolio_state_json", "single_symbol_exposure_json", "cluster_exposure_json"} and isinstance(value, str):
+    if header_lower in JSON_LIKE_HEADERS and isinstance(value, str):
         try:
             value = json_dumps(redact_report_payload(json.loads(value)))
         except (ValueError, TypeError):
-            value = redact(value)
+            value = "[REDACTED TEXT]" if ("payload" in header_lower or header_lower in TEXT_BLOB_KEYS) else redact(value)
     if isinstance(value, str):
         for pattern in SECRET_VALUE_PATTERNS:
             value = pattern.sub("[REDACTED SECRET]", value)

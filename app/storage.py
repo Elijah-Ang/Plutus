@@ -37,7 +37,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "trade_setups": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, side TEXT, action TEXT, setup_key TEXT, is_active INTEGER, price REAL, score REAL, asset_score REAL, volatility_regime TEXT, trend_state TEXT, gpt_status TEXT, proposal_eligible INTEGER, proposal_sent INTEGER, block_reason TEXT",
     "shadow_trades": "id TEXT PRIMARY KEY, run_id TEXT, setup_id TEXT, symbol TEXT, side TEXT, would_have_entry_price REAL, would_have_entry_time TEXT, would_have_notional REAL, would_have_shares REAL, would_have_stop_price REAL, would_have_stop_distance_pct REAL, reason_not_executed TEXT, score REAL, volatility_regime TEXT, gpt_confidence TEXT, gpt_caution TEXT, setup_key TEXT, portfolio_state_json TEXT, sleep_mode_active INTEGER, cooldown_state TEXT, selected_actual_trade_this_cycle INTEGER",
     "trade_outcomes": "id TEXT PRIMARY KEY, trade_id TEXT, actual_or_shadow TEXT, symbol TEXT, entry_time TEXT, entry_price REAL, outcome_status TEXT, forward_return_1d REAL, forward_return_5d REAL, forward_return_20d REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, stop_hit INTEGER, target_reached INTEGER, add_on_improved INTEGER, beat_shadow_alternatives INTEGER, updated_at TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, shadow_trade_id TEXT, risk_budget_decision_id TEXT, position_sizing_decision_id TEXT, approval_id TEXT, approval_batch_action_id TEXT, quantity REAL, notional REAL, score REAL, asset_score REAL, trade_score REAL, setup_reason TEXT, source TEXT",
-    "position_sizing_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, portfolio_equity REAL, risk_budget REAL, stop_distance_dollars REAL, risk_based_shares REAL, score_adjusted_notional REAL, vol_adjusted_notional REAL, final_notional REAL, suggested_shares REAL, base_notional REAL, score_multiplier REAL, volatility_multiplier REAL, stop_model_used TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT",
+    "position_sizing_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, portfolio_equity REAL, risk_budget REAL, stop_distance_dollars REAL, risk_based_shares REAL, score_adjusted_notional REAL, vol_adjusted_notional REAL, final_notional REAL, suggested_shares REAL, base_notional REAL, score_multiplier REAL, volatility_multiplier REAL, stop_model_used TEXT, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT",
     "portfolio_exposure_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, total_exposure_dollars REAL, single_symbol_exposure_json TEXT, cluster_exposure_json TEXT",
     "candidate_rankings": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, symbol TEXT, true_score_rank INTEGER, final_candidate_rank INTEGER, setup_quality_score REAL, portfolio_fit_score REAL, diversification_score REAL, sizing_score REAL, reason_selected TEXT, reason_not_selected TEXT",
     "add_on_opportunities": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, symbol TEXT, current_qty REAL, avg_entry_price REAL, current_price REAL, unrealized_gain_pct REAL, proposed_add_notional REAL, proposed_add_shares REAL, score REAL, score_improvement REAL, passed INTEGER, block_reasons TEXT",
@@ -49,7 +49,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "approval_batch_actions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, action TEXT, status TEXT, created_at TEXT, detail TEXT",
     "risk_budget_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, open_risk_pct REAL, daily_realized_loss_pct REAL, max_open_risk_pct REAL, buying_power REAL, payload TEXT",
     "ranked_opportunity_sets": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, timestamp TEXT, symbol TEXT, rank INTEGER, actionable INTEGER, reason TEXT, score REAL, suggested_notional REAL, suggested_shares REAL, payload TEXT",
-    "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
+    "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_model TEXT, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
     "position_management_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, decision_type TEXT, priority INTEGER, action TEXT, reason TEXT, current_price REAL, avg_entry_price REAL, quantity REAL, unrealized_profit_pct REAL, highest_price_since_entry REAL, max_unrealized_profit_pct REAL, pullback_from_peak_pct REAL, profit_giveback_ratio REAL, current_r_multiple REAL, trailing_stop_price REAL, suggested_sell_fraction REAL, suggested_add_notional REAL, blocking_reasons TEXT, is_actionable INTEGER, dip_trap_classification TEXT, created_at TEXT, payload TEXT",
     "profit_exit_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, event_type TEXT, proposal_id TEXT, proposal_batch_id TEXT, sell_fraction REAL, estimated_shares REAL, estimated_notional REAL, current_gain_pct REAL, peak_gain_pct REAL, giveback_ratio REAL, r_multiple REAL, trailing_stop_price REAL, status TEXT, created_at TEXT, resolved_at TEXT",
 }
@@ -235,6 +235,14 @@ class Storage:
             add_missing_columns(
                 "position_sizing_decisions",
                 {
+                    "initial_stop_price": "REAL",
+                    "initial_risk_per_share": "REAL",
+                    "initial_risk_pct": "REAL",
+                    "initial_risk_dollars": "REAL",
+                    "stop_source": "TEXT",
+                    "entry_price_for_r": "REAL",
+                    "risk_model_version": "TEXT",
+                    "r_multiple_unavailable_reason": "TEXT",
                     "batch_id": "TEXT",
                     "candidate_id": "TEXT",
                     "proposal_id": "TEXT",
@@ -264,6 +272,20 @@ class Storage:
                     "trade_score": "REAL",
                     "setup_reason": "TEXT",
                     "source": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "position_management_state",
+                {
+                    "initial_stop_price": "REAL",
+                    "initial_risk_per_share": "REAL",
+                    "initial_risk_pct": "REAL",
+                    "initial_risk_dollars": "REAL",
+                    "stop_model": "TEXT",
+                    "stop_source": "TEXT",
+                    "entry_price_for_r": "REAL",
+                    "risk_model_version": "TEXT",
+                    "r_multiple_unavailable_reason": "TEXT",
                 },
             )
                 
@@ -354,6 +376,12 @@ class Storage:
     def active_proposals(self, now_iso: str | None = None) -> list[dict[str, Any]]:
         return self.fetch_all("SELECT * FROM trade_proposals WHERE status='pending' AND expires_at>? ORDER BY created_at", (now_iso or iso_now(),))
 
+    def historical_proposals(self, now_iso: str | None = None) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            "SELECT * FROM trade_proposals WHERE NOT (status='pending' AND expires_at>?) ORDER BY created_at DESC",
+            (now_iso or iso_now(),),
+        )
+
     def expire_proposals(self, now_iso: str | None = None) -> int:
         with self.connect() as conn:
             cursor = conn.execute("UPDATE trade_proposals SET status='expired' WHERE status='pending' AND expires_at<=?", (now_iso or iso_now(),))
@@ -361,8 +389,11 @@ class Storage:
 
     def consume_approval(self, proposal_id: str, approval_id: str) -> bool:
         with self.connect() as conn:
-            proposal = conn.execute("SELECT status FROM trade_proposals WHERE id=?", (proposal_id,)).fetchone()
+            proposal = conn.execute("SELECT status, expires_at FROM trade_proposals WHERE id=?", (proposal_id,)).fetchone()
             if not proposal or proposal["status"] != "pending":
+                return False
+            expires_at = proposal["expires_at"]
+            if expires_at is not None and expires_at <= iso_now():
                 return False
             prior = conn.execute("SELECT 1 FROM approvals WHERE proposal_id=? AND consumed_at IS NOT NULL", (proposal_id,)).fetchone()
             if prior:

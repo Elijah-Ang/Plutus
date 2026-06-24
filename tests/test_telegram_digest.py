@@ -453,6 +453,59 @@ def test_digest_uses_authoritative_filled_state_over_stale_market_memory(temp_st
     assert "Proposals: 1 | Orders: 1 | Fills: 1" in msg
 
 
+def test_digest_does_not_treat_stale_approved_history_as_pending(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["DIA"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "DIA", 350.0, 350.0, "HOLD", 88.0, "Watch", 0, "no entry/exit signal", now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            "old-dia",
+            "old-run",
+            "DIA",
+            "buy",
+            10.0,
+            "approved",
+            (now - timedelta(days=2)).isoformat(),
+            (now - timedelta(days=2, minutes=-10)).isoformat(),
+            "rule_based_v1",
+            "{}",
+        ),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "pending approval" not in msg.lower()
+    assert "DIA has an active proposal pending approval." not in msg
+
+
 def test_digest_uses_authoritative_submitted_state_before_fill(temp_storage):
     config = {
         "mode": "paper",

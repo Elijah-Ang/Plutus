@@ -310,23 +310,102 @@ class TradingService:
         rows = self.storage.fetch_all("SELECT * FROM position_management_state WHERE symbol=?", (symbol.upper(),))
         return rows[0] if rows else None
 
-    def _initial_stop_for_position(self, symbol: str) -> float | None:
+    def _initial_risk_seed_for_position(self, symbol: str) -> dict[str, Any]:
+        existing_state = self._position_management_state(symbol)
+        if existing_state and existing_state.get("initial_stop_price") is not None:
+            return {
+                "initial_stop_price": existing_state.get("initial_stop_price"),
+                "initial_risk_per_share": existing_state.get("initial_risk_per_share"),
+                "initial_risk_pct": existing_state.get("initial_risk_pct"),
+                "initial_risk_dollars": existing_state.get("initial_risk_dollars"),
+                "stop_model": existing_state.get("stop_model"),
+                "stop_source": existing_state.get("stop_source"),
+                "entry_price_for_r": existing_state.get("entry_price_for_r"),
+                "risk_model_version": existing_state.get("risk_model_version"),
+                "r_multiple_unavailable_reason": existing_state.get("r_multiple_unavailable_reason"),
+            }
         rows = self.storage.fetch_all(
             "SELECT payload FROM trade_proposals WHERE symbol=? AND side='buy' AND status IN ('approved','submitted','filled') ORDER BY created_at ASC LIMIT 1",
             (symbol.upper(),),
         )
         if not rows:
-            return None
+            return {
+                "initial_stop_price": None,
+                "initial_risk_per_share": None,
+                "initial_risk_pct": None,
+                "initial_risk_dollars": None,
+                "stop_model": None,
+                "stop_source": None,
+                "entry_price_for_r": None,
+                "risk_model_version": None,
+                "r_multiple_unavailable_reason": "r_multiple_unavailable_initial_stop_missing",
+            }
         try:
             payload = json.loads(rows[0].get("payload") or "{}")
-            stop = payload.get("stop_price")
-            return float(stop) if stop is not None else None
+            stop = payload.get("initial_stop_price", payload.get("stop_price"))
+            entry = payload.get("entry_price_for_r", payload.get("latest_price"))
+            stop_val = float(stop) if stop is not None else None
+            entry_val = float(entry) if entry is not None else None
+            if stop_val is None:
+                return {
+                    "initial_stop_price": None,
+                    "initial_risk_per_share": None,
+                    "initial_risk_pct": None,
+                    "initial_risk_dollars": None,
+                    "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
+                    "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
+                    "entry_price_for_r": entry_val,
+                    "risk_model_version": payload.get("risk_model_version"),
+                    "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason", "r_multiple_unavailable_initial_stop_missing"),
+                }
+            if entry_val is not None and stop_val >= entry_val:
+                return {
+                    "initial_stop_price": None,
+                    "initial_risk_per_share": None,
+                    "initial_risk_pct": None,
+                    "initial_risk_dollars": None,
+                    "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
+                    "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
+                    "entry_price_for_r": entry_val,
+                    "risk_model_version": payload.get("risk_model_version"),
+                    "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason", "r_multiple_unavailable_initial_stop_invalid"),
+                }
+            return {
+                "initial_stop_price": stop_val,
+                "initial_risk_per_share": payload.get("initial_risk_per_share"),
+                "initial_risk_pct": payload.get("initial_risk_pct", payload.get("stop_distance_pct")),
+                "initial_risk_dollars": payload.get("initial_risk_dollars"),
+                "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
+                "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
+                "entry_price_for_r": entry_val,
+                "risk_model_version": payload.get("risk_model_version"),
+                "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason"),
+            }
         except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                "initial_stop_price": None,
+                "initial_risk_per_share": None,
+                "initial_risk_pct": None,
+                "initial_risk_dollars": None,
+                "stop_model": None,
+                "stop_source": None,
+                "entry_price_for_r": None,
+                "risk_model_version": None,
+                "r_multiple_unavailable_reason": "r_multiple_unavailable_initial_stop_missing",
+            }
+
+    def _initial_stop_for_position(self, symbol: str) -> float | None:
+        seed = self._initial_risk_seed_for_position(symbol)
+        stop = seed.get("initial_stop_price")
+        try:
+            return float(stop) if stop is not None else None
+        except (TypeError, ValueError):
             return None
 
     def _record_position_management(self, decision: PositionManagementDecision, now: datetime, proposal_id: str | None = None) -> None:
         symbol = decision.symbol.upper()
         previous = self._position_management_state(symbol)
+        risk_seed = self._initial_risk_seed_for_position(symbol)
         created_at = previous.get("created_at") if previous else now.isoformat()
         highest_seen_at = previous.get("highest_price_seen_at") if previous else None
         max_seen_at = previous.get("max_unrealized_profit_seen_at") if previous else None
@@ -357,8 +436,10 @@ class TradingService:
             INSERT INTO position_management_state(
                 id,symbol,broker_position_id,avg_entry_price,quantity,highest_price_since_entry,highest_price_seen_at,
                 max_unrealized_profit_pct,max_unrealized_profit_seen_at,profit_protection_active,profit_protection_activated_at,
-                take_profit_level_1_hit,take_profit_level_2_hit,take_profit_level_3_hit,trailing_stop_price,last_decision_type,last_reason,updated_at,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                take_profit_level_1_hit,take_profit_level_2_hit,take_profit_level_3_hit,trailing_stop_price,
+                initial_stop_price,initial_risk_per_share,initial_risk_pct,initial_risk_dollars,stop_model,stop_source,
+                entry_price_for_r,risk_model_version,r_multiple_unavailable_reason,last_decision_type,last_reason,updated_at,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 avg_entry_price=excluded.avg_entry_price,
                 quantity=excluded.quantity,
@@ -372,6 +453,15 @@ class TradingService:
                 take_profit_level_2_hit=excluded.take_profit_level_2_hit,
                 take_profit_level_3_hit=excluded.take_profit_level_3_hit,
                 trailing_stop_price=excluded.trailing_stop_price,
+                initial_stop_price=excluded.initial_stop_price,
+                initial_risk_per_share=excluded.initial_risk_per_share,
+                initial_risk_pct=excluded.initial_risk_pct,
+                initial_risk_dollars=excluded.initial_risk_dollars,
+                stop_model=excluded.stop_model,
+                stop_source=excluded.stop_source,
+                entry_price_for_r=excluded.entry_price_for_r,
+                risk_model_version=excluded.risk_model_version,
+                r_multiple_unavailable_reason=excluded.r_multiple_unavailable_reason,
                 last_decision_type=excluded.last_decision_type,
                 last_reason=excluded.last_reason,
                 updated_at=excluded.updated_at
@@ -380,7 +470,17 @@ class TradingService:
                 str(uuid.uuid4()), symbol, symbol, decision.avg_entry_price, decision.quantity,
                 decision.highest_price_since_entry, highest_seen_at, decision.max_unrealized_profit_pct,
                 max_seen_at, profit_active, profit_activated_at, level_hits[1], level_hits[2], level_hits[3],
-                decision.trailing_stop_price, decision.decision_type, decision.reason, now.isoformat(), created_at,
+                decision.trailing_stop_price,
+                risk_seed.get("initial_stop_price"),
+                risk_seed.get("initial_risk_per_share"),
+                risk_seed.get("initial_risk_pct"),
+                risk_seed.get("initial_risk_dollars"),
+                risk_seed.get("stop_model"),
+                risk_seed.get("stop_source"),
+                risk_seed.get("entry_price_for_r"),
+                risk_seed.get("risk_model_version"),
+                risk_seed.get("r_multiple_unavailable_reason"),
+                decision.decision_type, decision.reason, now.isoformat(), created_at,
             ),
         )
         self.storage.execute(
@@ -3538,6 +3638,19 @@ class TradingService:
                                 "stop_distance_pct": stop_distance_pct,
                                 "stop_distance_dollars": stop_distance_dollars,
                                 "stop_model_used": stop_model_used,
+                                "initial_stop_price": stop_price if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
+                                "initial_risk_per_share": (float(price) - float(stop_price)) if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
+                                "initial_risk_pct": stop_distance_pct if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
+                                "initial_risk_dollars": ((float(price) - float(stop_price)) * float(qty_val)) if stop_price is not None and price is not None and qty_val is not None and float(stop_price) < float(price) else None,
+                                "stop_model": stop_model_used,
+                                "stop_source": stop_model_used,
+                                "entry_price_for_r": price,
+                                "risk_model_version": "position_sizing_v1",
+                                "r_multiple_unavailable_reason": (
+                                    None
+                                    if stop_price is not None and price is not None and float(stop_price) < float(price)
+                                    else ("r_multiple_unavailable_initial_stop_missing" if stop_price is None else "r_multiple_unavailable_initial_stop_invalid")
+                                ),
                                 "risk_budget": risk_budget,
                                 "score_multiplier": score_multiplier,
                                 "volatility_multiplier": volatility_multiplier,
@@ -3825,15 +3938,21 @@ class TradingService:
                             id, run_id, symbol, timestamp, portfolio_equity, risk_budget,
                             stop_distance_dollars, risk_based_shares, score_adjusted_notional,
                             vol_adjusted_notional, final_notional, suggested_shares,
-                            base_notional, score_multiplier, volatility_multiplier, stop_model_used
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            base_notional, score_multiplier, volatility_multiplier, stop_model_used,
+                            initial_stop_price, initial_risk_per_share, initial_risk_pct, initial_risk_dollars,
+                            stop_source, entry_price_for_r, risk_model_version, r_multiple_unavailable_reason
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             str(uuid.uuid4()), self.run_id, symbol, now.isoformat(),
                             snapshot["portfolio_equity"], risk_budget, stop_distance_dollars,
                             risk_budget / stop_distance_dollars if stop_distance_dollars and stop_distance_dollars > 0 else 0.0,
                             res.get("score_adjusted_notional"), res.get("vol_adjusted_notional"),
                             proposal["notional"], qty_val,
-                            res.get("base_notional"), score_multiplier, volatility_multiplier, stop_model_used
+                            res.get("base_notional"), score_multiplier, volatility_multiplier, stop_model_used,
+                            proposal.get("initial_stop_price"), proposal.get("initial_risk_per_share"),
+                            proposal.get("initial_risk_pct"), proposal.get("initial_risk_dollars"),
+                            proposal.get("stop_source"), proposal.get("entry_price_for_r"),
+                            proposal.get("risk_model_version"), proposal.get("r_multiple_unavailable_reason"),
                         )
                     )
 

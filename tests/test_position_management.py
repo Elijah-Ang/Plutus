@@ -136,6 +136,7 @@ def test_fallback_take_profit_level_one_only_once():
 
     assert first.decision_type == "TAKE_PROFIT_PARTIAL"
     assert first.take_profit_level == 1
+    assert first.current_r_multiple is None
     assert second.decision_type == "HOLD"
 
 
@@ -281,3 +282,10 @@ def test_position_management_proposal_wording():
     assert "Paper profit-taking proposal" in msg
     assert "Current gain: +3.40%" in msg
     assert "Suggested action: Sell 25%" in msg
+
+
+def test_r_multiple_falls_back_safely_when_stop_equals_entry():
+    decision = classify(current_price=102.0, avg_entry_price=100.0, initial_stop_price=100.0)
+
+    assert decision.current_r_multiple is None
+    assert decision.decision_type in {"TAKE_PROFIT_PARTIAL", "HOLD"}

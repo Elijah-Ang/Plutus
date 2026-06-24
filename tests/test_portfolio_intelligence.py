@@ -213,6 +213,12 @@ def test_pyramiding_eligibility(temp_storage, base_config):
     assert len(props) == 1
     p_load = json.loads(props[0]["payload"])
     assert p_load["action"] == "add"
+    assert p_load["initial_stop_price"] is not None
+    assert p_load["initial_risk_per_share"] is not None
+    sizing = temp_storage.fetch_all("SELECT initial_stop_price, initial_risk_per_share, candidate_id, proposal_id FROM position_sizing_decisions WHERE symbol='SPY'")
+    assert len(sizing) == 1
+    assert sizing[0]["initial_stop_price"] is not None
+    assert sizing[0]["initial_risk_per_share"] is not None
 
 def test_shadow_trades_creation(temp_storage, base_config):
     broker = MockBroker()
@@ -285,3 +291,30 @@ def test_final_revalidation(temp_storage, base_config):
     app_status = temp_storage.fetch_all("SELECT final_order_decision, final_block_reason FROM approvals WHERE proposal_id='prop-2'")[0]
     assert app_status["final_order_decision"] == "blocked"
     assert "Price moved" in app_status["final_block_reason"]
+
+
+def test_new_buy_persists_initial_risk_fields(temp_storage, base_config):
+    broker = MockBroker()
+    service = TradingService(base_config, temp_storage, broker, "run-buy")
+    service.telegram = MagicMock()
+    service.telegram.is_available.return_value = True
+
+    with patch("app.service.evaluate_symbol") as mock_eval:
+        def side_effect(sym, *args, **kwargs):
+            if sym == "SPY":
+                return Signal("ENTRY", "buy", "SPY", "trend filters passed and volatility normal", 0.9, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.1})
+            return Signal("HOLD", None, sym, "not SPY", 0.0, {})
+        mock_eval.side_effect = side_effect
+        service.scan()
+
+    proposal = temp_storage.fetch_all("SELECT payload FROM trade_proposals WHERE symbol='SPY' AND status='pending'")[0]
+    payload = json.loads(proposal["payload"])
+    assert payload["initial_stop_price"] is not None
+    assert payload["initial_risk_per_share"] is not None
+    assert payload["entry_price_for_r"] is not None
+    assert payload["r_multiple_unavailable_reason"] is None
+    sizing = temp_storage.fetch_all("SELECT initial_stop_price, initial_risk_per_share, entry_price_for_r, r_multiple_unavailable_reason FROM position_sizing_decisions WHERE symbol='SPY'")[0]
+    assert sizing["initial_stop_price"] is not None
+    assert sizing["initial_risk_per_share"] is not None
+    assert sizing["entry_price_for_r"] is not None
+    assert sizing["r_multiple_unavailable_reason"] is None
