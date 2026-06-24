@@ -191,6 +191,8 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
   - SELL/EXIT proposals are not blocked by BUY risk-budget caps when they reduce risk. Emergency exits remain paper-only and final-revalidated.
   - If multiple candidates pass, one Telegram ranked opportunity set is sent. Each candidate has an internal proposal ID and batch candidate row.
   - Supported batch replies are `yes SPY`, `no SPY`, `yes all`, and `no all`. `yes all` is paper-only and still runs final revalidation separately for each candidate. Plain `yes` is rejected as ambiguous when more than one candidate is pending.
+  - Ranked batch approval routing is batch-first: control commands are checked first, then `yes SYMBOL` / `no SYMBOL` / `yes all` / `no all`, then reply-to batch approvals, then legacy single-proposal handling. A handled batch reply does not fall through to old single-proposal ambiguity text.
+  - Ranked batch Telegram messages show batch creation time and expiry in SGT, state clearly that no reply before expiry means no order, and reject approvals that arrive after expiry.
   - Watchlist position is called `Watchlist order` and is not labeled as market rank.
   - True ranking among active watchlist candidates is calculated based on the Trade Decision Score (score sort key) and labeled as `Score rank`.
   - The proposal message displays both `Score rank` and `Eligible proposal rank`.
@@ -218,7 +220,8 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
   - Base values: Normal buy/sell is 15 minutes, exits/sells are 10 minutes. High volatility limits base to 5 minutes, and low volatility extends base to 20 minutes.
   - Modifiers: Weak setups subtract 2 minutes, very strong setups add 2 minutes. Stale price data subtracts 3 minutes.
   - Close proximity: If market close is near, the duration is truncated to close time (min 5).
-  - Expiry notifications: If no yes/no reply is received before SGT expiry time, the proposal is marked as expired, a single natural language Telegram expiry notification is sent, and any execution attempt is blocked. Approved/rejected proposals do not send expiry notifications.
+  - Storage uses UTC timestamps internally; Telegram displays expiry in SGT.
+  - Expiry notifications: If no yes/no reply is received before SGT expiry time, the proposal is marked as expired, a single natural language Telegram expiry notification is sent, and any execution attempt is blocked. The listener rejects expired approvals immediately and also owns one-shot batch-expiry notifications; the scanner may still do non-notifying cleanup. Approved/rejected proposals do not send expiry notifications.
 - **Hardware/Env Gates**: Blocks trading if AC power is disconnected, internet is down, or database/broker is unreachable.
 - **Position/Risk Gates**: Enforces deterministic portfolio, symbol, cluster, buying-power, stale-data, and final approval gates. Risk-budgeted mode does not use fixed BUY proposal counts as the primary limiter.
 - **Drawdown Gates**: Stops trading if daily/weekly loss limits are breached.

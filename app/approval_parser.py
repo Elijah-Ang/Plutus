@@ -41,8 +41,8 @@ def parse_approval(
     is_plain_reject = bool(re.fullmatch(reject_words, normalized))
     is_plain_approve = bool(re.fullmatch(approve_words, normalized))
     
-    reject_match = re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized)
-    approve_match = re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9-]+))?", normalized)
+    reject_match = re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9.-]+))?", normalized)
+    approve_match = re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9.-]+))?", normalized)
     
     # 1. Handle reply_to_message_id targeting
     if reply_to_message_id is not None:
@@ -85,6 +85,10 @@ def parse_approval(
     if reject_match:
         side, symbol, proposal_id = reject_match.groups()
         candidates = pending_proposals
+        if proposal_id and not side and not symbol:
+            symbol_matches = [p for p in candidates if str(p.get("symbol", "")).lower() == proposal_id.lower()]
+            if len(symbol_matches) == 1:
+                return ApprovalResult("reject", True, "explicit rejection", str(symbol_matches[0]["id"]))
         if proposal_id:
             candidates = [p for p in candidates if str(p["id"]).lower().startswith(proposal_id.lower())]
         if side:
@@ -98,6 +102,13 @@ def parse_approval(
     if approve_match:
         side, symbol, proposal_id = approve_match.groups()
         candidates = pending_proposals
+        if proposal_id and not side and not symbol:
+            symbol_matches = [p for p in candidates if str(p.get("symbol", "")).lower() == proposal_id.lower()]
+            if len(symbol_matches) == 1:
+                proposal = symbol_matches[0]
+                if _time(proposal["expires_at"]) <= now:
+                    return ApprovalResult("approve", False, "proposal expired", str(proposal["id"]))
+                return ApprovalResult("approve", True, "unambiguous authorized approval", str(proposal["id"]))
         if proposal_id:
             candidates = [p for p in candidates if str(p["id"]).lower().startswith(proposal_id.lower())]
         if side:
@@ -116,4 +127,3 @@ def parse_approval(
 
 def parse_reply(*args: Any, **kwargs: Any) -> ApprovalResult:
     return parse_approval(*args, **kwargs)
-

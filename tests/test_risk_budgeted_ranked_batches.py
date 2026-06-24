@@ -13,6 +13,8 @@ class BatchTelegram:
         self.allowed_user_id = allowed_user_id
         self.chat_id = "123"
         self.messages: list[str] = []
+        self.updates: list[dict] = []
+        self.is_mock = True
 
     def send_message(self, text, chat_id=None):
         self.messages.append(text)
@@ -23,6 +25,14 @@ class BatchTelegram:
 
     def is_available(self, force=False):
         return True
+
+    def get_updates(self, timeout=0, offset=None):
+        updates = list(self.updates)
+        self.updates.clear()
+        return updates
+
+    def handle_command(self, text, sender):
+        return "ok"
 
 
 class BatchBroker:
@@ -218,16 +228,70 @@ def test_ranked_batch_message_contains_symbol_specific_and_yes_all_instructions(
     service, _ = make_service(tmp_path)
     message = service._format_ranked_batch_message(
         [
-            {"id": "p1", "symbol": "SPY", "side": "buy", "action": "entry", "notional": 18.4, "qty": 0.03, "score": 88, "selection_reason": "strongest active setup"},
-            {"id": "p2", "symbol": "IWM", "side": "buy", "action": "entry", "notional": 12.6, "qty": 0.10, "score": 84, "selection_reason": "passes risk budget"},
+            {"id": "p1", "symbol": "SPY", "side": "buy", "action": "entry", "notional": 18.4, "qty": 0.03, "score": 88, "selection_reason": "strongest active setup", "created_at": datetime.now(UTC).isoformat(), "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat()},
+            {"id": "p2", "symbol": "IWM", "side": "buy", "action": "entry", "notional": 12.6, "qty": 0.10, "score": 84, "selection_reason": "passes risk budget", "created_at": datetime.now(UTC).isoformat(), "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat()},
         ],
         [{"symbol": "XLV", "risk_budget_block_reason": "observation-only"}],
         {"total_exposure_pct": 4.8, "open_risk_pct": 0.22, "buying_power": 1000.0},
     )
     assert "Paper position and trade opportunity set" in message
+    assert "Created:" in message
+    assert "Expires:" in message
+    assert "No reply before expiry = no order." in message
     assert "yes SPY = approve SPY only" in message
     assert "yes all = approve all actionable candidates after final checks" in message
     assert "Plain yes is ambiguous" in message
+
+
+def test_ranked_batch_message_formats_tiny_positive_exposure_without_zeroing(tmp_path):
+    service, _ = make_service(tmp_path)
+    now = datetime.now(UTC)
+    message = service._format_ranked_batch_message(
+        [
+            {"id": "p1", "symbol": "SPY", "side": "buy", "action": "entry", "notional": 18.4, "qty": 0.03, "score": 88, "created_at": now.isoformat(), "expires_at": (now + timedelta(minutes=10)).isoformat()},
+        ],
+        [],
+        {"total_exposure_pct": 0.001, "open_risk_pct": 0.005, "buying_power": 1000.0},
+    )
+    assert "Total exposure after proposed trades: <0.01% / 6.0%" in message
+    assert "Open risk after proposed trades: <0.01% / 0.30%" in message
+
+
+def test_ranked_batch_message_uses_rank_specific_reason_wording(tmp_path):
+    service, _ = make_service(tmp_path)
+    now = datetime.now(UTC)
+    message = service._format_ranked_batch_message(
+        [
+            {
+                "id": "p1",
+                "symbol": "SPY",
+                "side": "buy",
+                "action": "entry",
+                "notional": 20.0,
+                "qty": 0.02,
+                "score": 95,
+                "selection_reason": "Selected as the strongest eligible candidate.",
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            },
+            {
+                "id": "p2",
+                "symbol": "IWM",
+                "side": "buy",
+                "action": "entry",
+                "notional": 15.0,
+                "qty": 0.05,
+                "score": 85,
+                "selection_reason": "Selected as the strongest eligible candidate.",
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            },
+        ],
+        [],
+        {"total_exposure_pct": 0.5, "open_risk_pct": 0.05, "buying_power": 1000.0},
+    )
+    assert "Reason: Selected as the strongest eligible candidate." in message
+    assert "Reason: Included as ranked eligible candidate #2 after risk-budget checks." in message
 
 
 def insert_batch(storage: Storage, proposals: list[tuple[str, str] | tuple[str, str, str, str]]) -> str:
@@ -315,6 +379,13 @@ def test_batch_buy_approval_blocked_when_sleep_mode_active(tmp_path):
     assert storage.fetch_all("SELECT COUNT(*) AS cnt FROM orders")[0]["cnt"] == 0
 
 
+def test_batch_approval_command_parser_accepts_case_and_punctuation(tmp_path):
+    service, _ = make_service(tmp_path)
+    assert service._parse_batch_approval_command("YES SPY") == ("yes", "SPY")
+    assert service._parse_batch_approval_command("yes, spy") == ("yes", "SPY")
+    assert service._parse_batch_approval_command("no SPY.") == ("no", "SPY")
+
+
 def test_batch_add_approval_blocked_when_sleep_mode_active(tmp_path):
     service, storage = make_service(tmp_path)
     storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
@@ -356,6 +427,131 @@ def test_batch_exit_approval_allowed_during_sleep_mode(tmp_path):
     assert service.broker.submitted and service.broker.submitted[0]["side"] == "sell"
     assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "approved"
     assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "submitted"
+
+
+def test_bad_symbol_gets_batch_aware_fallback_message(tmp_path):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY"), ("p2", "IWM")])
+
+    handled = service._handle_batch_approval_command("yes QQQ", "7777", "yes", "QQQ", "4242")
+
+    assert handled is True
+    assert service.telegram.messages[-1] == (
+        "I found an active proposal batch, but I could not match your reply to a pending candidate. "
+        "Use one of: yes SPY, yes IWM, yes all, no SPY, no IWM, no all."
+    )
+
+
+def test_expired_batch_candidate_cannot_be_approved(tmp_path):
+    service, storage = make_service(tmp_path)
+    now = datetime.now(UTC)
+    expired = (now - timedelta(minutes=1)).isoformat()
+    storage.execute(
+        "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?)",
+        ("batch-1", "run", "4242", "pending", now.isoformat(), expired, "{}"),
+    )
+    payload = {
+        "id": "p1",
+        "symbol": "SPY",
+        "side": "buy",
+        "action": "entry",
+        "notional": 5.0,
+        "qty": 0.05,
+        "latest_price": 100.0,
+        "price_at": now.isoformat(),
+        "created_at": now.isoformat(),
+        "expires_at": expired,
+        "strategy_version": "rule_based_v1",
+        "reason": "expired batch",
+        "order_type": "market",
+        "asset_class": "equity",
+    }
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("p1", "run", "sig-1", "SPY", "buy", 5.0, "pending", now.isoformat(), expired, "rule_based_v1", json.dumps(payload), "4242"),
+    )
+    storage.execute(
+        "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("cand-1", "batch-1", "p1", "4242", "SPY", "buy", "BUY", "pending", 1, "expired", now.isoformat(), expired, json.dumps(payload)),
+    )
+
+    handled = service._handle_batch_approval_command("yes SPY", "7777", "yes", "SPY", "4242")
+
+    assert handled is True
+    assert service.telegram.messages[-1] == "That candidate has expired, so I did not take action. I will not submit an order from an expired proposal."
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "pending"
+
+
+def test_listener_side_batch_expiry_notification_is_one_shot(tmp_path):
+    service, storage = make_service(tmp_path)
+    now = datetime.now(UTC)
+    expiry = (now - timedelta(minutes=1)).isoformat()
+    insert_batch(storage, [("p1", "SPY"), ("p2", "IWM")])
+    storage.execute("UPDATE proposal_batches SET expires_at=?, expiry_notified=0 WHERE id='batch-1'", (expiry,))
+    storage.execute("UPDATE proposal_batch_candidates SET expires_at=? WHERE batch_id='batch-1'", (expiry,))
+    storage.execute("UPDATE trade_proposals SET expires_at=?, status='expired', expiry_notified=1", (expiry,))
+
+    service._expire_pending_batches(notify=True)
+    service._expire_pending_batches(notify=True)
+
+    assert sum("Proposal batch expired" in msg for msg in service.telegram.messages) == 1
+    assert storage.fetch_all("SELECT status, expiry_notified FROM proposal_batches WHERE id='batch-1'")[0] == {
+        "status": "expired",
+        "expiry_notified": 1,
+    }
+    assert {r["candidate_status"] for r in storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE batch_id='batch-1'")} == {"expired"}
+
+
+def test_process_telegram_batch_route_stops_before_old_single_proposal_fallback(tmp_path, monkeypatch):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY"), ("p2", "IWM")])
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 101,
+            "message": {
+                "message_id": 5001,
+                "text": "yes SPY",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+                "reply_to_message": {"message_id": 4242},
+            },
+        }
+    ]
+
+    def fake_approve(*args, **kwargs):
+        return False, "blocked", "blocked for test"
+
+    monkeypatch.setattr(service, "_approve_batch_candidate", fake_approve)
+
+    service.process_telegram()
+
+    assert any("Received: YES for SPY paper buy candidate" in msg for msg in service.telegram.messages)
+    assert not any("could not match your reply to a single pending proposal" in msg for msg in service.telegram.messages)
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "blocked"
+
+
+def test_process_telegram_plain_yes_is_batch_ambiguous(tmp_path):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY"), ("p2", "IWM")])
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 102,
+            "message": {
+                "message_id": 5002,
+                "text": "yes",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+            },
+        }
+    ]
+
+    service.process_telegram()
+
+    assert service.telegram.messages[-1] == "Plain yes is ambiguous because more than one candidate is pending. Use yes SPY, yes IWM, yes all, no SPY, no IWM, no all."
 
 
 def insert_exit_proposal(storage: Storage, proposal_id: str, symbol: str, status: str, expires_at: str, emergency: int = 0) -> None:

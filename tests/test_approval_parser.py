@@ -75,9 +75,15 @@ def test_approval_with_side_and_symbol_resolves_multiple_pending():
     assert result.proposal_id == "def"
 
 
+def test_approval_with_symbol_only_prefers_exact_symbol_match():
+    proposals = [pending(id="spy-proposal", symbol="SPY"), pending(id="iwm-proposal", symbol="IWM")]
+    result = parse_approval("yes spy", 7, 7, proposals)
+    assert result.accepted
+    assert result.proposal_id == "spy-proposal"
+
+
 def test_approval_fails_if_still_ambiguous():
     proposals = [pending(id="abc", symbol="QQQ", side="buy"), pending(id="def", symbol="QQQ", side="buy")]
     result = parse_approval("yes buy qqq", 7, 7, proposals)
     assert not result.accepted
     assert result.reason == "exactly one matching pending proposal is required"
-

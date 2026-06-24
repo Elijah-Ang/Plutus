@@ -48,6 +48,40 @@ def _format_sgt_time(value: datetime) -> str:
     return f"{hour}:{sgt_dt:%M %p}"
 
 
+def _format_small_percent(value: float | int | None) -> str:
+    if value is None:
+        return "0.00%"
+    numeric = float(value)
+    if 0 < abs(numeric) < 0.01:
+        return "<0.01%"
+    return f"{numeric:.2f}%"
+
+
+def _format_expiry_line(expires_at: str | datetime, now: datetime | None = None) -> str:
+    expiry_dt = _parse_datetime(expires_at)
+    now_dt = now or datetime.now(UTC)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=UTC)
+    minutes = max(0, int((expiry_dt - now_dt).total_seconds() // 60))
+    return f"Expires: {_format_sgt_time(expiry_dt)} SGT" + (f" ({minutes} min left)" if minutes > 0 else "")
+
+
+def _normalize_ranked_candidate_reason(reason: str | None, rank: int) -> str:
+    normalized = str(reason or "").strip()
+    strongest_boilerplate = {
+        "selected because it was the strongest eligible candidate.",
+        "selected as the strongest eligible candidate.",
+        "strongest eligible candidate",
+    }
+    if rank == 1:
+        if not normalized:
+            return "Selected as the strongest eligible candidate."
+        return normalized
+    if not normalized or normalized.lower() in strongest_boilerplate:
+        return f"Included as ranked eligible candidate #{rank} after risk-budget checks."
+    return normalized
+
+
 def _format_sleep_window(start_time: str | datetime, end_time: str | datetime) -> str:
     start_sgt = _parse_datetime(start_time).astimezone(SGT)
     end_sgt = _parse_datetime(end_time).astimezone(SGT)
@@ -419,6 +453,137 @@ class TradingService:
                 (status, resolved_at, proposal_id),
             )
 
+    def _parse_batch_approval_command(self, text: str) -> tuple[str, str] | None:
+        normalized = text.strip()
+        match = re.fullmatch(
+            r"(?i)\s*(yes|approve|approved|no|reject|rejected)\s*,?\s*(all|[A-Z.]{1,10})\s*[.!]?\s*",
+            normalized,
+        )
+        if not match:
+            return None
+        return match.group(1).lower(), match.group(2).upper().rstrip(".")
+
+    def _fetch_batch_candidates(
+        self,
+        *,
+        now_iso: str,
+        reply_to_message_id: str | None = None,
+        active_only: bool = True,
+        pending_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        where = []
+        params: list[Any] = []
+        if active_only:
+            where.append("b.status IN ('pending','partially_approved')")
+            where.append("b.expires_at>?")
+            params.append(now_iso)
+        if pending_only:
+            where.append("c.candidate_status='pending'")
+            where.append("p.status='pending'")
+        if reply_to_message_id is not None:
+            where.append("b.telegram_message_id=?")
+            params.append(str(reply_to_message_id))
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        return self.storage.fetch_all(
+            f"""
+            SELECT
+                c.*,
+                b.status AS batch_status,
+                b.expires_at AS batch_expires_at,
+                b.telegram_message_id AS batch_message_id,
+                b.expiry_notified AS batch_expiry_notified,
+                p.status AS proposal_status,
+                p.expires_at AS proposal_expires_at
+            FROM proposal_batch_candidates c
+            JOIN proposal_batches b ON b.id=c.batch_id
+            JOIN trade_proposals p ON p.id=c.proposal_id
+            {where_sql}
+            ORDER BY b.created_at DESC, c.rank
+            """,
+            tuple(params),
+        )
+
+    def _batch_symbols_hint(self, rows: list[dict[str, Any]]) -> str:
+        symbols = []
+        for row in rows:
+            symbol = str(row.get("candidate_symbol", "")).upper()
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        if not symbols:
+            return "yes all, no all"
+        yes_parts = [f"yes {sym}" for sym in symbols]
+        no_parts = [f"no {sym}" for sym in symbols]
+        return ", ".join(yes_parts + ["yes all"] + no_parts + ["no all"])
+
+    def _proposal_or_candidate_expired(self, proposal: dict[str, Any], candidate_row: dict[str, Any] | None = None) -> bool:
+        now_dt = datetime.now(UTC)
+        proposal_expiry = proposal.get("expires_at")
+        if proposal_expiry and _parse_datetime(proposal_expiry) <= now_dt:
+            return True
+        if candidate_row is not None:
+            candidate_expiry = candidate_row.get("expires_at")
+            batch_expiry = candidate_row.get("batch_expires_at")
+            if candidate_expiry and _parse_datetime(candidate_expiry) <= now_dt:
+                return True
+            if batch_expiry and _parse_datetime(batch_expiry) <= now_dt:
+                return True
+        return False
+
+    def _mark_proposal_expiry_notified(self, proposal_id: str) -> None:
+        self.storage.execute("UPDATE trade_proposals SET expiry_notified=1 WHERE id=?", (proposal_id,))
+
+    def _mark_batch_expiry_notified(self, batch_id: str) -> None:
+        self.storage.execute("UPDATE proposal_batches SET expiry_notified=1 WHERE id=?", (batch_id,))
+
+    def _expire_pending_batches(self, notify: bool = False) -> None:
+        now_iso = iso_now()
+        expired_candidates = self.storage.fetch_all(
+            """
+            SELECT c.*, b.telegram_message_id AS batch_message_id, b.expires_at AS batch_expires_at, p.symbol, p.status AS proposal_status
+            FROM proposal_batch_candidates c
+            JOIN proposal_batches b ON b.id=c.batch_id
+            JOIN trade_proposals p ON p.id=c.proposal_id
+            WHERE c.candidate_status='pending'
+              AND (c.expires_at<=? OR b.expires_at<=? OR p.status='expired')
+            ORDER BY b.created_at, c.rank
+            """,
+            (now_iso, now_iso),
+        )
+        for row in expired_candidates:
+            self.storage.execute(
+                "UPDATE proposal_batch_candidates SET candidate_status='expired' WHERE id=? AND candidate_status='pending'",
+                (row["id"],),
+            )
+
+        expired_batches = self.storage.fetch_all(
+            """
+            SELECT * FROM proposal_batches
+            WHERE status IN ('pending','partially_approved')
+              AND expires_at<=?
+            ORDER BY created_at
+            """,
+            (now_iso,),
+        )
+        for row in expired_batches:
+            self.storage.execute("UPDATE proposal_batches SET status='expired' WHERE id=?", (row["id"],))
+            if notify and int(row.get("expiry_notified") or 0) == 0:
+                batch_rows = self.storage.fetch_all(
+                    "SELECT candidate_symbol FROM proposal_batch_candidates WHERE batch_id=? ORDER BY rank",
+                    (row["id"],),
+                )
+                symbols = ", ".join(str(r["candidate_symbol"]).upper() for r in batch_rows)
+                self.telegram.send_message(
+                    f"⏳ Proposal batch expired\n\n"
+                    f"The paper proposal batch for {symbols or 'pending candidates'} expired at {format_sgt(row['expires_at'])}.\n"
+                    f"No order was placed from expired batch candidates."
+                )
+                self.storage.execute("UPDATE proposal_batches SET expiry_notified=1 WHERE id=?", (row["id"],))
+                self.storage.audit(
+                    self.run_id,
+                    "proposal_batch_expiry_notified",
+                    {"batch_id": row["id"], "expires_at": row["expires_at"], "symbols": symbols},
+                )
+
     def _final_revalidate_position_management(self, proposal: dict[str, Any], refreshed_price: float | None = None) -> str | None:
         pm_type = proposal.get("position_management_decision_type")
         if not pm_type:
@@ -553,8 +718,12 @@ class TradingService:
         }
 
     def process_telegram(self) -> None:
+        self.storage.expire_proposals()
+        self._expire_pending_batches(notify=False)
         updates = self.telegram.get_updates(timeout=0)
         if not updates:
+            self.notify_expired_proposals()
+            self._expire_pending_batches(notify=True)
             return
 
         processed_update_ids = set()
@@ -700,13 +869,13 @@ class TradingService:
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
 
-            batch_match = re.fullmatch(r"(yes|approve|approved|no|reject|rejected)(?:\s+(all|[a-z.]{1,10}))", " ".join(text.lower().strip().split()))
+            batch_match = self._parse_batch_approval_command(text)
             if batch_match:
                 handled = self._handle_batch_approval_command(
                     raw_text=text,
                     sender=str(sender),
-                    action_word=batch_match.group(1),
-                    target=batch_match.group(2),
+                    action_word=batch_match[0],
+                    target=batch_match[1],
                     reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
                 )
                 if handled:
@@ -763,6 +932,7 @@ class TradingService:
                     continue
 
                 if prop_status == "expired":
+                    self._mark_proposal_expiry_notified(str(proposal_row["id"]))
                     self.telegram.send_message("⏳ This proposal has already expired. No order was placed.")
                     continue
                 elif prop_status in ("approved", "rejected", "superseded"):
@@ -777,6 +947,20 @@ class TradingService:
             is_plain_approve = bool(re.fullmatch(approve_words, normalized))
 
             if reply_to_message_id is None and (is_plain_approve or is_plain_reject):
+                active_batch_rows = self._fetch_batch_candidates(now_iso=iso_now(), active_only=True, pending_only=True)
+                active_batch_ids = {str(r["batch_id"]) for r in active_batch_rows}
+                if active_batch_rows:
+                    if len(active_batch_ids) > 1:
+                        self.telegram.send_message("Multiple proposal batches are pending. Please reply directly to the batch message or include the batch/proposal ID.")
+                    elif len(active_batch_rows) > 1:
+                        self.telegram.send_message(
+                            f"Plain yes is ambiguous because more than one candidate is pending. Use {self._batch_symbols_hint(active_batch_rows)}."
+                        )
+                    else:
+                        self.telegram.send_message(
+                            f"Plain yes is ambiguous because a ranked batch is pending. Use {self._batch_symbols_hint(active_batch_rows)}."
+                        )
+                    continue
                 if len(pending) > 1:
                     self.telegram.send_message("I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.")
                     continue
@@ -814,6 +998,8 @@ class TradingService:
             )
 
             if not parsed.accepted or not parsed.proposal_id:
+                if parsed.reason == "proposal expired" and parsed.proposal_id:
+                    self._mark_proposal_expiry_notified(str(parsed.proposal_id))
                 msg = translate_reason(parsed.reason)
                 self.telegram.send_message(msg)
 
@@ -1049,6 +1235,8 @@ class TradingService:
                 else:
                     self.telegram.send_message(f"⚠️ Approved, but no order was placed. Reason: {result.reason}.")
                 continue
+        self.notify_expired_proposals()
+        self._expire_pending_batches(notify=True)
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
@@ -1085,7 +1273,9 @@ class TradingService:
         statuses = {r["candidate_status"] for r in rows}
         if not rows:
             return
-        if statuses <= {"approved", "rejected", "expired", "blocked", "submitted"}:
+        if statuses == {"expired"}:
+            status = "expired"
+        elif statuses <= {"approved", "rejected", "expired", "blocked", "submitted"}:
             status = "completed"
         elif any(s in statuses for s in ("approved", "rejected", "blocked", "submitted")):
             status = "partially_approved"
@@ -1107,33 +1297,69 @@ class TradingService:
             return True
 
         action = "approve" if action_word in {"yes", "approve", "approved"} else "reject"
-        batch_filter = ""
-        params: list[Any] = []
-        if reply_to_message_id is not None:
-            batch_filter = " AND b.telegram_message_id=?"
-            params.append(reply_to_message_id)
-        rows = self.storage.fetch_all(
-            f"""
-            SELECT c.*, b.status AS batch_status
-            FROM proposal_batch_candidates c
-            JOIN proposal_batches b ON b.id=c.batch_id
-            WHERE c.candidate_status='pending'
-              AND b.status IN ('pending','partially_approved')
-              AND c.expires_at>?
-              {batch_filter}
-            ORDER BY c.rank
-            """,
-            (iso_now(), *params),
+        now_iso = iso_now()
+        active_rows = self._fetch_batch_candidates(
+            now_iso=now_iso,
+            reply_to_message_id=reply_to_message_id,
+            active_only=True,
+            pending_only=True,
         )
-        if not rows:
+        all_relevant_rows = self._fetch_batch_candidates(
+            now_iso=now_iso,
+            reply_to_message_id=reply_to_message_id,
+            active_only=False,
+            pending_only=False,
+        )
+        active_batch_ids = {str(r["batch_id"]) for r in active_rows}
+        if not active_rows:
+            if all_relevant_rows:
+                target_rows = [r for r in all_relevant_rows if target == "ALL" or str(r["candidate_symbol"]).upper() == target]
+                if target_rows and all(
+                    str(r.get("candidate_status")) == "expired"
+                    or str(r.get("proposal_status")) == "expired"
+                    or _parse_datetime(r.get("expires_at") or r.get("proposal_expires_at")) <= datetime.now(UTC)
+                    or _parse_datetime(r.get("batch_expires_at")) <= datetime.now(UTC)
+                    for r in target_rows
+                ):
+                    for row in target_rows:
+                        self._mark_proposal_expiry_notified(str(row["proposal_id"]))
+                        self._mark_batch_expiry_notified(str(row["batch_id"]))
+                    self.telegram.send_message("That candidate has expired, so I did not take action. I will not submit an order from an expired proposal.")
+                    return True
+                if target_rows:
+                    self.telegram.send_message("I did not take any action because that batch candidate was already handled earlier.")
+                    return True
             return False
+        if reply_to_message_id is None and len(active_batch_ids) > 1:
+            self.telegram.send_message("Multiple proposal batches are pending. Please reply directly to the batch message or include the batch/proposal ID.")
+            return True
 
-        target_upper = target.upper()
+        target_upper = str(target).upper()
         if target_upper != "ALL":
-            rows = [r for r in rows if str(r["candidate_symbol"]).upper() == target_upper]
+            rows = [r for r in active_rows if str(r["candidate_symbol"]).upper() == target_upper]
+        else:
+            rows = list(active_rows)
 
         if not rows:
-            self.telegram.send_message("I did not take any action because I could not match that symbol to a pending batch candidate.")
+            symbol_rows = [r for r in all_relevant_rows if str(r["candidate_symbol"]).upper() == target_upper]
+            if symbol_rows and all(
+                str(r.get("candidate_status")) == "expired"
+                or str(r.get("proposal_status")) == "expired"
+                or _parse_datetime(r.get("expires_at") or r.get("proposal_expires_at")) <= datetime.now(UTC)
+                or _parse_datetime(r.get("batch_expires_at")) <= datetime.now(UTC)
+                for r in symbol_rows
+            ):
+                for row in symbol_rows:
+                    self._mark_proposal_expiry_notified(str(row["proposal_id"]))
+                    self._mark_batch_expiry_notified(str(row["batch_id"]))
+                self.telegram.send_message("That candidate has expired, so I did not take action. I will not submit an order from an expired proposal.")
+                return True
+            if symbol_rows:
+                self.telegram.send_message("I did not take any action because that batch candidate was already handled earlier.")
+                return True
+            self.telegram.send_message(
+                f"I found an active proposal batch, but I could not match your reply to a pending candidate. Use one of: {self._batch_symbols_hint(active_rows)}."
+            )
             return True
         if target_upper == "ALL" and action == "approve":
             if self.config.get("mode") != "paper" or self.config.get("proposal_mode", {}).get("allow_yes_all_for_paper") is not True:
@@ -1167,7 +1393,7 @@ class TradingService:
                     action_label = str(row.get("candidate_action") or row.get("candidate_side") or "candidate").lower().replace("_", " ")
                     self.telegram.send_message(f"✅ Received: YES for {symbol} paper {action_label} candidate. I will run final safety checks now.")
                 submitted, status, reason = self._approve_batch_candidate(proposal_id, sender, raw_text, row)
-                candidate_status = "submitted" if submitted else ("pending" if status == "sleep_mode_active" else "blocked")
+                candidate_status = "submitted" if submitted else ("pending" if status == "sleep_mode_active" else ("expired" if status == "expired" else "blocked"))
                 self.storage.execute(
                     "UPDATE proposal_batch_candidates SET candidate_status=? WHERE proposal_id=?",
                     (candidate_status, proposal_id),
@@ -1186,6 +1412,15 @@ class TradingService:
             return False, "already_handled", "candidate already handled"
 
         row = rows[0]
+        if self._proposal_or_candidate_expired(row, batch_row):
+            self.storage.execute("UPDATE trade_proposals SET status='expired' WHERE id=? AND status='pending'", (proposal_id,))
+            self.storage.execute("UPDATE proposal_batch_candidates SET candidate_status='expired' WHERE proposal_id=? AND candidate_status='pending'", (proposal_id,))
+            self._mark_proposal_expiry_notified(proposal_id)
+            if batch_row.get("batch_id"):
+                self._mark_batch_expiry_notified(str(batch_row["batch_id"]))
+            self._update_batch_status(str(batch_row.get("batch_id") or ""))
+            self.telegram.send_message("That candidate has expired, so I did not take action. I will not submit an order from an expired proposal.")
+            return False, "expired", "candidate expired"
         if self._sleep_mode_blocks_approval({**json.loads(row.get("payload") or "{}"), **row}):
             msg = "Sleep mode is ON, so I did not process this BUY/ADD approval. Send awake first, then approve again if the proposal is still valid."
             self.telegram.send_message(msg)
@@ -1249,6 +1484,8 @@ class TradingService:
 
         proposal_price = proposal.get("latest_price") or row.get("current_price")
         if block_reason is None:
+            if self._proposal_or_candidate_expired(row, batch_row):
+                block_reason = "Proposal expired"
             if refresh_required:
                 if refreshed_price_val is None or refreshed_price_val <= 0:
                     block_reason = "Price refresh failed or price is unavailable"
@@ -3716,6 +3953,7 @@ class TradingService:
         self._context_cache = None
         self.storage.expire_proposals()
         self.notify_expired_proposals()
+        self._expire_pending_batches(notify=False)
         if self.config.get("telegram", {}).get("market_scan_processes_telegram_updates", True):
             self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
@@ -4200,11 +4438,20 @@ class TradingService:
         tracked_candidates: list[dict[str, Any]],
         risk_snapshot: dict[str, Any],
     ) -> str:
+        now_dt = datetime.now(UTC)
+        created_candidates = [p.get("created_at") for p in proposals if p.get("created_at")]
+        created_dt = _parse_datetime(created_candidates[0]) if created_candidates else now_dt
+        expiries = [_parse_datetime(p["expires_at"]) for p in proposals if p.get("expires_at")]
+        batch_expiry = min(expiries) if expiries else None
         lines = [
             "📊 Paper position and trade opportunity set",
+            f"Created: {_format_sgt_time(created_dt)} SGT",
+            _format_expiry_line(batch_expiry, now_dt) if batch_expiry else "Expires: not set",
+            "No reply before expiry = no order.",
+            "Replies after expiry will be rejected.",
             "Portfolio room:",
-            f"- Total exposure after proposed trades: {risk_snapshot.get('total_exposure_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
-            f"- Open risk after proposed trades: {risk_snapshot.get('open_risk_pct', 0.0):.2f}% / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
+            f"- Total exposure after proposed trades: {_format_small_percent(risk_snapshot.get('total_exposure_pct', 0.0))} / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
+            f"- Open risk after proposed trades: {_format_small_percent(risk_snapshot.get('open_risk_pct', 0.0))} / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
             f"- Available paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f}",
             "Actionable:",
         ]
@@ -4221,13 +4468,16 @@ class TradingService:
                 action_word = "ADD"
             qty = float(proposal.get("qty") or 0.0)
             pm = proposal.get("position_management_decision") or {}
+            candidate_expiry = proposal.get("candidate_expires_at") or proposal.get("expires_at")
             lines.extend([
                 f"{idx}. {action_word} {proposal['symbol']} - ${float(proposal.get('notional') or 0.0):.2f} / approx. {qty:.6f} shares",
                 f"   Score: {float(proposal.get('score') or 0.0):.0f}",
                 "   Risk: normal",
                 "   Portfolio fit: passes risk budget",
-                f"   Reason: {proposal.get('selection_reason') or proposal.get('reason') or 'ranked actionable setup'}",
+                f"   Reason: {_normalize_ranked_candidate_reason(proposal.get('selection_reason') or proposal.get('reason'), idx)}",
             ])
+            if batch_expiry and candidate_expiry and _parse_datetime(candidate_expiry) != batch_expiry:
+                lines.append(f"   Candidate expiry: {_format_expiry_line(candidate_expiry, now_dt).replace('Expires: ', '')}")
             if pm_type:
                 if pm_type == "HEALTHY_PULLBACK_ADD":
                     lines.append("   Note: add-to-winner, not averaging down")
@@ -4269,20 +4519,32 @@ class TradingService:
         if not proposals:
             return
         batch_id = str(uuid.uuid4())
-        expires_at = min(str(p.get("expires_at")) for p in proposals)
+        batch_expiry_dt = min(_parse_datetime(p["expires_at"]) for p in proposals if p.get("expires_at"))
+        expires_at = batch_expiry_dt.isoformat()
         self.storage.execute(
-            "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?)",
-            (batch_id, self.run_id, None, "pending", iso_now(), expires_at, json_dumps({"proposal_ids": [p["id"] for p in proposals]})),
+            "INSERT INTO proposal_batches(id,run_id,telegram_message_id,status,created_at,expires_at,payload,expiry_notified) VALUES(?,?,?,?,?,?,?,?)",
+            (batch_id, self.run_id, None, "pending", iso_now(), expires_at, json_dumps({"proposal_ids": [p["id"] for p in proposals]}), 0),
         )
         for idx, proposal in enumerate(proposals, start=1):
+            proposal["candidate_expires_at"] = proposal.get("expires_at")
+            proposal["selection_reason"] = _normalize_ranked_candidate_reason(proposal.get("selection_reason") or proposal.get("reason"), idx)
+            proposal["expires_at"] = expires_at
+            payload = json.loads(proposal.get("payload") or "{}") if isinstance(proposal.get("payload"), str) else {}
+            if payload:
+                payload["candidate_expires_at"] = proposal["candidate_expires_at"]
+                payload["expires_at"] = expires_at
             candidate_action = proposal.get("position_management_decision_type") or proposal.get("action") or proposal["side"]
             self.storage.execute(
-                "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "UPDATE trade_proposals SET expires_at=?, payload=? WHERE id=?",
+                (expires_at, json_dumps({**payload, **proposal}), proposal["id"]),
+            )
+            self.storage.execute(
+                "INSERT INTO proposal_batch_candidates(id,batch_id,proposal_id,telegram_message_id,candidate_symbol,candidate_side,candidate_action,candidate_status,rank,reason,created_at,expires_at,payload,expiry_notified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(uuid.uuid4()), batch_id, proposal["id"], None, proposal["symbol"], proposal["side"],
                     candidate_action, "pending", idx,
-                    proposal.get("selection_reason") or proposal.get("reason"), iso_now(), proposal.get("expires_at"),
-                    json_dumps(proposal)
+                    proposal.get("selection_reason") or proposal.get("reason"), iso_now(), expires_at,
+                    json_dumps(proposal), 0
                 ),
             )
         message = self._format_ranked_batch_message(proposals, tracked_candidates, risk_snapshot)
