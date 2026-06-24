@@ -4116,27 +4116,48 @@ class TradingService:
         top_watched = symbols_list[:max_syms]
 
         proposals = self.storage.fetch_all(
-            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE created_at >= ?",
-            (window_start_iso,)
+            """
+            SELECT COUNT(*) as cnt
+            FROM trade_proposals
+            WHERE datetime(created_at) >= datetime(?)
+              AND datetime(created_at) <= datetime(?)
+            """,
+            (window_start_iso, now.isoformat())
         )
         prop_cnt = proposals[0]["cnt"] if proposals else 0
 
         orders = self.storage.fetch_all(
-            "SELECT COUNT(*) as cnt FROM orders WHERE created_at >= ?",
-            (window_start_iso,)
+            """
+            SELECT COUNT(*) as cnt
+            FROM orders
+            WHERE datetime(created_at) >= datetime(?)
+              AND datetime(created_at) <= datetime(?)
+            """,
+            (window_start_iso, now.isoformat())
         )
         order_cnt = orders[0]["cnt"] if orders else 0
 
         fills = self.storage.fetch_all(
-            "SELECT COUNT(*) as cnt FROM fills WHERE filled_at >= ?",
-            (window_start_iso,)
+            """
+            SELECT COUNT(DISTINCT order_id) as cnt
+            FROM fills
+            WHERE datetime(filled_at) >= datetime(?)
+              AND datetime(filled_at) <= datetime(?)
+            """,
+            (window_start_iso, now.isoformat())
         )
         fill_cnt = fills[0]["cnt"] if fills else 0
 
         gpt_calls = sum(bool(r.get("gpt_called")) for r in rows)
 
         expired = self.storage.fetch_all(
-            "SELECT COUNT(*) as cnt FROM trade_proposals WHERE status='expired' AND expires_at >= ? AND expires_at <= ?",
+            """
+            SELECT COUNT(*) as cnt
+            FROM trade_proposals
+            WHERE status='expired'
+              AND datetime(expires_at) >= datetime(?)
+              AND datetime(expires_at) <= datetime(?)
+            """,
             (window_start_iso, now.isoformat())
         )
         expired_cnt = expired[0]["cnt"] if expired else 0

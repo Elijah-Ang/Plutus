@@ -453,6 +453,183 @@ def test_digest_uses_authoritative_filled_state_over_stale_market_memory(temp_st
     assert "Proposals: 1 | Orders: 1 | Fills: 1" in msg
 
 
+def test_digest_counts_fill_with_space_separated_timestamp(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["DIA"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(minutes=5)).isoformat()
+    filled_at_dt = now - timedelta(minutes=1)
+    filled_at = filled_at_dt.strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "DIA", 520.658, 519.0, "ENTRY", 100.0, "Very strong paper setup", 1, "proposal generated", created_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-dia", "run1", "DIA", "buy", 20.0, "approved", created_at, (now + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"symbol": "DIA", "score": 100})),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-dia", "run1", "prop-dia", "broker-dia", "client-dia", "DIA", "buy", 20.0, 0.038400983, "filled", "{}", created_at, filled_at_dt.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notified_at,fill_notification_status,fill_notification_error) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("run1", "order-dia", 0.038400983, 520.658, filled_at, "{}", None, None, None),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Status: Approved and filled — DIA paper buy filled" in msg
+    assert "Summary: DIA was approved and filled during this window." in msg
+    assert "Proposals: 1 | Orders: 1 | Fills: 1" in msg
+
+
+def test_digest_fill_count_ignores_fills_outside_the_window(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["DIA"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    created_at = (now - timedelta(minutes=5)).isoformat()
+    filled_at = (now - timedelta(minutes=1)).isoformat()
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "DIA", 520.658, 519.0, "ENTRY", 100.0, "Very strong paper setup", 1, "proposal generated", created_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-dia", "run1", "DIA", "buy", 20.0, "approved", created_at, (now + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"symbol": "DIA", "score": 100})),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-dia", "run1", "prop-dia", "broker-dia", "client-dia", "DIA", "buy", 20.0, 0.038400983, "filled", "{}", created_at, filled_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notified_at,fill_notification_status,fill_notification_error) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("run1", "order-dia", 0.038400983, 520.658, filled_at, "{}", None, None, None),
+    )
+    old_created_at = (now - timedelta(minutes=45)).isoformat()
+    old_filled_at = (now - timedelta(minutes=40)).isoformat()
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("prop-dia-old", "run0", "DIA", "buy", 5.0, "filled", old_created_at, (now - timedelta(minutes=35)).isoformat(), "rule_based_v1", json.dumps({"symbol": "DIA", "score": 90})),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-dia-old", "run0", "prop-dia-old", "broker-dia-old", "client-dia-old", "DIA", "buy", 5.0, 0.01, "filled", "{}", old_created_at, old_filled_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notified_at,fill_notification_status,fill_notification_error) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("run0", "order-dia-old", 0.01, 500.0, old_filled_at, "{}", None, None, None),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Proposals: 1 | Orders: 1 | Fills: 1" in msg
+
+
+def test_digest_delayed_fill_outside_window_does_not_count_as_window_fill(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["SPY"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    market_memory_at = (now - timedelta(minutes=5)).isoformat()
+    old_created_at = (now - timedelta(minutes=40)).isoformat()
+    old_filled_at = (now - timedelta(minutes=35)).isoformat()
+    refreshed_at = (now - timedelta(minutes=2)).isoformat()
+
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 600.0, 600.0, "HOLD", 55.0, "Weak setup", 0, "no entry/exit signal", market_memory_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("old-prop", "old-run", "SPY", "buy", 10.0, "filled", old_created_at, (now - timedelta(minutes=30)).isoformat(), "rule_based_v1", "{}"),
+    )
+    temp_storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("old-order", "old-run", "old-prop", "broker-spy", "client-spy", "SPY", "buy", 10.0, 0.01, "filled", "{}", old_created_at, refreshed_at),
+    )
+    temp_storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notified_at,fill_notification_status,fill_notification_error) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("old-run", "old-order", 0.01, 600.0, old_filled_at, "{}", refreshed_at, "sent", None),
+    )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[0]
+    assert "Approved and filled" not in msg
+    assert "Proposals: 0 | Orders: 0 | Fills: 0" in msg
+    assert "Summary:" in msg
+
+
 def test_digest_does_not_treat_stale_approved_history_as_pending(temp_storage):
     config = {
         "mode": "paper",
