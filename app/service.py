@@ -463,6 +463,99 @@ class TradingService:
             return None
         return match.group(1).lower(), match.group(2).upper().rstrip(".")
 
+    def _approval_intent_from_text(self, text: str) -> tuple[str, str | None, str | None, tuple[str, str] | None]:
+        batch_match = self._parse_batch_approval_command(text)
+        if batch_match:
+            action_word, target = batch_match
+            action = "yes" if action_word in {"yes", "approve", "approved"} else "no"
+            if target == "ALL":
+                return f"{action}_all", None, None, batch_match
+            return action, target, None, batch_match
+
+        normalized = " ".join(text.lower().strip().split())
+        approve_words = r"(?:yes|approve|approved)(?: please)?"
+        reject_words = r"(?:no|reject|rejected)(?: thanks)?"
+        if re.fullmatch(approve_words, normalized):
+            return "yes", None, None, None
+        if re.fullmatch(reject_words, normalized):
+            return "no", None, None, None
+
+        approve_match = re.fullmatch(approve_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9.-]+))?", normalized)
+        reject_match = re.fullmatch(reject_words + r"(?: (buy|sell) ([a-z.]{1,10}))?(?: (?:proposal )?([a-z0-9.-]+))?", normalized)
+        match = approve_match or reject_match
+        if match:
+            _side, symbol, proposal_id = match.groups()
+            action = "yes" if approve_match else "no"
+            if symbol:
+                return action, symbol.upper(), None, None
+            if proposal_id and re.fullmatch(r"[a-z.]{1,10}", proposal_id):
+                return action, proposal_id.upper(), None, None
+            return action, None, proposal_id, None
+        return "unknown", None, None, None
+
+    def _approval_route_context(self, text: str, reply_to_message_id: str | None) -> dict[str, Any]:
+        intent, target_symbol, target_proposal_id, batch_match = self._approval_intent_from_text(text)
+        active_batch_rows = self._fetch_batch_candidates(now_iso=iso_now(), active_only=True, pending_only=True)
+        if reply_to_message_id is not None:
+            reply_batch_rows = self._fetch_batch_candidates(
+                now_iso=iso_now(),
+                reply_to_message_id=reply_to_message_id,
+                active_only=True,
+                pending_only=True,
+            )
+            if reply_batch_rows:
+                active_batch_rows = reply_batch_rows
+        active_batch_ids = []
+        active_symbols = []
+        for row in active_batch_rows:
+            batch_id = str(row["batch_id"])
+            symbol = str(row["candidate_symbol"]).upper()
+            if batch_id not in active_batch_ids:
+                active_batch_ids.append(batch_id)
+            if symbol not in active_symbols:
+                active_symbols.append(symbol)
+        return {
+            "normalized_command": intent if target_symbol is None else f"{intent}_symbol",
+            "approval_intent": intent,
+            "target_symbol": target_symbol,
+            "target_proposal_id": target_proposal_id,
+            "batch_match": batch_match,
+            "active_batch_count": len(active_batch_ids),
+            "active_batch_ids": active_batch_ids,
+            "active_batch_candidate_symbols": active_symbols,
+            "active_single_proposal_count": len(self.storage.active_proposals()),
+        }
+
+    def _audit_telegram_approval_route(
+        self,
+        update_id: Any,
+        message_id: Any,
+        reply_to_message_id: str | None,
+        context: dict[str, Any],
+        route_chosen: str,
+        route_outcome: str,
+        fallback_reason: str | None = None,
+        stopped_processing: bool = True,
+    ) -> None:
+        detail = {
+            "update_id": update_id,
+            "message_id": message_id,
+            "reply_to_message_id": reply_to_message_id,
+            "normalized_command": context.get("normalized_command"),
+            "approval_intent": context.get("approval_intent"),
+            "target_symbol": context.get("target_symbol"),
+            "target_proposal_id": context.get("target_proposal_id"),
+            "active_batch_count": context.get("active_batch_count"),
+            "active_batch_ids": context.get("active_batch_ids"),
+            "active_batch_candidate_symbols": context.get("active_batch_candidate_symbols"),
+            "active_single_proposal_count": context.get("active_single_proposal_count"),
+            "route_chosen": route_chosen,
+            "route_outcome": route_outcome,
+            "fallback_reason": fallback_reason,
+            "stopped_processing": bool(stopped_processing),
+        }
+        self.storage.audit(self.run_id, "telegram_approval_route", detail)
+
     def _fetch_batch_candidates(
         self,
         *,
@@ -869,7 +962,12 @@ class TradingService:
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
 
-            batch_match = self._parse_batch_approval_command(text)
+            route_context = self._approval_route_context(
+                text,
+                str(reply_to_message_id) if reply_to_message_id is not None else None,
+            ) if self.telegram.is_authorized(sender) else None
+
+            batch_match = route_context.get("batch_match") if route_context else self._parse_batch_approval_command(text)
             if batch_match:
                 handled = self._handle_batch_approval_command(
                     raw_text=text,
@@ -879,7 +977,54 @@ class TradingService:
                     reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
                 )
                 if handled:
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            str(reply_to_message_id) if reply_to_message_id is not None else None,
+                            route_context,
+                            "batch",
+                            "handled",
+                            None,
+                            True,
+                        )
                     continue
+                if route_context and int(route_context.get("active_batch_count") or 0) > 0:
+                    self.telegram.send_message(
+                        f"I found an active proposal batch, but I could not match your reply to a pending candidate. Try: {self._batch_symbols_hint(self._fetch_batch_candidates(now_iso=iso_now(), active_only=True, pending_only=True))}."
+                    )
+                    self._audit_telegram_approval_route(
+                        update_id,
+                        message.get("message_id"),
+                        str(reply_to_message_id) if reply_to_message_id is not None else None,
+                        route_context,
+                        "batch",
+                        "fallback",
+                        "active_batch_unhandled",
+                        True,
+                    )
+                    continue
+
+            if (
+                route_context
+                and route_context.get("approval_intent") != "unknown"
+                and (route_context.get("target_symbol") or route_context.get("target_proposal_id"))
+                and int(route_context.get("active_batch_count") or 0) > 0
+            ):
+                self.telegram.send_message(
+                    f"I found an active proposal batch, but I could not match your reply to a pending candidate. Try: {self._batch_symbols_hint(self._fetch_batch_candidates(now_iso=iso_now(), active_only=True, pending_only=True))}."
+                )
+                self._audit_telegram_approval_route(
+                    update_id,
+                    message.get("message_id"),
+                    str(reply_to_message_id) if reply_to_message_id is not None else None,
+                    route_context,
+                    "batch",
+                    "fallback",
+                    "active_batch_non_batch_command",
+                    True,
+                )
+                continue
 
             # Determine targeting method
             targeting_method = None
@@ -912,6 +1057,17 @@ class TradingService:
             if reply_to_message_id is not None:
                 proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE telegram_message_id=?", (str(reply_to_message_id),))
                 if not proposal_rows:
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            str(reply_to_message_id),
+                            route_context,
+                            "single_reply_to",
+                            "fallback",
+                            "reply_to_target_not_found",
+                            True,
+                        )
                     self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
                     continue
 
@@ -933,9 +1089,31 @@ class TradingService:
 
                 if prop_status == "expired":
                     self._mark_proposal_expiry_notified(str(proposal_row["id"]))
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            str(reply_to_message_id),
+                            route_context,
+                            "single_reply_to",
+                            "expired",
+                            "proposal_expired",
+                            True,
+                        )
                     self.telegram.send_message("⏳ This proposal has already expired. No order was placed.")
                     continue
                 elif prop_status in ("approved", "rejected", "superseded"):
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            str(reply_to_message_id),
+                            route_context,
+                            "single_reply_to",
+                            "already_handled",
+                            "proposal_already_handled",
+                            True,
+                        )
                     self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                     continue
 
@@ -952,16 +1130,41 @@ class TradingService:
                 if active_batch_rows:
                     if len(active_batch_ids) > 1:
                         self.telegram.send_message("Multiple proposal batches are pending. Please reply directly to the batch message or include the batch/proposal ID.")
+                        fallback_reason = "multiple_active_batches"
                     elif len(active_batch_rows) > 1:
                         self.telegram.send_message(
                             f"Plain yes is ambiguous because more than one candidate is pending. Use {self._batch_symbols_hint(active_batch_rows)}."
                         )
+                        fallback_reason = "plain_yes_multiple_batch_candidates"
                     else:
                         self.telegram.send_message(
                             f"Plain yes is ambiguous because a ranked batch is pending. Use {self._batch_symbols_hint(active_batch_rows)}."
                         )
+                        fallback_reason = "plain_yes_single_batch_candidate"
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            None,
+                            route_context,
+                            "batch",
+                            "fallback",
+                            fallback_reason,
+                            True,
+                        )
                     continue
                 if len(pending) > 1:
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            None,
+                            route_context,
+                            "single_pending",
+                            "fallback",
+                            "multiple_single_proposals",
+                            True,
+                        )
                     self.telegram.send_message("I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.")
                     continue
                 elif len(pending) == 0:
@@ -972,8 +1175,21 @@ class TradingService:
                     )
                     if recent:
                         self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
+                        fallback_reason = "recent_approval_already_handled"
                     else:
                         self.telegram.send_message("I did not take any action because I could not match your reply to a single pending proposal. Please specify the proposal ID or symbol.")
+                        fallback_reason = "no_pending_single_proposal"
+                    if route_context:
+                        self._audit_telegram_approval_route(
+                            update_id,
+                            message.get("message_id"),
+                            None,
+                            route_context,
+                            "single_pending",
+                            "fallback",
+                            fallback_reason,
+                            True,
+                        )
                     continue
 
             parsed = parse_approval(
@@ -1002,6 +1218,17 @@ class TradingService:
                     self._mark_proposal_expiry_notified(str(parsed.proposal_id))
                 msg = translate_reason(parsed.reason)
                 self.telegram.send_message(msg)
+                if route_context:
+                    self._audit_telegram_approval_route(
+                        update_id,
+                        message.get("message_id"),
+                        str(reply_to_message_id) if reply_to_message_id is not None else None,
+                        route_context,
+                        "single_parser",
+                        "rejected",
+                        parsed.reason,
+                        True,
+                    )
 
                 # Update delay for non-accepted/expired/ambiguous updates
                 ack_sent = iso_now()

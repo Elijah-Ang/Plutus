@@ -530,6 +530,49 @@ def test_process_telegram_batch_route_stops_before_old_single_proposal_fallback(
     assert any("Received: YES for SPY paper buy candidate" in msg for msg in service.telegram.messages)
     assert not any("could not match your reply to a single pending proposal" in msg for msg in service.telegram.messages)
     assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "blocked"
+    audits = storage.fetch_all("SELECT event_type, detail FROM audit_events WHERE event_type='telegram_approval_route'")
+    assert audits
+    detail = json.loads(audits[-1]["detail"])
+    assert detail["approval_intent"] == "yes"
+    assert detail["target_symbol"] == "SPY"
+    assert detail["route_chosen"] == "batch"
+    assert detail["stopped_processing"] is True
+
+
+def test_process_telegram_yes_symbol_matches_one_candidate_batch_without_reply_to(tmp_path, monkeypatch):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY")])
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 103,
+            "message": {
+                "message_id": 5003,
+                "text": "yes SPY",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+            },
+        }
+    ]
+
+    def fake_approve(*args, **kwargs):
+        return False, "blocked", "blocked for test"
+
+    monkeypatch.setattr(service, "_approve_batch_candidate", fake_approve)
+
+    service.process_telegram()
+
+    assert any("Received: YES for SPY paper buy candidate" in msg for msg in service.telegram.messages)
+    assert not any("could not match your reply to a single pending proposal" in msg for msg in service.telegram.messages)
+    assert service.broker.submitted == []
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "blocked"
+    audits = storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='telegram_approval_route'")
+    detail = json.loads(audits[-1]["detail"])
+    assert detail["target_symbol"] == "SPY"
+    assert detail["active_batch_count"] == 1
+    assert detail["active_batch_candidate_symbols"] == ["SPY"]
+    assert detail["route_chosen"] == "batch"
 
 
 def test_process_telegram_plain_yes_is_batch_ambiguous(tmp_path):
@@ -552,6 +595,95 @@ def test_process_telegram_plain_yes_is_batch_ambiguous(tmp_path):
     service.process_telegram()
 
     assert service.telegram.messages[-1] == "Plain yes is ambiguous because more than one candidate is pending. Use yes SPY, yes IWM, yes all, no SPY, no IWM, no all."
+
+
+def test_process_telegram_plain_yes_single_batch_candidate_is_documented_ambiguous(tmp_path):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY")])
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 104,
+            "message": {
+                "message_id": 5004,
+                "text": "yes",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+            },
+        }
+    ]
+
+    service.process_telegram()
+
+    assert service.telegram.messages[-1] == "Plain yes is ambiguous because a ranked batch is pending. Use yes SPY, yes all, no SPY, no all."
+    assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "pending"
+
+
+def test_process_telegram_active_batch_bad_symbol_uses_batch_fallback(tmp_path):
+    service, storage = make_service(tmp_path)
+    insert_batch(storage, [("p1", "SPY")])
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 105,
+            "message": {
+                "message_id": 5005,
+                "text": "yes QQQ",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+            },
+        }
+    ]
+
+    service.process_telegram()
+
+    assert service.telegram.messages[-1] == "I found an active proposal batch, but I could not match your reply to a pending candidate. Use one of: yes SPY, yes all, no SPY, no all."
+    assert not any("single pending proposal" in msg for msg in service.telegram.messages)
+
+
+def test_process_telegram_no_active_batch_keeps_single_proposal_behavior(tmp_path):
+    service, storage = make_service(tmp_path)
+    now = datetime.now(UTC)
+    expiry = (now + timedelta(minutes=10)).isoformat()
+    payload = {
+        "id": "p-single",
+        "symbol": "SPY",
+        "side": "buy",
+        "action": "entry",
+        "notional": 5.0,
+        "qty": 0.05,
+        "latest_price": 100.0,
+        "price_at": now.isoformat(),
+        "created_at": now.isoformat(),
+        "expires_at": expiry,
+        "strategy_version": "rule_based_v1",
+        "reason": "single proposal",
+        "order_type": "market",
+        "asset_class": "equity",
+    }
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("p-single", "run", "sig-single", "SPY", "buy", 5.0, "pending", now.isoformat(), expiry, "rule_based_v1", json.dumps(payload), "9999"),
+    )
+    service.listener_started_at = 0
+    service.telegram.updates = [
+        {
+            "update_id": 106,
+            "message": {
+                "message_id": 5006,
+                "text": "maybe",
+                "date": int(datetime.now(UTC).timestamp()),
+                "from": {"id": 7777},
+                "chat": {"id": "123"},
+            },
+        }
+    ]
+
+    service.process_telegram()
+
+    assert "could not tell whether you meant yes or no" in service.telegram.messages[-1]
 
 
 def insert_exit_proposal(storage: Storage, proposal_id: str, symbol: str, status: str, expires_at: str, emergency: int = 0) -> None:
