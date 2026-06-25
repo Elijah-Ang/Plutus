@@ -87,6 +87,103 @@ risk_budget:
   max_adds_only_if_profitable: true
   block_averaging_down: true
 
+data_providers:
+  dynamic_universe_provider: eodhd
+
+eodhd:
+  enabled: true
+  api_key_secret_name: TradingAgent.EODHD_API_KEY
+  base_url: https://eodhd.com/api
+  timeout_seconds: 10
+  max_retries: 2
+  retry_backoff_seconds: 2
+  cache_ttl_minutes:
+    symbols: 1440
+    daily_bars: 720
+    intraday_bars: 15
+    news: 60
+    fundamentals: 1440
+    technicals: 60
+    screener: 60
+  rate_limit:
+    max_calls_per_run: 80
+    max_calls_per_day: 1000
+    fail_closed_when_exceeded: false
+
+dynamic_universe:
+  enabled: true
+  provider: eodhd
+  paper_only: true
+  asset_classes_enabled:
+    equities: true
+    etfs: true
+    funds: true
+    indices: true
+    forex: false
+    crypto: false
+    options: false
+    bonds: false
+  execution_allowed_asset_classes:
+    equities: true
+    etfs: true
+    funds: false
+    indices: false
+    forex: false
+    crypto: false
+    options: false
+    bonds: false
+  raw_sources:
+    eodhd_exchange_symbols: true
+    eodhd_screener: true
+    eodhd_news: true
+    eodhd_intraday_bars: true
+    eodhd_eod_bars: true
+    existing_static_watchlist: true
+  max_raw_symbols_per_research_run: 500
+  max_research_symbols_per_run: 100
+  max_observation_symbols: 30
+  max_dynamic_paper_tradable_symbols: 12
+  min_price: 5.0
+  min_avg_daily_volume: 1000000
+  min_dollar_volume: 10000000
+  max_spread_pct: 0.50
+  exclusions:
+    otc: true
+    penny_stocks: true
+    leveraged_etfs: true
+    inverse_etfs: true
+    halted_symbols: true
+    stale_data: true
+    illiquid_symbols: true
+    extreme_volatility: true
+  promotion:
+    min_research_score: 75
+    min_observation_cycles: 3
+    min_observation_sessions: 1
+    min_liquidity_score: 70
+    min_trend_score: 70
+    min_relative_strength_score: 65
+    min_news_score: 50
+    require_shadow_tracking: true
+    allow_fast_track_paper_tradable: false
+    max_new_paper_tradable_per_day: 3
+  demotion:
+    max_weak_cycles: 5
+    max_no_entry_days: 5
+    catalyst_stale_after_days: 3
+    demote_if_liquidity_fails: true
+    demote_if_volatility_extreme: true
+    demote_if_shadow_performance_bad: true
+    demote_if_cluster_overcrowded: true
+  schedules:
+    daily_deep_research_enabled: true
+    daily_deep_research_time_sgt: "20:30"
+    intraday_light_refresh_enabled: true
+    intraday_light_refresh_minutes: 30
+    event_triggered_refresh_enabled: true
+    post_market_review_enabled: true
+    weekly_cleanup_enabled: true
+
 position_management:
   enabled: true
   profit_taking:

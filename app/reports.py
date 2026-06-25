@@ -53,6 +53,22 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Healthy Pullback Adds", "SELECT * FROM position_management_decisions WHERE decision_type='HEALTHY_PULLBACK_ADD'"),
     ("Profit Protection Events", "SELECT * FROM position_management_decisions WHERE decision_type='PROFIT_PROTECT_EXIT'"),
     ("Trailing Stop Events", "SELECT * FROM position_management_decisions WHERE decision_type='TRAILING_STOP_EXIT'"),
+    ("Dynamic Universe Summary", "SELECT tier, COUNT(*) AS symbols, SUM(executable) AS executable_symbols, SUM(observation_only) AS observation_only_symbols, MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY tier ORDER BY tier"),
+    ("Universe Membership", "universe_membership_history"),
+    ("Raw Universe Snapshot", "SELECT * FROM universe_symbols WHERE tier='raw_universe' ORDER BY score DESC, symbol"),
+    ("Research Candidates", "SELECT * FROM universe_symbols WHERE tier='research_candidate' ORDER BY score DESC, symbol"),
+    ("Observation Symbols", "SELECT * FROM universe_symbols WHERE tier='observation' ORDER BY score DESC, symbol"),
+    ("Paper-Tradable Symbols", "SELECT * FROM universe_symbols WHERE tier='paper_tradable' ORDER BY score DESC, symbol"),
+    ("Demoted Symbols", "SELECT * FROM universe_symbols WHERE tier='demoted' ORDER BY updated_at DESC, symbol"),
+    ("Symbol Research Scores", "symbol_research_scores"),
+    ("News Events", "symbol_news_events"),
+    ("Trend Snapshots", "symbol_trend_snapshots"),
+    ("Sector Regime", "sector_regime_snapshots"),
+    ("Promotion Decisions", "symbol_promotion_decisions"),
+    ("Demotion Decisions", "symbol_demotion_decisions"),
+    ("Dynamic Universe Audit", "dynamic_universe_audit"),
+    ("Data Provider Health", "data_provider_health"),
+    ("Dynamic Universe Performance", "dynamic_universe_performance"),
 ]
 
 

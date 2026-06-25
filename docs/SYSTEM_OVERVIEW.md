@@ -36,7 +36,7 @@ The system is strictly configured for **Paper Trading Only** (`mode: paper`, `li
 
 ## 3. High-Level Architecture
 The project follows a modular design with clear separation between:
-1. **Inputs/Data**: Market data from Alpaca, system status (power, internet), user directives from Telegram.
+1. **Inputs/Data**: Broker market data from Alpaca for current execution workflows, EODHD-backed research data for Dynamic Universe discovery, system status (power, internet), and user directives from Telegram.
 2. **Analysis/AI**: Rule-based technical strategy indicators and OpenAI `gpt-5.4-mini` summary and caution evaluations.
 3. **Safety/Control**: Local database records, `RiskEngine` limits, and manual Telegram approval gating.
 4. **Execution**: The `AlpacaBroker` interface submitting orders exclusively to Alpaca paper endpoints.
@@ -63,6 +63,8 @@ The project follows a modular design with clear separation between:
 - [approval_parser.py](../app/approval_parser.py): Parses Telegram approvals and rejections (supports prefix matching, side, and symbol disambiguation).
 - [risk_engine.py](../app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
 - [position_management.py](../app/position_management.py): Deterministic position classifier for profit-taking, profit protection, trailing stops, and healthy-pullback add candidates. It returns decisions only and does not place orders.
+- [dynamic_universe.py](../app/dynamic_universe.py): Deterministic research engine that discovers, scores, promotes, demotes, and audits symbols across raw, research, observation, paper-tradable, and demoted tiers. It does not place orders or bypass proposal approval.
+- [data_providers/](../app/data_providers): Research-provider abstraction and EODHD implementation. EODHD is used only for discovery/research data; Alpaca remains the paper broker/execution/reconciliation authority.
 - [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
 - [reconciliation.py](../app/reconciliation.py): Read-only broker reconciliation that updates local order/fill/account/position records without submitting or retrying orders.
@@ -118,6 +120,23 @@ Every trade proposal is written to SQLite with `status='pending'`, assigned a Te
     - **Expired**: `⏳ This proposal has already expired. No order was placed.`
     - **Ambiguous**: `I found multiple pending proposals. Please reply directly to the proposal message, or include the symbol/proposal ID.`
 
+## 9. Dynamic Universe Research Engine
+The Dynamic Universe Engine follows `research many -> watch some -> trade few -> measure all`.
+
+- EODHD is the first research/discovery provider behind `app/data_providers`. API keys are read from environment/Keychain, never code.
+- Alpaca remains broker-only for paper order submission, reconciliation, positions, fills, and the existing execution-time market truth.
+- Dynamic tiers:
+  - `raw_universe`: discovered symbols only, never executable.
+  - `research_candidate`: scored candidates needing more evidence, never executable.
+  - `observation`: tracked in scanner/Performance Lab as shadow-only, not executable.
+  - `paper_tradable`: allowed into the existing proposal/risk engine only after deterministic promotion and recorded evidence.
+  - `demoted`: historical/retired symbols retained for audit.
+- Forex, crypto, options, bonds, and unsupported asset classes are research-only by default.
+- Unknown-cluster symbols cannot become executable until sufficient risk classification exists.
+- GPT is not used to promote, demote, approve, reject, or execute symbols. Any future GPT use must be limited to summaries after deterministic filters narrow research items.
+- The engine runs through existing scanner due checks; no separate launchd job is required. Supported run types are daily deep research, intraday light refresh, event-triggered refresh, post-market review, and weekly cleanup.
+- Telegram universe updates are informational digest sections and are emitted only when promotions, demotions, or provider health changes occurred.
+
 - **Proposal Conflict Handling after Approval**:
   - If a BUY proposal is approved and successfully submitted as an order:
     - The system automatically marks all other pending BUY proposals as `superseded`.
@@ -125,12 +144,12 @@ Every trade proposal is written to SQLite with `status='pending'`, assigned a Te
     - Superseded proposals are blocked from execution. Exits are never superseded by this logic.
     - If approved, the approval token is consumed to prevent double-spending, and final validation is run.
 
-## 9. Alpaca Paper Broker Flow
+## 10. Alpaca Paper Broker Flow
 The broker is initialized in paper mode using keys fetched securely from the macOS Keychain.
 - Submit order methods are guarded against `mode != 'paper'` unless live is explicitly enabled and confirmed.
 - Supports market and limit order types, and fractional share order sizes.
 
-## 10. OpenAI / AI Review Flow
+## 11. OpenAI / AI Review Flow
 The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or the configured reasoning model).
 - **No Authority**: The AI review layer has **no access to broker APIs or execution tools**; it is strictly an analysis layer and cannot place or execute orders.
 - **Rule-Based Precedence**: GPT cannot create or override the rule-based trade decision score from scratch, and it cannot override risk engine gates or bypass Telegram user approvals.
@@ -142,7 +161,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
   - `reason`: Explanation of the critique
 - **Throttled State**: If GPT is not called (due to scoring thresholds or daily call throttle limits), the Telegram proposal displays: `GPT review: Not called because score/signal did not meet review threshold.`
 
-## 11. Risk Engine and Safety Gates
+## 12. Risk Engine and Safety Gates
 - **Scoring Systems**:
   - **Asset Selection Score** (0–100): Ranks approved watchlist symbols compared with observation universe symbols based on liquidity, trend, volatility, and data quality. It is used for prioritization and does not trigger orders by itself.
   - **Trade Decision Score** (0–100): Deterministic score measuring setup strength. Derived from the following 100-point weighting:
@@ -233,7 +252,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
 - **Live Trading & Auto-Execution**: Both are unsupported by code-level capability constants as well as disabled in configuration. YAML and Telegram cannot enable them. Normal operation requires Telegram approval and no reply means no order.
 - **Authoritative Final Context**: Daily/weekly losses come from Alpaca account/portfolio history, margin use comes from current account values, and broker/internet/Telegram/database health is checked rather than assumed. Missing loss or margin state blocks risk approval.
 
-## 12. Database / SQLite Tables
+## 13. Database / SQLite Tables
 Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `runs`: History of cycles run with configuration mode.
 - `preflight_checks`: Preflight health validation results.
@@ -276,9 +295,21 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `position_management_state`: Per-symbol high-water mark, trailing stop, profit-protection, and handled take-profit level state.
 - `position_management_decisions`: Per-cycle position-management classifications, metrics, actionability, and block reasons.
 - `profit_exit_events`: Lifecycle rows for take-profit, profit-protection, and trailing-stop proposals.
+- `universe_symbols`: Current symbol tier, execution eligibility, observation-only flag, provider symbol, asset class, sector, cluster, and data-quality state.
+- `universe_research_runs`: Dynamic Universe run history for daily deep research, intraday refresh, event refresh, post-market review, and weekly cleanup.
+- `symbol_research_scores`: Deterministic liquidity, trend, relative strength, volatility, news, sector/theme, and data-quality component scores.
+- `symbol_news_events`: Redacted, structured news/catalyst event records used for research scoring.
+- `symbol_trend_snapshots`: Trend, relative-strength, volatility, and cluster snapshots.
+- `symbol_promotion_decisions` / `symbol_demotion_decisions`: Recorded deterministic membership changes. GPT cannot promote or demote symbols.
+- `universe_membership_history`: Historical tier transitions preserved for audit.
+- `sector_regime_snapshots`: Sector/cluster regime snapshots for dynamic research context.
+- `dynamic_universe_audit`: Provider availability, degradation, and engine audit events.
+- `data_provider_health`: Research-provider status and rate-limit health without secrets.
+- `data_provider_cache_index`: Cached provider responses keyed by provider/endpoint/params. Payloads are redacted in reports.
+- `dynamic_universe_performance`: Scanner/Performance Lab metrics for dynamic symbols and tier outcomes.
 - `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
 
-## 13. Excel Reporting Flow
+## 14. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
 - Telegram raw text and sender IDs are redacted by default. JSON payloads are recursively redacted and scanned for supported secret-value patterns before cells are written.
 - **Summary Dashboard**: Derived from database records (calculated metrics).
@@ -308,13 +339,14 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Position Sizing Decisions**: Dynamic sizing inputs and final notional/share decisions.
 - **Candidate Ranking Decisions**: Ranking components and selection reasons.
 - **Ranked Opportunity Sets**, **Proposal Batches**, **Batch Candidates**, **Risk Budget Decisions**, **Batch Approval Actions**, and **Candidate Allocation Decisions**: Ranked-batch proposal and risk-budget audit views.
+- **Dynamic Universe Summary**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Observation Symbols**, **Paper-Tradable Symbols**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, provider health, and performance audit views.
 - **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
-## 14. Testing Strategy
+## 15. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).
 - Verified via `pytest`.
 
-## 15. Launchd / Scheduling Status
+## 16. Launchd / Scheduling Status
 
 The system is configured with two separate scheduled jobs:
 1. **Scanner (`com.elijah.tradingagent`)**:
@@ -340,11 +372,11 @@ The system is configured with two separate scheduled jobs:
 - **Lock Recovery**: `run_once.sh` records PID and epoch time. Active/recent locks are preserved; only a dead owner older than the grace period is atomically recovered and audited.
 - **macOS Sandbox Note**: The project has been relocated to `/Users/elijahang/Projects/TradingAgent` to completely bypass the macOS TCC/Sandbox restrictions on `~/Desktop`, ensuring launchd runs execute successfully without requiring system-wide Full Disk Access configurations.
 
-## 16. Live Trading Gates
+## 17. Live Trading Gates
 Live trading is disabled. If a live proposal is attempted, it is caught and blocked by the safety gate:
 `Blocked for safety: live trading is disabled.`
 
-## 17. Current Known State
+## 18. Current Known State
 > [!WARNING]
 > **Stale-State Warning:** This section reflects the last verified manual checkpoint. It must be updated after every paper execution, sell/exit test, launchd setup, risk limit change, or live-trading gate change.
 
@@ -356,7 +388,7 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Active Orders**: 0
 - **Daily Trade Count**: 0 local order rows for June 22; Alpaca reports two older filled paper orders
 
-## 18. Recent Milestones Completed
+## 19. Recent Milestones Completed
 - **Initial safe scaffold**: Basic project setup and configuration framework.
 - **Telegram setup**: Bot token stored, chat IDs verified, and approval testing implemented.
 - **OpenAI setup**: API credentials stored in Keychain and model configuration parsed.
@@ -369,7 +401,7 @@ Live trading is disabled. If a live proposal is attempted, it is caught and bloc
 - **Controlled Alpaca Paper SELL execution test**: Successfully approved and executed a paper sell order to close the SPY position.
 - **GitHub remote integration & scheduled scoring**: Configured the remote repository, added a limited staged-file secret-scan helper, and designed lightweight 10-minute observation telemetry.
 
-## 19. How to Update This Document
+## 20. How to Update This Document
 Whenever you edit code structure, config parameters, database tables, or broker/safety logic:
 1. Update the description in the relevant section.
 2. Log the change in the **Change Log** at the bottom.
@@ -377,7 +409,7 @@ Whenever you edit code structure, config parameters, database tables, or broker/
 
 ---
 
-## 20. Mermaid Diagram of System Connections
+## 21. Mermaid Diagram of System Connections
 ```mermaid
 flowchart TD
     subgraph Core system
@@ -400,7 +432,7 @@ flowchart TD
     end
 ```
 
-## 21. Mermaid Flowchart of Trade Proposal → Approval → Execution
+## 22. Mermaid Flowchart of Trade Proposal → Approval → Execution
 ```mermaid
 sequenceDiagram
     participant S as TradingService (scan)
@@ -429,7 +461,7 @@ sequenceDiagram
     E->>T: Notify order submission result
 ```
 
-## 22. Mermaid Flowchart of Safety Blocks
+## 23. Mermaid Flowchart of Safety Blocks
 ```mermaid
 flowchart TD
     start[Process Telegram Approval] --> check_live{mode == live & live_enabled == false?}
@@ -460,8 +492,8 @@ To support the bot's current 10-minute schedule during trading hours:
    - launchd `StartInterval` triggers does not replay missed runs in a burst after waking up. It will only run the next scheduled cycle.
    - The run lock `logs/runtime/agent.lockdir` ensures overlapping runs never occur.
 
-## 26. Market Coverage & Data Provider Policy
-- **US Equities/ETFs**: The system uses **Alpaca** as the broker and data source. Alpaca is configured for US-listed symbols only and is limited to Paper trading mode.
+## 25. Market Coverage & Data Provider Policy
+- **US Equities/ETFs**: The system uses **Alpaca** as the paper broker and execution-time broker truth for current orders, positions, fills, and final revalidation. Dynamic Universe discovery/research uses the configured research provider, currently EODHD.
 - **Market Hours & Holidays**:
   - The system queries the broker's real-time clock API to check if the market is open.
   - On weekends and US market holidays (such as Juneteenth, Independence Day, Thanksgiving, Christmas, etc.), the broker reports the market is closed, causing the preflight `market_open` gate to fail.
@@ -478,7 +510,7 @@ To support the bot's current 10-minute schedule during trading hours:
   - The system must not hallucinate, mock, or infer live market data. If real, structured data is not available from an approved API, the symbol/profile is skipped.
   - Profiles for SGX/HKEX are configured as `observation_only` or `disabled` with `execution_enabled: false` and `proposals_enabled: false` to ensure no proposals are created or executed.
 
-## 27. Portfolio Intelligence and Performance Lab
+## 26. Portfolio Intelligence and Performance Lab
 - **Paper-only scope**: The upgrade changes proposal sizing, measurement, ranking, and reporting only. Live trading and live auto-execution remain unsupported and disabled.
 - **Performance Lab**: Meaningful setups are recorded even when no proposal is sent. Suppressed candidates, observation-only candidates, cooldown blocks, sleep-mode blocks, GPT deferrals, exposure blocks, rejected proposals, and expired proposals can become shadow trades for later analysis.
 - **Shadow trades**: Shadow records are measurement-only. They do not create broker orders, do not create actionable Telegram proposals, and do not alter broker state.
@@ -491,7 +523,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Final revalidation**: Approved BUY/ADD orders still refresh price, re-evaluate size and exposure, check market/broker/database/Telegram/internet/paper-mode state, and can block after approval. `YES` means permission to attempt after final safety checks, not guaranteed order.
 - **Ranked proposal batching**: Actionable BUY/ADD candidates are grouped into one paper opportunity-set message. Observation-only, sleep-suppressed, cooldown, GPT-unavailable, exposure-blocked, and risk-budget-blocked setups remain tracked through Performance Lab and batch/ranking tables but are not actionable.
 
-## 28. Telegram Market Digest
+## 27. Telegram Market Digest
 - **Purpose**: Sends a 30-minute informational digest to the user during active US regular trading hours (9:30 PM to 4:00 AM SGT, or based on the broker's clock is_open API) summarizing recent telemetry.
 - **Informational Only**: Unlike trade proposal messages, the digest is strictly informational. It does not ask for user approval, does not create trade proposals in the database, and does not place or execute broker orders.
 - **Wording & Formatting**: Displays market open status, a SGT local time window, top watched symbols (capped at 6), weakest symbol, action counters (proposals, orders, fills, GPT calls, and expirations over the last 30 minutes), and a plain English summary concluding with "No action needed."
@@ -502,7 +534,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Cluster wording**: Cluster blocks are described in user-facing terms such as `broad-market cluster limit reached` and include currently held symbols when available (for example, `DIA` and `IWM`) instead of generic gate language.
 - **Fill confirmations**: Broker reconciliation sends a one-shot paper fill confirmation to Telegram when it first sees a new fill for a submitted paper order. The notification is tracked on the `fills` row so repeated reconciliations do not resend it.
 
-## 29. Manual Telegram Sleep Mode
+## 28. Manual Telegram Sleep Mode
 - **Purpose**: Allows the user to put the trading agent into a silent "Sleep Mode" via Telegram commands (e.g. `/sleep`, `sleep mode on`).
 - **Behavior**: When sleep mode is active:
   - Normal BUY candidates are fully scanned and logged but suppressed from generating proposals.
@@ -513,7 +545,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Command Age Check**: Commands older than 24 hours are ignored to prevent stale state toggles.
 - **Wake Up & Summary**: Toggling sleep mode OFF (e.g., `/awake`, `wake up`) triggers an overnight wake summary to Telegram detailing suppressed buys, normal sells, emergency exit triggers, and current positions/orders.
 
-## 30. Emergency Auto-Exit Engine (Paper Mode Only)
+## 29. Emergency Auto-Exit Engine (Paper Mode Only)
 - **Objective**: Deterministic risk management for active paper positions. Operating strictly under paper mode, live auto-execution is disabled.
 - **6-Point Risk Score (0-100)**: Calculates a position risk score based on:
   1. Drawdown (max 35 pts): Bands from 0% to -10%+. Falls back to fill prices or fail-closed max points if entry price is missing.
@@ -534,7 +566,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Revalidation**: Execution enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
 - **GPT Exit Explanations**: Exit reviews are executed by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout to avoid delaying execution.
 
-## 31. Change Log
+## 30. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
 - **2026-06-18**: Tightened system overview document by converting local links to relative markdown paths, expanding database schema/reporting details, and clarifying supervised operation constraints.
 - **2026-06-19**: Executed controlled Alpaca Paper SELL exit test, updated current known position state to zero, and documented `test_paper_sell_proposal.sh` as an active script.

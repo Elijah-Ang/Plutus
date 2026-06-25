@@ -21,6 +21,8 @@ logger = logging.getLogger("trading_agent")
 SGT = ZoneInfo("Asia/Singapore")
 
 from .approval_parser import parse_approval
+from .data_providers.eodhd import EODHDProvider
+from .dynamic_universe import DynamicUniverseEngine
 from .execution import Executor, ExecutionResult
 from .internet import internet_available
 from .market_data import normalize_bars
@@ -298,6 +300,56 @@ class TradingService:
             return int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
         except (TypeError, ValueError):
             return False
+
+    def _dynamic_universe_engine(self) -> DynamicUniverseEngine | None:
+        du_cfg = self.config.get("dynamic_universe", {}) or {}
+        if not du_cfg.get("enabled", False) or self.config.get("mode") != "paper":
+            return None
+        provider_name = self.config.get("data_providers", {}).get("dynamic_universe_provider", du_cfg.get("provider", "eodhd"))
+        provider = None
+        if provider_name == "eodhd" and self.config.get("eodhd", {}).get("enabled", True):
+            provider = EODHDProvider(self.config, self.storage, self.run_id)
+        return DynamicUniverseEngine(self.config, self.storage, provider, self.run_id)
+
+    def _dynamic_universe_scan_symbols(self) -> tuple[list[str], list[str]]:
+        engine = self._dynamic_universe_engine()
+        if not engine:
+            return [], []
+        try:
+            return engine.dynamic_scan_symbols()
+        except Exception as exc:
+            self.storage.audit(self.run_id, "dynamic_universe_scan_symbols_failed", {"error": type(exc).__name__})
+            return [], []
+
+    def _dynamic_universe_event_refresh_due(self) -> bool:
+        if not self.config.get("dynamic_universe", {}).get("schedules", {}).get("event_triggered_refresh_enabled", True):
+            return False
+        cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
+        rows = self.storage.fetch_all(
+            """
+            SELECT 1 FROM fills WHERE filled_at>=?
+            UNION ALL
+            SELECT 1 FROM trade_proposals WHERE status='expired' AND expires_at>=?
+            UNION ALL
+            SELECT 1 FROM audit_events WHERE event_type LIKE 'emergency_exit%' AND created_at>=?
+            LIMIT 1
+            """,
+            (cutoff, cutoff, cutoff),
+        )
+        return bool(rows)
+
+    def _run_dynamic_universe_due(self) -> list[dict[str, Any]]:
+        engine = self._dynamic_universe_engine()
+        if not engine:
+            return []
+        run_types = ["daily_deep_research", "intraday_light_refresh", "post_market_review", "weekly_cleanup"]
+        if self._dynamic_universe_event_refresh_due():
+            run_types.append("event_triggered_refresh")
+        try:
+            return engine.run_due(run_types=run_types)
+        except Exception as exc:
+            self.storage.audit(self.run_id, "dynamic_universe_due_failed", {"error": type(exc).__name__})
+            return []
 
     def _sleep_mode_blocks_approval(self, proposal: dict[str, Any]) -> bool:
         side = str(proposal.get("side") or proposal.get("candidate_side") or "").lower()
@@ -2526,6 +2578,9 @@ class TradingService:
 
             active_watchlist = [str(s).upper() for s in profile.get("watchlist", [])]
             obs_watchlist = [str(s).upper() for s in profile.get("observation_watchlist", [])]
+            dynamic_active, dynamic_observation = self._dynamic_universe_scan_symbols()
+            active_watchlist = list(dict.fromkeys(active_watchlist + dynamic_active))
+            obs_watchlist = list(dict.fromkeys(obs_watchlist + [s for s in dynamic_observation if s not in active_watchlist]))
             proposals_enabled = profile.get("proposals_enabled", True)
             pos_symbols = [str(_value(p, "symbol", "")).upper() for p in positions if _value(p, "symbol")]
             all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist + pos_symbols))
@@ -4036,6 +4091,9 @@ class TradingService:
             if p.get("status") == "active":
                 active_watchlist.extend(p.get("watchlist", []))
                 obs_watchlist.extend(p.get("observation_watchlist", []))
+        dynamic_active, dynamic_observation = self._dynamic_universe_scan_symbols()
+        active_watchlist.extend(dynamic_active)
+        obs_watchlist.extend(s for s in dynamic_observation if s not in active_watchlist)
 
         allowed_symbols = set(active_watchlist)
         if include_obs:
@@ -4163,6 +4221,9 @@ class TradingService:
         expired_cnt = expired[0]["cnt"] if expired else 0
 
         summary_str = self._build_digest_summary(strongest, symbols_list)
+        universe_update = self._dynamic_universe_update_since(window_start_iso)
+        if universe_update:
+            summary_str += f" {universe_update}"
 
         # Mention deferred candidates due to AI review unavailability
         deferred_rows = self.storage.fetch_all(
@@ -4218,6 +4279,7 @@ class TradingService:
         self.storage.expire_proposals()
         self.notify_expired_proposals()
         self._expire_pending_batches(notify=False)
+        self._run_dynamic_universe_due()
         if self.config.get("telegram", {}).get("market_scan_processes_telegram_updates", True):
             self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
@@ -4237,6 +4299,15 @@ class TradingService:
         for c_name, c_symbols in clusters.items():
             if symbol.upper() in [s.upper() for s in c_symbols]:
                 return c_name
+        try:
+            rows = self.storage.fetch_all(
+                "SELECT cluster FROM universe_symbols WHERE symbol=? AND cluster IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                (symbol.upper(),),
+            )
+            if rows and rows[0]["cluster"] and rows[0]["cluster"] != "unknown_cluster":
+                return rows[0]["cluster"]
+        except Exception:
+            pass
         return None
 
     def _get_exposure_snapshot(self, positions: list[Any], account: Any) -> dict[str, Any]:
@@ -4744,6 +4815,57 @@ class TradingService:
                 parts.append("No setup crossed the score threshold.")
         return " ".join(parts)
 
+    def _dynamic_universe_update_since(self, window_start_iso: str) -> str | None:
+        promotions = self.storage.fetch_all(
+            """
+            SELECT symbol, to_tier, reason
+            FROM symbol_promotion_decisions
+            WHERE created_at>=?
+            ORDER BY created_at DESC
+            LIMIT 12
+            """,
+            (window_start_iso,),
+        )
+        demotions = self.storage.fetch_all(
+            """
+            SELECT symbol, reason
+            FROM symbol_demotion_decisions
+            WHERE created_at>=?
+            ORDER BY created_at DESC
+            LIMIT 12
+            """,
+            (window_start_iso,),
+        )
+        health = self.storage.fetch_all(
+            """
+            SELECT provider, status, error
+            FROM data_provider_health
+            WHERE checked_at>=? AND status!='ok'
+            ORDER BY checked_at DESC
+            LIMIT 3
+            """,
+            (window_start_iso,),
+        )
+        if not promotions and not demotions and not health:
+            return None
+        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
+        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
+        to_research = sorted({r["symbol"] for r in promotions if r["to_tier"] == "research_candidate"})
+        demoted = sorted({r["symbol"] for r in demotions})
+        parts = ["Universe update:"]
+        if to_research:
+            parts.append(f"Research candidates: {', '.join(to_research)}.")
+        if to_observation:
+            parts.append(f"Promoted to observation: {', '.join(to_observation)}.")
+        if to_tradable:
+            parts.append(f"Promoted to paper-tradable: {', '.join(to_tradable)}.")
+        if demoted:
+            parts.append(f"Demoted: {', '.join(demoted)}.")
+        if health:
+            statuses = ", ".join(f"{r['provider']} {r['status']}" for r in health)
+            parts.append(f"Provider health: {statuses}.")
+        return " ".join(parts)
+
     def _risk_budget_cfg(self) -> dict[str, Any]:
         rb = self.config.get("risk_budget", {})
         pb = self.config.get("portfolio_behavior", {})
@@ -5083,6 +5205,28 @@ class TradingService:
                     res.get("no_action_reason")
                 )
             )
+            tier_rows = self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? LIMIT 1", (symbol,))
+            if tier_rows:
+                self.storage.execute(
+                    "INSERT INTO dynamic_universe_performance(id,run_id,symbol,tier,metric,value,created_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        str(uuid.uuid4()),
+                        self.run_id,
+                        symbol,
+                        tier_rows[0]["tier"],
+                        "scan_score",
+                        score,
+                        now.isoformat(),
+                        json_dumps(
+                            {
+                                "setup_id": setup_id,
+                                "action": signal.action,
+                                "proposal_eligible": 1 if res.get("proposal_allowed") else 0,
+                                "proposal_sent": 1 if res.get("proposal_generated") else 0,
+                            }
+                        ),
+                    ),
+                )
 
             is_tradable_buy = (score >= 65 and signal.side == "buy" and signal.action == "ENTRY")
             if is_tradable_buy:
