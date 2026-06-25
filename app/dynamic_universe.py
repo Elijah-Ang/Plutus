@@ -126,7 +126,17 @@ class DynamicUniverseEngine:
             (PAPER_TRADABLE, int(self.cfg.get("max_dynamic_paper_tradable_symbols", 12))),
         )
         obs = self.storage.fetch_all(
-            "SELECT symbol FROM universe_symbols WHERE tier=? AND observation_only=1 ORDER BY score DESC, symbol LIMIT ?",
+            """
+            SELECT symbol
+            FROM universe_symbols
+            WHERE tier=?
+              AND observation_only=1
+              AND exchange='US'
+              AND symbol NOT LIKE '%.%'
+              AND asset_class IN ('equity','etf')
+            ORDER BY score DESC, symbol
+            LIMIT ?
+            """,
             (OBSERVATION, int(self.cfg.get("max_observation_symbols", 30))),
         )
         return [r["symbol"] for r in paper], [r["symbol"] for r in obs]
