@@ -32,6 +32,9 @@ class ResearchScore:
     news_score: float
     sector_theme_score: float
     data_quality_score: float
+    data_confidence: str
+    data_confidence_reason: str
+    existing_static: bool = False
     block_reason: str | None = None
 
 
@@ -62,6 +65,7 @@ class DynamicUniverseEngine:
         self._provider_failed = False
         self._provider_health_status = "unknown"
         self._data_freshness_status = "fresh"
+        self._last_score_candidates: list[ResearchScore] = []
 
     def enabled(self) -> bool:
         return bool(self.cfg.get("enabled", False)) and self.config.get("mode") == "paper"
@@ -140,6 +144,7 @@ class DynamicUniverseEngine:
         demoted = []
         candidates = self._collect_raw_candidates(run_type)
         considered = 0
+        self._last_score_candidates = []
         try:
             for info in candidates[: int(self.cfg.get("max_research_symbols_per_run", 100))]:
                 symbol = self._normalize_symbol(info)
@@ -152,7 +157,10 @@ class DynamicUniverseEngine:
                     self._upsert_universe_symbol(symbol, metadata, RAW_UNIVERSE, executable=0, observation_only=1)
                     self._record_membership(symbol, None, RAW_UNIVERSE, "raw candidate discovered", metadata)
                 score = self._score_symbol(symbol, metadata)
+                self._last_score_candidates.append(score)
                 self._record_score(score, metadata)
+                if not metadata.get("existing_static") and (score.block_reason or score.total_score < float(self.cfg.get("promotion", {}).get("min_research_score", 75))):
+                    self._record_candidate_block(score, metadata)
                 new_tier = self._decide_tier(symbol, metadata, score)
                 old_tier = current.get("tier") if current else None
                 if new_tier != old_tier:
@@ -173,6 +181,8 @@ class DynamicUniverseEngine:
             elif self._provider_failed:
                 self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"run_type": run_type})
             status = "completed"
+            self._provider_health_status = self._provider_summary_status()
+            self._record_near_miss_symbols()
             detail = {"provider_status": self._provider_health_status, "run_type": run_type, "catchup": is_catchup}
         except Exception as exc:
             status = "error"
@@ -458,7 +468,7 @@ class DynamicUniverseEngine:
     def _record_schedule_completed(self, run_type: str, status: str, gate: ResearchGate, is_catchup: bool) -> None:
         fields = {
             "last_completed_at": iso_now(),
-            "provider_health_status": gate.provider_health_status,
+            "provider_health_status": self._provider_health_status if self._provider_health_status != "unknown" else gate.provider_health_status,
             "internet_status": gate.internet_status,
             "power_status": gate.power_status,
             "battery_pct": gate.battery_pct,
@@ -471,6 +481,21 @@ class DynamicUniverseEngine:
         if is_catchup:
             fields.update(catchup_completed_at=iso_now(), catchup_status=status)
         self._upsert_schedule_state(run_type, fields)
+
+    def _provider_summary_status(self) -> str:
+        if self._provider_failed:
+            return self._provider_health_status
+        rows = self.storage.fetch_all(
+            "SELECT SUM(CASE WHEN available=1 THEN 1 ELSE 0 END) ok_count, SUM(CASE WHEN plan_limited=1 THEN 1 ELSE 0 END) plan_limited_count FROM data_provider_capabilities WHERE provider=?",
+            (self.cfg.get("provider", "eodhd"),),
+        )
+        if not rows:
+            return self._provider_health_status
+        ok_count = int(rows[0].get("ok_count") or 0)
+        plan_limited_count = int(rows[0].get("plan_limited_count") or 0)
+        if ok_count > 0 and plan_limited_count > 0:
+            return "partial"
+        return self._provider_health_status
 
     def _mark_dynamic_symbols_stale(self, reason: str, gate: ResearchGate) -> None:
         stale_after = int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30))
@@ -563,25 +588,97 @@ class DynamicUniverseEngine:
             res = self.provider.get_screener_results(limit=min(max_raw, 100))
             candidates.extend(self._rows_from_response(res, "eodhd_screener"))
 
+        if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_news", True):
+            res = self.provider.get_news(limit=min(max_raw, 100))
+            candidates.extend(self._news_candidate_rows(res))
+
         if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_exchange_symbols", True) and run_type == "daily_deep_research":
             res = self.provider.list_symbols("US", limit=max_raw)
             candidates.extend(self._rows_from_response(res, "eodhd_exchange_symbols"))
 
         deduped: dict[str, dict[str, Any]] = {}
-        for row in candidates:
+        for row in self._prioritize_candidates(candidates):
             symbol = self._normalize_symbol(row)
             if symbol and symbol not in deduped:
                 deduped[symbol] = row
         return list(deduped.values())[:max_raw]
 
+    def _news_candidate_rows(self, response: ProviderResponse) -> list[dict[str, Any]]:
+        if response.status != "ok" or not isinstance(response.data, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for item in response.data:
+            if not isinstance(item, dict):
+                continue
+            symbols = item.get("symbols") or item.get("tickers") or item.get("codes") or []
+            if isinstance(symbols, str):
+                symbols = [symbols]
+            for raw in symbols:
+                symbol = str(raw).upper().replace(".US", "").strip()
+                if not symbol or "." in symbol:
+                    continue
+                rows.append(
+                    {
+                        "Code": symbol,
+                        "Exchange": "US",
+                        "Type": "Common Stock",
+                        "source": "eodhd_news",
+                        "reason": "recent news catalyst",
+                    }
+                )
+        return rows
+
+    def _prioritize_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def priority(row: dict[str, Any]) -> tuple[int, str]:
+            metadata = self._metadata(row)
+            source = str(row.get("source") or "")
+            exchange = str(metadata.get("exchange") or "").upper()
+            asset_class = str(metadata.get("asset_class") or "")
+            symbol = str(metadata.get("symbol") or "")
+            if source == "existing_static_watchlist":
+                base = 0
+            elif source == "eodhd_news":
+                base = 1
+            elif exchange in {"NYSE", "NASDAQ", "NYSE ARCA", "NYSEARCA", "AMEX"} and asset_class in {"equity", "etf"}:
+                base = 2
+            elif asset_class in {"fund", "index"}:
+                base = 8
+            elif exchange in {"PINK", "OTC", "OTCQB", "OTCQX"}:
+                base = 9
+            else:
+                base = 5
+            return base, symbol
+
+        return [row for row in sorted(candidates, key=priority) if not self._excluded_candidate(row)]
+
+    def _excluded_candidate(self, row: dict[str, Any]) -> bool:
+        metadata = self._metadata(row)
+        exclusions = self.cfg.get("exclusions", {})
+        exchange = str(metadata.get("exchange") or "").upper()
+        asset_class = str(metadata.get("asset_class") or "")
+        symbol = str(metadata.get("symbol") or "")
+        if "." in symbol and exchange != "US":
+            return True
+        if exclusions.get("otc", True) and exchange in {"PINK", "OTC", "OTCQB", "OTCQX"}:
+            return True
+        if asset_class == "fund" and not self.cfg.get("asset_classes_enabled", {}).get("funds", True):
+            return True
+        if exclusions.get("leveraged_etfs", True) and any(token in symbol for token in ("2X", "3X", "ULTRA", "BEAR", "BULL")):
+            return True
+        return False
+
     def _rows_from_response(self, response: ProviderResponse, source: str) -> list[dict[str, Any]]:
         if response.status != "ok" or not response.data:
-            self._provider_failed = True
-            self._provider_health_status = response.status
-            self._promotion_allowed = False
-            self._demotion_allowed = False
+            if response.status in {"plan_limited", "rate_limited"}:
+                self._provider_health_status = "partial" if response.status == "plan_limited" else "rate_limited"
+            else:
+                self._provider_failed = True
+                self._provider_health_status = response.status
+                self._promotion_allowed = False
+                self._demotion_allowed = False
             self._record_audit("provider_unavailable", None, {"source": source, "status": response.status, "error": response.error})
-            self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"source": source, "status": response.status})
+            if response.status not in {"plan_limited", "rate_limited"}:
+                self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"source": source, "status": response.status})
             return []
         rows = response.data if isinstance(response.data, list) else response.data.get("data", []) if isinstance(response.data, dict) else []
         return [{**row, "source": source} for row in rows if isinstance(row, dict)]
@@ -649,22 +746,35 @@ class DynamicUniverseEngine:
 
     def _score_symbol(self, symbol: str, metadata: dict[str, Any]) -> ResearchScore:
         bars = []
+        quote_ok = False
+        news_ok = False
         if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_eod_bars", True) and not metadata.get("existing_static"):
             res = self.provider.get_historical_bars(metadata.get("provider_symbol") or symbol, limit=80)
             if res.status == "ok" and isinstance(res.data, list):
                 bars = res.data
+            elif res.status not in {"plan_limited", "rate_limited"}:
+                self._provider_failed = True
+                self._provider_health_status = res.status
+        if self.provider and not metadata.get("existing_static") and bars:
+            quote = self.provider.get_latest_quote(metadata.get("provider_symbol") or symbol)
+            quote_ok = quote.status == "ok" and bool(quote.data)
         liquidity, liquidity_block = self._liquidity_score(metadata, bars)
         trend = self._trend_score(bars)
         rel = self._relative_strength_score(bars)
         vol = self._volatility_quality_score(bars)
-        news = self._news_score(symbol, metadata)
+        news, news_ok = self._news_score(symbol, metadata)
         sector = 5.0 if metadata.get("cluster") != "unknown_cluster" else 3.0
         quality = self._data_quality_score(metadata, bars)
+        confidence, confidence_reason = self._data_confidence(metadata, bars, quote_ok, news_ok)
+        metadata["data_confidence"] = confidence
+        metadata["data_confidence_reason"] = confidence_reason
         total = liquidity + trend + rel + vol + news + sector + quality
         block_reason = liquidity_block
         if quality < 2.0 and not metadata.get("existing_static"):
             block_reason = "missing or stale price data"
-        return ResearchScore(symbol, min(100.0, total), liquidity, trend, rel, vol, news, sector, quality, block_reason)
+        if confidence == "insufficient" and not metadata.get("existing_static"):
+            block_reason = block_reason or "insufficient data confidence"
+        return ResearchScore(symbol, min(100.0, total), liquidity, trend, rel, vol, news, sector, quality, confidence, confidence_reason, bool(metadata.get("existing_static")), block_reason)
 
     def _liquidity_score(self, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> tuple[float, str | None]:
         if metadata.get("existing_static"):
@@ -722,13 +832,24 @@ class DynamicUniverseEngine:
             return 5.0
         return 15.0
 
-    def _news_score(self, symbol: str, metadata: dict[str, Any]) -> float:
+    def _news_score(self, symbol: str, metadata: dict[str, Any]) -> tuple[float, bool]:
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_news", True) or metadata.get("existing_static"):
-            return 7.5
+            return 7.5, False
         res = self.provider.get_news(symbol=symbol, limit=5)
         if res.status != "ok" or not isinstance(res.data, list):
-            return 7.5
-        return min(15.0, 7.5 + len(res.data) * 1.5)
+            return 7.5, False
+        return min(15.0, 7.5 + len(res.data) * 1.5), True
+
+    def _data_confidence(self, metadata: dict[str, Any], bars: list[dict[str, Any]], quote_ok: bool, news_ok: bool) -> tuple[str, str]:
+        if metadata.get("existing_static"):
+            return "high", "static universe symbol"
+        if len(bars) < 20:
+            return "insufficient", "missing usable EOD price/liquidity data"
+        if quote_ok and news_ok:
+            return "medium", "EOD bars, realtime quote, and news available; optional intraday/fundamental/technical endpoints not required for research tier"
+        if quote_ok:
+            return "low", "EOD bars and realtime quote available; news unavailable or neutral"
+        return "low", "EOD bars available; realtime quote unavailable"
 
     def _data_quality_score(self, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> float:
         if metadata.get("existing_static"):
@@ -749,23 +870,31 @@ class DynamicUniverseEngine:
             return current.get("tier") if current else RAW_UNIVERSE
         if score.block_reason:
             return RAW_UNIVERSE
+        if score.data_confidence == "insufficient":
+            return RAW_UNIVERSE
         promo = self.cfg.get("promotion", {})
         if score.total_score < float(promo.get("min_research_score", 75)):
             return RAW_UNIVERSE
         current = self._current_symbol(symbol)
         if not current or current.get("tier") == RAW_UNIVERSE:
+            if score.data_confidence not in {"low", "medium", "high"}:
+                return RAW_UNIVERSE
             return RESEARCH_CANDIDATE
         if current.get("tier") == RESEARCH_CANDIDATE:
+            if score.data_confidence not in {"medium", "high"}:
+                return RESEARCH_CANDIDATE
             return OBSERVATION
         if current.get("tier") == OBSERVATION:
             cycles = self._score_count(symbol)
             sessions = self._session_count(symbol)
             has_shadow = self._has_shadow_tracking(symbol)
+            confidence_ok = score.data_confidence == "high" or (score.data_confidence == "medium" and bool(promo.get("allow_medium_confidence_paper_tradable", True)))
             if (
                 cycles >= int(promo.get("min_observation_cycles", 3))
                 and sessions >= int(promo.get("min_observation_sessions", 1))
                 and has_shadow
                 and metadata.get("cluster") != "unknown_cluster"
+                and confidence_ok
             ):
                 return PAPER_TRADABLE
             return OBSERVATION
@@ -838,10 +967,10 @@ class DynamicUniverseEngine:
             """
             INSERT INTO universe_symbols(
                 id,symbol,provider_symbol,exchange,asset_class,country,region,currency,sector,cluster,tier,state,
-                executable,observation_only,score,reason,source,provider,data_quality,data_freshness_status,
+                executable,observation_only,score,reason,source,provider,data_quality,data_confidence,data_confidence_reason,data_freshness_status,
                 last_successful_research_at,provider_health_status,promotion_allowed,demotion_allowed,stale_after_minutes,
                 last_seen_at,last_promoted_at,last_demoted_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 provider_symbol=excluded.provider_symbol,
                 exchange=excluded.exchange,
@@ -860,6 +989,8 @@ class DynamicUniverseEngine:
                 source=excluded.source,
                 provider=excluded.provider,
                 data_quality=excluded.data_quality,
+                data_confidence=excluded.data_confidence,
+                data_confidence_reason=excluded.data_confidence_reason,
                 data_freshness_status=excluded.data_freshness_status,
                 last_successful_research_at=excluded.last_successful_research_at,
                 provider_health_status=excluded.provider_health_status,
@@ -891,6 +1022,8 @@ class DynamicUniverseEngine:
                 metadata.get("source"),
                 self.cfg.get("provider", "eodhd"),
                 "ok" if score is not None else "seed",
+                metadata.get("data_confidence"),
+                metadata.get("data_confidence_reason"),
                 self._data_freshness_status,
                 now if score is not None and self._data_freshness_status == "fresh" else None,
                 self._provider_health_status,
@@ -916,15 +1049,52 @@ class DynamicUniverseEngine:
             """
             INSERT INTO symbol_research_scores(
                 id,run_id,symbol,provider,score,liquidity_score,trend_score,relative_strength_score,
-                volatility_quality_score,news_score,sector_theme_score,data_quality_score,block_reason,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                volatility_quality_score,news_score,sector_theme_score,data_quality_score,data_confidence,data_confidence_reason,block_reason,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, score.symbol.upper(), self.cfg.get("provider", "eodhd"), score.total_score,
                 score.liquidity_score, score.trend_score, score.relative_strength_score, score.volatility_quality_score,
-                score.news_score, score.sector_theme_score, score.data_quality_score, score.block_reason, iso_now(),
+                score.news_score, score.sector_theme_score, score.data_quality_score, score.data_confidence,
+                score.data_confidence_reason, score.block_reason, iso_now(),
             ),
         )
+
+    def _record_candidate_block(self, score: ResearchScore, metadata: dict[str, Any]) -> None:
+        reason = score.block_reason or "score below research threshold"
+        self.storage.execute(
+            """
+            INSERT INTO research_candidate_block_reasons(
+                id,run_id,symbol,score,data_confidence,block_reason,liquidity_score,trend_score,
+                relative_strength_score,volatility_quality_score,news_score,sector_theme_score,data_quality_score,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid.uuid4()), self.run_id, score.symbol.upper(), score.total_score, score.data_confidence, reason,
+                score.liquidity_score, score.trend_score, score.relative_strength_score, score.volatility_quality_score,
+                score.news_score, score.sector_theme_score, score.data_quality_score, iso_now(), json_dumps(metadata),
+            ),
+        )
+
+    def _record_near_miss_symbols(self) -> None:
+        threshold = float(self.cfg.get("promotion", {}).get("min_research_score", 75))
+        near = sorted(
+            (s for s in self._last_score_candidates if not s.existing_static and s.total_score < threshold),
+            key=lambda s: s.total_score,
+            reverse=True,
+        )[:10]
+        if near:
+            self._record_audit(
+                "dynamic_universe_near_miss_symbols",
+                None,
+                {
+                    "threshold": threshold,
+                    "symbols": [
+                        {"symbol": s.symbol, "score": s.total_score, "block_reason": s.block_reason or "score below research threshold", "data_confidence": s.data_confidence}
+                        for s in near
+                    ],
+                },
+            )
 
     def _record_trend_snapshot(self, symbol: str, metadata: dict[str, Any], score: ResearchScore) -> None:
         self.storage.execute(

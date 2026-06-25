@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from urllib.error import HTTPError
 from typing import Any
 
 from app.data_providers.base import ProviderResponse
@@ -67,6 +68,25 @@ class FakeProvider:
         return self._response("screener", self.rows[:limit])
 
 
+class PartialProvider(FakeProvider):
+    def __init__(self, *args: Any, news_status: str = "ok", quote_status: str = "ok", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.news_status = news_status
+        self.quote_status = quote_status
+
+    def get_latest_quote(self, symbol: str) -> ProviderResponse:
+        self.calls.append("latest_quote")
+        if self.quote_status != "ok":
+            return ProviderResponse("fake", "latest_quote", self.quote_status, None, self.quote_status)
+        return ProviderResponse("fake", "latest_quote", "ok", {"close": 100.0})
+
+    def get_news(self, symbol: str | None = None, topic: str | None = None, limit: int = 10) -> ProviderResponse:
+        self.calls.append("news")
+        if self.news_status != "ok":
+            return ProviderResponse("fake", "news", self.news_status, None, self.news_status)
+        return ProviderResponse("fake", "news", "ok", [{"title": "filtered catalyst"}])
+
+
 def dynamic_config() -> dict[str, Any]:
     cfg = load_config()
     cfg["mode"] = "paper"
@@ -99,6 +119,40 @@ def test_provider_cache_round_trip(temp_storage):
     assert cache.get("eodhd", "screener", {"limit": 6}) is None
 
 
+def test_eodhd_plan_limited_endpoint_is_cooled_down(temp_storage, monkeypatch):
+    cfg = load_config()
+    cfg["eodhd"]["max_retries"] = 0
+    provider = EODHDProvider(cfg, temp_storage, "run-test", api_key="test-secret")
+
+    def blocked(*args, **kwargs):
+        raise HTTPError("https://example.test", 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setattr("urllib.request.urlopen", blocked)
+
+    first = provider.get_intraday_bars("SPY")
+    calls_after_first = provider.calls_this_run
+    second = provider.get_intraday_bars("SPY")
+
+    assert first.status == "plan_limited"
+    assert second.status == "plan_limited"
+    assert provider.calls_this_run == calls_after_first
+    capability = temp_storage.fetch_all("SELECT * FROM data_provider_capabilities WHERE endpoint_name='intraday_bars'")[0]
+    assert capability["plan_limited"] == 1
+    assert capability["disabled_until"] is not None
+
+
+def test_provider_capability_recovery_marks_available(temp_storage):
+    cache = ProviderCache(temp_storage)
+    cache.record_capability("eodhd", "news", status="plan_limited", run_id="run-1", error_category="forbidden", cooldown_minutes=1440)
+    cache.record_capability("eodhd", "news", status="ok", run_id="run-2", used_for_scoring=True)
+
+    capability = temp_storage.fetch_all("SELECT available, plan_limited, failure_count, disabled_until FROM data_provider_capabilities WHERE endpoint_name='news'")[0]
+    assert capability["available"] == 1
+    assert capability["plan_limited"] == 0
+    assert capability["failure_count"] == 0
+    assert capability["disabled_until"] is None
+
+
 def test_eodhd_key_loaded_from_env_without_network(temp_storage, monkeypatch):
     monkeypatch.setenv("EODHD_API_KEY", "test-secret-token")
     provider = EODHDProvider(load_config(), temp_storage, "run-test")
@@ -127,12 +181,61 @@ def test_dynamic_symbol_starts_non_executable_research_candidate(temp_storage):
     engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test")
 
     result = engine.run_research_cycle("daily_deep_research")
-    row = temp_storage.fetch_all("SELECT tier, executable, observation_only FROM universe_symbols WHERE symbol='SMH'")[0]
+    row = temp_storage.fetch_all("SELECT tier, executable, observation_only, data_confidence FROM universe_symbols WHERE symbol='SMH'")[0]
 
     assert result["considered"] == 1
     assert row["tier"] == RESEARCH_CANDIDATE
     assert row["executable"] == 0
     assert row["observation_only"] == 1
+    assert row["data_confidence"] == "medium"
+
+
+def test_partial_data_eod_quote_news_can_create_research_candidate(temp_storage):
+    cfg = dynamic_config()
+    provider = PartialProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='SMH'")[0]
+    assert row["tier"] == RESEARCH_CANDIDATE
+    assert row["data_confidence"] == "medium"
+
+
+def test_missing_news_is_neutral_and_low_confidence_research_candidate(temp_storage):
+    cfg = dynamic_config()
+    provider = PartialProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+        news_status="plan_limited",
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    score = temp_storage.fetch_all("SELECT news_score, data_confidence FROM symbol_research_scores WHERE symbol='SMH'")[0]
+    row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='SMH'")[0]
+    assert score["news_score"] == 7.5
+    assert score["data_confidence"] == "low"
+    assert row["tier"] == RESEARCH_CANDIDATE
+
+
+def test_missing_price_liquidity_blocks_research_candidate_and_records_reason(temp_storage):
+    cfg = dynamic_config()
+    provider = PartialProvider(
+        rows=[{"Code": "NODATA", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=[],
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='NODATA'")[0]
+    block = temp_storage.fetch_all("SELECT block_reason, data_confidence FROM research_candidate_block_reasons WHERE symbol='NODATA'")[0]
+    assert row["tier"] == RAW_UNIVERSE
+    assert row["data_confidence"] == "insufficient"
+    assert block["block_reason"] in {"missing liquidity data", "missing or stale price data"}
+    assert block["data_confidence"] == "insufficient"
 
 
 def test_observation_requires_shadow_tracking_before_paper_tradable(temp_storage):
@@ -253,6 +356,12 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Missed Research Cycles" in sheet_names
     assert "Catch-Up Runs" in sheet_names
     assert "Stale Research Guards" in sheet_names
+    assert "Provider Capabilities" in sheet_names
+    assert "Endpoint Availability" in sheet_names
+    assert "Research Candidate Blocks" in sheet_names
+    assert "Data Confidence" in sheet_names
+    assert "Top Near-Miss Symbols" in sheet_names
+    assert "Dynamic Universe Source Coverage" in sheet_names
 
 
 def test_run_due_respects_paper_only_and_schedule(temp_storage, monkeypatch):

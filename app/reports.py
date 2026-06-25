@@ -68,6 +68,8 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Demotion Decisions", "symbol_demotion_decisions"),
     ("Dynamic Universe Audit", "dynamic_universe_audit"),
     ("Data Provider Health", "data_provider_health"),
+    ("Provider Capabilities", "data_provider_capabilities"),
+    ("Endpoint Availability", "SELECT provider,endpoint_name,available,plan_limited,last_success_at,last_failure_at,failure_count,last_status_code,last_error_category,disabled_until,used_for_scoring,updated_at FROM data_provider_capabilities ORDER BY provider, endpoint_name"),
     ("Dynamic Universe Performance", "dynamic_universe_performance"),
     ("Dynamic Universe Schedule State", "dynamic_universe_schedule_state"),
     ("Missed Research Cycles", "SELECT * FROM dynamic_universe_schedule_state WHERE missed_count > 0 OR catchup_required=1 ORDER BY updated_at DESC"),
@@ -75,6 +77,10 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Stale Research Guards", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_stale_data_guard' ORDER BY created_at DESC"),
     ("Dynamic Universe Promotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_promotions_blocked_stale_research' ORDER BY created_at DESC"),
     ("Dynamic Universe Demotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable' ORDER BY created_at DESC"),
+    ("Research Candidate Blocks", "research_candidate_block_reasons"),
+    ("Data Confidence", "SELECT symbol,tier,score,data_confidence,data_confidence_reason,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM universe_symbols ORDER BY updated_at DESC, score DESC"),
+    ("Top Near-Miss Symbols", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_near_miss_symbols' ORDER BY created_at DESC"),
+    ("Dynamic Universe Source Coverage", "SELECT source,tier,data_confidence,COUNT(*) AS symbols,AVG(score) AS avg_score,MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY source,tier,data_confidence ORDER BY source,tier,data_confidence"),
 ]
 
 

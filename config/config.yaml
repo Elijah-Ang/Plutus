@@ -97,6 +97,7 @@ eodhd:
   timeout_seconds: 10
   max_retries: 2
   retry_backoff_seconds: 2
+  plan_limited_cooldown_minutes: 1440
   cache_ttl_minutes:
     symbols: 1440
     daily_bars: 720
@@ -166,6 +167,7 @@ dynamic_universe:
     min_news_score: 50
     require_shadow_tracking: true
     allow_fast_track_paper_tradable: false
+    allow_medium_confidence_paper_tradable: true
     max_new_paper_tradable_per_day: 3
   demotion:
     max_weak_cycles: 5

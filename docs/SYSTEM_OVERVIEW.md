@@ -124,6 +124,8 @@ Every trade proposal is written to SQLite with `status='pending'`, assigned a Te
 The Dynamic Universe Engine follows `research many -> watch some -> trade few -> measure all`.
 
 - EODHD is the first research/discovery provider behind `app/data_providers`. API keys are read from environment/Keychain, never code.
+- EODHD capability is tracked per endpoint. Plan-limited endpoints are marked and cooled down so unavailable intraday, fundamentals, technicals, or screener endpoints are not called repeatedly every cycle.
+- Research scoring can operate on partial provider coverage. EOD bars plus quote/news can produce research candidates with explicit data confidence; missing optional endpoints reduce confidence but do not automatically block raw-to-research promotion. Missing usable price/liquidity data still blocks promotion.
 - Alpaca remains broker-only for paper order submission, reconciliation, positions, fills, and the existing execution-time market truth.
 - Dynamic tiers:
   - `raw_universe`: discovered symbols only, never executable.
@@ -311,7 +313,9 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `sector_regime_snapshots`: Sector/cluster regime snapshots for dynamic research context.
 - `dynamic_universe_audit`: Provider availability, degradation, and engine audit events.
 - `data_provider_health`: Research-provider status and rate-limit health without secrets.
+- `data_provider_capabilities`: Endpoint-level availability, plan-limit, cooldown, and scoring-use status.
 - `data_provider_cache_index`: Cached provider responses keyed by provider/endpoint/params. Payloads are redacted in reports.
+- `research_candidate_block_reasons`: Dynamic Universe near-miss and block reasons, including confidence and score components.
 - `dynamic_universe_performance`: Scanner/Performance Lab metrics for dynamic symbols and tier outcomes.
 - `dynamic_universe_schedule_state`: Due, skipped, missed, catch-up, provider health, internet, power, battery, freshness, and promotion/demotion permission state for each research schedule.
 - `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
@@ -346,8 +350,9 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Position Sizing Decisions**: Dynamic sizing inputs and final notional/share decisions.
 - **Candidate Ranking Decisions**: Ranking components and selection reasons.
 - **Ranked Opportunity Sets**, **Proposal Batches**, **Batch Candidates**, **Risk Budget Decisions**, **Batch Approval Actions**, and **Candidate Allocation Decisions**: Ranked-batch proposal and risk-budget audit views.
-- **Dynamic Universe Summary**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Observation Symbols**, **Paper-Tradable Symbols**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, provider health, and performance audit views.
+- **Dynamic Universe Summary**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Observation Symbols**, **Paper-Tradable Symbols**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, **Provider Capabilities**, **Endpoint Availability**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, endpoint capability, provider health, and performance audit views.
 - **Dynamic Universe Schedule State**, **Missed Research Cycles**, **Catch-Up Runs**, **Stale Research Guards**, **Dynamic Universe Promotion Blocks**, and **Dynamic Universe Demotion Blocks**: Resilience, missed-run, catch-up, and stale/provider guard reporting.
+- **Research Candidate Blocks**, **Data Confidence**, **Top Near-Miss Symbols**, and **Dynamic Universe Source Coverage**: Partial-data confidence, block-reason, near-miss, and source coverage reporting for Dynamic Universe candidate quality.
 - **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
 ## 15. Testing Strategy

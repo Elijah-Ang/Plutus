@@ -4846,6 +4846,15 @@ class TradingService:
             """,
             (window_start_iso,),
         )
+        capabilities = self.storage.fetch_all(
+            """
+            SELECT endpoint_name, available, plan_limited
+            FROM data_provider_capabilities
+            WHERE updated_at>=?
+            ORDER BY endpoint_name
+            """,
+            (window_start_iso,),
+        )
         schedule_rows = self.storage.fetch_all(
             """
             SELECT schedule_name, last_skip_reason, missed_count, catchup_status, provider_health_status, internet_status, power_status, updated_at
@@ -4871,7 +4880,7 @@ class TradingService:
             """,
             (window_start_iso,),
         )
-        if not promotions and not demotions and not health and not schedule_rows and not stale_rows:
+        if not promotions and not demotions and not health and not schedule_rows and not stale_rows and not capabilities:
             return None
         to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
         to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
@@ -4889,6 +4898,13 @@ class TradingService:
         if health:
             statuses = ", ".join(f"{r['provider']} {r['status']}" for r in health)
             parts.append(f"Provider health: {statuses}.")
+        if capabilities:
+            available = sorted({r["endpoint_name"] for r in capabilities if int(r.get("available") or 0) == 1})
+            limited = sorted({r["endpoint_name"] for r in capabilities if int(r.get("plan_limited") or 0) == 1})
+            if limited:
+                using = ", ".join(available) if available else "available endpoints"
+                unavailable = ", ".join(limited)
+                parts.append(f"Dynamic universe provider access is partial. Using {using}; plan-limited: {unavailable}.")
         if schedule_rows:
             latest = schedule_rows[0]
             if latest.get("last_skip_reason"):
