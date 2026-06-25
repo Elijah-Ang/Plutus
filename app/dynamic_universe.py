@@ -8,6 +8,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.data_providers.base import MarketResearchProvider, ProviderResponse
+from app.internet import internet_available
+from app.power import get_power_status
 from app.storage import Storage
 from app.utils import iso_now, json_dumps
 
@@ -33,6 +35,19 @@ class ResearchScore:
     block_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ResearchGate:
+    allowed: bool
+    reason: str | None
+    provider_health_status: str
+    internet_status: str
+    power_status: str
+    battery_pct: float | None
+    promotion_allowed: bool
+    demotion_allowed: bool
+    data_freshness_status: str
+
+
 class DynamicUniverseEngine:
     def __init__(self, config: dict[str, Any], storage: Storage, provider: MarketResearchProvider | None, run_id: str) -> None:
         self.config = config
@@ -40,7 +55,13 @@ class DynamicUniverseEngine:
         self.provider = provider
         self.run_id = run_id
         self.cfg = config.get("dynamic_universe", {})
+        self.resilience_cfg = config.get("dynamic_universe_resilience", {})
         self.now = datetime.now(UTC)
+        self._promotion_allowed = True
+        self._demotion_allowed = True
+        self._provider_failed = False
+        self._provider_health_status = "unknown"
+        self._data_freshness_status = "fresh"
 
     def enabled(self) -> bool:
         return bool(self.cfg.get("enabled", False)) and self.config.get("mode") == "paper"
@@ -56,14 +77,60 @@ class DynamicUniverseEngine:
             "weekly_cleanup",
         ]
         results = []
+        catchups_run = 0
+        catchup_cfg = self.resilience_cfg.get("catchup_policy", {})
+        max_catchups = int(catchup_cfg.get("max_catchup_runs_per_scanner_cycle", 2))
         for run_type in run_types:
-            if force or self._is_due(run_type):
-                results.append(self.run_research_cycle(run_type))
+            due = force or self._is_due(run_type)
+            catchup_required = self._catchup_required(run_type)
+            if not due and not catchup_required:
+                continue
+            if catchup_required and not self._catchup_allowed(run_type):
+                self._record_schedule_skip(run_type, "catchup_not_allowed", catchup_required=True)
+                results.append({"status": "skipped", "reason": "catchup_not_allowed", "run_type": run_type})
+                continue
+            if catchup_required and catchups_run >= max_catchups:
+                self._record_schedule_skip(run_type, "catchup_limit_reached", catchup_required=True)
+                results.append({"status": "skipped", "reason": "catchup_limit_reached", "run_type": run_type})
+                continue
+            gate = self._research_gate(run_type, is_catchup=catchup_required)
+            self._record_schedule_due(run_type, gate)
+            if not gate.allowed:
+                self._record_schedule_skip(run_type, gate.reason or "research_gate_blocked", gate, catchup_required=True)
+                self._mark_dynamic_symbols_stale(gate.reason or "research skipped", gate)
+                results.append({"status": "skipped", "reason": gate.reason, "run_type": run_type})
+                continue
+            if catchup_required:
+                catchups_run += 1
+                self._record_catchup_started(run_type, gate)
+            result = self.run_research_cycle(run_type, is_catchup=catchup_required, gate=gate)
+            results.append(result)
         return results
 
-    def run_research_cycle(self, run_type: str = "daily_deep_research") -> dict[str, Any]:
+    def run_research_cycle(self, run_type: str = "daily_deep_research", is_catchup: bool = False, gate: ResearchGate | None = None) -> dict[str, Any]:
+        gate = gate or ResearchGate(True, None, "ok", "online", "ac", None, True, True, "fresh")
+        self._promotion_allowed = gate.promotion_allowed
+        self._demotion_allowed = gate.demotion_allowed
+        self._provider_failed = False
+        self._provider_health_status = gate.provider_health_status
+        self._data_freshness_status = gate.data_freshness_status
         run_id = str(uuid.uuid4())
         now_iso = self.now.isoformat()
+        self._record_audit("dynamic_universe_research_started", None, {"run_type": run_type, "catchup": is_catchup})
+        self._upsert_schedule_state(
+            run_type,
+            {
+                "last_started_at": now_iso,
+                "provider_health_status": gate.provider_health_status,
+                "internet_status": gate.internet_status,
+                "power_status": gate.power_status,
+                "battery_pct": gate.battery_pct,
+                "promotion_allowed": 1 if gate.promotion_allowed else 0,
+                "demotion_allowed": 1 if gate.demotion_allowed else 0,
+                "data_freshness_status": gate.data_freshness_status,
+                "notes": json_dumps({"catchup": is_catchup}),
+            },
+        )
         self.storage.execute(
             "INSERT INTO universe_research_runs(id,run_id,research_type,provider,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, self.run_id, run_type, self.cfg.get("provider", "eodhd"), "running", now_iso, None, 0, 0, 0, "{}"),
@@ -101,29 +168,47 @@ class DynamicUniverseEngine:
                 self._upsert_universe_symbol(symbol, metadata, new_tier, executable=executable, observation_only=observation_only, score=score.total_score)
                 self._record_trend_snapshot(symbol, metadata, score)
                 self._record_news(symbol, metadata)
-
-            self._demote_stale_symbols(demoted)
+            if self._demotion_allowed and not self._provider_failed:
+                self._demote_stale_symbols(demoted)
+            elif self._provider_failed:
+                self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"run_type": run_type})
             status = "completed"
-            detail = {"provider_status": "ok", "run_type": run_type}
+            detail = {"provider_status": self._provider_health_status, "run_type": run_type, "catchup": is_catchup}
         except Exception as exc:
             status = "error"
             detail = {"error": type(exc).__name__, "run_type": run_type}
-            self.storage.execute(
-                "INSERT INTO dynamic_universe_audit(id,run_id,event_type,symbol,detail,created_at) VALUES(?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.run_id, "dynamic_universe_error", None, json_dumps(detail), iso_now()),
-            )
+            self._record_audit("dynamic_universe_error", None, detail)
         self.storage.execute(
             "UPDATE universe_research_runs SET status=?, ended_at=?, symbols_considered=?, symbols_promoted=?, symbols_demoted=?, detail=? WHERE id=?",
             (status, iso_now(), considered, len(promoted), len(demoted), json_dumps(detail), run_id),
+        )
+        self._record_schedule_completed(run_type, status, gate, is_catchup)
+        self._record_audit(
+            "dynamic_universe_catchup_completed" if is_catchup else "dynamic_universe_research_completed",
+            None,
+            {"run_type": run_type, "status": status, "promoted": promoted, "demoted": demoted},
         )
         return {"status": status, "considered": considered, "promoted": promoted, "demoted": demoted, "run_id": run_id}
 
     def dynamic_scan_symbols(self) -> tuple[list[str], list[str]]:
         if not self.enabled():
             return [], []
+        max_stale = int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30))
+        freshness_cutoff = (self.now - timedelta(minutes=max_stale)).isoformat()
         paper = self.storage.fetch_all(
-            "SELECT symbol FROM universe_symbols WHERE tier=? AND executable=1 ORDER BY score DESC, symbol LIMIT ?",
-            (PAPER_TRADABLE, int(self.cfg.get("max_dynamic_paper_tradable_symbols", 12))),
+            """
+            SELECT symbol
+            FROM universe_symbols
+            WHERE tier=?
+              AND executable=1
+              AND (
+                COALESCE(source, '')='existing_static_watchlist'
+                OR COALESCE(last_successful_research_at, last_seen_at, updated_at) >= ?
+              )
+            ORDER BY score DESC, symbol
+            LIMIT ?
+            """,
+            (PAPER_TRADABLE, freshness_cutoff, int(self.cfg.get("max_dynamic_paper_tradable_symbols", 12))),
         )
         obs = self.storage.fetch_all(
             """
@@ -140,6 +225,270 @@ class DynamicUniverseEngine:
             (OBSERVATION, int(self.cfg.get("max_observation_symbols", 30))),
         )
         return [r["symbol"] for r in paper], [r["symbol"] for r in obs]
+
+    def _schedule_type(self, run_type: str) -> str:
+        return {
+            "daily_deep_research": "daily_deep",
+            "intraday_light_refresh": "intraday_light",
+            "event_triggered_refresh": "event_triggered",
+            "post_market_review": "post_market",
+            "weekly_cleanup": "weekly_cleanup",
+        }.get(run_type, run_type)
+
+    def _record_audit(self, event_type: str, symbol: str | None, detail: dict[str, Any]) -> None:
+        self.storage.execute(
+            "INSERT INTO dynamic_universe_audit(id,run_id,event_type,symbol,detail,created_at) VALUES(?,?,?,?,?,?)",
+            (str(uuid.uuid4()), self.run_id, event_type, symbol, json_dumps(detail), iso_now()),
+        )
+
+    def _schedule_state(self, run_type: str) -> dict[str, Any] | None:
+        rows = self.storage.fetch_all("SELECT * FROM dynamic_universe_schedule_state WHERE schedule_name=?", (run_type,))
+        return rows[0] if rows else None
+
+    def _upsert_schedule_state(self, run_type: str, fields: dict[str, Any]) -> None:
+        now = iso_now()
+        current = self._schedule_state(run_type)
+        data = {
+            "id": current.get("id") if current else str(uuid.uuid4()),
+            "schedule_name": run_type,
+            "schedule_type": self._schedule_type(run_type),
+            "due_at": fields.get("due_at") if "due_at" in fields else (current.get("due_at") if current else None),
+            "last_started_at": fields.get("last_started_at") if "last_started_at" in fields else (current.get("last_started_at") if current else None),
+            "last_completed_at": fields.get("last_completed_at") if "last_completed_at" in fields else (current.get("last_completed_at") if current else None),
+            "last_success_at": fields.get("last_success_at") if "last_success_at" in fields else (current.get("last_success_at") if current else None),
+            "last_skipped_at": fields.get("last_skipped_at") if "last_skipped_at" in fields else (current.get("last_skipped_at") if current else None),
+            "last_skip_reason": fields.get("last_skip_reason") if "last_skip_reason" in fields else (current.get("last_skip_reason") if current else None),
+            "missed_count": fields.get("missed_count") if "missed_count" in fields else (current.get("missed_count") if current else 0),
+            "catchup_required": fields.get("catchup_required") if "catchup_required" in fields else (current.get("catchup_required") if current else 0),
+            "catchup_attempted_at": fields.get("catchup_attempted_at") if "catchup_attempted_at" in fields else (current.get("catchup_attempted_at") if current else None),
+            "catchup_completed_at": fields.get("catchup_completed_at") if "catchup_completed_at" in fields else (current.get("catchup_completed_at") if current else None),
+            "catchup_status": fields.get("catchup_status") if "catchup_status" in fields else (current.get("catchup_status") if current else None),
+            "data_freshness_status": fields.get("data_freshness_status") if "data_freshness_status" in fields else (current.get("data_freshness_status") if current else None),
+            "provider_health_status": fields.get("provider_health_status") if "provider_health_status" in fields else (current.get("provider_health_status") if current else None),
+            "internet_status": fields.get("internet_status") if "internet_status" in fields else (current.get("internet_status") if current else None),
+            "power_status": fields.get("power_status") if "power_status" in fields else (current.get("power_status") if current else None),
+            "battery_pct": fields.get("battery_pct") if "battery_pct" in fields else (current.get("battery_pct") if current else None),
+            "stale_after_minutes": fields.get("stale_after_minutes") if "stale_after_minutes" in fields else (current.get("stale_after_minutes") if current else None),
+            "promotion_allowed": fields.get("promotion_allowed") if "promotion_allowed" in fields else (current.get("promotion_allowed") if current else 0),
+            "demotion_allowed": fields.get("demotion_allowed") if "demotion_allowed" in fields else (current.get("demotion_allowed") if current else 0),
+            "notes": fields.get("notes") if "notes" in fields else (current.get("notes") if current else None),
+            "created_at": current.get("created_at") if current else now,
+            "updated_at": now,
+        }
+        self.storage.execute(
+            """
+            INSERT INTO dynamic_universe_schedule_state(
+                id,schedule_name,schedule_type,due_at,last_started_at,last_completed_at,last_success_at,last_skipped_at,
+                last_skip_reason,missed_count,catchup_required,catchup_attempted_at,catchup_completed_at,catchup_status,
+                data_freshness_status,provider_health_status,internet_status,power_status,battery_pct,stale_after_minutes,
+                promotion_allowed,demotion_allowed,notes,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(schedule_name) DO UPDATE SET
+                schedule_type=excluded.schedule_type,
+                due_at=excluded.due_at,
+                last_started_at=excluded.last_started_at,
+                last_completed_at=excluded.last_completed_at,
+                last_success_at=excluded.last_success_at,
+                last_skipped_at=excluded.last_skipped_at,
+                last_skip_reason=excluded.last_skip_reason,
+                missed_count=excluded.missed_count,
+                catchup_required=excluded.catchup_required,
+                catchup_attempted_at=excluded.catchup_attempted_at,
+                catchup_completed_at=excluded.catchup_completed_at,
+                catchup_status=excluded.catchup_status,
+                data_freshness_status=excluded.data_freshness_status,
+                provider_health_status=excluded.provider_health_status,
+                internet_status=excluded.internet_status,
+                power_status=excluded.power_status,
+                battery_pct=excluded.battery_pct,
+                stale_after_minutes=excluded.stale_after_minutes,
+                promotion_allowed=excluded.promotion_allowed,
+                demotion_allowed=excluded.demotion_allowed,
+                notes=excluded.notes,
+                updated_at=excluded.updated_at
+            """,
+            tuple(data.values()),
+        )
+
+    def _provider_available(self) -> tuple[str, str | None]:
+        if not self.provider:
+            return "provider_unavailable", "provider_not_configured"
+        api_key = getattr(self.provider, "api_key", "configured")
+        if not api_key:
+            return "provider_unavailable", "missing_api_key"
+        return "ok", None
+
+    def _record_provider_health(self, status: str, error: str | None = None) -> None:
+        self.storage.execute(
+            "INSERT INTO data_provider_health(id,run_id,provider,status,checked_at,rate_limit_remaining,error,detail) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                f"{self.cfg.get('provider', 'eodhd')}-{uuid.uuid4()}",
+                self.run_id,
+                self.cfg.get("provider", "eodhd"),
+                status,
+                iso_now(),
+                None,
+                error,
+                json_dumps({"error": error} if error else {}),
+            ),
+        )
+
+    def _research_gate(self, run_type: str, is_catchup: bool = False) -> ResearchGate:
+        res_cfg = self.resilience_cfg
+        if not res_cfg.get("enabled", True):
+            return ResearchGate(True, None, "ok", "unchecked", "unchecked", None, True, True, "fresh")
+        internet_ok = internet_available()
+        internet_status = "online" if internet_ok else "offline"
+        provider_status, provider_error = self._provider_available()
+        if provider_status != "ok":
+            self._record_provider_health(provider_status, provider_error)
+
+        power = get_power_status()
+        power_status = "ac" if power.connected is True else "battery" if power.connected is False else "unknown"
+        battery_pct = power.battery_pct
+        policy = res_cfg.get("power_policy", {})
+        critical_pct = float(policy.get("skip_all_research_below_battery_pct", 25))
+        if battery_pct is not None and battery_pct < critical_pct:
+            return ResearchGate(False, "battery_below_research_threshold", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+
+        deep = run_type in {"daily_deep_research", "weekly_cleanup"}
+        light = run_type in {"intraday_light_refresh", "event_triggered_refresh", "post_market_review"}
+        if power.connected is False and deep and not policy.get("allow_deep_research_on_battery", False):
+            return ResearchGate(False, "deep_research_skipped_on_battery", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+        if power.connected is False and light:
+            min_light = float(policy.get("min_battery_pct_for_light_refresh", 35))
+            if battery_pct is not None and battery_pct < min_light:
+                return ResearchGate(False, "light_research_skipped_low_battery", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+            if not policy.get("allow_light_refresh_on_battery", True):
+                return ResearchGate(False, "light_research_skipped_on_battery", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+
+        if res_cfg.get("internet_required_for_provider_calls", True) and not internet_ok:
+            return ResearchGate(False, "no_internet", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+        if provider_status != "ok":
+            return ResearchGate(False, provider_error or "provider_unavailable", provider_status, internet_status, power_status, battery_pct, False, False, "stale")
+
+        promotion_allowed = True
+        if is_catchup and res_cfg.get("catchup_policy", {}).get("block_new_promotions_during_late_day_catchup", True) and run_type == "daily_deep_research":
+            promotion_allowed = False
+        return ResearchGate(True, None, provider_status, internet_status, power_status, battery_pct, promotion_allowed, True, "fresh")
+
+    def _catchup_required(self, run_type: str) -> bool:
+        if not self.resilience_cfg.get("catchup_policy", {}).get("enabled", True):
+            return False
+        state = self._schedule_state(run_type)
+        return bool(state and int(state.get("catchup_required") or 0) == 1)
+
+    def _catchup_allowed(self, run_type: str) -> bool:
+        cfg = self.resilience_cfg.get("catchup_policy", {})
+        key = {
+            "daily_deep_research": "daily_deep_catchup_allowed",
+            "intraday_light_refresh": "intraday_light_catchup_allowed",
+            "post_market_review": "post_market_catchup_allowed",
+            "weekly_cleanup": "weekly_cleanup_catchup_allowed",
+        }.get(run_type)
+        if key and not cfg.get(key, True):
+            return False
+        state = self._schedule_state(run_type)
+        attempted = state.get("catchup_attempted_at") if state else None
+        if attempted:
+            try:
+                last = datetime.fromisoformat(str(attempted).replace("Z", "+00:00")).astimezone(UTC)
+                min_gap = int(cfg.get("min_minutes_between_catchups", 15))
+                if self.now - last < timedelta(minutes=min_gap):
+                    return False
+            except Exception:
+                return True
+        return True
+
+    def _record_schedule_due(self, run_type: str, gate: ResearchGate) -> None:
+        self._upsert_schedule_state(
+            run_type,
+            {
+                "due_at": self.now.isoformat(),
+                "provider_health_status": gate.provider_health_status,
+                "internet_status": gate.internet_status,
+                "power_status": gate.power_status,
+                "battery_pct": gate.battery_pct,
+                "promotion_allowed": 1 if gate.promotion_allowed else 0,
+                "demotion_allowed": 1 if gate.demotion_allowed else 0,
+                "data_freshness_status": gate.data_freshness_status,
+            },
+        )
+        self._record_audit("dynamic_universe_research_due", None, {"run_type": run_type, "gate_allowed": gate.allowed})
+
+    def _record_schedule_skip(self, run_type: str, reason: str, gate: ResearchGate | None = None, catchup_required: bool = True) -> None:
+        gate = gate or ResearchGate(False, reason, "unknown", "unknown", "unknown", None, False, False, "stale")
+        state = self._schedule_state(run_type)
+        missed_count = int(state.get("missed_count") or 0) + 1 if state else 1
+        self._upsert_schedule_state(
+            run_type,
+            {
+                "last_skipped_at": iso_now(),
+                "last_skip_reason": reason,
+                "missed_count": missed_count,
+                "catchup_required": 1 if catchup_required else 0,
+                "catchup_status": "required" if catchup_required else "not_required",
+                "data_freshness_status": "stale",
+                "provider_health_status": gate.provider_health_status,
+                "internet_status": gate.internet_status,
+                "power_status": gate.power_status,
+                "battery_pct": gate.battery_pct,
+                "promotion_allowed": 0,
+                "demotion_allowed": 0,
+                "notes": json_dumps({"reason": reason}),
+            },
+        )
+        self._record_audit("dynamic_universe_research_skipped", None, {"run_type": run_type, "reason": reason})
+        self._record_audit("dynamic_universe_research_missed", None, {"run_type": run_type, "reason": reason, "missed_count": missed_count})
+
+    def _record_catchup_started(self, run_type: str, gate: ResearchGate) -> None:
+        self._upsert_schedule_state(
+            run_type,
+            {
+                "catchup_attempted_at": iso_now(),
+                "catchup_status": "running",
+                "provider_health_status": gate.provider_health_status,
+                "internet_status": gate.internet_status,
+                "power_status": gate.power_status,
+                "battery_pct": gate.battery_pct,
+            },
+        )
+        self._record_audit("dynamic_universe_catchup_started", None, {"run_type": run_type})
+
+    def _record_schedule_completed(self, run_type: str, status: str, gate: ResearchGate, is_catchup: bool) -> None:
+        fields = {
+            "last_completed_at": iso_now(),
+            "provider_health_status": gate.provider_health_status,
+            "internet_status": gate.internet_status,
+            "power_status": gate.power_status,
+            "battery_pct": gate.battery_pct,
+            "promotion_allowed": 1 if gate.promotion_allowed else 0,
+            "demotion_allowed": 1 if gate.demotion_allowed else 0,
+            "data_freshness_status": "fresh" if status == "completed" else "stale",
+        }
+        if status == "completed":
+            fields.update(last_success_at=iso_now(), catchup_required=0, missed_count=0)
+        if is_catchup:
+            fields.update(catchup_completed_at=iso_now(), catchup_status=status)
+        self._upsert_schedule_state(run_type, fields)
+
+    def _mark_dynamic_symbols_stale(self, reason: str, gate: ResearchGate) -> None:
+        stale_after = int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30))
+        self.storage.execute(
+            """
+            UPDATE universe_symbols
+            SET data_freshness_status='stale',
+                provider_health_status=?,
+                promotion_allowed=0,
+                demotion_allowed=0,
+                stale_after_minutes=?,
+                reason=?,
+                updated_at=?
+            WHERE COALESCE(source, '') NOT IN ('existing_static_watchlist', 'existing_static_observation')
+            """,
+            (gate.provider_health_status, stale_after, reason, iso_now()),
+        )
+        self._record_audit("dynamic_universe_stale_data_guard", None, {"reason": reason, "stale_after_minutes": stale_after})
 
     def _is_due(self, run_type: str) -> bool:
         schedules = self.cfg.get("schedules", {})
@@ -227,10 +576,12 @@ class DynamicUniverseEngine:
 
     def _rows_from_response(self, response: ProviderResponse, source: str) -> list[dict[str, Any]]:
         if response.status != "ok" or not response.data:
-            self.storage.execute(
-                "INSERT INTO dynamic_universe_audit(id,run_id,event_type,symbol,detail,created_at) VALUES(?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.run_id, "provider_unavailable", None, json_dumps({"source": source, "status": response.status, "error": response.error}), iso_now()),
-            )
+            self._provider_failed = True
+            self._provider_health_status = response.status
+            self._promotion_allowed = False
+            self._demotion_allowed = False
+            self._record_audit("provider_unavailable", None, {"source": source, "status": response.status, "error": response.error})
+            self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"source": source, "status": response.status})
             return []
         rows = response.data if isinstance(response.data, list) else response.data.get("data", []) if isinstance(response.data, dict) else []
         return [{**row, "source": source} for row in rows if isinstance(row, dict)]
@@ -391,6 +742,11 @@ class DynamicUniverseEngine:
     def _decide_tier(self, symbol: str, metadata: dict[str, Any], score: ResearchScore) -> str:
         if metadata.get("existing_static"):
             return OBSERVATION if metadata.get("observation") else PAPER_TRADABLE
+        if not self._promotion_allowed:
+            if score.total_score >= float(self.cfg.get("promotion", {}).get("min_research_score", 75)):
+                self._record_audit("dynamic_universe_promotions_blocked_stale_research", symbol, {"score": score.total_score, "provider_health_status": self._provider_health_status})
+            current = self._current_symbol(symbol)
+            return current.get("tier") if current else RAW_UNIVERSE
         if score.block_reason:
             return RAW_UNIVERSE
         promo = self.cfg.get("promotion", {})
@@ -482,8 +838,10 @@ class DynamicUniverseEngine:
             """
             INSERT INTO universe_symbols(
                 id,symbol,provider_symbol,exchange,asset_class,country,region,currency,sector,cluster,tier,state,
-                executable,observation_only,score,reason,source,provider,data_quality,last_seen_at,last_promoted_at,last_demoted_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                executable,observation_only,score,reason,source,provider,data_quality,data_freshness_status,
+                last_successful_research_at,provider_health_status,promotion_allowed,demotion_allowed,stale_after_minutes,
+                last_seen_at,last_promoted_at,last_demoted_at,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 provider_symbol=excluded.provider_symbol,
                 exchange=excluded.exchange,
@@ -502,6 +860,12 @@ class DynamicUniverseEngine:
                 source=excluded.source,
                 provider=excluded.provider,
                 data_quality=excluded.data_quality,
+                data_freshness_status=excluded.data_freshness_status,
+                last_successful_research_at=excluded.last_successful_research_at,
+                provider_health_status=excluded.provider_health_status,
+                promotion_allowed=excluded.promotion_allowed,
+                demotion_allowed=excluded.demotion_allowed,
+                stale_after_minutes=excluded.stale_after_minutes,
                 last_seen_at=excluded.last_seen_at,
                 last_promoted_at=COALESCE(excluded.last_promoted_at, universe_symbols.last_promoted_at),
                 last_demoted_at=COALESCE(excluded.last_demoted_at, universe_symbols.last_demoted_at),
@@ -527,6 +891,12 @@ class DynamicUniverseEngine:
                 metadata.get("source"),
                 self.cfg.get("provider", "eodhd"),
                 "ok" if score is not None else "seed",
+                self._data_freshness_status,
+                now if score is not None and self._data_freshness_status == "fresh" else None,
+                self._provider_health_status,
+                1 if self._promotion_allowed else 0,
+                1 if self._demotion_allowed else 0,
+                int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30)),
                 now,
                 now if tier == PAPER_TRADABLE else None,
                 now if tier == DEMOTED else None,

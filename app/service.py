@@ -4846,7 +4846,32 @@ class TradingService:
             """,
             (window_start_iso,),
         )
-        if not promotions and not demotions and not health:
+        schedule_rows = self.storage.fetch_all(
+            """
+            SELECT schedule_name, last_skip_reason, missed_count, catchup_status, provider_health_status, internet_status, power_status, updated_at
+            FROM dynamic_universe_schedule_state
+            WHERE updated_at>=?
+            ORDER BY updated_at DESC
+            LIMIT 5
+            """,
+            (window_start_iso,),
+        )
+        stale_rows = self.storage.fetch_all(
+            """
+            SELECT event_type, detail
+            FROM dynamic_universe_audit
+            WHERE created_at>=?
+              AND event_type IN (
+                'dynamic_universe_stale_data_guard',
+                'dynamic_universe_promotions_blocked_stale_research',
+                'dynamic_universe_demotions_blocked_provider_unavailable'
+              )
+            ORDER BY created_at DESC
+            LIMIT 3
+            """,
+            (window_start_iso,),
+        )
+        if not promotions and not demotions and not health and not schedule_rows and not stale_rows:
             return None
         to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
         to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
@@ -4864,6 +4889,16 @@ class TradingService:
         if health:
             statuses = ", ".join(f"{r['provider']} {r['status']}" for r in health)
             parts.append(f"Provider health: {statuses}.")
+        if schedule_rows:
+            latest = schedule_rows[0]
+            if latest.get("last_skip_reason"):
+                missed = int(latest.get("missed_count") or 0)
+                suffix = f" Missed count: {missed}." if missed else ""
+                parts.append(f"Research skipped: {latest['schedule_name']} — {latest['last_skip_reason']}.{suffix}")
+            elif latest.get("catchup_status") == "completed":
+                parts.append(f"Research catch-up completed: {latest['schedule_name']}.")
+        if stale_rows:
+            parts.append("Stale research guard active; new dynamic promotions or BUY/ADD eligibility may be blocked until refresh.")
         return " ".join(parts)
 
     def _risk_budget_cfg(self) -> dict[str, Any]:

@@ -184,6 +184,42 @@ dynamic_universe:
     post_market_review_enabled: true
     weekly_cleanup_enabled: true
 
+dynamic_universe_resilience:
+  enabled: true
+  internet_required_for_provider_calls: true
+  fail_closed_on_no_internet: true
+  keep_existing_universe_on_no_internet: true
+  block_new_promotions_when_offline: true
+  block_demotions_when_provider_unavailable: true
+  power_policy:
+    allow_light_refresh_on_battery: true
+    allow_deep_research_on_battery: false
+    min_battery_pct_for_light_refresh: 35
+    min_battery_pct_for_deep_research: 60
+    skip_all_research_below_battery_pct: 25
+  stale_data_policy:
+    max_age_minutes_for_intraday_research: 45
+    max_age_minutes_for_promotion: 90
+    max_age_minutes_for_trade_eligibility: 30
+    block_promotion_if_research_stale: true
+    block_new_paper_tradable_if_provider_down: true
+    block_trade_from_stale_dynamic_research: true
+  catchup_policy:
+    enabled: true
+    run_one_catchup_per_schedule_type: true
+    do_not_replay_all_missed_intraday_cycles: true
+    daily_deep_catchup_allowed: true
+    intraday_light_catchup_allowed: true
+    post_market_catchup_allowed: true
+    weekly_cleanup_catchup_allowed: true
+    max_catchup_runs_per_scanner_cycle: 2
+    min_minutes_between_catchups: 15
+    block_new_promotions_during_late_day_catchup: true
+  offline_digest:
+    include_provider_health_in_digest: true
+    include_missed_research_count: true
+    alert_only_on_state_change: true
+
 position_management:
   enabled: true
   profit_taking:

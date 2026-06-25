@@ -52,7 +52,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_model TEXT, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
     "position_management_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, decision_type TEXT, priority INTEGER, action TEXT, reason TEXT, current_price REAL, avg_entry_price REAL, quantity REAL, unrealized_profit_pct REAL, highest_price_since_entry REAL, max_unrealized_profit_pct REAL, pullback_from_peak_pct REAL, profit_giveback_ratio REAL, current_r_multiple REAL, trailing_stop_price REAL, suggested_sell_fraction REAL, suggested_add_notional REAL, blocking_reasons TEXT, is_actionable INTEGER, dip_trap_classification TEXT, created_at TEXT, payload TEXT",
     "profit_exit_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, event_type TEXT, proposal_id TEXT, proposal_batch_id TEXT, sell_fraction REAL, estimated_shares REAL, estimated_notional REAL, current_gain_pct REAL, peak_gain_pct REAL, giveback_ratio REAL, r_multiple REAL, trailing_stop_price REAL, status TEXT, created_at TEXT, resolved_at TEXT",
-    "universe_symbols": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, provider_symbol TEXT, exchange TEXT, asset_class TEXT, country TEXT, region TEXT, currency TEXT, sector TEXT, cluster TEXT, tier TEXT, state TEXT, executable INTEGER DEFAULT 0, observation_only INTEGER DEFAULT 1, score REAL, reason TEXT, source TEXT, provider TEXT, data_quality TEXT, last_seen_at TEXT, last_promoted_at TEXT, last_demoted_at TEXT, created_at TEXT, updated_at TEXT",
+    "universe_symbols": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, provider_symbol TEXT, exchange TEXT, asset_class TEXT, country TEXT, region TEXT, currency TEXT, sector TEXT, cluster TEXT, tier TEXT, state TEXT, executable INTEGER DEFAULT 0, observation_only INTEGER DEFAULT 1, score REAL, reason TEXT, source TEXT, provider TEXT, data_quality TEXT, data_freshness_status TEXT, last_successful_research_at TEXT, provider_health_status TEXT, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, stale_after_minutes INTEGER, last_seen_at TEXT, last_promoted_at TEXT, last_demoted_at TEXT, created_at TEXT, updated_at TEXT",
     "universe_research_runs": "id TEXT PRIMARY KEY, run_id TEXT, research_type TEXT, provider TEXT, status TEXT, started_at TEXT, ended_at TEXT, symbols_considered INTEGER, symbols_promoted INTEGER, symbols_demoted INTEGER, detail TEXT",
     "symbol_research_scores": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, provider TEXT, score REAL, liquidity_score REAL, trend_score REAL, relative_strength_score REAL, volatility_quality_score REAL, news_score REAL, sector_theme_score REAL, data_quality_score REAL, block_reason TEXT, created_at TEXT",
     "symbol_news_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, provider TEXT, event_time TEXT, headline TEXT, sentiment TEXT, source TEXT, url TEXT, relevance_score REAL, created_at TEXT",
@@ -65,6 +65,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "data_provider_health": "id TEXT PRIMARY KEY, run_id TEXT, provider TEXT, status TEXT, checked_at TEXT, rate_limit_remaining INTEGER, error TEXT, detail TEXT",
     "data_provider_cache_index": "id TEXT PRIMARY KEY, provider TEXT, endpoint TEXT, cache_key TEXT UNIQUE, symbol TEXT, fetched_at TEXT, expires_at TEXT, status TEXT, payload TEXT",
     "dynamic_universe_performance": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, tier TEXT, metric TEXT, value REAL, created_at TEXT, payload TEXT",
+    "dynamic_universe_schedule_state": "id TEXT PRIMARY KEY, schedule_name TEXT UNIQUE, schedule_type TEXT, due_at TEXT, last_started_at TEXT, last_completed_at TEXT, last_success_at TEXT, last_skipped_at TEXT, last_skip_reason TEXT, missed_count INTEGER DEFAULT 0, catchup_required INTEGER DEFAULT 0, catchup_attempted_at TEXT, catchup_completed_at TEXT, catchup_status TEXT, data_freshness_status TEXT, provider_health_status TEXT, internet_status TEXT, power_status TEXT, battery_pct REAL, stale_after_minutes INTEGER, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, notes TEXT, created_at TEXT, updated_at TEXT",
 }
 
 
@@ -97,6 +98,7 @@ class Storage:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_symbols(tier, executable, observation_only)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_symbol ON symbol_research_scores(symbol, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dynamic_schedule_state ON dynamic_universe_schedule_state(schedule_type, catchup_required, updated_at)")
             
             # Migration check for existing databases
             cursor = conn.execute("PRAGMA table_info(trade_proposals)")
@@ -301,6 +303,17 @@ class Storage:
                     "entry_price_for_r": "REAL",
                     "risk_model_version": "TEXT",
                     "r_multiple_unavailable_reason": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "universe_symbols",
+                {
+                    "data_freshness_status": "TEXT",
+                    "last_successful_research_at": "TEXT",
+                    "provider_health_status": "TEXT",
+                    "promotion_allowed": "INTEGER DEFAULT 0",
+                    "demotion_allowed": "INTEGER DEFAULT 0",
+                    "stale_after_minutes": "INTEGER",
                 },
             )
                 

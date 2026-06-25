@@ -136,6 +136,12 @@ The Dynamic Universe Engine follows `research many -> watch some -> trade few ->
 - GPT is not used to promote, demote, approve, reject, or execute symbols. Any future GPT use must be limited to summaries after deterministic filters narrow research items.
 - The engine runs through existing scanner due checks; no separate launchd job is required. Supported run types are daily deep research, intraday light refresh, event-triggered refresh, post-market review, and weekly cleanup.
 - Telegram universe updates are informational digest sections and are emitted only when promotions, demotions, or provider health changes occurred.
+- Resilience rules are configured under `dynamic_universe_resilience`. If internet, provider key, provider health, or battery state is unsuitable, research is skipped safely, schedule state is updated, and catch-up is marked required.
+- Missing EODHD keys record `provider_unavailable: missing_api_key`. Existing static scanner behavior continues, but dynamic provider research makes no provider calls and creates no new promotions.
+- On battery, light refresh may run above the configured threshold, while deep research is skipped unless explicitly allowed. Critically low battery skips all dynamic research.
+- Missed daily/intraday/post-market/weekly research is recorded in `dynamic_universe_schedule_state`; catch-up runs at the next safe opportunity and does not replay every missed intraday cycle.
+- Stale dynamic research blocks new dynamic BUY/ADD eligibility and paper-tradable promotion. It does not block risk-reducing SELL/EXIT monitoring for held positions.
+- Provider-unavailable states block demotions based only on missing data, so a provider outage cannot incorrectly retire symbols.
 
 - **Proposal Conflict Handling after Approval**:
   - If a BUY proposal is approved and successfully submitted as an order:
@@ -307,6 +313,7 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `data_provider_health`: Research-provider status and rate-limit health without secrets.
 - `data_provider_cache_index`: Cached provider responses keyed by provider/endpoint/params. Payloads are redacted in reports.
 - `dynamic_universe_performance`: Scanner/Performance Lab metrics for dynamic symbols and tier outcomes.
+- `dynamic_universe_schedule_state`: Due, skipped, missed, catch-up, provider health, internet, power, battery, freshness, and promotion/demotion permission state for each research schedule.
 - `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
 
 ## 14. Excel Reporting Flow
@@ -340,6 +347,7 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Candidate Ranking Decisions**: Ranking components and selection reasons.
 - **Ranked Opportunity Sets**, **Proposal Batches**, **Batch Candidates**, **Risk Budget Decisions**, **Batch Approval Actions**, and **Candidate Allocation Decisions**: Ranked-batch proposal and risk-budget audit views.
 - **Dynamic Universe Summary**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Observation Symbols**, **Paper-Tradable Symbols**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, provider health, and performance audit views.
+- **Dynamic Universe Schedule State**, **Missed Research Cycles**, **Catch-Up Runs**, **Stale Research Guards**, **Dynamic Universe Promotion Blocks**, and **Dynamic Universe Demotion Blocks**: Resilience, missed-run, catch-up, and stale/provider guard reporting.
 - **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
 ## 15. Testing Strategy

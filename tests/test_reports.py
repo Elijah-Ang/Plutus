@@ -48,6 +48,7 @@ def test_report_redaction_removes_embedded_text_but_preserves_numeric_fields():
         "telegram_message": "Buy SPY now",
         "proposal_text": "Generated proposal text",
         "review_text": "GPT narrative",
+        "risks": ["This is a generated review sentence that should not export."],
         "score": 91,
         "suggested_notional": 15.0,
         "nested": {"message_text": "hello telegram", "risk_score": 12.5},
@@ -58,6 +59,7 @@ def test_report_redaction_removes_embedded_text_but_preserves_numeric_fields():
     assert "Buy SPY now" not in redacted
     assert "Generated proposal text" not in redacted
     assert "GPT narrative" not in redacted
+    assert "generated review sentence" not in redacted
     assert '"score":91' in redacted
     assert '"suggested_notional":15.0' in redacted
     assert '"risk_score":12.5' in redacted

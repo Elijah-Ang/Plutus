@@ -69,6 +69,12 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Dynamic Universe Audit", "dynamic_universe_audit"),
     ("Data Provider Health", "data_provider_health"),
     ("Dynamic Universe Performance", "dynamic_universe_performance"),
+    ("Dynamic Universe Schedule State", "dynamic_universe_schedule_state"),
+    ("Missed Research Cycles", "SELECT * FROM dynamic_universe_schedule_state WHERE missed_count > 0 OR catchup_required=1 ORDER BY updated_at DESC"),
+    ("Catch-Up Runs", "SELECT * FROM dynamic_universe_schedule_state WHERE catchup_attempted_at IS NOT NULL OR catchup_completed_at IS NOT NULL ORDER BY updated_at DESC"),
+    ("Stale Research Guards", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_stale_data_guard' ORDER BY created_at DESC"),
+    ("Dynamic Universe Promotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_promotions_blocked_stale_research' ORDER BY created_at DESC"),
+    ("Dynamic Universe Demotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable' ORDER BY created_at DESC"),
 ]
 
 
@@ -97,6 +103,9 @@ TEXT_BLOB_KEYS = {
     "summary",
     "reasoning_notes",
     "main_risk",
+    "risks",
+    "warnings",
+    "messages",
 }
 JSON_LIKE_HEADERS = {
     "payload",
@@ -112,6 +121,20 @@ JSON_LIKE_HEADERS = {
     "single_symbol_exposure_json",
     "cluster_exposure_json",
 }
+
+
+def _looks_like_report_text_blob(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if len(stripped) >= 32 and " " in stripped:
+        return True
+    words = stripped.split()
+    if len(words) >= 4:
+        return True
+    if any(mark in stripped for mark in (". ", "! ", "? ", "\n")):
+        return True
+    return False
 
 
 def redact_report_payload(value: Any) -> Any:
@@ -134,7 +157,13 @@ def redact_report_payload(value: Any) -> Any:
                 redacted[key] = redact_report_payload(item)
         return redacted
     if isinstance(value, list):
-        return [redact_report_payload(item) for item in value]
+        redacted_items: list[Any] = []
+        for item in value:
+            if isinstance(item, str) and _looks_like_report_text_blob(item):
+                redacted_items.append("[REDACTED TEXT]")
+            else:
+                redacted_items.append(redact_report_payload(item))
+        return redacted_items
     return redact(value)
 
 

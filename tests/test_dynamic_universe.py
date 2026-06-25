@@ -14,6 +14,7 @@ from app.dynamic_universe import (
     RESEARCH_CANDIDATE,
     DynamicUniverseEngine,
 )
+from app.power import PowerStatus
 from app.reports import SHEETS
 from app.service import TradingService
 from app.utils import load_config
@@ -75,6 +76,11 @@ def dynamic_config() -> dict[str, Any]:
     cfg["dynamic_universe"]["raw_sources"]["eodhd_screener"] = True
     cfg["dynamic_universe"]["raw_sources"]["eodhd_news"] = True
     return cfg
+
+
+def allow_resilience_environment(monkeypatch, *, internet: bool = True, connected: bool | None = True, battery_pct: float | None = 90.0) -> None:
+    monkeypatch.setattr("app.dynamic_universe.internet_available", lambda: internet)
+    monkeypatch.setattr("app.dynamic_universe.get_power_status", lambda: PowerStatus(connected, "test", "test power", battery_pct))
 
 
 def liquid_bars(close: float = 100.0, volume: float = 2_000_000.0, rows: int = 80) -> list[dict[str, Any]]:
@@ -243,9 +249,14 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Paper-Tradable Symbols" in sheet_names
     assert "Data Provider Health" in sheet_names
     assert "Dynamic Universe Performance" in sheet_names
+    assert "Dynamic Universe Schedule State" in sheet_names
+    assert "Missed Research Cycles" in sheet_names
+    assert "Catch-Up Runs" in sheet_names
+    assert "Stale Research Guards" in sheet_names
 
 
-def test_run_due_respects_paper_only_and_schedule(temp_storage):
+def test_run_due_respects_paper_only_and_schedule(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
     cfg = dynamic_config()
     provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}], bars=liquid_bars())
     engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test")
@@ -257,6 +268,160 @@ def test_run_due_respects_paper_only_and_schedule(temp_storage):
     cfg["mode"] = "live"
     live_engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-live")
     assert live_engine.run_due(force=True) == []
+
+
+def test_missing_provider_key_records_schedule_skip_and_no_promotion(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}], bars=liquid_bars())
+    provider.api_key = None
+    engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test")
+
+    result = engine.run_due(force=True, run_types=["daily_deep_research"])[0]
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "missing_api_key"
+    assert provider.calls == []
+    assert temp_storage.fetch_all("SELECT * FROM universe_symbols WHERE symbol='SMH'") == []
+    state = temp_storage.fetch_all("SELECT * FROM dynamic_universe_schedule_state WHERE schedule_name='daily_deep_research'")[0]
+    assert state["catchup_required"] == 1
+    assert state["last_skip_reason"] == "missing_api_key"
+    health = temp_storage.fetch_all("SELECT * FROM data_provider_health WHERE status='provider_unavailable'")
+    assert health
+
+
+def test_no_internet_records_missed_cycle_and_preserves_universe(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch, internet=False)
+    cfg = dynamic_config()
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("u-existing", "SMH", OBSERVATION, "eodhd_screener", 0, 1, 85.0, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+    )
+    provider = FakeProvider(rows=[{"Code": "QQQ", "Type": "ETF", "Exchange": "US"}], bars=liquid_bars())
+    provider.api_key = "configured"
+
+    result = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_due(force=True, run_types=["intraday_light_refresh"])[0]
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_internet"
+    assert provider.calls == []
+    existing = temp_storage.fetch_all("SELECT tier, data_freshness_status, promotion_allowed FROM universe_symbols WHERE symbol='SMH'")[0]
+    assert existing["tier"] == OBSERVATION
+    assert existing["data_freshness_status"] == "stale"
+    assert existing["promotion_allowed"] == 0
+    state = temp_storage.fetch_all("SELECT missed_count, catchup_required FROM dynamic_universe_schedule_state WHERE schedule_name='intraday_light_refresh'")[0]
+    assert state["missed_count"] == 1
+    assert state["catchup_required"] == 1
+
+
+def test_battery_policy_allows_light_and_blocks_deep(temp_storage, monkeypatch):
+    cfg = dynamic_config()
+    provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}], bars=liquid_bars())
+    provider.api_key = "configured"
+
+    allow_resilience_environment(monkeypatch, connected=False, battery_pct=50)
+    light = DynamicUniverseEngine(cfg, temp_storage, provider, "run-light").run_due(force=True, run_types=["intraday_light_refresh"])[0]
+    assert light["status"] == "completed"
+
+    deep = DynamicUniverseEngine(cfg, temp_storage, provider, "run-deep").run_due(force=True, run_types=["daily_deep_research"])[0]
+    assert deep["status"] == "skipped"
+    assert deep["reason"] == "deep_research_skipped_on_battery"
+
+    allow_resilience_environment(monkeypatch, connected=False, battery_pct=20)
+    low = DynamicUniverseEngine(cfg, temp_storage, provider, "run-low").run_due(force=True, run_types=["intraday_light_refresh"])[0]
+    assert low["status"] == "skipped"
+    assert low["reason"] == "battery_below_research_threshold"
+
+
+def test_catchup_runs_once_and_does_not_replay_intraday_cycles(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch, internet=False)
+    cfg = dynamic_config()
+    provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}], bars=liquid_bars())
+    provider.api_key = "configured"
+    engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-offline")
+    engine.run_due(force=True, run_types=["intraday_light_refresh"])
+    engine.run_due(force=True, run_types=["intraday_light_refresh"])
+
+    state = temp_storage.fetch_all("SELECT missed_count, catchup_required FROM dynamic_universe_schedule_state WHERE schedule_name='intraday_light_refresh'")[0]
+    assert state["missed_count"] == 2
+    assert state["catchup_required"] == 1
+
+    allow_resilience_environment(monkeypatch, internet=True)
+    recovery_provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}], bars=liquid_bars())
+    recovery_provider.api_key = "configured"
+    results = DynamicUniverseEngine(cfg, temp_storage, recovery_provider, "run-recovery").run_due(force=False, run_types=["intraday_light_refresh"])
+
+    assert len(results) == 1
+    assert results[0]["status"] == "completed"
+    state = temp_storage.fetch_all("SELECT missed_count, catchup_required, catchup_status FROM dynamic_universe_schedule_state WHERE schedule_name='intraday_light_refresh'")[0]
+    assert state["missed_count"] == 0
+    assert state["catchup_required"] == 0
+    assert state["catchup_status"] == "completed"
+
+
+def test_stale_dynamic_paper_tradable_blocked_from_buy_scan_but_static_kept(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    cfg["dynamic_universe_resilience"]["stale_data_policy"]["max_age_minutes_for_trade_eligibility"] = 30
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    old = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    fresh = datetime.now(UTC).isoformat()
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn-old", "SMH", PAPER_TRADABLE, "eodhd_screener", 1, 0, 95.0, old, old, old),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-static", "SPY", PAPER_TRADABLE, "existing_static_watchlist", 1, 0, 90.0, old, old, old),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn-fresh", "JPM", PAPER_TRADABLE, "eodhd_screener", 1, 0, 80.0, fresh, fresh, fresh),
+    )
+
+    active, _ = service._dynamic_universe_scan_symbols()
+
+    assert "SMH" not in active
+    assert "SPY" in active
+    assert "JPM" in active
+
+
+def test_provider_unavailable_blocks_demotions_from_missing_data(temp_storage):
+    cfg = dynamic_config()
+    provider = FakeProvider(fail=True)
+    provider.api_key = "configured"
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("u-weak", "WEAK", OBSERVATION, "eodhd_screener", 0, 1, 20.0, now.isoformat(), now.isoformat()),
+    )
+    for idx in range(5):
+        temp_storage.execute(
+            "INSERT INTO symbol_research_scores(id,run_id,symbol,provider,score,created_at) VALUES(?,?,?,?,?,?)",
+            (f"weak-score-{idx}", "run-test", "WEAK", "fake", 20.0, (now + timedelta(minutes=idx)).isoformat()),
+        )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("intraday_light_refresh")
+
+    row = temp_storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol='WEAK'")[0]
+    assert row["tier"] == OBSERVATION
+    audit = temp_storage.fetch_all("SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable'")
+    assert audit
+
+
+def test_dynamic_universe_digest_mentions_schedule_state(temp_storage, monkeypatch):
+    cfg = dynamic_config()
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO dynamic_universe_schedule_state(id,schedule_name,schedule_type,last_skipped_at,last_skip_reason,missed_count,catchup_required,provider_health_status,internet_status,power_status,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("state-1", "intraday_light_refresh", "intraday_light", now.isoformat(), "no_internet", 2, 1, "provider_unavailable", "offline", "ac", now.isoformat(), now.isoformat()),
+    )
+    text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
+
+    assert text is not None
+    assert "Research skipped: intraday_light_refresh" in text
+    assert "Missed count: 2" in text
 
 
 def test_demote_repeated_weak_scores_preserves_history(temp_storage):
