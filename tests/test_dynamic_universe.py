@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 from urllib.error import HTTPError
 from typing import Any
 
@@ -89,6 +90,16 @@ class PartialProvider(FakeProvider):
         if self.news_status != "ok":
             return ProviderResponse("fake", "news", self.news_status, None, self.news_status)
         return ProviderResponse("fake", "news", "ok", [{"title": "filtered catalyst"}])
+
+
+class HistoricalIntradayProvider(FakeProvider):
+    def get_intraday_bars(self, symbol: str, interval: str = "5m", limit: int = 100) -> ProviderResponse:
+        self.calls.append("intraday_bars")
+        bars = [
+            {"close": 100.0 + idx * 0.2, "volume": 500000.0}
+            for idx in range(max(2, min(limit, 20)))
+        ]
+        return ProviderResponse("fake", "intraday_bars", "ok", bars)
 
 
 def dynamic_config() -> dict[str, Any]:
@@ -673,6 +684,26 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Observation Promotion Source" in sheet_names
     assert "Candidate Promotion Trace" in sheet_names
     assert "Digest Status Semantics" in sheet_names
+    assert "Tier Summary" in sheet_names
+    assert "Static Paper-Tradable Symbols" in sheet_names
+    assert "Dynamic Paper-Tradable Symbols" in sheet_names
+    assert "XL Sector Observation Audit" in sheet_names
+    assert "Observation Maturity Review" in sheet_names
+    assert "Promotion Review Status" in sheet_names
+    assert "Demotion Review Status" in sheet_names
+    assert "Observation Keep Reasons" in sheet_names
+    assert "Paper-Tradable Demotion Review" in sheet_names
+    assert "Stage Decision History" in sheet_names
+    assert "Promotion Block Reasons" in sheet_names
+    assert "Demotion Risk Reasons" in sheet_names
+    assert "Tradability Status" in sheet_names
+    assert "Proposal Eligibility Status" in sheet_names
+    assert "Digest Tier Snapshot" in sheet_names
+    assert "Provider Health Deduped" in sheet_names
+    assert "Universe Events Timeline" in sheet_names
+    assert "EODHD Historical Metrics" in sheet_names
+    assert "Relative Strength Metrics" in sheet_names
+    assert "Cluster Exposure Blockers" in sheet_names
     assert "Missed Research Cycles" in sheet_names
     assert "Catch-Up Runs" in sheet_names
     assert "Stale Research Guards" in sheet_names
@@ -897,15 +928,85 @@ def test_digest_shows_promotions_with_subtask_skip_not_full_research_skip(temp_s
         "INSERT INTO dynamic_universe_schedule_state(id,schedule_name,schedule_type,last_skipped_at,last_skip_reason,missed_count,catchup_required,provider_health_status,internet_status,power_status,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         ("state-1", "post_market_review", "post_market", now.isoformat(), "rate_limited", 1, 1, "rate_limited", "online", "ac", now.isoformat(), now.isoformat()),
     )
+    for idx in range(3):
+        temp_storage.execute(
+            "INSERT INTO data_provider_health(id,run_id,provider,status,checked_at,rate_limit_remaining,error,detail) VALUES(?,?,?,?,?,?,?,?)",
+            (f"health-{idx}", "run-test", "eodhd", "rate_limited", (now + timedelta(seconds=idx)).isoformat(), None, "rate_limited", "{}"),
+        )
 
     text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
 
     assert text is not None
     assert "Promoted to observation: BIIB." in text
     assert "Post market review skipped: provider rate-limited; existing research state was still used." in text
+    assert text.count("eodhd rate_limited") == 1
     assert "Dynamic Universe research skipped" not in text
     assert "Observation promotions used deterministic candidate state" in text
     assert "No dynamic proposals/orders created." in text
+
+
+def test_xl_observation_maturity_review_records_explicit_keep_reason_without_trades(temp_storage):
+    cfg = dynamic_config()
+    cfg["portfolio_optimizer"]["clusters"]["us_growth_tech"] = ["XLK", "QQQ"]
+    cfg["dynamic_universe"]["observation_maturity_review"]["min_observation_cycles"] = 3
+    cfg["dynamic_universe"]["observation_maturity_review"]["min_market_open_refreshes"] = 2
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO positions(run_id,symbol,qty,market_value,unrealized_pl,payload,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("run-pos", "QQQ", 1, 100.0, 0.0, "{}", now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,source,universe_lane,alpaca_compatible,executable,observation_only,score,data_confidence,provider_health_status,data_freshness_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-xlk", "XLK", "US", "etf", "us_growth_tech", OBSERVATION, "existing_static_observation", LANE_ALPACA_US, 1, 0, 1, 92.0, "high", "ok", "fresh", (now - timedelta(days=2)).isoformat(), now.isoformat()),
+    )
+    for idx in range(3):
+        temp_storage.execute(
+            "INSERT INTO symbol_research_scores(id,run_id,symbol,provider,score,liquidity_score,trend_score,relative_strength_score,volatility_quality_score,data_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (f"xlk-score-{idx}", "run-test", "XLK", "fake", 92.0, 20.0, 20.0, 10.0, 8.0, "high", (now - timedelta(minutes=idx)).isoformat()),
+        )
+    for idx in range(2):
+        temp_storage.execute(
+            "INSERT INTO market_memory(run_id,market_profile,symbol,price,signal,score,classification,reason,proposal_allowed,gpt_called,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (f"mm-{idx}", "us_equities", "XLK", 100.0 + idx, "HOLD", 92.0, "Observation only", "review", 0, 0, (now - timedelta(minutes=idx)).isoformat()),
+        )
+
+    reviewed = DynamicUniverseEngine(cfg, temp_storage, HistoricalIntradayProvider(bars=liquid_bars()), "run-review").review_observation_maturity(symbols=["XLK"], fetch_provider=True)
+
+    assert reviewed == 1
+    review = temp_storage.fetch_all("SELECT * FROM dynamic_universe_stage_reviews WHERE symbol='XLK'")[0]
+    assert review["decision"] == "keep_observation"
+    assert "XL-sector ETF remains observation-only" in review["reason"]
+    assert "static observation profile is not dynamic promotion evidence" in review["reason"]
+    assert "cluster overlap with held symbols QQQ" in review["reason"]
+    assert review["eod_available"] == 1
+    assert review["intraday_available"] == 1
+    assert review["tradable_status"] == "not_tradable"
+    assert review["proposal_allowed_status"] == "no"
+    assert "no proposals or orders created" in json.loads(review["payload"])["safety"]
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert temp_storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_provider_unavailable_pauses_observation_maturity_demotion_risk(temp_storage):
+    cfg = dynamic_config()
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,source,universe_lane,alpaca_compatible,executable,observation_only,score,data_confidence,provider_health_status,data_freshness_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-xle", "XLE", "US", "etf", "energy", OBSERVATION, "existing_static_observation", LANE_ALPACA_US, 1, 0, 1, 35.0, "high", "ok", "fresh", (now - timedelta(days=2)).isoformat(), now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO symbol_research_scores(id,run_id,symbol,provider,score,trend_score,data_confidence,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("xle-score", "run-test", "XLE", "fake", 35.0, 1.0, "high", now.isoformat()),
+    )
+
+    reviewed = DynamicUniverseEngine(cfg, temp_storage, FakeProvider(fail=True), "run-review").review_observation_maturity(symbols=["XLE"], fetch_provider=True)
+
+    assert reviewed == 1
+    review = temp_storage.fetch_all("SELECT * FROM dynamic_universe_stage_reviews WHERE symbol='XLE'")[0]
+    assert review["decision"] == "keep_observation"
+    assert review["demotion_guard_active"] == 1
+    assert "provider guard active" in review["reason"]
+    assert "score below demotion threshold" in review["demotion_risk_reasons"]
 
 
 def test_demote_repeated_weak_scores_preserves_history(temp_storage):

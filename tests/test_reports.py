@@ -21,9 +21,11 @@ def test_report_redacts_telegram_text_and_sender_ids_inside_json_detail():
     assert "sleep" not in redacted
     assert "awake" not in redacted
     assert "authorized_user_123" not in redacted
-    assert '"raw_command":"[REDACTED TELEGRAM TEXT]"' in redacted
-    assert '"sender_id":"[REDACTED ID]"' in redacted
-    assert '"updated_by":"[REDACTED ID]"' in redacted
+    assert "raw_command" not in redacted
+    assert "sender_id" not in redacted
+    assert "[REDACTED TELEGRAM TEXT FIELD" in redacted
+    assert "[REDACTED ID FIELD" in redacted
+    assert "updated_by" not in redacted
 
 
 def test_export_redacts_control_state_last_command_value(tmp_path):

@@ -477,26 +477,65 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         f"US market: {digest_data['market_open_status']}",
         f"Window: {w_start}–{w_end} SGT",
         f"Mode: {mode_str}\n",
-        "Top watched:"
     ]
 
-    for idx, sym_data in enumerate(digest_data["symbols_list"]):
-        rank = idx + 1
-        score_val = sym_data["trade_score"]
-        score_str = f"{score_val:.1f}" if isinstance(score_val, (int, float)) else "N/A"
-        class_str = sym_data["trade_classification"]
+    tier_snapshot = digest_data.get("tier_snapshot") or {}
+    tier_snapshot_has_items = any(tier_snapshot.get(key) for key in tier_snapshot)
 
-        change_30m = sym_data["price_change_30m"]
-        change_30m_str = f"{change_30m:+.2f}%" if isinstance(change_30m, (int, float)) else "0.00%"
+    def fmt_score(value: Any) -> str:
+        return f"{value:.1f}" if isinstance(value, (int, float)) else "N/A"
 
-        session_change = sym_data["session_change"]
-        session_change_str = f"{session_change:+.2f}%" if isinstance(session_change, (int, float)) else "0.00%"
+    def line_for_symbol(item: dict[str, Any], label: str) -> str:
+        held = " | Held" if item.get("held") else ""
+        tradable = "Tradable" if item.get("tradable") else "Not tradable"
+        proposal = item.get("proposal_allowed") or "blocked"
+        reason = item.get("proposal_block_reason") or "not eligible"
+        proposal_label = "allowed" if proposal == "allowed" else "blocked"
+        score = item.get("score")
+        score_part = f" | Score {fmt_score(score)}" if score is not None else ""
+        return f"{item['symbol']} — {label} | {tradable}{held}{score_part} | Proposal {proposal_label}: {reason}"
 
+    if tier_snapshot_has_items:
+        actions = digest_data.get("actions", {})
         msg_parts.append(
-            f"{rank}. {sym_data['symbol']} — Trade score {score_str}, {class_str}\n"
-            f"   30-min: {change_30m_str} | Session: {session_change_str}\n"
-            f"   Status: {sym_data['status']}"
+            f"Actions: Proposals {actions.get('proposals', 0)} | Orders {actions.get('orders', 0)} | "
+            f"Fills {actions.get('fills', 0)} | GPT {actions.get('gpt_calls', 0)} | Expired {actions.get('expired', 0)}\n"
         )
+        section_specs = [
+            ("Paper-tradable watch", "static_paper_tradable", "static paper-tradable", 6),
+            ("Dynamic paper-tradable", "dynamic_paper_tradable", "dynamic paper-tradable", 4),
+            ("Observation watch", "observation", "observation only", 6),
+            ("Research candidates", "research_candidate", "research candidate only", 6),
+        ]
+        for title, key, label, limit in section_specs:
+            items = tier_snapshot.get(key) or []
+            msg_parts.append(f"{title}:")
+            if not items:
+                msg_parts.append("None")
+                continue
+            for item in items[:limit]:
+                msg_parts.append(line_for_symbol(item, label))
+            if len(items) > limit:
+                msg_parts.append(f"{title} shown: {limit} of {len(items)}")
+    else:
+        msg_parts.append("Top watched:")
+        for idx, sym_data in enumerate(digest_data["symbols_list"]):
+            rank = idx + 1
+            score_val = sym_data["trade_score"]
+            score_str = f"{score_val:.1f}" if isinstance(score_val, (int, float)) else "N/A"
+            class_str = sym_data["trade_classification"]
+
+            change_30m = sym_data["price_change_30m"]
+            change_30m_str = f"{change_30m:+.2f}%" if isinstance(change_30m, (int, float)) else "0.00%"
+
+            session_change = sym_data["session_change"]
+            session_change_str = f"{session_change:+.2f}%" if isinstance(session_change, (int, float)) else "0.00%"
+
+            msg_parts.append(
+                f"{rank}. {sym_data['symbol']} — Trade score {score_str}, {class_str}\n"
+                f"   30-min: {change_30m_str} | Session: {session_change_str}\n"
+                f"   Status: {sym_data['status']}"
+            )
 
     weakest_score = digest_data.get("weakest_score")
     weakest_score_str = f"{weakest_score:.1f}" if isinstance(weakest_score, (int, float)) else "N/A"
@@ -505,10 +544,11 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
     )
 
     actions = digest_data.get("actions", {})
-    msg_parts.append(
-        f"Past 30 min actions:\n"
-        f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | Fills: {actions.get('fills', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
-    )
+    if not tier_snapshot_has_items:
+        msg_parts.append(
+            f"Past 30 min actions:\n"
+            f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | Fills: {actions.get('fills', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
+        )
 
     exit_first_blocker = digest_data.get("exit_first_blocker")
     if exit_first_blocker:

@@ -194,6 +194,7 @@ class DynamicUniverseEngine:
                 self._demote_stale_symbols(demoted)
             elif self._provider_failed:
                 self._record_audit("dynamic_universe_demotions_blocked_provider_unavailable", None, {"run_type": run_type})
+            self.review_observation_maturity(run_type=run_type, fetch_provider=False)
             status = "completed"
             self._provider_health_status = self._provider_summary_status()
             self._record_near_miss_symbols()
@@ -325,6 +326,257 @@ class DynamicUniverseEngine:
             count += 1
         self._record_llm_explanation_usage([])
         return count
+
+    def review_observation_maturity(self, symbols: list[str] | None = None, run_type: str = "observation_maturity_review", fetch_provider: bool = False) -> int:
+        review_cfg = self.cfg.get("observation_maturity_review", {})
+        if not review_cfg.get("enabled", True):
+            return 0
+        params: tuple[Any, ...]
+        if symbols:
+            placeholders = ",".join("?" for _ in symbols)
+            where = f"WHERE upper(symbol) IN ({placeholders})"
+            params = tuple(s.upper() for s in symbols)
+        else:
+            where = "WHERE tier IN (?, ?)"
+            params = (OBSERVATION, PAPER_TRADABLE)
+        rows = self.storage.fetch_all(
+            f"""
+            SELECT *
+            FROM universe_symbols
+            {where}
+            ORDER BY
+                CASE WHEN symbol LIKE 'XL%' THEN 0 ELSE 1 END,
+                tier,
+                score DESC,
+                symbol
+            LIMIT ?
+            """,
+            (*params, int(review_cfg.get("max_symbols_per_review", self.cfg.get("max_observation_symbols", 30)))),
+        )
+        reviewed = 0
+        for row in rows:
+            self._record_stage_review(row, run_type, fetch_provider=fetch_provider)
+            reviewed += 1
+        if reviewed:
+            self._record_audit("dynamic_universe_maturity_review_completed", None, {"run_type": run_type, "reviewed": reviewed, "fetch_provider": fetch_provider})
+        return reviewed
+
+    def _record_stage_review(self, row: dict[str, Any], run_type: str, fetch_provider: bool = False) -> None:
+        symbol = str(row.get("symbol") or "").upper()
+        now = iso_now()
+        review_cfg = self.cfg.get("observation_maturity_review", {})
+        promo = self.cfg.get("promotion", {})
+        interval = int(review_cfg.get("review_interval_minutes", 30))
+        next_review = (datetime.now(UTC) + timedelta(minutes=interval)).isoformat()
+        score_rows = self.storage.fetch_all(
+            "SELECT * FROM symbol_research_scores WHERE symbol=? ORDER BY created_at DESC LIMIT 20",
+            (symbol,),
+        )
+        latest_score = score_rows[0] if score_rows else {}
+        score = float(latest_score.get("score") if latest_score.get("score") is not None else row.get("score") or 0.0)
+        confidence = str(row.get("data_confidence") or latest_score.get("data_confidence") or "unknown")
+        cycles = len(score_rows)
+        sessions = len({str(r.get("created_at") or "")[:10] for r in score_rows if r.get("created_at")})
+        market_open_refreshes = int(self.storage.fetch_all(
+            "SELECT COUNT(DISTINCT run_id) c FROM market_memory WHERE symbol=?",
+            (symbol,),
+        )[0]["c"])
+        shadow = self._has_shadow_tracking(symbol)
+        position_symbols = self._latest_position_symbols()
+        cluster = row.get("cluster") or self._infer_cluster(symbol, row.get("asset_class"), row)
+        cluster_holdings = self._cluster_holding_symbols(cluster, position_symbols)
+        source = str(row.get("source") or "")
+        is_static_observation = source == "existing_static_observation"
+        is_global = row.get("universe_lane") != LANE_ALPACA_US
+        metrics = self._stage_review_metrics(row, fetch_provider)
+        demotion_guard = bool(
+            self._provider_failed
+            or row.get("provider_health_status") in {"provider_unavailable", "rate_limited"}
+            or metrics.get("provider_guard_active")
+        )
+        eod_available = bool(metrics.get("eod_available"))
+        intraday_available = bool(metrics.get("intraday_available"))
+        liquidity_ok = float(latest_score.get("liquidity_score") or 0.0) >= 12.0 or row.get("source") == "existing_static_observation"
+        trend_ok = float(latest_score.get("trend_score") or 0.0) >= 14.0
+        rel_ok = float(latest_score.get("relative_strength_score") or 0.0) >= 8.5
+        volatility_ok = float(latest_score.get("volatility_quality_score") or 0.0) >= 5.0
+        requirements = {
+            "alpaca_compatible_us_lane": not is_global,
+            "not_static_observation_placeholder": not is_static_observation,
+            "score_at_or_above_paper_tradable_threshold": score >= self._paper_tradable_threshold(),
+            "observation_cycles": cycles >= int(review_cfg.get("min_observation_cycles", promo.get("min_observation_cycles", 3))),
+            "market_open_refreshes": market_open_refreshes >= int(review_cfg.get("min_market_open_refreshes", 2)),
+            "shadow_tracking_recorded": shadow,
+            "fresh_eod_available": eod_available or not review_cfg.get("require_fresh_eod", True),
+            "fresh_intraday_available": intraday_available or not review_cfg.get("require_fresh_intraday_for_promotion", True),
+            "data_confidence_medium_or_high": confidence in {"medium", "high"},
+            "liquidity_ok": liquidity_ok,
+            "trend_ok": trend_ok,
+            "relative_strength_ok": rel_ok,
+            "volatility_ok": volatility_ok,
+            "cluster_clearance": not cluster_holdings or not review_cfg.get("require_cluster_clearance", True),
+            "provider_guard_clear": not demotion_guard,
+        }
+        missing = [key for key, passed in requirements.items() if not passed]
+        met = [key for key, passed in requirements.items() if passed]
+        demotion_risks: list[str] = []
+        if score < float(self.cfg.get("demotion", {}).get("demote_if_score_below", 45)):
+            demotion_risks.append("score below demotion threshold")
+        if not eod_available and row.get("data_freshness_status") == "stale":
+            demotion_risks.append("stale price data")
+        if latest_score and float(latest_score.get("trend_score") or 0.0) < 5.0:
+            demotion_risks.append("weak trend score")
+        if is_global:
+            demotion_risks.append("global research-only lane")
+        if row.get("tier") == PAPER_TRADABLE and demotion_guard:
+            demotion_risks.append("demotion paused by provider guard")
+        if row.get("tier") == PAPER_TRADABLE:
+            decision = "keep_paper_tradable"
+            reason = "paper-tradable eligibility retained; proposal still requires setup, RiskEngine, Telegram approval, and final validation"
+            tradable = "tradable"
+            proposal_allowed = "blocked_pending_setup_and_risk"
+            proposal_block = "proposal requires current ENTRY setup, RiskEngine pass, cluster/exposure clearance, Telegram approval, and final validation"
+        elif not missing:
+            decision = "eligible_for_dynamic_paper_tradable_review"
+            reason = "all maturity review requirements passed; deterministic promotion loop may record paper-tradable promotion"
+            tradable = "not_tradable_until_promoted"
+            proposal_allowed = "no"
+            proposal_block = "not paper-tradable until recorded deterministic promotion"
+        elif demotion_risks and not demotion_guard:
+            decision = "keep_observation_with_demotion_risk"
+            reason = "; ".join(demotion_risks)
+            tradable = "not_tradable"
+            proposal_allowed = "no"
+            proposal_block = "observation-only; demotion risk under review"
+        else:
+            decision = "keep_observation"
+            reason = self._review_reason_from_missing(missing, cluster_holdings)
+            tradable = "not_tradable"
+            proposal_allowed = "no"
+            proposal_block = "observation-only; needs paper-tradable promotion before any proposal"
+        if symbol in set(str(s).upper() for s in review_cfg.get("xl_sector_symbols", [])) and decision.startswith("keep_observation"):
+            reason = f"XL-sector ETF remains observation-only: {reason}"
+        payload = {
+            "requirements": requirements,
+            "position_symbols": position_symbols,
+            "score_history": [r.get("score") for r in score_rows[:10]],
+            "source": source,
+            "run_type": run_type,
+            "provider_fetch_attempted": fetch_provider,
+            "metrics": metrics,
+            "safety": "review-only; no proposals or orders created",
+        }
+        self.storage.execute(
+            """
+            INSERT INTO dynamic_universe_stage_reviews(
+                id,run_id,symbol,current_tier,review_type,decision,reason,score,data_confidence,
+                observation_since,observation_cycles,market_open_refreshes,latest_price,price_freshness,
+                eod_available,intraday_available,trend_summary,intraday_summary,liquidity_summary,
+                volatility_summary,relative_strength_spy,relative_strength_qqq,cluster,cluster_exposure_blocker,
+                promotion_requirements_met,promotion_requirements_missing,demotion_risk_reasons,demotion_guard_active,
+                current_stage_reason,next_stage_blocker,tradable_status,proposal_allowed_status,proposal_block_reason,
+                last_promotion_review_at,last_demotion_review_at,next_promotion_review_at,next_demotion_review_at,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid.uuid4()), self.run_id, symbol, row.get("tier"), run_type, decision, reason, score, confidence,
+                row.get("created_at"), cycles, market_open_refreshes, metrics.get("latest_price"), metrics.get("price_freshness"),
+                1 if eod_available else 0, 1 if intraday_available else 0, metrics.get("trend_summary"), metrics.get("intraday_summary"),
+                metrics.get("liquidity_summary"), metrics.get("volatility_summary"), metrics.get("relative_strength_spy"),
+                metrics.get("relative_strength_qqq"), cluster, ", ".join(cluster_holdings),
+                json_dumps(met), json_dumps(missing), json_dumps(demotion_risks), 1 if demotion_guard else 0,
+                f"{row.get('tier')} from {source or 'unknown source'}", reason, tradable, proposal_allowed, proposal_block,
+                now, now, next_review, next_review, now, json_dumps(payload),
+            ),
+        )
+
+    def _review_reason_from_missing(self, missing: list[str], cluster_holdings: list[str]) -> str:
+        if not missing:
+            return "requirements satisfied"
+        ordered_missing = list(missing)
+        if "provider_guard_clear" in ordered_missing:
+            ordered_missing.remove("provider_guard_clear")
+            ordered_missing.insert(0, "provider_guard_clear")
+        labels = {
+            "not_static_observation_placeholder": "static observation profile is not dynamic promotion evidence",
+            "score_at_or_above_paper_tradable_threshold": "score below paper-tradable threshold",
+            "observation_cycles": "not enough observation cycles",
+            "market_open_refreshes": "not enough market-open observation refreshes",
+            "shadow_tracking_recorded": "no shadow-tracking record yet",
+            "fresh_eod_available": "fresh EOD evidence unavailable",
+            "fresh_intraday_available": "fresh intraday evidence unavailable",
+            "cluster_clearance": f"cluster overlap with held symbols {', '.join(cluster_holdings)}" if cluster_holdings else "cluster clearance missing",
+            "provider_guard_clear": "provider guard active",
+            "trend_ok": "trend confirmation missing",
+            "relative_strength_ok": "relative strength confirmation missing",
+            "liquidity_ok": "liquidity confirmation missing",
+            "volatility_ok": "volatility quality not acceptable",
+        }
+        return "; ".join(labels.get(key, key) for key in ordered_missing[:6])
+
+    def _stage_review_metrics(self, row: dict[str, Any], fetch_provider: bool) -> dict[str, Any]:
+        symbol = str(row.get("symbol") or "").upper()
+        bars: list[dict[str, Any]] = []
+        intraday_available = False
+        eod_status = "not_requested"
+        intraday_status = "not_requested"
+        if fetch_provider and self.provider:
+            provider_symbol = row.get("provider_symbol") or (f"{symbol}.US" if "." not in symbol else symbol)
+            eod = self.provider.get_historical_bars(provider_symbol, limit=180)
+            eod_status = eod.status
+            if eod.status == "ok" and isinstance(eod.data, list):
+                bars = eod.data
+            intraday = self.provider.get_intraday_bars(provider_symbol, limit=60)
+            intraday_status = intraday.status
+            intraday_available = intraday.status == "ok" and isinstance(intraday.data, list) and len(intraday.data) >= 2
+        local = self._local_metric_summary(bars)
+        latest_price = local.get("latest_price") if bars else row.get("score")
+        trend_summary = "EOD trend unavailable"
+        if bars:
+            trend_summary = f"trend score {self._trend_score(bars):.1f}; MA20={local.get('ma20')}; MA50={local.get('ma50')}; MA200={local.get('ma200')}"
+        intraday_summary = "intraday unavailable"
+        if intraday_available:
+            intraday_summary = "intraday data available for current/recent session"
+        dollar_volume = local.get("dollar_volume")
+        liquidity_summary = f"dollar volume {dollar_volume:.0f}" if isinstance(dollar_volume, (int, float)) else "liquidity from latest stored score"
+        volatility = local.get("volatility")
+        atr = local.get("atr")
+        volatility_summary = f"volatility {volatility:.2%}; ATR {atr:.2f}" if isinstance(volatility, (int, float)) and isinstance(atr, (int, float)) else "volatility from latest stored score"
+        rel = local.get("relative_strength_20d")
+        rel_summary = f"20d return proxy {rel:.2%}" if isinstance(rel, (int, float)) else "relative strength from latest stored score"
+        return {
+            "latest_price": latest_price,
+            "price_freshness": "fresh_eod" if bars else row.get("data_freshness_status") or "stored",
+            "eod_available": bool(bars),
+            "intraday_available": intraday_available,
+            "eod_status": eod_status,
+            "intraday_status": intraday_status,
+            "provider_guard_active": eod_status in {"provider_unavailable", "rate_limited", "plan_limited"} or intraday_status in {"provider_unavailable", "rate_limited", "plan_limited"},
+            "trend_summary": trend_summary,
+            "intraday_summary": intraday_summary,
+            "liquidity_summary": liquidity_summary,
+            "volatility_summary": volatility_summary,
+            "relative_strength_spy": rel_summary,
+            "relative_strength_qqq": rel_summary if symbol.startswith("XL") else "not applicable",
+        }
+
+    def _latest_position_symbols(self) -> list[str]:
+        rows = self.storage.fetch_all(
+            """
+            SELECT symbol
+            FROM positions
+            WHERE created_at=(SELECT MAX(created_at) FROM positions)
+            ORDER BY symbol
+            """
+        )
+        return [str(r["symbol"]).upper() for r in rows if r.get("symbol")]
+
+    def _cluster_holding_symbols(self, cluster: str | None, position_symbols: list[str]) -> list[str]:
+        if not cluster:
+            return []
+        clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})
+        cluster_symbols = {str(s).upper() for s in clusters.get(cluster, [])}
+        return sorted(symbol for symbol in position_symbols if symbol in cluster_symbols)
 
     def _current_endpoint_coverage(self) -> dict[str, bool]:
         rows = self.storage.fetch_all("SELECT endpoint_name, available FROM data_provider_capabilities WHERE provider=?", (self.cfg.get("provider", "eodhd"),))

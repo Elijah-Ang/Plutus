@@ -73,6 +73,28 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Block Reason Chart Data", "SELECT main_blockers AS block_reason, COUNT(*) AS candidates FROM research_candidate_briefs GROUP BY main_blockers ORDER BY candidates DESC"),
     ("Observation Symbols", "SELECT * FROM universe_symbols WHERE tier='observation' ORDER BY score DESC, symbol"),
     ("Paper-Tradable Symbols", "SELECT * FROM universe_symbols WHERE tier='paper_tradable' ORDER BY score DESC, symbol"),
+    ("Tier Summary", "SELECT tier, CASE WHEN tier='paper_tradable' THEN 'yes' ELSE 'no' END AS tradable, COUNT(*) AS symbols, SUM(CASE WHEN executable=1 THEN 1 ELSE 0 END) AS executable_symbols, SUM(CASE WHEN observation_only=1 THEN 1 ELSE 0 END) AS observation_only_symbols, AVG(score) AS avg_score, MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY tier ORDER BY CASE tier WHEN 'paper_tradable' THEN 1 WHEN 'observation' THEN 2 WHEN 'research_candidate' THEN 3 WHEN 'global_research_only' THEN 4 ELSE 5 END"),
+    ("Static Paper-Tradable Symbols", "SELECT symbol,tier,'yes' AS tradable,'static core' AS source_type,source,score,data_confidence,provider_health_status,last_successful_research_at,updated_at,'proposal requires setup, RiskEngine, Telegram approval, and final validation' AS proposal_status FROM universe_symbols WHERE tier='paper_tradable' AND source='existing_static_watchlist' ORDER BY symbol"),
+    ("Dynamic Paper-Tradable Symbols", "SELECT symbol,tier,'yes' AS tradable,'dynamic promotion' AS source_type,source,score,data_confidence,last_promoted_at,provider_health_status,last_successful_research_at,updated_at,'proposal requires setup, RiskEngine, Telegram approval, and final validation' AS proposal_status FROM universe_symbols WHERE tier='paper_tradable' AND COALESCE(source,'')!='existing_static_watchlist' ORDER BY score DESC, symbol"),
+    ("XL Sector Observation Audit", "SELECT r.symbol,r.current_tier,r.decision,r.reason,r.score,r.data_confidence,r.observation_since,r.observation_cycles,r.market_open_refreshes,r.eod_available,r.intraday_available,r.trend_summary,r.intraday_summary,r.liquidity_summary,r.volatility_summary,r.relative_strength_spy,r.relative_strength_qqq,r.cluster,r.cluster_exposure_blocker,r.promotion_requirements_met,r.promotion_requirements_missing,r.demotion_risk_reasons,r.tradable_status,r.proposal_allowed_status,r.proposal_block_reason,r.next_promotion_review_at,r.next_demotion_review_at,r.created_at FROM dynamic_universe_stage_reviews r INNER JOIN (SELECT symbol, MAX(created_at) AS created_at FROM dynamic_universe_stage_reviews WHERE symbol LIKE 'XL%' GROUP BY symbol) latest ON latest.symbol=r.symbol AND latest.created_at=r.created_at ORDER BY r.symbol"),
+    ("Observation Maturity Review", "SELECT * FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Promotion Review Status", "SELECT symbol,current_tier,decision,reason,promotion_requirements_met,promotion_requirements_missing,last_promotion_review_at,next_promotion_review_at,tradable_status,proposal_allowed_status,proposal_block_reason,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Demotion Review Status", "SELECT symbol,current_tier,decision,reason,demotion_risk_reasons,demotion_guard_active,last_demotion_review_at,next_demotion_review_at,tradable_status,proposal_allowed_status,proposal_block_reason,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Observation Promotion Decisions", "SELECT symbol,from_tier,to_tier,score,reason,payload,created_at FROM symbol_promotion_decisions WHERE to_tier='observation' ORDER BY created_at DESC"),
+    ("Observation Keep Reasons", "SELECT symbol,current_tier,decision,reason,next_stage_blocker,promotion_requirements_missing,created_at FROM dynamic_universe_stage_reviews WHERE decision LIKE 'keep_observation%' ORDER BY created_at DESC, symbol"),
+    ("Observation Demotion Decisions", "SELECT symbol,current_tier,decision,reason,demotion_risk_reasons,created_at FROM dynamic_universe_stage_reviews WHERE decision LIKE '%demotion%' OR demotion_risk_reasons NOT IN ('[]','') ORDER BY created_at DESC, symbol"),
+    ("Paper-Tradable Demotion Review", "SELECT symbol,current_tier,decision,reason,demotion_risk_reasons,demotion_guard_active,tradable_status,proposal_allowed_status,proposal_block_reason,created_at FROM dynamic_universe_stage_reviews WHERE current_tier='paper_tradable' ORDER BY created_at DESC, symbol"),
+    ("Stage Decision History", "SELECT symbol,current_tier,review_type,decision,reason,score,data_confidence,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Promotion Block Reasons", "SELECT symbol,current_tier,promotion_requirements_missing,next_stage_blocker,reason,created_at FROM dynamic_universe_stage_reviews WHERE promotion_requirements_missing NOT IN ('[]','') ORDER BY created_at DESC, symbol"),
+    ("Demotion Risk Reasons", "SELECT symbol,current_tier,demotion_risk_reasons,demotion_guard_active,reason,created_at FROM dynamic_universe_stage_reviews WHERE demotion_risk_reasons NOT IN ('[]','') OR demotion_guard_active=1 ORDER BY created_at DESC, symbol"),
+    ("Tradability Status", "SELECT symbol,current_tier,tradable_status,proposal_allowed_status,proposal_block_reason,decision,reason,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Proposal Eligibility Status", "SELECT symbol,current_tier,proposal_allowed_status,proposal_block_reason,tradable_status,decision,reason,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Digest Tier Snapshot", "SELECT symbol,tier,CASE WHEN tier='paper_tradable' THEN 'yes' ELSE 'no' END AS tradable,CASE WHEN tier='paper_tradable' THEN 'blocked until setup/risk/approval/final validation pass' WHEN tier='observation' THEN 'no: needs paper-tradable promotion' WHEN tier='research_candidate' THEN 'no: needs observation promotion first' ELSE 'no' END AS proposal_status,source,universe_lane,score,data_confidence,provider_health_status,updated_at FROM universe_symbols WHERE tier IN ('paper_tradable','observation','research_candidate') ORDER BY CASE tier WHEN 'paper_tradable' THEN 1 WHEN 'observation' THEN 2 ELSE 3 END, score DESC, symbol"),
+    ("Provider Health Deduped", "SELECT provider,status,COUNT(*) AS events,MAX(checked_at) AS latest_checked,MAX(error) AS latest_error FROM data_provider_health GROUP BY provider,status ORDER BY latest_checked DESC"),
+    ("Universe Events Timeline", "SELECT created_at,'promotion' AS event_type,symbol,from_tier AS from_state,to_tier AS to_state,reason FROM symbol_promotion_decisions UNION ALL SELECT created_at,'demotion' AS event_type,symbol,from_tier AS from_state,to_tier AS to_state,reason FROM symbol_demotion_decisions UNION ALL SELECT created_at,review_type AS event_type,symbol,current_tier AS from_state,decision AS to_state,reason FROM dynamic_universe_stage_reviews ORDER BY created_at DESC"),
+    ("EODHD Historical Metrics", "SELECT symbol,eod_available,latest_price,price_freshness,trend_summary,liquidity_summary,volatility_summary,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Relative Strength Metrics", "SELECT symbol,relative_strength_spy,relative_strength_qqq,score,data_confidence,created_at FROM dynamic_universe_stage_reviews ORDER BY created_at DESC, symbol"),
+    ("Cluster Exposure Blockers", "SELECT symbol,current_tier,cluster,cluster_exposure_blocker,promotion_requirements_missing,reason,created_at FROM dynamic_universe_stage_reviews WHERE COALESCE(cluster,'')!='' OR COALESCE(cluster_exposure_blocker,'')!='' ORDER BY created_at DESC, symbol"),
     ("Demoted Symbols", "SELECT * FROM universe_symbols WHERE tier='demoted' ORDER BY updated_at DESC, symbol"),
     ("Symbol Research Scores", "symbol_research_scores"),
     ("News Events", "symbol_news_events"),
@@ -182,14 +204,14 @@ def redact_report_payload(value: Any) -> Any:
         for key, item in value.items():
             key_lower = str(key).lower()
             if key_lower in TELEGRAM_TEXT_KEYS:
-                redacted[key] = "[REDACTED TELEGRAM TEXT]"
+                redacted[f"[REDACTED TELEGRAM TEXT FIELD:{len(redacted)}]"] = "[REDACTED TELEGRAM TEXT]"
             elif key_lower in TEXT_BLOB_KEYS or "payload" in key_lower:
                 if isinstance(item, (dict, list)):
                     redacted[key] = redact_report_payload(item)
                 else:
                     redacted[key] = "[REDACTED TEXT]"
             elif key_lower in TELEGRAM_ID_KEYS or key_lower.endswith("_sender_id"):
-                redacted[key] = "[REDACTED ID]"
+                redacted[f"[REDACTED ID FIELD:{len(redacted)}]"] = "[REDACTED ID]"
             elif any(part in key_lower for part in SENSITIVE_KEY_PARTS):
                 redacted[key] = "[REDACTED]"
             else:
@@ -232,7 +254,16 @@ def _write_rows(sheet: Any, rows: list[dict[str, Any]], table: str, include_raw_
         sheet.append(["No records"])
         return
     headers = list(rows[0])
-    sheet.append(headers)
+    display_headers = []
+    for header in headers:
+        header_lower = str(header).lower()
+        if header_lower in TELEGRAM_TEXT_KEYS and not include_raw_telegram:
+            display_headers.append("[REDACTED TELEGRAM TEXT FIELD]")
+        elif header_lower in TELEGRAM_ID_KEYS or header_lower.endswith("_sender_id"):
+            display_headers.append("[REDACTED ID FIELD]")
+        else:
+            display_headers.append(header)
+    sheet.append(display_headers)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill("solid", fgColor="D9EAF7")

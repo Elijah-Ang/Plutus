@@ -194,6 +194,16 @@ dynamic_universe:
     require_price_data: true
     allow_news_missing: true
     allow_fundamentals_missing: true
+  observation_maturity_review:
+    enabled: true
+    min_observation_cycles: 3
+    min_market_open_refreshes: 2
+    review_interval_minutes: 30
+    require_fresh_eod: true
+    require_fresh_intraday_for_promotion: true
+    require_cluster_clearance: true
+    allow_keep_observation_with_reason: true
+    xl_sector_symbols: [XLK, XLE, XLF, XLV, XLY]
   demotion:
     max_weak_cycles: 5
     max_no_entry_days: 5

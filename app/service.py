@@ -22,7 +22,7 @@ SGT = ZoneInfo("Asia/Singapore")
 
 from .approval_parser import parse_approval
 from .data_providers.eodhd import EODHDProvider
-from .dynamic_universe import DynamicUniverseEngine
+from .dynamic_universe import DynamicUniverseEngine, OBSERVATION, PAPER_TRADABLE, RESEARCH_CANDIDATE
 from .execution import Executor, ExecutionResult
 from .internet import internet_available
 from .market_data import normalize_bars
@@ -4239,6 +4239,7 @@ class TradingService:
             "window_start": window_start,
             "window_end": now,
             "symbols_list": top_watched,
+            "tier_snapshot": self._digest_tier_snapshot(symbols_list, window_start_iso, now.isoformat()),
             "weakest_symbol": weakest["symbol"],
             "weakest_score": weakest["trade_score"],
             "weakest_classification": weakest["trade_classification"],
@@ -4269,6 +4270,83 @@ class TradingService:
             (self.run_id, window_start_iso, now.isoformat(), now.isoformat(), symbols_str, summary_str, status)
         )
         self.storage.audit(self.run_id, "digest_processed", {"status": status, "window_start": window_start_iso, "window_end": now.isoformat()})
+
+    def _digest_tier_snapshot(self, symbols_list: list[dict[str, Any]], window_start_iso: str, window_end_iso: str) -> dict[str, Any]:
+        status_by_symbol = {str(item.get("symbol", "")).upper(): item for item in symbols_list}
+        position_symbols = set()
+        try:
+            position_symbols = {str(_value(p, "symbol", "")).upper() for p in self.broker.get_positions()}
+        except Exception:
+            rows = self.storage.fetch_all("SELECT symbol FROM positions WHERE created_at=(SELECT MAX(created_at) FROM positions)")
+            position_symbols = {str(r.get("symbol", "")).upper() for r in rows}
+        universe = self.storage.fetch_all(
+            """
+            SELECT symbol,tier,source,universe_lane,score,data_confidence,last_promoted_at,created_at,updated_at
+            FROM universe_symbols
+            WHERE tier IN ('paper_tradable','observation','research_candidate')
+            ORDER BY tier, score DESC, symbol
+            """
+        )
+        latest_reviews = {
+            r["symbol"]: r
+            for r in self.storage.fetch_all(
+                """
+                SELECT r.*
+                FROM dynamic_universe_stage_reviews r
+                INNER JOIN (
+                    SELECT symbol, MAX(created_at) AS created_at
+                    FROM dynamic_universe_stage_reviews
+                    GROUP BY symbol
+                ) latest ON latest.symbol=r.symbol AND latest.created_at=r.created_at
+                """
+            )
+        }
+
+        def proposal_status(symbol: str, tier: str, source: str) -> tuple[str, str]:
+            status_item = status_by_symbol.get(symbol, {})
+            status = str(status_item.get("status") or "")
+            if tier != PAPER_TRADABLE:
+                if tier == OBSERVATION:
+                    return "no", "observation only; needs paper-tradable promotion"
+                return "no", "research candidate only; needs observation promotion first"
+            if "cluster limit" in status.lower():
+                return "blocked", status.replace("Watch — ", "").replace("Status: ", "")
+            if status:
+                return "blocked", status
+            if source == "existing_static_watchlist":
+                return "blocked", "no current ENTRY setup recorded"
+            return "blocked", "requires setup, RiskEngine, Telegram approval, and final validation"
+
+        rows_by_tier = {"static_paper_tradable": [], "dynamic_paper_tradable": [], "observation": [], "research_candidate": []}
+        for row in universe:
+            symbol = str(row["symbol"]).upper()
+            tier = str(row["tier"])
+            source = str(row.get("source") or "")
+            allowed, block = proposal_status(symbol, tier, source)
+            review = latest_reviews.get(symbol, {})
+            item = {
+                "symbol": symbol,
+                "tier": tier,
+                "source": source,
+                "score": row.get("score"),
+                "data_confidence": row.get("data_confidence"),
+                "tradable": tier == PAPER_TRADABLE,
+                "held": symbol in position_symbols,
+                "proposal_allowed": allowed,
+                "proposal_block_reason": block,
+                "stage_reason": review.get("reason") or ("static core paper-tradable" if source == "existing_static_watchlist" else "needs next stage promotion"),
+                "next_check": review.get("next_promotion_review_at") or "next scanner refresh",
+                "decision": review.get("decision"),
+            }
+            if tier == PAPER_TRADABLE and source == "existing_static_watchlist":
+                rows_by_tier["static_paper_tradable"].append(item)
+            elif tier == PAPER_TRADABLE:
+                rows_by_tier["dynamic_paper_tradable"].append(item)
+            elif tier == OBSERVATION:
+                rows_by_tier["observation"].append(item)
+            elif tier == RESEARCH_CANDIDATE:
+                rows_by_tier["research_candidate"].append(item)
+        return rows_by_tier
 
     def run_cycle(self, run_dynamic_universe: bool = True) -> None:
         self._update_forward_outcomes()
@@ -4973,7 +5051,7 @@ class TradingService:
         if demoted:
             parts.append(f"Demoted: {', '.join(demoted)}.")
         if health:
-            statuses = ", ".join(f"{r['provider']} {r['status']}" for r in health)
+            statuses = ", ".join(sorted({f"{r['provider']} {r['status']}" for r in health}))
             parts.append(f"Provider health: {statuses}.")
         if capabilities:
             available = sorted({r["endpoint_name"] for r in capabilities if int(r.get("available") or 0) == 1})

@@ -130,6 +130,78 @@ def test_digest_wording_and_structure():
     assert "yes" not in msg.lower()
     assert "approve" not in msg.lower()
 
+
+def test_digest_tier_snapshot_is_explicit_and_truncated():
+    digest_data = {
+        "market_open_status": "Open",
+        "window_start": datetime(2026, 6, 22, 13, 30, 0, tzinfo=UTC),
+        "window_end": datetime(2026, 6, 22, 14, 0, 0, tzinfo=UTC),
+        "symbols_list": [],
+        "tier_snapshot": {
+            "static_paper_tradable": [
+                {
+                    "symbol": "SPY",
+                    "score": 100.0,
+                    "tradable": True,
+                    "held": False,
+                    "proposal_allowed": "blocked",
+                    "proposal_block_reason": "broad-market cluster limit due DIA/IWM",
+                }
+            ],
+            "dynamic_paper_tradable": [
+                {
+                    "symbol": "SMH",
+                    "score": 91.0,
+                    "tradable": True,
+                    "held": False,
+                    "proposal_allowed": "blocked",
+                    "proposal_block_reason": "requires setup and RiskEngine pass",
+                }
+            ],
+            "observation": [
+                {
+                    "symbol": f"OBS{idx}",
+                    "score": 80.0 - idx,
+                    "tradable": False,
+                    "held": False,
+                    "proposal_allowed": "no",
+                    "proposal_block_reason": "observation only; needs paper-tradable promotion",
+                }
+                for idx in range(7)
+            ],
+            "research_candidate": [
+                {
+                    "symbol": "AAL",
+                    "score": 58.0,
+                    "tradable": False,
+                    "held": False,
+                    "proposal_allowed": "no",
+                    "proposal_block_reason": "research candidate only; needs observation promotion first",
+                }
+            ],
+        },
+        "weakest_symbol": "AVGO",
+        "weakest_score": 33.0,
+        "weakest_classification": "No action suggested",
+        "actions": {"proposals": 0, "orders": 0, "fills": 0, "gpt_calls": 0, "expired": 0},
+        "summary": "No dynamic proposals/orders created.",
+    }
+
+    msg = format_digest_message(digest_data, {"mode": "paper"})
+
+    assert "Paper-tradable watch:" in msg
+    assert "Dynamic paper-tradable:" in msg
+    assert "Observation watch:" in msg
+    assert "Research candidates:" in msg
+    assert "SPY — static paper-tradable | Tradable" in msg
+    assert "SMH — dynamic paper-tradable | Tradable" in msg
+    assert "OBS0 — observation only | Not tradable" in msg
+    assert "AAL — research candidate only | Not tradable" in msg
+    assert "Proposal blocked: broad-market cluster limit due DIA/IWM" in msg
+    assert "Proposal blocked: observation only; needs paper-tradable promotion" in msg
+    assert "Observation watch shown: 6 of 7" in msg
+    assert "Actions: Proposals 0 | Orders 0 | Fills 0 | GPT 0 | Expired 0" in msg
+
 def test_digest_throttling_and_market_hours(temp_storage):
     config = {
         "mode": "paper",
