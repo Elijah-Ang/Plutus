@@ -559,6 +559,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         uu = digest_data.get("universe_update") or {}
         obs_promo = uu.get("promoted_to_observation") or []
         obs_promo_str = ", ".join(obs_promo) if obs_promo else "none"
+        global_updates = uu.get("global_research_only_updated") or []
+        global_updates_str = ", ".join(global_updates) if global_updates else "none"
+        static_reconciled = uu.get("static_paper_tradable_reconciled") or []
+        static_reconciled_str = ", ".join(static_reconciled) if static_reconciled else "none"
         trade_promo = uu.get("promoted_to_paper_tradable") or []
         trade_promo_str = ", ".join(trade_promo) if trade_promo else "none"
         demoted = uu.get("demoted_retired") or []
@@ -567,8 +571,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         
         uu_lines = [
             "Universe update:",
-            f"* Promoted to observation: {obs_promo_str}",
-            f"* Promoted to paper-tradable: {trade_promo_str}",
+            f"* Static paper-tradable reconciled: {static_reconciled_str}",
+            f"* Dynamic paper-tradable promotions: {trade_promo_str}",
+            f"* Global research-only tracked: {global_updates_str}",
+            f"* Observation promoted: {obs_promo_str}",
             f"* Demoted/retired: {demoted_str}",
             f"* {actions_created_str}"
         ]

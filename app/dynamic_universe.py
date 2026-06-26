@@ -23,6 +23,11 @@ DEMOTED = "demoted"
 LANE_ALPACA_US = "alpaca_compatible_us"
 LANE_GLOBAL_RESEARCH = "global_research_only"
 LANE_EXCLUDED = "excluded_or_low_quality"
+PATH_FULL_FRESH = "full_fresh_data"
+PATH_CACHED_INTRADAY = "cached_intraday"
+PATH_ALPACA_QUOTE_FALLBACK = "alpaca_quote_fallback"
+PATH_EOD_ONLY_CLOSED = "eod_only_market_closed"
+PATH_NONE = "none"
 SGT = ZoneInfo("Asia/Singapore")
 
 
@@ -383,7 +388,6 @@ class DynamicUniverseEngine:
             "SELECT COUNT(DISTINCT run_id) c FROM market_memory WHERE symbol=?",
             (symbol,),
         )[0]["c"])
-        shadow = self._has_shadow_tracking(symbol)
         position_symbols = self._latest_position_symbols()
         cluster = row.get("cluster") or self._infer_cluster(symbol, row.get("asset_class"), row)
         cluster_holdings = self._cluster_holding_symbols(cluster, position_symbols)
@@ -391,11 +395,18 @@ class DynamicUniverseEngine:
         is_static_observation = source == "existing_static_observation"
         is_global = row.get("universe_lane") != LANE_ALPACA_US
         metrics = self._stage_review_metrics(row, fetch_provider)
-        demotion_guard = bool(
+        fallback = self._promotion_freshness_decision(symbol, row, latest_score, metrics, fetch_provider)
+        provider_guard_for_demotion = bool(
             self._provider_failed
             or row.get("provider_health_status") in {"provider_unavailable", "rate_limited"}
             or metrics.get("provider_guard_active")
         )
+        provider_guard_for_promotion = bool(
+            self._provider_failed
+            or row.get("provider_health_status") in {"provider_unavailable", "rate_limited"}
+            or (metrics.get("provider_guard_active") and fallback["path"] == PATH_NONE)
+        )
+        demotion_guard = provider_guard_for_demotion
         eod_available = bool(metrics.get("eod_available"))
         intraday_available = bool(metrics.get("intraday_available"))
         liquidity_ok = float(latest_score.get("liquidity_score") or 0.0) >= 12.0 or row.get("source") == "existing_static_observation"
@@ -408,16 +419,15 @@ class DynamicUniverseEngine:
             "score_at_or_above_paper_tradable_threshold": score >= self._paper_tradable_threshold(),
             "observation_cycles": cycles >= int(review_cfg.get("min_observation_cycles", promo.get("min_observation_cycles", 3))),
             "market_open_refreshes": market_open_refreshes >= int(review_cfg.get("min_market_open_refreshes", 2)),
-            "shadow_tracking_recorded": shadow,
             "fresh_eod_available": eod_available or not review_cfg.get("require_fresh_eod", True),
-            "fresh_intraday_available": intraday_available or not review_cfg.get("require_fresh_intraday_for_promotion", True),
+            "promotion_freshness_path": fallback["path"] != PATH_NONE,
             "data_confidence_medium_or_high": confidence in {"medium", "high"},
             "liquidity_ok": liquidity_ok,
             "trend_ok": trend_ok,
             "relative_strength_ok": rel_ok,
             "volatility_ok": volatility_ok,
             "cluster_clearance": not cluster_holdings or not review_cfg.get("require_cluster_clearance", True),
-            "provider_guard_clear": not demotion_guard,
+            "provider_guard_clear": not provider_guard_for_promotion,
         }
         missing = [key for key, passed in requirements.items() if not passed]
         met = [key for key, passed in requirements.items() if passed]
@@ -439,11 +449,11 @@ class DynamicUniverseEngine:
             proposal_allowed = "blocked_pending_setup_and_risk"
             proposal_block = "proposal requires current ENTRY setup, RiskEngine pass, cluster/exposure clearance, Telegram approval, and final validation"
         elif not missing:
-            decision = "eligible_for_dynamic_paper_tradable_review"
-            reason = "all maturity review requirements passed; deterministic promotion loop may record paper-tradable promotion"
+            decision = "promote_to_dynamic_paper_tradable"
+            reason = f"maturity review requirements passed using {fallback['path']}; deterministic promotion loop may record paper-tradable promotion"
             tradable = "not_tradable_until_promoted"
             proposal_allowed = "no"
-            proposal_block = "not paper-tradable until recorded deterministic promotion"
+            proposal_block = "proposal blocked until fresh market validation, ENTRY setup, RiskEngine, Telegram approval, and final validation pass"
         elif demotion_risks and not demotion_guard:
             decision = "keep_observation_with_demotion_risk"
             reason = "; ".join(demotion_risks)
@@ -456,6 +466,8 @@ class DynamicUniverseEngine:
             tradable = "not_tradable"
             proposal_allowed = "no"
             proposal_block = "observation-only; needs paper-tradable promotion before any proposal"
+        if demotion_guard and "provider guard active" not in reason:
+            reason = f"provider guard active; {reason}"
         if symbol in set(str(s).upper() for s in review_cfg.get("xl_sector_symbols", [])) and decision.startswith("keep_observation"):
             reason = f"XL-sector ETF remains observation-only: {reason}"
         payload = {
@@ -466,6 +478,12 @@ class DynamicUniverseEngine:
             "run_type": run_type,
             "provider_fetch_attempted": fetch_provider,
             "metrics": metrics,
+            "promotion_freshness_path": fallback["path"],
+            "confidence_adjustment": fallback["confidence_adjustment"],
+            "data_limitations": fallback["data_limitations"],
+            "proposal_allowed": "no",
+            "proposal_block_reason": proposal_block,
+            "next_review_time": next_review,
             "safety": "review-only; no proposals or orders created",
         }
         self.storage.execute(
@@ -477,8 +495,10 @@ class DynamicUniverseEngine:
                 volatility_summary,relative_strength_spy,relative_strength_qqq,cluster,cluster_exposure_blocker,
                 promotion_requirements_met,promotion_requirements_missing,demotion_risk_reasons,demotion_guard_active,
                 current_stage_reason,next_stage_blocker,tradable_status,proposal_allowed_status,proposal_block_reason,
-                last_promotion_review_at,last_demotion_review_at,next_promotion_review_at,next_demotion_review_at,created_at,payload
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                last_promotion_review_at,last_demotion_review_at,next_promotion_review_at,next_demotion_review_at,created_at,payload,
+                promotion_freshness_path,promotion_confidence_adjustment,promotion_data_limitations,proposal_block_reason_after_promotion,
+                fallback_used,next_review_time,alpaca_quote_freshness,alpaca_tradability_result,intraday_freshness,eod_freshness
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, symbol, row.get("tier"), run_type, decision, reason, score, confidence,
@@ -489,6 +509,9 @@ class DynamicUniverseEngine:
                 json_dumps(met), json_dumps(missing), json_dumps(demotion_risks), 1 if demotion_guard else 0,
                 f"{row.get('tier')} from {source or 'unknown source'}", reason, tradable, proposal_allowed, proposal_block,
                 now, now, next_review, next_review, now, json_dumps(payload),
+                fallback["path"], fallback["confidence_adjustment"], json_dumps(fallback["data_limitations"]),
+                proposal_block, fallback["fallback_used"], next_review, fallback["alpaca_quote_freshness"],
+                fallback["alpaca_tradability_result"], fallback["intraday_freshness"], fallback["eod_freshness"],
             ),
         )
 
@@ -506,7 +529,7 @@ class DynamicUniverseEngine:
             "market_open_refreshes": "not enough market-open observation refreshes",
             "shadow_tracking_recorded": "no shadow-tracking record yet",
             "fresh_eod_available": "fresh EOD evidence unavailable",
-            "fresh_intraday_available": "fresh intraday evidence unavailable",
+            "promotion_freshness_path": "no valid promotion freshness path",
             "cluster_clearance": f"cluster overlap with held symbols {', '.join(cluster_holdings)}" if cluster_holdings else "cluster clearance missing",
             "provider_guard_clear": "provider guard active",
             "trend_ok": "trend confirmation missing",
@@ -515,6 +538,114 @@ class DynamicUniverseEngine:
             "volatility_ok": "volatility quality not acceptable",
         }
         return "; ".join(labels.get(key, key) for key in ordered_missing[:6])
+
+    def _promotion_freshness_decision(
+        self,
+        symbol: str,
+        row: dict[str, Any],
+        latest_score: dict[str, Any],
+        metrics: dict[str, Any],
+        fetch_provider: bool,
+    ) -> dict[str, Any]:
+        review_cfg = self.cfg.get("observation_maturity_review", {})
+        if row.get("universe_lane") != LANE_ALPACA_US or row.get("source") == "existing_static_watchlist":
+            return {
+                "path": PATH_NONE,
+                "confidence_adjustment": "none",
+                "data_limitations": ["not a dynamic Alpaca-compatible promotion candidate"],
+                "fallback_used": "no",
+                "alpaca_quote_freshness": "not_checked",
+                "alpaca_tradability_result": "not_applicable",
+                "intraday_freshness": "not_applicable",
+                "eod_freshness": "not_applicable",
+            }
+        eod_ok = bool(metrics.get("eod_available")) or str(row.get("data_freshness_status") or "") == "fresh"
+        intraday_ok = bool(metrics.get("intraday_available"))
+        data_limitations: list[str] = []
+        quote_freshness = "not_checked"
+        tradability = "not_checked"
+
+        if eod_ok and intraday_ok:
+            path = PATH_FULL_FRESH
+            confidence_adjustment = "none"
+            fallback_used = "no"
+        elif eod_ok and review_cfg.get("allow_cached_intraday_for_promotion", True) and self._cached_intraday_within_window(symbol):
+            path = PATH_CACHED_INTRADAY
+            confidence_adjustment = "none"
+            fallback_used = "yes"
+            data_limitations.append("intraday bars served from recent stored score cache")
+        else:
+            quote_ok = False
+            if eod_ok and review_cfg.get("allow_alpaca_quote_fallback_for_promotion", True):
+                quote_ok, quote_freshness, tradability = self._alpaca_quote_fallback_check(symbol)
+            if eod_ok and quote_ok:
+                path = PATH_ALPACA_QUOTE_FALLBACK
+                confidence_adjustment = "reduced" if review_cfg.get("reduce_confidence_if_intraday_missing", True) else "none"
+                fallback_used = "yes"
+                data_limitations.append("EODHD intraday unavailable; Alpaca latest price used only for promotion sanity")
+            elif (
+                eod_ok
+                and review_cfg.get("allow_eod_only_promotion_when_market_closed", True)
+                and not self._market_open_for_promotion_review()
+            ):
+                path = PATH_EOD_ONLY_CLOSED
+                confidence_adjustment = "reduced" if review_cfg.get("reduce_confidence_if_intraday_missing", True) else "none"
+                fallback_used = "yes"
+                data_limitations.append("market closed; EOD-only promotion review")
+            else:
+                path = PATH_NONE
+                confidence_adjustment = "none"
+                fallback_used = "no"
+                if not eod_ok:
+                    data_limitations.append("fresh EOD unavailable")
+                if not intraday_ok:
+                    data_limitations.append("fresh or acceptable fallback intraday unavailable")
+
+        return {
+            "path": path,
+            "confidence_adjustment": confidence_adjustment,
+            "data_limitations": data_limitations,
+            "fallback_used": fallback_used,
+            "alpaca_quote_freshness": quote_freshness,
+            "alpaca_tradability_result": tradability,
+            "intraday_freshness": "fresh" if intraday_ok else ("cached" if path == PATH_CACHED_INTRADAY else "missing"),
+            "eod_freshness": "fresh_or_acceptable" if eod_ok else "missing",
+        }
+
+    def _cached_intraday_within_window(self, symbol: str) -> bool:
+        minutes = int(self.cfg.get("observation_maturity_review", {}).get("intraday_freshness_window_minutes", 30))
+        cutoff = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+        rows = self.storage.fetch_all(
+            """
+            SELECT 1
+            FROM symbol_research_scores
+            WHERE symbol=?
+              AND created_at>=?
+              AND COALESCE(intraday_momentum_score, 0) > 0
+            LIMIT 1
+            """,
+            (symbol.upper(), cutoff),
+        )
+        return bool(rows)
+
+    def _market_open_for_promotion_review(self) -> bool:
+        if not self.broker or not hasattr(self.broker, "is_market_open"):
+            return False
+        try:
+            return bool(self.broker.is_market_open())
+        except Exception:
+            return False
+
+    def _alpaca_quote_fallback_check(self, symbol: str) -> tuple[bool, str, str]:
+        if not self._check_alpaca_compatibility(symbol):
+            return False, "not_checked", "not_tradable"
+        if not self.broker or not hasattr(self.broker, "get_latest_price"):
+            return False, "not_available", "tradable"
+        try:
+            price = self.broker.get_latest_price(symbol)
+            return price is not None, "fresh" if price is not None else "missing", "tradable"
+        except Exception:
+            return False, "error", "tradable"
 
     def _stage_review_metrics(self, row: dict[str, Any], fetch_provider: bool) -> dict[str, Any]:
         symbol = str(row.get("symbol") or "").upper()
@@ -1473,25 +1604,44 @@ class DynamicUniverseEngine:
         if current.get("tier") == OBSERVATION:
             cycles = self._score_count(symbol)
             sessions = self._session_count(symbol)
-            has_shadow = self._has_shadow_tracking(symbol)
             confidence_ok = score.data_confidence == "high" or (score.data_confidence == "medium" and bool(promo.get("allow_medium_confidence_paper_tradable", True)))
+            freshness = self._score_promotion_freshness(symbol, metadata, score)
+            metadata.update(freshness)
             if (
                 metadata.get("universe_lane") == LANE_ALPACA_US
                 and score.total_score >= self._paper_tradable_threshold()
                 and cycles >= int(promo.get("min_observation_cycles", 3))
                 and sessions >= int(promo.get("min_observation_sessions", 1))
-                and has_shadow
-                and metadata.get("cluster") != "unknown_cluster"
                 and confidence_ok
+                and freshness["promotion_freshness_path"] != PATH_NONE
                 and self._check_alpaca_compatibility(symbol)
+                and not self._has_open_order_conflict(symbol)
             ):
                 return PAPER_TRADABLE
             return OBSERVATION
         return current.get("tier") or RESEARCH_CANDIDATE
 
+    def _score_promotion_freshness(self, symbol: str, metadata: dict[str, Any], score: ResearchScore) -> dict[str, Any]:
+        metrics = {
+            "eod_available": bool((metadata.get("endpoint_coverage") or {}).get("eod_bars")) or metadata.get("price_freshness") in {"eod_bars", "fresh_eod"},
+            "intraday_available": bool((metadata.get("endpoint_coverage") or {}).get("intraday_bars")) or bool(metadata.get("intraday_points")),
+        }
+        fallback = self._promotion_freshness_decision(symbol, metadata, {"score": score.total_score}, metrics, fetch_provider=False)
+        return {
+            "promotion_freshness_path": fallback["path"],
+            "promotion_confidence_adjustment": fallback["confidence_adjustment"],
+            "promotion_data_limitations": fallback["data_limitations"],
+            "fallback_used": fallback["fallback_used"],
+            "alpaca_quote_freshness": fallback["alpaca_quote_freshness"],
+            "alpaca_tradability_result": fallback["alpaca_tradability_result"],
+            "intraday_freshness": fallback["intraday_freshness"],
+            "eod_freshness": fallback["eod_freshness"],
+            "proposal_block_reason_after_promotion": "proposal blocked until fresh market validation, ENTRY setup, RiskEngine, Telegram approval, and final validation pass",
+        }
+
     def _check_alpaca_compatibility(self, symbol: str) -> bool:
         if not self.broker or not hasattr(self.broker, "get_asset"):
-            return True
+            return False
         try:
             asset = self.broker.get_asset(symbol)
             if not asset:
@@ -1509,6 +1659,18 @@ class DynamicUniverseEngine:
             return True
         except Exception:
             return False
+
+    def _has_open_order_conflict(self, symbol: str) -> bool:
+        if not self.broker or not hasattr(self.broker, "get_open_orders"):
+            return False
+        try:
+            for order in self.broker.get_open_orders() or []:
+                order_symbol = str(getattr(order, "symbol", "") or (order.get("symbol") if isinstance(order, dict) else "")).upper()
+                if order_symbol == symbol.upper():
+                    return True
+        except Exception:
+            return True
+        return False
 
     def _research_threshold(self) -> float:
         promo = self.cfg.get("promotion", {})
@@ -1640,8 +1802,10 @@ class DynamicUniverseEngine:
                 id,symbol,provider_symbol,exchange,asset_class,country,region,currency,sector,cluster,tier,state,
                 universe_lane,alpaca_compatible,exclusion_reason,executable,observation_only,score,reason,source,provider,data_quality,data_confidence,data_confidence_reason,data_freshness_status,
                 last_successful_research_at,provider_health_status,promotion_allowed,demotion_allowed,stale_after_minutes,
+                promotion_freshness_path,promotion_confidence_adjustment,promotion_data_limitations,proposal_block_reason_after_promotion,
+                fallback_used,next_review_time,alpaca_quote_freshness,alpaca_tradability_result,intraday_freshness,eod_freshness,
                 last_seen_at,last_promoted_at,last_demoted_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 provider_symbol=excluded.provider_symbol,
                 exchange=excluded.exchange,
@@ -1671,6 +1835,16 @@ class DynamicUniverseEngine:
                 promotion_allowed=excluded.promotion_allowed,
                 demotion_allowed=excluded.demotion_allowed,
                 stale_after_minutes=excluded.stale_after_minutes,
+                promotion_freshness_path=excluded.promotion_freshness_path,
+                promotion_confidence_adjustment=excluded.promotion_confidence_adjustment,
+                promotion_data_limitations=excluded.promotion_data_limitations,
+                proposal_block_reason_after_promotion=excluded.proposal_block_reason_after_promotion,
+                fallback_used=excluded.fallback_used,
+                next_review_time=excluded.next_review_time,
+                alpaca_quote_freshness=excluded.alpaca_quote_freshness,
+                alpaca_tradability_result=excluded.alpaca_tradability_result,
+                intraday_freshness=excluded.intraday_freshness,
+                eod_freshness=excluded.eod_freshness,
                 last_seen_at=excluded.last_seen_at,
                 last_promoted_at=COALESCE(excluded.last_promoted_at, universe_symbols.last_promoted_at),
                 last_demoted_at=COALESCE(excluded.last_demoted_at, universe_symbols.last_demoted_at),
@@ -1707,6 +1881,16 @@ class DynamicUniverseEngine:
                 1 if self._promotion_allowed else 0,
                 1 if self._demotion_allowed else 0,
                 int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30)),
+                metadata.get("promotion_freshness_path"),
+                metadata.get("promotion_confidence_adjustment"),
+                json_dumps(metadata.get("promotion_data_limitations", [])),
+                metadata.get("proposal_block_reason_after_promotion"),
+                metadata.get("fallback_used"),
+                metadata.get("next_review_time"),
+                metadata.get("alpaca_quote_freshness"),
+                metadata.get("alpaca_tradability_result"),
+                metadata.get("intraday_freshness"),
+                metadata.get("eod_freshness"),
                 now,
                 now if tier == PAPER_TRADABLE else None,
                 now if tier == DEMOTED else None,
@@ -1988,9 +2172,12 @@ class DynamicUniverseEngine:
         )
 
     def _record_promotion(self, symbol: str, old_tier: str | None, new_tier: str, score: ResearchScore, metadata: dict[str, Any]) -> None:
+        reason = score.block_reason or "deterministic promotion rule"
+        if new_tier == PAPER_TRADABLE and metadata.get("promotion_freshness_path"):
+            reason = f"dynamic promotion using {metadata.get('promotion_freshness_path')}; proposal blocked until fresh market validation"
         self.storage.execute(
             "INSERT INTO symbol_promotion_decisions(id,run_id,symbol,from_tier,to_tier,score,reason,deterministic_pass,gpt_summary_used,created_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), self.run_id, symbol.upper(), old_tier, new_tier, score.total_score, score.block_reason or "deterministic promotion rule", 1, 0, iso_now(), json_dumps(metadata)),
+            (str(uuid.uuid4()), self.run_id, symbol.upper(), old_tier, new_tier, score.total_score, reason, 1, 0, iso_now(), json_dumps(metadata)),
         )
 
     def _record_demotion(self, symbol: str, old_tier: str | None, score: ResearchScore | None, metadata: dict[str, Any], reason: str | None = None) -> None:

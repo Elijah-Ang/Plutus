@@ -200,10 +200,18 @@ dynamic_universe:
     min_market_open_refreshes: 2
     review_interval_minutes: 30
     require_fresh_eod: true
-    require_fresh_intraday_for_promotion: true
+    require_fresh_intraday_for_promotion: false
+    allow_cached_intraday_for_promotion: true
+    intraday_freshness_window_minutes: 30
+    allow_alpaca_quote_fallback_for_promotion: true
+    reduce_confidence_if_intraday_missing: true
+    allow_eod_only_promotion_when_market_closed: true
     require_cluster_clearance: true
     allow_keep_observation_with_reason: true
     xl_sector_symbols: [XLK, XLE, XLF, XLV, XLY]
+  proposal_generation:
+    require_fresh_market_data: true
+    require_final_validation: true
   demotion:
     max_weak_cycles: 5
     max_no_entry_days: 5

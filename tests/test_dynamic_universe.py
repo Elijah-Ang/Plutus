@@ -102,6 +102,40 @@ class HistoricalIntradayProvider(FakeProvider):
         return ProviderResponse("fake", "intraday_bars", "ok", bars)
 
 
+class NoIntradayProvider(FakeProvider):
+    def get_intraday_bars(self, symbol: str, interval: str = "5m", limit: int = 100) -> ProviderResponse:
+        self.calls.append("intraday_bars")
+        return ProviderResponse("fake", "intraday_bars", "rate_limited", None, "rate_limited")
+
+
+class MockAsset:
+    def __init__(self, tradable: bool = True, status: str = "active", asset_class: str = "us_equity", exchange: str = "NASDAQ") -> None:
+        self.tradable = tradable
+        self.status = status
+        self.asset_class = asset_class
+        self.exchange = exchange
+
+
+class PromotionBroker:
+    def __init__(self, *, price: float | None = 100.0, market_open: bool = True, asset: MockAsset | None = None, open_orders: list[Any] | None = None) -> None:
+        self.price = price
+        self.market_open = market_open
+        self.asset = asset or MockAsset()
+        self.open_orders = open_orders or []
+
+    def get_asset(self, symbol: str):
+        return self.asset
+
+    def get_open_orders(self):
+        return self.open_orders
+
+    def get_latest_price(self, symbol: str):
+        return self.price
+
+    def is_market_open(self):
+        return self.market_open
+
+
 def dynamic_config() -> dict[str, Any]:
     cfg = load_config()
     cfg["mode"] = "paper"
@@ -548,7 +582,7 @@ def test_optional_marketaux_news_provider_disabled_safely_without_key(monkeypatc
     assert provider.get_news("SMH").status == "disabled_missing_key"
 
 
-def test_observation_requires_shadow_tracking_before_paper_tradable(temp_storage):
+def test_observation_requires_alpaca_compatibility_before_paper_tradable(temp_storage):
     cfg = dynamic_config()
     provider = FakeProvider(
         rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
@@ -575,11 +609,82 @@ def test_observation_requires_shadow_tracking_before_paper_tradable(temp_storage
     )
     DynamicUniverseEngine(cfg, temp_storage, provider, "run-test-5").run_research_cycle("intraday_light_refresh")
     row = temp_storage.fetch_all("SELECT tier, executable FROM universe_symbols WHERE symbol='SMH'")[0]
-    assert row["tier"] == PAPER_TRADABLE
-    assert row["executable"] == 1
+    assert row["tier"] == OBSERVATION
+    assert row["executable"] == 0
 
     promotion = temp_storage.fetch_all("SELECT * FROM symbol_promotion_decisions WHERE symbol='SMH' AND to_tier='paper_tradable'")
-    assert promotion
+    assert promotion == []
+
+
+def seed_observation_for_review(temp_storage, symbol: str = "SMH", *, score_created_at: datetime | None = None, intraday_score: float = 9.0) -> None:
+    now = datetime.now(UTC)
+    score_created_at = score_created_at or now
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,source,universe_lane,alpaca_compatible,executable,observation_only,score,data_confidence,provider_health_status,data_freshness_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (f"u-{symbol}", symbol, "US", "etf", "semiconductors", OBSERVATION, "dynamic_research", LANE_ALPACA_US, 1, 0, 1, 90.0, "medium", "ok", "fresh", (now - timedelta(days=2)).isoformat(), now.isoformat()),
+    )
+    for idx in range(3):
+        temp_storage.execute(
+            "INSERT INTO symbol_research_scores(id,run_id,symbol,provider,score,liquidity_score,trend_score,relative_strength_score,intraday_momentum_score,volatility_quality_score,data_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"{symbol}-score-{idx}", "run-test", symbol, "fake", 90.0, 18.0, 18.0, 10.0, intraday_score, 8.0, "medium", (score_created_at - timedelta(minutes=idx)).isoformat()),
+        )
+    for idx in range(2):
+        temp_storage.execute(
+            "INSERT INTO market_memory(run_id,market_profile,symbol,price,signal,score,classification,reason,proposal_allowed,gpt_called,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (f"mm-{symbol}-{idx}", "us_equities", symbol, 100.0, "HOLD", 90.0, "Observation only", "review", 0, 0, (now - timedelta(minutes=idx)).isoformat()),
+        )
+
+
+def test_observation_review_records_full_fresh_path_without_proposal(temp_storage):
+    cfg = dynamic_config()
+    seed_observation_for_review(temp_storage)
+
+    reviewed = DynamicUniverseEngine(cfg, temp_storage, HistoricalIntradayProvider(bars=liquid_bars()), "run-review", broker=PromotionBroker()).review_observation_maturity(symbols=["SMH"], fetch_provider=True)
+
+    assert reviewed == 1
+    review = temp_storage.fetch_all("SELECT decision,promotion_freshness_path,promotion_confidence_adjustment,proposal_allowed_status,proposal_block_reason FROM dynamic_universe_stage_reviews WHERE symbol='SMH'")[0]
+    assert review["decision"] == "promote_to_dynamic_paper_tradable"
+    assert review["promotion_freshness_path"] == "full_fresh_data"
+    assert review["promotion_confidence_adjustment"] == "none"
+    assert review["proposal_allowed_status"] == "no"
+    assert "fresh market validation" in review["proposal_block_reason"]
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert temp_storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_cached_intraday_and_stale_cached_paths_are_labeled(temp_storage):
+    cfg = dynamic_config()
+    seed_observation_for_review(temp_storage, "CACHE", score_created_at=datetime.now(UTC), intraday_score=8.0)
+
+    DynamicUniverseEngine(cfg, temp_storage, NoIntradayProvider(bars=[]), "run-cache", broker=PromotionBroker(price=None, market_open=True)).review_observation_maturity(symbols=["CACHE"], fetch_provider=False)
+    cached = temp_storage.fetch_all("SELECT promotion_freshness_path,fallback_used FROM dynamic_universe_stage_reviews WHERE symbol='CACHE'")[0]
+    assert cached["promotion_freshness_path"] == "cached_intraday"
+    assert cached["fallback_used"] == "yes"
+
+    seed_observation_for_review(temp_storage, "STALE", score_created_at=datetime.now(UTC) - timedelta(minutes=45), intraday_score=8.0)
+    DynamicUniverseEngine(cfg, temp_storage, NoIntradayProvider(bars=[]), "run-stale", broker=PromotionBroker(price=None, market_open=True)).review_observation_maturity(symbols=["STALE"], fetch_provider=False)
+    stale = temp_storage.fetch_all("SELECT decision,promotion_freshness_path,reason,next_review_time FROM dynamic_universe_stage_reviews WHERE symbol='STALE'")[0]
+    assert stale["decision"] == "keep_observation"
+    assert stale["promotion_freshness_path"] == "none"
+    assert "no valid promotion freshness path" in stale["reason"]
+    assert stale["next_review_time"] is not None
+
+
+def test_alpaca_quote_and_market_closed_eod_fallbacks_are_labeled(temp_storage):
+    cfg = dynamic_config()
+    seed_observation_for_review(temp_storage, "QUOTE", score_created_at=datetime.now(UTC) - timedelta(minutes=45), intraday_score=8.0)
+    DynamicUniverseEngine(cfg, temp_storage, NoIntradayProvider(bars=[]), "run-quote", broker=PromotionBroker(price=101.0, market_open=True)).review_observation_maturity(symbols=["QUOTE"], fetch_provider=False)
+    quote = temp_storage.fetch_all("SELECT promotion_freshness_path,promotion_confidence_adjustment,alpaca_quote_freshness,alpaca_tradability_result FROM dynamic_universe_stage_reviews WHERE symbol='QUOTE'")[0]
+    assert quote["promotion_freshness_path"] == "alpaca_quote_fallback"
+    assert quote["promotion_confidence_adjustment"] == "reduced"
+    assert quote["alpaca_quote_freshness"] == "fresh"
+    assert quote["alpaca_tradability_result"] == "tradable"
+
+    seed_observation_for_review(temp_storage, "CLOSED", score_created_at=datetime.now(UTC) - timedelta(minutes=45), intraday_score=8.0)
+    DynamicUniverseEngine(cfg, temp_storage, NoIntradayProvider(bars=[]), "run-closed", broker=PromotionBroker(price=None, market_open=False)).review_observation_maturity(symbols=["CLOSED"], fetch_provider=False)
+    closed = temp_storage.fetch_all("SELECT promotion_freshness_path,promotion_confidence_adjustment FROM dynamic_universe_stage_reviews WHERE symbol='CLOSED'")[0]
+    assert closed["promotion_freshness_path"] == "eod_only_market_closed"
+    assert closed["promotion_confidence_adjustment"] == "reduced"
 
 
 def test_unsupported_asset_class_remains_research_only(temp_storage):
@@ -937,7 +1042,7 @@ def test_digest_shows_promotions_with_subtask_skip_not_full_research_skip(temp_s
     text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
 
     assert text is not None
-    assert "Promoted to observation: BIIB." in text
+    assert "Observation promoted: BIIB." in text
     assert "Post market review skipped: provider rate-limited; existing research state was still used." in text
     assert text.count("eodhd rate_limited") == 1
     assert "Dynamic Universe research skipped" not in text
@@ -1139,4 +1244,3 @@ def test_eodhd_cooldown_by_run_id(temp_storage):
     # Check if disabled with run_id "run-B" -> should NOT be disabled (False)
     disabled_run_b = cache.capability_disabled("eodhd", "news", current_run_id="run-B")
     assert disabled_run_b is False
-

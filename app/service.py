@@ -4228,8 +4228,10 @@ class TradingService:
             "SELECT symbol, reason FROM symbol_demotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
             (window_start_iso,),
         )
-        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
-        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
+        static_reconciled = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable" and '"existing_static":true' in str(r.get("payload") or "")})
+        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation" and ('"universe_lane":"alpaca_compatible_us"' in str(r.get("payload") or "") or "universe_lane" not in str(r.get("payload") or ""))})
+        global_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation" and '"universe_lane":"global_research_only"' in str(r.get("payload") or "")})
+        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable" and '"existing_static":true' not in str(r.get("payload") or "")})
         to_research = sorted({r["symbol"] for r in promotions if r["to_tier"] == "research_candidate"})
         demoted = sorted({r["symbol"] for r in demotions})
 
@@ -4359,6 +4361,8 @@ class TradingService:
             "summary": summary_str,
             "universe_update": {
                 "promoted_to_observation": to_observation,
+                "global_research_only_updated": global_observation,
+                "static_paper_tradable_reconciled": static_reconciled,
                 "promoted_to_paper_tradable": to_tradable,
                 "promoted_to_research_candidate": to_research,
                 "demoted_retired": demoted,
@@ -5338,17 +5342,25 @@ class TradingService:
         )
         if not promotions and not demotions and not health and not schedule_rows and not stale_rows and not capabilities and not completed_runs:
             return None
-        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
-        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
+        static_reconciled = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable" and '"existing_static":true' in str(r.get("payload") or "")})
+        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation" and ('"universe_lane":"alpaca_compatible_us"' in str(r.get("payload") or "") or "universe_lane" not in str(r.get("payload") or ""))})
+        global_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation" and '"universe_lane":"global_research_only"' in str(r.get("payload") or "")})
+        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable" and '"existing_static":true' not in str(r.get("payload") or "")})
         to_research = sorted({r["symbol"] for r in promotions if r["to_tier"] == "research_candidate"})
         demoted = sorted({r["symbol"] for r in demotions})
         parts = ["Universe update:"]
         if to_research:
             parts.append(f"Research candidates: {', '.join(to_research)}.")
+        if static_reconciled:
+            parts.append(f"Static paper-tradable reconciled: {', '.join(static_reconciled)}.")
+        if global_observation:
+            parts.append(f"Global research-only tracked: {', '.join(global_observation)}.")
         if to_observation:
-            parts.append(f"Promoted to observation: {', '.join(to_observation)}.")
+            parts.append(f"Observation promoted: {', '.join(to_observation)}.")
+        if not to_tradable:
+            parts.append("Dynamic paper-tradable promotions: none.")
         if to_tradable:
-            parts.append(f"Promoted to paper-tradable: {', '.join(to_tradable)}.")
+            parts.append(f"Dynamic paper-tradable promotions: {', '.join(to_tradable)}.")
         if demoted:
             parts.append(f"Demoted: {', '.join(demoted)}.")
         if health:
