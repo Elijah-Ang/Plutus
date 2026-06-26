@@ -149,6 +149,7 @@ class DynamicUniverseEngine:
 
         promoted = []
         demoted = []
+        brief_items: list[tuple[ResearchScore, dict[str, Any]]] = []
         self._backfill_unclassified_universe_symbols()
         candidates = self._collect_raw_candidates(run_type)
         considered = 0
@@ -182,8 +183,13 @@ class DynamicUniverseEngine:
                 executable = 1 if new_tier == PAPER_TRADABLE and self._asset_execution_allowed(metadata.get("asset_class")) else 0
                 observation_only = 0 if executable else 1
                 self._upsert_universe_symbol(symbol, metadata, new_tier, executable=executable, observation_only=observation_only, score=score.total_score)
+                if new_tier == RESEARCH_CANDIDATE:
+                    brief_items.append((score, dict(metadata)))
                 self._record_trend_snapshot(symbol, metadata, score)
                 self._record_news(symbol, metadata)
+            for rank, (score, metadata) in enumerate(sorted(brief_items, key=lambda item: item[0].total_score, reverse=True), start=1):
+                self._record_candidate_brief(score, metadata, rank, run_type)
+            self._record_llm_explanation_usage(brief_items)
             if self._demotion_allowed and not self._provider_failed:
                 self._demote_stale_symbols(demoted)
             elif self._provider_failed:
@@ -191,7 +197,7 @@ class DynamicUniverseEngine:
             status = "completed"
             self._provider_health_status = self._provider_summary_status()
             self._record_near_miss_symbols()
-            detail = {"provider_status": self._provider_health_status, "run_type": run_type, "catchup": is_catchup}
+            detail = {"provider_status": self._provider_health_status, "run_type": run_type, "catchup": is_catchup, "candidate_briefs": len(brief_items)}
         except Exception as exc:
             status = "error"
             detail = {"error": type(exc).__name__, "run_type": run_type}
@@ -206,7 +212,7 @@ class DynamicUniverseEngine:
             None,
             {"run_type": run_type, "status": status, "promoted": promoted, "demoted": demoted},
         )
-        return {"status": status, "considered": considered, "promoted": promoted, "demoted": demoted, "run_id": run_id, "run_type": run_type}
+        return {"status": status, "considered": considered, "promoted": promoted, "demoted": demoted, "run_id": run_id, "run_type": run_type, "candidate_briefs": len(brief_items)}
 
     def dynamic_scan_symbols(self) -> tuple[list[str], list[str]]:
         if not self.enabled():
@@ -244,6 +250,90 @@ class DynamicUniverseEngine:
             (OBSERVATION, int(self.cfg.get("max_observation_symbols", 30))),
         )
         return [r["symbol"] for r in paper], [r["symbol"] for r in obs]
+
+    def generate_current_research_candidate_briefs(self, run_type: str = "report_backfill") -> int:
+        """Create deterministic brief rows for current research candidates without provider calls."""
+        rows = self.storage.fetch_all(
+            """
+            SELECT u.*, s.score AS latest_score, s.liquidity_score, s.trend_score, s.intraday_momentum_score,
+                   s.relative_strength_score, s.volatility_quality_score, s.screener_mover_score,
+                   s.news_score, s.sector_theme_score, s.data_quality_score, s.data_confidence AS score_confidence,
+                   s.data_confidence_reason AS score_confidence_reason, s.universe_lane AS score_lane, s.block_reason
+            FROM universe_symbols u
+            LEFT JOIN (
+                SELECT s1.*
+                FROM symbol_research_scores s1
+                INNER JOIN (
+                    SELECT symbol, MAX(created_at) AS max_created_at
+                    FROM symbol_research_scores
+                    GROUP BY symbol
+                ) latest ON latest.symbol=s1.symbol AND latest.max_created_at=s1.created_at
+            ) s ON s.symbol=u.symbol
+            WHERE u.tier=?
+            ORDER BY COALESCE(s.score, u.score) DESC, u.symbol
+            """,
+            (RESEARCH_CANDIDATE,),
+        )
+        count = 0
+        for rank, row in enumerate(rows, start=1):
+            metadata = {
+                "symbol": row.get("symbol"),
+                "provider_symbol": row.get("provider_symbol"),
+                "exchange": row.get("exchange"),
+                "asset_class": row.get("asset_class"),
+                "sector": row.get("sector"),
+                "cluster": row.get("cluster"),
+                "region": row.get("region"),
+                "currency": row.get("currency"),
+                "source": row.get("source"),
+                "universe_lane": row.get("universe_lane") or row.get("score_lane") or LANE_ALPACA_US,
+                "alpaca_compatible": row.get("alpaca_compatible"),
+                "exclusion_reason": row.get("exclusion_reason"),
+                "data_confidence": row.get("data_confidence") or row.get("score_confidence"),
+                "data_confidence_reason": row.get("data_confidence_reason") or row.get("score_confidence_reason"),
+                "endpoint_coverage": self._current_endpoint_coverage(),
+                "price_freshness": row.get("data_freshness_status") or "latest stored research score",
+                "local_metrics_available": {
+                    "ma20": False,
+                    "ma50": False,
+                    "ma200": False,
+                    "rsi": False,
+                    "atr": False,
+                    "relative_strength": row.get("relative_strength_score") is not None,
+                    "liquidity_dollar_volume": False,
+                    "volatility": row.get("volatility_quality_score") is not None,
+                },
+            }
+            score = ResearchScore(
+                symbol=str(row.get("symbol")).upper(),
+                total_score=float(row.get("latest_score") or row.get("score") or 0.0),
+                liquidity_score=float(row.get("liquidity_score") or 0.0),
+                trend_score=float(row.get("trend_score") or 0.0),
+                intraday_momentum_score=float(row.get("intraday_momentum_score") or 0.0),
+                relative_strength_score=float(row.get("relative_strength_score") or 0.0),
+                volatility_quality_score=float(row.get("volatility_quality_score") or 0.0),
+                screener_mover_score=float(row.get("screener_mover_score") or 0.0),
+                news_score=float(row.get("news_score") or 0.0),
+                sector_theme_score=float(row.get("sector_theme_score") or 0.0),
+                data_quality_score=float(row.get("data_quality_score") or 0.0),
+                data_confidence=str(row.get("data_confidence") or row.get("score_confidence") or "unknown"),
+                data_confidence_reason=str(row.get("data_confidence_reason") or row.get("score_confidence_reason") or "latest stored research score"),
+                universe_lane=str(row.get("universe_lane") or row.get("score_lane") or LANE_ALPACA_US),
+                block_reason=row.get("block_reason"),
+            )
+            self._record_candidate_brief(score, metadata, rank, run_type)
+            count += 1
+        self._record_llm_explanation_usage([])
+        return count
+
+    def _current_endpoint_coverage(self) -> dict[str, bool]:
+        rows = self.storage.fetch_all("SELECT endpoint_name, available FROM data_provider_capabilities WHERE provider=?", (self.cfg.get("provider", "eodhd"),))
+        coverage = {name: False for name in ("screener", "eod_bars", "intraday_bars", "realtime_quote", "technicals", "news", "fundamentals")}
+        for row in rows:
+            endpoint = str(row.get("endpoint_name") or "")
+            if endpoint in coverage:
+                coverage[endpoint] = bool(row.get("available"))
+        return coverage
 
     def _schedule_type(self, run_type: str) -> str:
         return {
@@ -793,11 +883,21 @@ class DynamicUniverseEngine:
         bars = []
         quote_ok = False
         news_ok = False
+        endpoint_coverage = {
+            "screener": metadata.get("source") == "eodhd_screener",
+            "eod_bars": False,
+            "intraday_bars": False,
+            "realtime_quote": False,
+            "technicals": False,
+            "news": False,
+            "fundamentals": False,
+        }
         lane = metadata.get("universe_lane") or LANE_ALPACA_US
         if lane == LANE_EXCLUDED:
             reason = metadata.get("exclusion_reason") or "excluded_or_low_quality"
             metadata["data_confidence"] = "insufficient"
             metadata["data_confidence_reason"] = reason
+            metadata["endpoint_coverage"] = endpoint_coverage
             return ResearchScore(
                 symbol=symbol,
                 total_score=0.0,
@@ -820,24 +920,31 @@ class DynamicUniverseEngine:
             res = self.provider.get_historical_bars(metadata.get("provider_symbol") or symbol, limit=80)
             if res.status == "ok" and isinstance(res.data, list):
                 bars = res.data
+                endpoint_coverage["eod_bars"] = True
             elif res.status not in {"plan_limited", "rate_limited"}:
                 self._provider_failed = True
                 self._provider_health_status = res.status
         if self.provider and not metadata.get("existing_static") and bars:
             quote = self.provider.get_latest_quote(metadata.get("provider_symbol") or symbol)
             quote_ok = quote.status == "ok" and bool(quote.data)
+            endpoint_coverage["realtime_quote"] = quote_ok
+            if quote_ok and isinstance(quote.data, dict):
+                metadata["quote_payload_available"] = True
         liquidity, liquidity_block = self._liquidity_score(metadata, bars)
         trend = self._trend_score(bars)
-        intraday = self._intraday_momentum_score(symbol, metadata, bars)
+        intraday = self._intraday_momentum_score(symbol, metadata, bars, endpoint_coverage)
         rel = self._relative_strength_score(bars)
         vol = self._volatility_quality_score(bars)
         screener = self._screener_mover_score(metadata)
         news, news_ok = self._news_score(symbol, metadata)
+        endpoint_coverage["news"] = news_ok
         sector = 5.0 if metadata.get("cluster") != "unknown_cluster" else 2.5
         quality = self._data_quality_score(metadata, bars)
         confidence, confidence_reason = self._data_confidence(metadata, bars, quote_ok, news_ok)
         metadata["data_confidence"] = confidence
         metadata["data_confidence_reason"] = confidence_reason
+        metadata["endpoint_coverage"] = endpoint_coverage
+        metadata.update(self._local_metric_summary(bars))
         total = liquidity + trend + intraday + rel + vol + screener + news + sector + quality
         block_reason = liquidity_block
         if quality < 2.0 and not metadata.get("existing_static"):
@@ -919,7 +1026,50 @@ class DynamicUniverseEngine:
             return 4.0
         return 10.0
 
-    def _intraday_momentum_score(self, symbol: str, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> float:
+    def _local_metric_summary(self, bars: list[dict[str, Any]]) -> dict[str, Any]:
+        closes = [float(b.get("close") or b.get("adjusted_close") or 0) for b in bars if float(b.get("close") or b.get("adjusted_close") or 0) > 0]
+        vols = [float(b.get("volume") or 0) for b in bars if b.get("volume") is not None]
+        latest = closes[-1] if closes else None
+        avg_volume_20 = sum(vols[-20:]) / len(vols[-20:]) if vols[-20:] else None
+        dollar_volume = latest * avg_volume_20 if latest is not None and avg_volume_20 is not None else None
+        ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+        ma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
+        ma200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
+        ret20 = closes[-1] / closes[-20] - 1.0 if len(closes) >= 20 else None
+        returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes))]
+        volatility = None
+        atr_proxy = None
+        if returns:
+            mean = sum(returns) / len(returns)
+            volatility = math.sqrt(sum((r - mean) ** 2 for r in returns) / len(returns))
+        if len(closes) >= 15:
+            ranges = [abs(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+            atr_proxy = sum(ranges[-14:]) / min(14, len(ranges))
+        return {
+            "latest_price": latest,
+            "avg_volume_20": avg_volume_20,
+            "dollar_volume": dollar_volume,
+            "ma20": ma20,
+            "ma50": ma50,
+            "ma200": ma200,
+            "rsi": None,
+            "atr": atr_proxy,
+            "relative_strength_20d": ret20,
+            "volatility": volatility,
+            "price_freshness": "eod_bars" if latest is not None else "unavailable",
+            "local_metrics_available": {
+                "ma20": ma20 is not None,
+                "ma50": ma50 is not None,
+                "ma200": ma200 is not None,
+                "rsi": False,
+                "atr": atr_proxy is not None,
+                "relative_strength": ret20 is not None,
+                "liquidity_dollar_volume": dollar_volume is not None,
+                "volatility": volatility is not None,
+            },
+        }
+
+    def _intraday_momentum_score(self, symbol: str, metadata: dict[str, Any], bars: list[dict[str, Any]], endpoint_coverage: dict[str, bool] | None = None) -> float:
         if metadata.get("existing_static"):
             return 10.0
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_intraday_bars", True) or not bars:
@@ -927,11 +1077,15 @@ class DynamicUniverseEngine:
         res = self.provider.get_intraday_bars(metadata.get("provider_symbol") or symbol, limit=60)
         if res.status != "ok" or not isinstance(res.data, list) or len(res.data) < 2:
             return 7.5
+        if endpoint_coverage is not None:
+            endpoint_coverage["intraday_bars"] = True
         closes = [float(b.get("close") or 0) for b in res.data if float(b.get("close") or 0) > 0]
         vols = [float(b.get("volume") or 0) for b in res.data if b.get("volume") is not None]
         if len(closes) < 2:
             return 7.5
         ret = closes[-1] / closes[0] - 1.0
+        metadata["intraday_return"] = ret
+        metadata["intraday_points"] = len(closes)
         score = 7.5 + ret * 250
         if len(vols) >= 10:
             recent = sum(vols[-3:]) / 3
@@ -1310,6 +1464,200 @@ class DynamicUniverseEngine:
         self.storage.execute(
             "INSERT INTO symbol_news_events(id,run_id,symbol,provider,event_time,headline,sentiment,source,url,relevance_score,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (str(uuid.uuid4()), self.run_id, symbol.upper(), self.cfg.get("provider", "eodhd"), iso_now(), None, "neutral", metadata.get("source"), None, None, iso_now()),
+        )
+
+    def _score_reason_labels(self, score: ResearchScore) -> list[str]:
+        labels: list[str] = []
+        if score.liquidity_score >= 12:
+            labels.append("liquidity")
+        if score.trend_score >= 14:
+            labels.append("trend")
+        if score.intraday_momentum_score >= 9:
+            labels.append("intraday strength")
+        if score.relative_strength_score >= 8.5:
+            labels.append("relative strength")
+        if score.volatility_quality_score >= 8:
+            labels.append("controlled volatility")
+        if score.screener_mover_score >= 7:
+            labels.append("screener momentum")
+        if score.news_score > 2.5:
+            labels.append("news catalyst")
+        return labels or ["score above research threshold"]
+
+    def _observation_requirement_status(self, score: ResearchScore, metadata: dict[str, Any]) -> dict[str, Any]:
+        enough_score = score.total_score >= self._observation_threshold()
+        component_count = self._positive_component_count(score)
+        confidence_ok = score.data_confidence in {"medium", "high"}
+        liquidity_ok = score.liquidity_score >= 12.0 and not score.block_reason
+        trend_ok = score.trend_score >= 14.0
+        rs_ok = score.relative_strength_score >= 8.5
+        freshness_ok = self._data_freshness_status == "fresh"
+        cluster_clean = bool(metadata.get("cluster")) and metadata.get("cluster") != "unknown_cluster"
+        requirements = {
+            "score_at_or_above_observation_threshold": enough_score,
+            "at_least_two_positive_components": component_count >= 2,
+            "data_confidence_medium_or_high": confidence_ok,
+            "liquidity_passes": liquidity_ok,
+            "trend_passes": trend_ok,
+            "relative_strength_passes": rs_ok,
+            "provider_data_fresh_enough": freshness_ok,
+            "cluster_mapping_clean": cluster_clean,
+            "intraday_confirmation_needed": score.intraday_momentum_score < 9.0,
+            "enough_observation_cycles_passed": False,
+        }
+        missing = [key for key, passed in requirements.items() if key != "intraday_confirmation_needed" and not passed]
+        satisfied = [key for key, passed in requirements.items() if passed]
+        return {
+            "requirements": requirements,
+            "satisfied": satisfied,
+            "missing": missing,
+            "current_blockers": missing or ["observation promotion requires a later market-open check"],
+        }
+
+    def _paper_requirement_status(self, score: ResearchScore, metadata: dict[str, Any]) -> dict[str, Any]:
+        promo = self.cfg.get("promotion", {})
+        confidence_ok = score.data_confidence == "high" or (score.data_confidence == "medium" and bool(promo.get("allow_medium_confidence_paper_tradable", True)))
+        requirements = {
+            "alpaca_compatible_us_lane": metadata.get("universe_lane") == LANE_ALPACA_US,
+            "paper_tradable_score_threshold": score.total_score >= self._paper_tradable_threshold(),
+            "minimum_observation_cycles": False,
+            "minimum_observation_sessions": False,
+            "shadow_tracking_recorded": False,
+            "cluster_mapping_clean": bool(metadata.get("cluster")) and metadata.get("cluster") != "unknown_cluster",
+            "confidence_allowed": confidence_ok,
+            "risk_engine_must_pass_later": False,
+            "telegram_approval_required_later": False,
+            "final_validation_required_later": False,
+        }
+        return {
+            "requirements": requirements,
+            "missing": [key for key, passed in requirements.items() if not passed],
+        }
+
+    def _next_expected_check(self, run_type: str) -> str:
+        if run_type == "daily_deep_research":
+            return "market-open refresh/promotion checks"
+        if run_type == "intraday_light_refresh":
+            minutes = int(self.cfg.get("schedules", {}).get("intraday_light_refresh_minutes", 30))
+            return (self.now + timedelta(minutes=minutes)).isoformat()
+        return "next scheduled Dynamic Universe check"
+
+    def _record_candidate_brief(self, score: ResearchScore, metadata: dict[str, Any], rank: int, run_type: str) -> None:
+        endpoint_coverage = metadata.get("endpoint_coverage") or {}
+        local_metrics = metadata.get("local_metrics_available") or {}
+        positives = self._score_reason_labels(score)
+        missing_neutral = []
+        if not endpoint_coverage.get("fundamentals"):
+            missing_neutral.append("fundamentals unavailable or not required")
+        if not endpoint_coverage.get("news"):
+            missing_neutral.append(f"news neutral ({metadata.get('news_unavailable_reason') or 'unavailable or not called'})")
+        if not endpoint_coverage.get("technicals"):
+            missing_neutral.append("technical API not required; local MA/ATR/volatility used when available")
+        if not local_metrics.get("rsi"):
+            missing_neutral.append("RSI unavailable")
+        obs_status = self._observation_requirement_status(score, metadata)
+        paper_status = self._paper_requirement_status(score, metadata)
+        blockers = list(obs_status["current_blockers"])
+        if score.block_reason:
+            blockers.insert(0, score.block_reason)
+        latest_price = metadata.get("latest_price")
+        avg_volume = metadata.get("avg_volume_20")
+        dollar_volume = metadata.get("dollar_volume")
+        ma20 = metadata.get("ma20")
+        ma50 = metadata.get("ma50")
+        ma200 = metadata.get("ma200")
+        relative = metadata.get("relative_strength_20d")
+        volatility = metadata.get("volatility")
+        atr = metadata.get("atr")
+        trend_bits = []
+        if latest_price is not None and ma20 is not None:
+            trend_bits.append("above MA20" if latest_price > ma20 else "below MA20")
+        if ma20 is not None and ma50 is not None:
+            trend_bits.append("MA20 above MA50" if ma20 > ma50 else "MA20 below MA50")
+        if latest_price is not None and ma50 is not None:
+            trend_bits.append("above MA50" if latest_price > ma50 else "below MA50")
+        if ma200 is None:
+            trend_bits.append("MA200 unavailable")
+        intraday_return = metadata.get("intraday_return")
+        intraday_summary = "intraday bars unavailable or neutral"
+        if intraday_return is not None:
+            intraday_summary = f"intraday return {intraday_return:.2%} over {metadata.get('intraday_points')} points"
+        payload = {
+            "observation_promotion": obs_status,
+            "paper_tradable_promotion": paper_status,
+            "endpoint_coverage": endpoint_coverage,
+            "local_metrics_available": local_metrics,
+            "llm_boundary": "explanation_only_never_decisioning",
+        }
+        self.storage.execute(
+            """
+            INSERT INTO research_candidate_briefs(
+                id,run_id,symbol,company_name,current_tier,universe_lane,research_score,rank,data_confidence,
+                latest_price,price_freshness,liquidity_metrics,dollar_volume,trend_summary,intraday_summary,
+                relative_strength_vs_spy,sector,industry,sector_relative_context,volatility_risk_summary,
+                screener_reason,main_positive_reasons,main_blockers,missing_neutral_data,endpoint_coverage,
+                before_observation_requirements,before_paper_tradable_requirements,allowed_actions,blocked_actions,
+                proposal_order_confirmation,last_pre_market_scan_at,last_candidate_brief_at,last_intraday_refresh_at,
+                last_observation_check_at,next_expected_check,current_stage,next_stage_requirements,explanation_source,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid.uuid4()),
+                self.run_id,
+                score.symbol.upper(),
+                metadata.get("Name") or metadata.get("name"),
+                RESEARCH_CANDIDATE,
+                score.universe_lane,
+                score.total_score,
+                rank,
+                score.data_confidence,
+                latest_price,
+                metadata.get("price_freshness"),
+                json_dumps({"avg_volume_20": avg_volume, "liquidity_score": score.liquidity_score}),
+                dollar_volume,
+                ", ".join(trend_bits) if trend_bits else "trend metrics unavailable",
+                intraday_summary,
+                f"20-day return proxy {relative:.2%}" if relative is not None else "relative strength proxy unavailable",
+                metadata.get("sector"),
+                metadata.get("industry"),
+                f"cluster {metadata.get('cluster') or 'unknown_cluster'}",
+                f"volatility {volatility:.2%}; ATR proxy {atr:.2f}" if volatility is not None and atr is not None else "volatility or ATR unavailable",
+                metadata.get("reason") or metadata.get("source") or "deterministic scan score",
+                ", ".join(positives),
+                ", ".join(blockers),
+                ", ".join(missing_neutral),
+                json_dumps(endpoint_coverage),
+                json_dumps(obs_status),
+                json_dumps(paper_status),
+                "research, track, report, explain",
+                "trade proposals, orders, manual promotion, RiskEngine bypass",
+                "No proposal or order is allowed at research-candidate tier.",
+                self.now.isoformat() if run_type == "daily_deep_research" else None,
+                iso_now(),
+                self.now.isoformat() if run_type == "intraday_light_refresh" else None,
+                iso_now(),
+                self._next_expected_check(run_type),
+                RESEARCH_CANDIDATE,
+                json_dumps(obs_status),
+                "deterministic",
+                iso_now(),
+                json_dumps(payload),
+            ),
+        )
+
+    def _record_llm_explanation_usage(self, brief_items: list[tuple[ResearchScore, dict[str, Any]]]) -> None:
+        llm_cfg = self.cfg.get("llm_explanations", {})
+        enabled = bool(llm_cfg.get("enabled", False))
+        status = "disabled"
+        detail: dict[str, Any] = {"candidate_count": len(brief_items)}
+        if not enabled:
+            status = "llm_explanation_disabled"
+        else:
+            status = "llm_explanation_disabled_missing_safe_client"
+            detail["reason"] = "disabled-by-default stub only; deterministic briefs remain source of truth"
+        self.storage.execute(
+            "INSERT INTO llm_explanation_usage(id,run_id,enabled,attempted_calls,successful_calls,failed_calls,discarded_invalid,conflicts_ignored,total_estimated_cost,status,created_at,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), self.run_id, 1 if enabled else 0, 0, 0, 0, 0, 0, 0.0, status, iso_now(), json_dumps(detail)),
         )
 
     def _record_promotion(self, symbol: str, old_tier: str | None, new_tier: str, score: ResearchScore, metadata: dict[str, Any]) -> None:

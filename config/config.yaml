@@ -121,6 +121,12 @@ dynamic_universe:
   enabled: true
   provider: eodhd
   paper_only: true
+  llm_explanations:
+    enabled: false
+    max_candidates_per_run: 5
+    explanation_only: true
+    deterministic_scores_authoritative: true
+    cache_enabled: true
   asset_classes_enabled:
     equities: true
     etfs: true

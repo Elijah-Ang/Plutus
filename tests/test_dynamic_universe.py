@@ -280,6 +280,110 @@ def test_dynamic_symbol_starts_non_executable_research_candidate(temp_storage):
     assert row["data_confidence"] == "medium"
 
 
+def test_research_candidate_brief_records_depth_and_safety(temp_storage):
+    cfg = dynamic_config()
+    provider = FakeProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors", "Name": "VanEck Semiconductor ETF"}],
+        bars=liquid_bars(),
+    )
+
+    result = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    assert result["candidate_briefs"] == 1
+    brief = temp_storage.fetch_all("SELECT * FROM research_candidate_briefs WHERE symbol='SMH'")[0]
+    assert brief["current_tier"] == RESEARCH_CANDIDATE
+    assert brief["explanation_source"] == "deterministic"
+    assert brief["research_score"] is not None
+    assert brief["data_confidence"] == "medium"
+    assert "liquidity" in brief["main_positive_reasons"]
+    assert "trade proposals" in brief["blocked_actions"]
+    assert "No proposal or order is allowed" in brief["proposal_order_confirmation"]
+    assert "endpoint_coverage" in brief["payload"]
+    assert "before_observation_requirements" in set(brief.keys())
+    proposals = temp_storage.fetch_all("SELECT * FROM trade_proposals")
+    orders = temp_storage.fetch_all("SELECT * FROM orders")
+    assert proposals == []
+    assert orders == []
+
+
+def test_stage_semantics_are_seeded_and_block_research_candidate_trading(temp_storage):
+    rows = temp_storage.fetch_all("SELECT * FROM dynamic_universe_stage_semantics WHERE tier='research_candidate'")
+
+    assert rows
+    row = rows[0]
+    assert row["telegram_trade_proposals_allowed"] == 0
+    assert row["orders_possible"] == 0
+    assert row["llm_explanations_allowed"] == 1
+    assert row["llm_can_affect_decisions"] == 0
+
+
+def test_llm_explanation_stub_disabled_by_default_and_decisionless(temp_storage):
+    cfg = dynamic_config()
+    provider = FakeProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    usage = temp_storage.fetch_all("SELECT * FROM llm_explanation_usage")[0]
+    assert usage["enabled"] == 0
+    assert usage["attempted_calls"] == 0
+    assert usage["successful_calls"] == 0
+    assert usage["conflicts_ignored"] == 0
+    row = temp_storage.fetch_all("SELECT tier, executable FROM universe_symbols WHERE symbol='SMH'")[0]
+    assert row["tier"] == RESEARCH_CANDIDATE
+    assert row["executable"] == 0
+
+
+def test_current_research_candidate_brief_backfill_does_not_promote_or_trade(temp_storage):
+    cfg = dynamic_config()
+    now = datetime.now(UTC).isoformat()
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,universe_lane,alpaca_compatible,executable,observation_only,score,data_confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-smh", "SMH", "US", "etf", "semiconductors", RESEARCH_CANDIDATE, LANE_ALPACA_US, 1, 0, 1, 70.0, "medium", now, now),
+    )
+    temp_storage.execute(
+        "INSERT INTO symbol_research_scores(id,run_id,symbol,provider,score,liquidity_score,trend_score,relative_strength_score,intraday_momentum_score,volatility_quality_score,screener_mover_score,news_score,sector_theme_score,data_quality_score,data_confidence,data_confidence_reason,universe_lane,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("score-smh", "run-old", "SMH", "fake", 70.0, 18.0, 15.0, 9.0, 8.0, 10.0, 8.0, 2.5, 5.0, 5.0, "medium", "stored score", LANE_ALPACA_US, now),
+    )
+    engine = DynamicUniverseEngine(cfg, temp_storage, None, "run-backfill")
+
+    count = engine.generate_current_research_candidate_briefs()
+
+    assert count == 1
+    row = temp_storage.fetch_all("SELECT tier, executable FROM universe_symbols WHERE symbol='SMH'")[0]
+    assert row["tier"] == RESEARCH_CANDIDATE
+    assert row["executable"] == 0
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert temp_storage.fetch_all("SELECT * FROM orders") == []
+    brief = temp_storage.fetch_all("SELECT * FROM research_candidate_briefs WHERE symbol='SMH'")[0]
+    assert "No proposal or order is allowed" in brief["proposal_order_confirmation"]
+
+
+def test_premarket_telegram_wording_uses_scan_and_no_orders_line(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    provider = FakeProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+    )
+    result = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    service.telegram = MockTelegramBot()
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed")
+
+    msg = service.telegram.messages[-1]
+    assert "pre-market universe scan completed" in msg
+    assert "pre-market research completed" not in msg
+    assert "Research candidates: 1" in msg
+    assert "Briefs: 1" in msg
+    assert "Trading remains blocked until market open" in msg
+    assert "No trade proposals/orders created" in msg
+    assert len(msg) < 900
+
+
 def test_partial_data_eod_quote_news_can_create_research_candidate(temp_storage):
     cfg = dynamic_config()
     provider = PartialProvider(
@@ -493,6 +597,20 @@ def test_dynamic_universe_report_sheets_registered():
     sheet_names = {name for name, _ in SHEETS}
 
     assert "Dynamic Universe Summary" in sheet_names
+    assert "Dynamic Research Summary" in sheet_names
+    assert "Stage Semantics" in sheet_names
+    assert "Research Candidate Briefs" in sheet_names
+    assert "Candidate Scores" in sheet_names
+    assert "Candidate Data Coverage" in sheet_names
+    assert "Candidate Endpoint Coverage" in sheet_names
+    assert "Candidate Promotion Requirements" in sheet_names
+    assert "Candidate Block Reasons" in sheet_names
+    assert "Candidate Next Steps" in sheet_names
+    assert "Candidate Chart Data" in sheet_names
+    assert "Research Funnel Chart Data" in sheet_names
+    assert "Data Confidence Chart Data" in sheet_names
+    assert "Candidate Score Chart Data" in sheet_names
+    assert "Block Reason Chart Data" in sheet_names
     assert "Universe Membership" in sheet_names
     assert "Paper-Tradable Symbols" in sheet_names
     assert "Data Provider Health" in sheet_names

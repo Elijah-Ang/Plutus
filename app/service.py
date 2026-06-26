@@ -4297,13 +4297,46 @@ class TradingService:
         skipped = [r for r in results if r.get("status") == "skipped"]
         if completed:
             promoted = sorted({sym for r in completed for sym in r.get("promoted", [])})
-            suffix = f" Research candidates: {', '.join(promoted[:8])}." if promoted else ""
-            text = f"Dynamic Universe pre-market research completed. Trading remains blocked until market open.{suffix}"
+            run_ids = [str(r.get("run_id")) for r in completed if r.get("run_id")]
+            placeholders = ",".join("?" for _ in run_ids)
+            briefs = []
+            if run_ids:
+                briefs = self.storage.fetch_all(
+                    f"""
+                    SELECT symbol,research_score,main_positive_reasons
+                    FROM research_candidate_briefs
+                    WHERE run_id IN ({placeholders})
+                    ORDER BY research_score DESC, symbol
+                    LIMIT 5
+                    """,
+                    tuple(run_ids),
+                )
+            candidate_count = len(promoted)
+            brief_count = sum(int(r.get("candidate_briefs") or 0) for r in completed)
+            observation_count = len({sym for r in completed for sym in r.get("promoted", []) if self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? AND tier='observation'", (sym,))})
+            paper_count = len({sym for r in completed for sym in r.get("promoted", []) if self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? AND tier='paper_tradable'", (sym,))})
+            top = ", ".join(
+                f"{row['symbol']} {float(row['research_score'] or 0):.0f} {str(row.get('main_positive_reasons') or 'score').split(',')[0]}"
+                for row in briefs
+            )
+            provider_rows = self.storage.fetch_all(
+                "SELECT SUM(CASE WHEN available=1 THEN 1 ELSE 0 END) available_count, SUM(CASE WHEN disabled_until IS NOT NULL THEN 1 ELSE 0 END) cooldown_count FROM data_provider_capabilities"
+            )
+            provider = provider_rows[0] if provider_rows else {}
+            provider_line = f"Provider: {int(provider.get('available_count') or 0)} endpoints available, {int(provider.get('cooldown_count') or 0)} on cooldown."
+            lines = [
+                "Dynamic Universe pre-market universe scan completed. Trading remains blocked until market open.",
+                f"Research candidates: {candidate_count} | Briefs: {brief_count} | Observation: {observation_count} | Paper-tradable: {paper_count}",
+            ]
+            if top:
+                lines.append(f"Top: {top}.")
+            lines.extend([provider_line, "Next: market-open refresh/promotion checks.", "No trade proposals/orders created."])
+            text = "\n".join(lines)
         elif skipped:
             reason = skipped[0].get("reason") or "research skipped"
-            text = f"Dynamic Universe pre-market research skipped: {reason}. Trading remains blocked until market open."
+            text = f"Dynamic Universe pre-market universe scan skipped: {reason}. Trading remains blocked until market open.\nNo trade proposals/orders created."
         else:
-            text = f"Dynamic Universe pre-market research checked. Trading remains blocked until market open: {trading_skipped_reason}."
+            text = f"Dynamic Universe pre-market universe scan checked. Trading remains blocked until market open: {trading_skipped_reason}.\nNo trade proposals/orders created."
         try:
             self.telegram.send_message(text)
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", {"status": "sent", "trading_skipped_reason": trading_skipped_reason})
