@@ -4220,12 +4220,92 @@ class TradingService:
         )
         expired_cnt = expired[0]["cnt"] if expired else 0
 
-        summary_str = self._build_digest_summary(strongest, symbols_list)
-        universe_update = self._dynamic_universe_update_since(window_start_iso)
-        if universe_update:
-            summary_str += f" {universe_update}"
+        promotions = self.storage.fetch_all(
+            "SELECT symbol, from_tier, to_tier, reason FROM symbol_promotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
+            (window_start_iso,),
+        )
+        demotions = self.storage.fetch_all(
+            "SELECT symbol, reason FROM symbol_demotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
+            (window_start_iso,),
+        )
+        to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
+        to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
+        to_research = sorted({r["symbol"] for r in promotions if r["to_tier"] == "research_candidate"})
+        demoted = sorted({r["symbol"] for r in demotions})
 
-        # Mention deferred candidates due to AI review unavailability
+        if prop_cnt == 0 and order_cnt == 0:
+            universe_actions_str = "No dynamic proposals/orders created"
+        else:
+            universe_actions_str = f"Proposals {prop_cnt} | Orders {order_cnt} created"
+
+        capabilities = self.storage.fetch_all(
+            "SELECT endpoint_name, available, plan_limited, disabled_until, last_error_category FROM data_provider_capabilities"
+        )
+        health_events = self.storage.fetch_all(
+            "SELECT status, checked_at FROM data_provider_health WHERE checked_at>=? ORDER BY checked_at DESC",
+            (window_start_iso,),
+        )
+
+        completed_runs = self.storage.fetch_all(
+            "SELECT research_type FROM universe_research_runs WHERE status='completed' AND ended_at>=? ORDER BY ended_at DESC LIMIT 5",
+            (window_start_iso,),
+        )
+
+        cap_statuses = {}
+        for r in capabilities:
+            name = r["endpoint_name"]
+            disabled = False
+            if r.get("disabled_until"):
+                try:
+                    dt = datetime.fromisoformat(r["disabled_until"].replace("Z", "+00:00")).astimezone(UTC)
+                    disabled = dt > now
+                except Exception:
+                    pass
+
+            if int(r.get("plan_limited") or 0) == 1:
+                cap_statuses[name] = "plan-limited"
+            elif disabled:
+                if r.get("last_error_category") == "rate_limited":
+                    cap_statuses[name] = "rate-limited"
+                else:
+                    cap_statuses[name] = "cooldown"
+            elif int(r.get("available") or 0) == 1:
+                cap_statuses[name] = "ok"
+            else:
+                cap_statuses[name] = "unknown"
+
+        had_historical_rate_limit = any(h["status"] == "rate_limited" for h in health_events)
+        active_rate_limits = [name for name, status in cap_statuses.items() if status == "rate-limited"]
+        active_cooldowns = [name for name, status in cap_statuses.items() if status == "cooldown"]
+        active_plan_limits = [name for name, status in cap_statuses.items() if status == "plan-limited"]
+        completed_subtasks = [str(r["research_type"]) for r in completed_runs if r.get("research_type")]
+
+        provider_status_str = "EODHD: ok for current research subtasks"
+        if not active_rate_limits and not active_cooldowns and not active_plan_limits:
+            if had_historical_rate_limit:
+                provider_status_str = "EODHD recovered from recent rate-limit"
+            elif completed_subtasks:
+                provider_status_str = f"EODHD ok for {completed_subtasks[0]}"
+        else:
+            if len(active_rate_limits) == 1 and active_rate_limits[0] == "news":
+                provider_status_str = "EODHD partial — optional news endpoint rate-limited"
+            elif len(active_cooldowns) == 1 and active_cooldowns[0] == "news":
+                if "intraday_light_refresh" in completed_subtasks:
+                    provider_status_str = "EODHD partial — intraday ok; news cooldown"
+                else:
+                    provider_status_str = "EODHD partial — news cooldown active"
+            else:
+                statuses_desc = []
+                for ep in ["eod_bars", "intraday_bars", "realtime_quote", "screener", "technicals", "news", "fundamentals"]:
+                    status = cap_statuses.get(ep)
+                    if status and status != "ok" and status != "unknown":
+                        statuses_desc.append(f"{ep} {status}")
+                if statuses_desc:
+                    provider_status_str = f"EODHD: {'; '.join(statuses_desc)}"
+                else:
+                    provider_status_str = "EODHD rate-limited"
+
+        summary_str = self._build_digest_summary(strongest, symbols_list)
         deferred_rows = self.storage.fetch_all(
             "SELECT DISTINCT symbol FROM market_memory WHERE created_at >= ? AND deferred_ai_review_reason='deferred_ai_review_unavailable'",
             (window_start_iso,)
@@ -4251,7 +4331,15 @@ class TradingService:
                 "expired": expired_cnt
             },
             "exit_first_blocker": "; ".join(sorted({x.get("_blocker") for x in symbols_list if x.get("_blocker")} - {None})),
-            "summary": summary_str
+            "summary": summary_str,
+            "universe_update": {
+                "promoted_to_observation": to_observation,
+                "promoted_to_paper_tradable": to_tradable,
+                "promoted_to_research_candidate": to_research,
+                "demoted_retired": demoted,
+                "actions_created": universe_actions_str
+            },
+            "provider_status": provider_status_str,
         }
 
         from .utils import format_digest_message
@@ -4307,14 +4395,24 @@ class TradingService:
             status = str(status_item.get("status") or "")
             if tier != PAPER_TRADABLE:
                 if tier == OBSERVATION:
-                    return "no", "observation only; needs paper-tradable promotion"
-                return "no", "research candidate only; needs observation promotion first"
+                    return "no", "needs paper-tradable promotion"
+                return "no", "needs observation promotion first"
             if "cluster limit" in status.lower():
-                return "blocked", status.replace("Watch — ", "").replace("Status: ", "")
+                cleaned = status.replace("Watch — ", "").replace("Status: ", "")
+                if "broad-market cluster limit reached" in cleaned.lower():
+                    import re
+                    syms = sorted({s for s in re.findall(r'\b[A-Z]{3,4}\b', cleaned) if s != symbol})
+                    if syms:
+                        return "blocked", f"broad-market cluster limit due {'/'.join(syms)}"
+                    return "blocked", "broad-market cluster limit"
+                return "blocked", cleaned
             if status:
-                return "blocked", status
+                cleaned = status.replace("Watch — ", "").replace("Watch only — ", "").replace("Status: ", "")
+                if cleaned.lower() == "no entry signal" or cleaned.lower() == "no entry/exit signal":
+                    return "blocked", "no ENTRY signal"
+                return "blocked", cleaned
             if source == "existing_static_watchlist":
-                return "blocked", "no current ENTRY setup recorded"
+                return "blocked", "no ENTRY signal"
             return "blocked", "requires setup, RiskEngine, Telegram approval, and final validation"
 
         rows_by_tier = {"static_paper_tradable": [], "dynamic_paper_tradable": [], "observation": [], "research_candidate": []}
@@ -4324,11 +4422,34 @@ class TradingService:
             source = str(row.get("source") or "")
             allowed, block = proposal_status(symbol, tier, source)
             review = latest_reviews.get(symbol, {})
+            status_item = status_by_symbol.get(symbol, {})
+            universe_score = row.get("score")
+
+            if tier == PAPER_TRADABLE:
+                trade_score = status_item.get("trade_score")
+                if trade_score is not None:
+                    score_val = trade_score
+                    score_label = "Trade score"
+                else:
+                    score_val = universe_score
+                    score_label = "Fallback score"
+            elif tier == OBSERVATION:
+                score_val = universe_score
+                score_label = "Research score"
+            elif tier == RESEARCH_CANDIDATE:
+                score_val = universe_score
+                score_label = "Research score"
+            else:
+                score_val = universe_score
+                score_label = "Score"
+
             item = {
                 "symbol": symbol,
                 "tier": tier,
                 "source": source,
                 "score": row.get("score"),
+                "score_val": score_val,
+                "score_label": score_label,
                 "data_confidence": row.get("data_confidence"),
                 "tradable": tier == PAPER_TRADABLE,
                 "held": symbol in position_symbols,
@@ -4346,6 +4467,10 @@ class TradingService:
                 rows_by_tier["observation"].append(item)
             elif tier == RESEARCH_CANDIDATE:
                 rows_by_tier["research_candidate"].append(item)
+
+        for key in rows_by_tier:
+            rows_by_tier[key].sort(key=lambda x: (-(x["score_val"] if x["score_val"] is not None else -1.0), x["symbol"]))
+
         return rows_by_tier
 
     def run_cycle(self, run_dynamic_universe: bool = True) -> None:

@@ -189,18 +189,16 @@ def test_digest_tier_snapshot_is_explicit_and_truncated():
 
     msg = format_digest_message(digest_data, {"mode": "paper"})
 
-    assert "Paper-tradable watch:" in msg
+    assert "Static paper-tradable:" in msg
     assert "Dynamic paper-tradable:" in msg
-    assert "Observation watch:" in msg
+    assert "Observation:" in msg
     assert "Research candidates:" in msg
-    assert "SPY — static paper-tradable | Tradable" in msg
-    assert "SMH — dynamic paper-tradable | Tradable" in msg
-    assert "OBS0 — observation only | Not tradable" in msg
-    assert "AAL — research candidate only | Not tradable" in msg
-    assert "Proposal blocked: broad-market cluster limit due DIA/IWM" in msg
-    assert "Proposal blocked: observation only; needs paper-tradable promotion" in msg
-    assert "Observation watch shown: 6 of 7" in msg
-    assert "Actions: Proposals 0 | Orders 0 | Fills 0 | GPT 0 | Expired 0" in msg
+    assert "* SPY — Tradable | Score 100 | Proposal blocked: broad-market cluster limit due DIA/IWM" in msg
+    assert "* SMH — Tradable | Score 91 | Proposal blocked: requires setup and RiskEngine pass" in msg
+    assert "* OBS0 — Not tradable | Score 80 | Proposal blocked: observation only; needs paper-tradable promotion" in msg
+    assert "* AAL — Not tradable | Score 58 | Proposal blocked: research candidate only; needs observation promotion first" in msg
+    assert "* Observation shown: top 6 of 7 by score" in msg
+    assert "Actions:\n* Proposals 0 | Orders 0 | Fills 0 | GPT 0 | Expired 0" in msg
 
 def test_digest_throttling_and_market_hours(temp_storage):
     config = {
@@ -901,3 +899,202 @@ def test_digest_cluster_summary_names_held_symbols_without_duplicate_strongest(t
     assert "Status: Watch — broad-market cluster limit reached: existing DIA and IWM positions" in msg
     assert "Summary: SPY scored highest, but it was blocked by the broad-market cluster limit because DIA and IWM are already held." in msg
     assert "SPY was strongest and DIA, IWM, SPY" not in msg
+
+
+def test_digest_tier_sorting_and_score_source_labels(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["SPY", "QQQ"],
+                "observation_watchlist": ["AMGN"],
+            }
+        },
+    }
+    broker = MockBroker()
+    service = TradingService(config, temp_storage, broker, "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+
+    # SPY: static paper-tradable, score = 45.5 in universe_symbols, but scanned with trade_score = 95.0
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("u-spy", "SPY", "paper_tradable", "existing_static_watchlist", 45.5, now.isoformat(), now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 400.0, 400.0, "HOLD", 95.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
+    )
+
+    # QQQ: static paper-tradable, score = 45.5 in universe, scanned with trade_score = 88.0
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("u-qqq", "QQQ", "paper_tradable", "existing_static_watchlist", 45.5, now.isoformat(), now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "QQQ", 500.0, 500.0, "HOLD", 88.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
+    )
+
+    # AMGN: observation symbol, score = 93.0 in universe
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("u-amgn", "AMGN", "observation", "dynamic_research", 93.0, now.isoformat(), now.isoformat())
+    )
+
+    # CFG: research candidate, score = 75.0 in universe
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("u-cfg", "CFG", "research_candidate", "dynamic_research", 75.0, now.isoformat(), now.isoformat())
+    )
+
+    service.check_and_send_digest()
+
+    assert len(service.telegram.messages) == 1
+    msg = service.telegram.messages[0]
+
+    # Verify score labeling and correct display values
+    assert "* SPY — Tradable | Trade score 95 | Proposal blocked: no ENTRY signal" in msg
+    assert "* QQQ — Tradable | Trade score 88 | Proposal blocked: no ENTRY signal" in msg
+    assert "* AMGN — Not tradable | Research score 93 | Proposal blocked: needs paper-tradable promotion" in msg
+    assert "* CFG — Not tradable | Research score 75 | Proposal blocked: needs observation promotion first" in msg
+
+    # Verify tier headers in correct order
+    idx_static = msg.index("Static paper-tradable:")
+    idx_obs = msg.index("Observation:")
+    idx_cfg = msg.index("Research candidates:")
+    assert idx_static < idx_obs < idx_cfg
+
+    # Verify no proposals or orders were created during formatting/sorting
+    props = temp_storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals")[0]["cnt"]
+    orders = temp_storage.fetch_all("SELECT COUNT(*) as cnt FROM orders")[0]["cnt"]
+    assert props == 0
+    assert orders == 0
+
+
+def test_digest_eodhd_provider_status_reporting(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "watchlist": ["SPY"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+
+    # Setup universe symbol so check_and_send_digest succeeds
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("u-spy", "SPY", "paper_tradable", "existing_static_watchlist", 90.0, now.isoformat(), now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 400.0, 400.0, "HOLD", 90.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
+    )
+
+    # Case A: news rate limit
+    temp_storage.execute("DELETE FROM data_provider_capabilities")
+    future_cooldown = (now + timedelta(minutes=10)).isoformat()
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-news", "run_id", "eodhd", "news", 0, 0, future_cooldown, "rate_limited", now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-intraday", "run_id", "eodhd", "intraday_bars", 1, 0, None, None, now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_research_runs(id,run_id,research_type,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("run-1", "run_id", "intraday_light_refresh", "completed", now.isoformat(), now.isoformat(), 1, 0, 0, "{}")
+    )
+
+    service.check_and_send_digest()
+    msg = service.telegram.messages[-1]
+    assert "* EODHD partial — optional news endpoint rate-limited" in msg
+
+    # Case B: recovered from recent rate-limit
+    temp_storage.execute("DELETE FROM telegram_digests")
+    temp_storage.execute("DELETE FROM data_provider_capabilities")
+    temp_storage.execute("DELETE FROM data_provider_health")
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-intraday", "run_id", "eodhd", "intraday_bars", 1, 0, None, None, now.isoformat())
+    )
+    # Insert a rate_limited log from 5 mins ago
+    temp_storage.execute(
+        "INSERT INTO data_provider_health(id,run_id,provider,status,checked_at) VALUES(?,?,?,?,?)",
+        ("eodhd-h1", "run_id", "eodhd", "rate_limited", (now - timedelta(minutes=5)).isoformat())
+    )
+
+    service.check_and_send_digest()
+    msg = service.telegram.messages[-1]
+    assert "* EODHD recovered from recent rate-limit" in msg
+
+    # Case C: plan-limited fundamentals
+    temp_storage.execute("DELETE FROM telegram_digests")
+    temp_storage.execute("DELETE FROM data_provider_capabilities")
+    temp_storage.execute("DELETE FROM data_provider_health")
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-fundamentals", "run_id", "eodhd", "fundamentals", 0, 1, (now + timedelta(hours=10)).isoformat(), "forbidden", now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-intraday", "run_id", "eodhd", "intraday_bars", 1, 0, None, None, now.isoformat())
+    )
+
+    service.check_and_send_digest()
+    msg = service.telegram.messages[-1]
+    assert "* EODHD: fundamentals plan-limited" in msg
+
+    # Case D: news cooldown active
+    temp_storage.execute("DELETE FROM telegram_digests")
+    temp_storage.execute("DELETE FROM data_provider_capabilities")
+    temp_storage.execute("DELETE FROM data_provider_health")
+    future_cooldown = (now + timedelta(minutes=10)).isoformat()
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-news", "run_id", "eodhd", "news", 0, 0, future_cooldown, "cooldown_active", now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("eodhd-intraday", "run_id", "eodhd", "intraday_bars", 1, 0, None, None, now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_research_runs(id,run_id,research_type,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("run-2", "run_id", "intraday_light_refresh", "completed", now.isoformat(), now.isoformat(), 1, 0, 0, "{}")
+    )
+
+    service.check_and_send_digest()
+    msg = service.telegram.messages[-1]
+    assert "* EODHD partial — intraday ok; news cooldown" in msg
