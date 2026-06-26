@@ -51,6 +51,7 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 - Missing EODHD keys, no internet, provider downtime, and low battery skip Dynamic Universe research safely. Existing static scanning can continue when normal scanner preflight passes.
 - Dynamic universe intake is split into lanes: `alpaca_compatible_us`, `global_research_only`, and `excluded_or_low_quality`. Only the Alpaca-compatible US lane can ever enter the paper-trading scanner, and only after recorded promotion evidence. Global and low-quality symbols remain research/reporting-only.
 - Partial EODHD plans are supported. Missing fundamentals or news does not block research candidates when price/liquidity data is usable. Missing critical EOD price/liquidity data still blocks promotion.
+- Pre-market Dynamic Universe research can run before US market open. The market-open gate remains required for trading/proposal/order paths, so research-only runs can complete with trading explicitly blocked.
 - Final risk validation uses current broker/account loss and margin state plus live internet, Telegram, broker, and database checks. Unknown state blocks execution.
 - Each cycle reconciles existing local orders/fills from Alpaca using broker/client order IDs without resubmitting anything.
 - Excel reports redact Telegram text, sender IDs, and sensitive payload fields by default.

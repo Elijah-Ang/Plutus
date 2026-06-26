@@ -4270,7 +4270,7 @@ class TradingService:
         )
         self.storage.audit(self.run_id, "digest_processed", {"status": status, "window_start": window_start_iso, "window_end": now.isoformat()})
 
-    def run_cycle(self) -> None:
+    def run_cycle(self, run_dynamic_universe: bool = True) -> None:
         self._update_forward_outcomes()
         BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
         # Reconciliation has refreshed account/position state; force the next
@@ -4279,12 +4279,36 @@ class TradingService:
         self.storage.expire_proposals()
         self.notify_expired_proposals()
         self._expire_pending_batches(notify=False)
-        self._run_dynamic_universe_due()
+        if run_dynamic_universe:
+            self._run_dynamic_universe_due()
         if self.config.get("telegram", {}).get("market_scan_processes_telegram_updates", True):
             self.process_telegram()
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
         self.check_and_send_digest()
+
+    def run_dynamic_universe_research_only(self) -> list[dict[str, Any]]:
+        return self._run_dynamic_universe_due()
+
+    def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str) -> None:
+        if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
+            return
+        completed = [r for r in results if r.get("status") == "completed"]
+        skipped = [r for r in results if r.get("status") == "skipped"]
+        if completed:
+            promoted = sorted({sym for r in completed for sym in r.get("promoted", [])})
+            suffix = f" Research candidates: {', '.join(promoted[:8])}." if promoted else ""
+            text = f"Dynamic Universe pre-market research completed. Trading remains blocked until market open.{suffix}"
+        elif skipped:
+            reason = skipped[0].get("reason") or "research skipped"
+            text = f"Dynamic Universe pre-market research skipped: {reason}. Trading remains blocked until market open."
+        else:
+            text = f"Dynamic Universe pre-market research checked. Trading remains blocked until market open: {trading_skipped_reason}."
+        try:
+            self.telegram.send_message(text)
+            self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", {"status": "sent", "trading_skipped_reason": trading_skipped_reason})
+        except Exception as exc:
+            self.storage.audit(self.run_id, "dynamic_universe_premarket_update_failed", {"error": type(exc).__name__, "trading_skipped_reason": trading_skipped_reason})
 
     def _get_symbol_cluster(self, symbol: str) -> str | None:
         clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})

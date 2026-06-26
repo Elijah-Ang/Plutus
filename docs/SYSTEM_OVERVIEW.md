@@ -139,7 +139,10 @@ The Dynamic Universe Engine follows `research many -> watch some -> trade few ->
 - Unknown-cluster symbols cannot become executable until sufficient risk classification exists.
 - GPT is not used to promote, demote, approve, reject, or execute symbols. Any future GPT use must be limited to summaries after deterministic filters narrow research items.
 - The engine runs through existing scanner due checks; no separate launchd job is required. Supported run types are daily deep research, intraday light refresh, event-triggered refresh, post-market review, and weekly cleanup.
+- Scanner preflight is split by purpose. Core safety checks run first, then Dynamic Universe due/catch-up research may run even when the US market is closed. The market-open check remains a trading-only gate, so scan/proposal/order paths stay blocked until market open.
+- The default pre-market research target is configured for 20:30 SGT. A market-closed run with due research is recorded as `research_completed_trading_blocked_market_closed` when research succeeds and trading remains blocked by `market_open`.
 - Telegram universe updates are informational digest sections and are emitted only when promotions, demotions, or provider health changes occurred.
+- Optional pre-market universe notifications can state that Dynamic Universe research completed or skipped while trading remains blocked until market open. They are research-only messages, not trade proposals.
 - Resilience rules are configured under `dynamic_universe_resilience`. If internet, provider key, provider health, or battery state is unsuitable, research is skipped safely, schedule state is updated, and catch-up is marked required.
 - Missing EODHD keys record `provider_unavailable: missing_api_key`. Existing static scanner behavior continues, but dynamic provider research makes no provider calls and creates no new promotions.
 - On battery, light refresh may run above the configured threshold, while deep research is skipped unless explicitly allowed. Critically low battery skips all dynamic research.
