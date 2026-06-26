@@ -76,10 +76,19 @@ class ProviderCache:
         )
         return rows[0] if rows else None
 
-    def capability_disabled(self, provider: str, endpoint_name: str) -> bool:
+    def capability_disabled(self, provider: str, endpoint_name: str, reprobe_after_minutes: int | None = None) -> bool:
         row = self.get_capability(provider, endpoint_name)
-        if row and row.get("last_error_category") == "no_data":
+        if row and row.get("last_error_category") in {"no_data", "not_found"}:
             return False
+        if row and int(row.get("plan_limited") or 0) and reprobe_after_minutes:
+            updated_at = row.get("updated_at") or row.get("last_failure_at")
+            if updated_at:
+                try:
+                    updated_dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00")).astimezone(UTC)
+                    if updated_dt + timedelta(minutes=max(1, int(reprobe_after_minutes))) <= datetime.now(UTC):
+                        return False
+                except Exception:
+                    pass
         disabled_until = row.get("disabled_until") if row else None
         if not disabled_until:
             return False
@@ -105,7 +114,7 @@ class ProviderCache:
         current = self.get_capability(provider, endpoint_name)
         failure_count = int(current.get("failure_count") or 0) if current else 0
         available = status == "ok"
-        plan_limited = status == "plan_limited" or error_category in {"forbidden", "not_found", "http_402"}
+        plan_limited = status == "plan_limited" or error_category in {"forbidden", "http_402"}
         if available:
             failure_count = 0
             last_success_at = now.isoformat()

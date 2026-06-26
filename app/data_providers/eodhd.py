@@ -33,6 +33,7 @@ class EODHDProvider:
         self.max_calls_per_run = int(self.provider_cfg.get("rate_limit", {}).get("max_calls_per_run", 80))
         self.ttls = self.provider_cfg.get("cache_ttl_minutes", {})
         self.plan_limited_cooldown_minutes = int(self.provider_cfg.get("plan_limited_cooldown_minutes", 1440))
+        self.plan_limited_reprobe_minutes = int(self.provider_cfg.get("plan_limited_reprobe_minutes", 60))
 
     def _ttl(self, name: str, default: int) -> int:
         return int(self.ttls.get(name, default))
@@ -79,7 +80,7 @@ class EODHDProvider:
         cached = self.cache.get(self.name, endpoint, clean_params)
         if cached is not None:
             return ProviderResponse(self.name, endpoint, "ok", cached, cached=True)
-        if self.cache.capability_disabled(self.name, capability):
+        if self.cache.capability_disabled(self.name, capability, reprobe_after_minutes=self.plan_limited_reprobe_minutes):
             row = self.cache.get_capability(self.name, capability) or {}
             status = "plan_limited" if int(row.get("plan_limited") or 0) else "provider_unavailable"
             return ProviderResponse(self.name, endpoint, status, None, row.get("last_error_category") or "capability_disabled")

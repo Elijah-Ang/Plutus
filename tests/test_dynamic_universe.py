@@ -141,6 +141,92 @@ def test_eodhd_plan_limited_endpoint_is_cooled_down(temp_storage, monkeypatch):
     assert capability["disabled_until"] is not None
 
 
+def test_provider_capability_reprobe_waits_until_interval(temp_storage):
+    cache = ProviderCache(temp_storage)
+    cache.record_capability("eodhd", "news", status="plan_limited", run_id="run-1", error_category="forbidden", cooldown_minutes=1440)
+
+    assert cache.capability_disabled("eodhd", "news", reprobe_after_minutes=60) is True
+
+
+def test_eodhd_retries_stale_plan_limited_capability(temp_storage, monkeypatch):
+    cfg = load_config()
+    cfg["eodhd"]["max_retries"] = 0
+    cfg["eodhd"]["plan_limited_reprobe_minutes"] = 60
+    provider = EODHDProvider(cfg, temp_storage, "run-test", api_key="test-secret")
+    cache = ProviderCache(temp_storage)
+    cache.record_capability("eodhd", "news", status="plan_limited", run_id="run-1", error_category="forbidden", cooldown_minutes=1440)
+    stale_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    temp_storage.execute(
+        "UPDATE data_provider_capabilities SET updated_at=?, last_failure_at=? WHERE provider=? AND endpoint_name=?",
+        (stale_at, stale_at, "eodhd", "news"),
+    )
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'[{\"title\":\"fresh catalyst\"}]'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeHTTPResponse())
+
+    result = provider.get_news("SPY")
+
+    assert result.status == "ok"
+    assert provider.calls_this_run == 1
+    capability = temp_storage.fetch_all("SELECT available, plan_limited, disabled_until FROM data_provider_capabilities WHERE endpoint_name='news'")[0]
+    assert capability["available"] == 1
+    assert capability["plan_limited"] == 0
+    assert capability["disabled_until"] is None
+
+
+def test_eodhd_symbol_not_found_does_not_disable_endpoint(temp_storage, monkeypatch):
+    cfg = load_config()
+    cfg["eodhd"]["max_retries"] = 0
+    provider = EODHDProvider(cfg, temp_storage, "run-test", api_key="test-secret")
+    responses = iter(
+        [
+            HTTPError("https://example.test", 404, "Not Found", hdrs=None, fp=None),
+            b'[{\"close\":600.0,\"adjusted_close\":600.0,\"volume\":1000000}]',
+        ]
+    )
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __init__(self, payload: bytes):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+    def fake_urlopen(*args, **kwargs):
+        next_item = next(responses)
+        if isinstance(next_item, Exception):
+            raise next_item
+        return FakeHTTPResponse(next_item)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    missing = provider.get_historical_bars("BAD.US")
+    recovered = provider.get_historical_bars("SPY.US")
+
+    assert missing.status == "plan_limited"
+    assert recovered.status == "ok"
+    assert provider.calls_this_run == 2
+    capability = temp_storage.fetch_all("SELECT available, plan_limited, last_error_category, disabled_until FROM data_provider_capabilities WHERE endpoint_name='eod_bars'")[0]
+    assert capability["available"] == 1
+    assert capability["plan_limited"] == 0
+    assert capability["disabled_until"] is None
+
+
 def test_provider_capability_recovery_marks_available(temp_storage):
     cache = ProviderCache(temp_storage)
     cache.record_capability("eodhd", "news", status="plan_limited", run_id="run-1", error_category="forbidden", cooldown_minutes=1440)
