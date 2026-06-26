@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -18,6 +19,9 @@ RESEARCH_CANDIDATE = "research_candidate"
 OBSERVATION = "observation"
 PAPER_TRADABLE = "paper_tradable"
 DEMOTED = "demoted"
+LANE_ALPACA_US = "alpaca_compatible_us"
+LANE_GLOBAL_RESEARCH = "global_research_only"
+LANE_EXCLUDED = "excluded_or_low_quality"
 SGT = ZoneInfo("Asia/Singapore")
 
 
@@ -27,13 +31,16 @@ class ResearchScore:
     total_score: float
     liquidity_score: float
     trend_score: float
+    intraday_momentum_score: float
     relative_strength_score: float
     volatility_quality_score: float
+    screener_mover_score: float
     news_score: float
     sector_theme_score: float
     data_quality_score: float
     data_confidence: str
     data_confidence_reason: str
+    universe_lane: str = LANE_ALPACA_US
     existing_static: bool = False
     block_reason: str | None = None
 
@@ -142,6 +149,7 @@ class DynamicUniverseEngine:
 
         promoted = []
         demoted = []
+        self._backfill_unclassified_universe_symbols()
         candidates = self._collect_raw_candidates(run_type)
         considered = 0
         self._last_score_candidates = []
@@ -159,7 +167,7 @@ class DynamicUniverseEngine:
                 score = self._score_symbol(symbol, metadata)
                 self._last_score_candidates.append(score)
                 self._record_score(score, metadata)
-                if not metadata.get("existing_static") and (score.block_reason or score.total_score < float(self.cfg.get("promotion", {}).get("min_research_score", 75))):
+                if not metadata.get("existing_static") and (score.block_reason or score.total_score < self._research_threshold()):
                     self._record_candidate_block(score, metadata)
                 new_tier = self._decide_tier(symbol, metadata, score)
                 old_tier = current.get("tier") if current else None
@@ -227,6 +235,7 @@ class DynamicUniverseEngine:
             WHERE tier=?
               AND observation_only=1
               AND exchange='US'
+              AND COALESCE(universe_lane, 'alpaca_compatible_us')='alpaca_compatible_us'
               AND symbol NOT LIKE '%.%'
               AND asset_class IN ('equity','etf')
             ORDER BY score DESC, symbol
@@ -614,16 +623,19 @@ class DynamicUniverseEngine:
             if isinstance(symbols, str):
                 symbols = [symbols]
             for raw in symbols:
-                symbol = str(raw).upper().replace(".US", "").strip()
-                if not symbol or "." in symbol:
+                raw_symbol = str(raw).upper().strip()
+                if not raw_symbol:
                     continue
+                source_exchange = "US" if raw_symbol.endswith(".US") or "." not in raw_symbol else raw_symbol.rsplit(".", 1)[-1]
+                symbol = raw_symbol.replace(".US", "")
                 rows.append(
                     {
                         "Code": symbol,
-                        "Exchange": "US",
+                        "Exchange": source_exchange,
                         "Type": "Common Stock",
                         "source": "eodhd_news",
                         "reason": "recent news catalyst",
+                        "news_symbol_raw": raw_symbol,
                     }
                 )
         return rows
@@ -637,6 +649,10 @@ class DynamicUniverseEngine:
             symbol = str(metadata.get("symbol") or "")
             if source == "existing_static_watchlist":
                 base = 0
+            elif metadata.get("universe_lane") == LANE_EXCLUDED:
+                base = 10
+            elif metadata.get("universe_lane") == LANE_GLOBAL_RESEARCH:
+                base = 7
             elif source == "eodhd_news":
                 base = 1
             elif exchange in {"NYSE", "NASDAQ", "NYSE ARCA", "NYSEARCA", "AMEX"} and asset_class in {"equity", "etf"}:
@@ -649,23 +665,11 @@ class DynamicUniverseEngine:
                 base = 5
             return base, symbol
 
-        return [row for row in sorted(candidates, key=priority) if not self._excluded_candidate(row)]
+        return sorted(candidates, key=priority)
 
     def _excluded_candidate(self, row: dict[str, Any]) -> bool:
         metadata = self._metadata(row)
-        exclusions = self.cfg.get("exclusions", {})
-        exchange = str(metadata.get("exchange") or "").upper()
-        asset_class = str(metadata.get("asset_class") or "")
-        symbol = str(metadata.get("symbol") or "")
-        if "." in symbol and exchange != "US":
-            return True
-        if exclusions.get("otc", True) and exchange in {"PINK", "OTC", "OTCQB", "OTCQX"}:
-            return True
-        if asset_class == "fund" and not self.cfg.get("asset_classes_enabled", {}).get("funds", True):
-            return True
-        if exclusions.get("leveraged_etfs", True) and any(token in symbol for token in ("2X", "3X", "ULTRA", "BEAR", "BULL")):
-            return True
-        return False
+        return metadata.get("universe_lane") == LANE_EXCLUDED
 
     def _rows_from_response(self, response: ProviderResponse, source: str) -> list[dict[str, Any]]:
         if response.status != "ok" or not response.data:
@@ -712,19 +716,60 @@ class DynamicUniverseEngine:
         else:
             asset_class = "equity"
         cluster = self._infer_cluster(symbol, asset_class, info)
+        exchange = info.get("Exchange") or info.get("exchange") or "US"
+        region = info.get("Country") or info.get("country") or "US"
+        lane, alpaca_compatible, exclusion_reason = self._classify_symbol_lane(symbol, str(exchange), asset_class, info)
         return {
             "symbol": symbol,
             "provider_symbol": info.get("provider_symbol") or (f"{symbol}.US" if "." not in symbol else symbol),
-            "exchange": info.get("Exchange") or info.get("exchange") or "US",
+            "exchange": exchange,
             "asset_class": asset_class,
             "sector": info.get("Sector") or info.get("sector"),
             "cluster": cluster,
-            "region": info.get("Country") or info.get("country") or "US",
+            "region": region,
             "currency": info.get("Currency") or info.get("currency") or "USD",
             "source": info.get("source", "unknown"),
             "existing_static": bool(info.get("existing_static")),
             "observation": bool(info.get("observation")),
+            "universe_lane": lane,
+            "alpaca_compatible": 1 if alpaca_compatible else 0,
+            "exclusion_reason": exclusion_reason,
         }
+
+    def _classify_symbol_lane(self, symbol: str, exchange: str, asset_class: str, info: dict[str, Any]) -> tuple[str, bool, str | None]:
+        symbol = symbol.upper().strip()
+        exchange_upper = str(exchange or "").upper()
+        source = str(info.get("source") or "")
+        exclusions = self.cfg.get("exclusions", {})
+        us_exchanges = {"US", "NYSE", "NASDAQ", "NYSE ARCA", "NYSEARCA", "AMEX", "BATS", "CBOE"}
+        execution_allowed = self._asset_execution_allowed(asset_class)
+        clean_us_ticker = bool(re.fullmatch(r"[A-Z]{1,5}", symbol))
+
+        if not symbol:
+            return LANE_EXCLUDED, False, "invalid_symbol"
+        if any(ch in symbol for ch in (":", "/", "\\")):
+            return LANE_GLOBAL_RESEARCH, False, "non_us_or_cross_asset_symbol"
+        if "-" in symbol and exchange_upper not in us_exchanges:
+            return LANE_GLOBAL_RESEARCH, False, "non_us_or_cross_asset_symbol"
+        if symbol.isdigit():
+            return LANE_GLOBAL_RESEARCH if exchange_upper not in us_exchanges else LANE_EXCLUDED, False, "numeric_symbol_not_us_execution_lane"
+        if "." in symbol and not symbol.endswith(".US"):
+            return LANE_GLOBAL_RESEARCH, False, "non_us_exchange_suffix"
+        if exclusions.get("otc", True) and (exchange_upper in {"PINK", "OTC", "OTCQB", "OTCQX"} or (len(symbol) == 5 and symbol[-1] in {"F", "Y"})):
+            return LANE_EXCLUDED, False, "otc_or_adr_like_symbol"
+        if asset_class == "fund" and not self.cfg.get("asset_classes_enabled", {}).get("funds", True):
+            return LANE_GLOBAL_RESEARCH, False, "fund_research_only"
+        if asset_class not in {"equity", "etf", "fund"}:
+            return LANE_GLOBAL_RESEARCH, False, "unsupported_asset_class_research_only"
+        if exclusions.get("leveraged_etfs", True) and any(token in symbol for token in ("2X", "3X", "ULTRA", "BEAR", "BULL")):
+            return LANE_EXCLUDED, False, "leveraged_or_inverse_symbol"
+        if exchange_upper not in us_exchanges:
+            return LANE_GLOBAL_RESEARCH, False, "non_us_exchange"
+        if not clean_us_ticker:
+            return LANE_EXCLUDED, False, "unclean_us_ticker_format"
+        if not execution_allowed:
+            return LANE_GLOBAL_RESEARCH, False, "asset_class_not_execution_enabled"
+        return LANE_ALPACA_US, True, None
 
     def _infer_cluster(self, symbol: str, asset_class: str, info: dict[str, Any]) -> str:
         configured = self.config.get("portfolio_optimizer", {}).get("clusters", {})
@@ -748,6 +793,29 @@ class DynamicUniverseEngine:
         bars = []
         quote_ok = False
         news_ok = False
+        lane = metadata.get("universe_lane") or LANE_ALPACA_US
+        if lane == LANE_EXCLUDED:
+            reason = metadata.get("exclusion_reason") or "excluded_or_low_quality"
+            metadata["data_confidence"] = "insufficient"
+            metadata["data_confidence_reason"] = reason
+            return ResearchScore(
+                symbol=symbol,
+                total_score=0.0,
+                liquidity_score=0.0,
+                trend_score=0.0,
+                intraday_momentum_score=0.0,
+                relative_strength_score=0.0,
+                volatility_quality_score=0.0,
+                screener_mover_score=0.0,
+                news_score=0.0,
+                sector_theme_score=0.0,
+                data_quality_score=0.0,
+                data_confidence="insufficient",
+                data_confidence_reason=reason,
+                universe_lane=lane,
+                existing_static=bool(metadata.get("existing_static")),
+                block_reason=reason,
+            )
         if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_eod_bars", True) and not metadata.get("existing_static"):
             res = self.provider.get_historical_bars(metadata.get("provider_symbol") or symbol, limit=80)
             if res.status == "ok" and isinstance(res.data, list):
@@ -760,21 +828,40 @@ class DynamicUniverseEngine:
             quote_ok = quote.status == "ok" and bool(quote.data)
         liquidity, liquidity_block = self._liquidity_score(metadata, bars)
         trend = self._trend_score(bars)
+        intraday = self._intraday_momentum_score(symbol, metadata, bars)
         rel = self._relative_strength_score(bars)
         vol = self._volatility_quality_score(bars)
+        screener = self._screener_mover_score(metadata)
         news, news_ok = self._news_score(symbol, metadata)
-        sector = 5.0 if metadata.get("cluster") != "unknown_cluster" else 3.0
+        sector = 5.0 if metadata.get("cluster") != "unknown_cluster" else 2.5
         quality = self._data_quality_score(metadata, bars)
         confidence, confidence_reason = self._data_confidence(metadata, bars, quote_ok, news_ok)
         metadata["data_confidence"] = confidence
         metadata["data_confidence_reason"] = confidence_reason
-        total = liquidity + trend + rel + vol + news + sector + quality
+        total = liquidity + trend + intraday + rel + vol + screener + news + sector + quality
         block_reason = liquidity_block
         if quality < 2.0 and not metadata.get("existing_static"):
             block_reason = "missing or stale price data"
         if confidence == "insufficient" and not metadata.get("existing_static"):
             block_reason = block_reason or "insufficient data confidence"
-        return ResearchScore(symbol, min(100.0, total), liquidity, trend, rel, vol, news, sector, quality, confidence, confidence_reason, bool(metadata.get("existing_static")), block_reason)
+        return ResearchScore(
+            symbol=symbol,
+            total_score=min(100.0, total),
+            liquidity_score=liquidity,
+            trend_score=trend,
+            intraday_momentum_score=intraday,
+            relative_strength_score=rel,
+            volatility_quality_score=vol,
+            screener_mover_score=screener,
+            news_score=news,
+            sector_theme_score=sector,
+            data_quality_score=quality,
+            data_confidence=confidence,
+            data_confidence_reason=confidence_reason,
+            universe_lane=lane,
+            existing_static=bool(metadata.get("existing_static")),
+            block_reason=block_reason,
+        )
 
     def _liquidity_score(self, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> tuple[float, str | None]:
         if metadata.get("existing_static"):
@@ -821,7 +908,7 @@ class DynamicUniverseEngine:
     def _volatility_quality_score(self, bars: list[dict[str, Any]]) -> float:
         closes = [float(b.get("close") or b.get("adjusted_close") or 0) for b in bars if float(b.get("close") or b.get("adjusted_close") or 0) > 0]
         if len(closes) < 20:
-            return 7.5 if closes else 0.0
+            return 5.0 if closes else 0.0
         returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes))]
         mean = sum(returns) / len(returns)
         variance = sum((r - mean) ** 2 for r in returns) / len(returns)
@@ -829,16 +916,50 @@ class DynamicUniverseEngine:
         if daily_vol > 0.08:
             return 0.0
         if daily_vol < 0.002:
+            return 4.0
+        return 10.0
+
+    def _intraday_momentum_score(self, symbol: str, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> float:
+        if metadata.get("existing_static"):
+            return 10.0
+        if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_intraday_bars", True) or not bars:
+            return 7.5 if bars else 0.0
+        res = self.provider.get_intraday_bars(metadata.get("provider_symbol") or symbol, limit=60)
+        if res.status != "ok" or not isinstance(res.data, list) or len(res.data) < 2:
+            return 7.5
+        closes = [float(b.get("close") or 0) for b in res.data if float(b.get("close") or 0) > 0]
+        vols = [float(b.get("volume") or 0) for b in res.data if b.get("volume") is not None]
+        if len(closes) < 2:
+            return 7.5
+        ret = closes[-1] / closes[0] - 1.0
+        score = 7.5 + ret * 250
+        if len(vols) >= 10:
+            recent = sum(vols[-3:]) / 3
+            baseline = sum(vols[:-3]) / max(1, len(vols[:-3]))
+            if baseline > 0 and recent > baseline * 1.5:
+                score += 2.0
+        return max(0.0, min(15.0, score))
+
+    def _screener_mover_score(self, metadata: dict[str, Any]) -> float:
+        source = str(metadata.get("source") or "")
+        if metadata.get("existing_static"):
             return 5.0
-        return 15.0
+        if source == "eodhd_screener":
+            return 8.0
+        if source == "eodhd_news":
+            return 5.0
+        if source == "eodhd_exchange_symbols":
+            return 3.0
+        return 2.5
 
     def _news_score(self, symbol: str, metadata: dict[str, Any]) -> tuple[float, bool]:
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_news", True) or metadata.get("existing_static"):
-            return 7.5, False
+            return 2.5, False
         res = self.provider.get_news(symbol=symbol, limit=5)
         if res.status != "ok" or not isinstance(res.data, list):
-            return 7.5, False
-        return min(15.0, 7.5 + len(res.data) * 1.5), True
+            metadata["news_unavailable_reason"] = res.status
+            return 2.5, False
+        return min(5.0, 2.5 + len(res.data) * 0.5), True
 
     def _data_confidence(self, metadata: dict[str, Any], bars: list[dict[str, Any]], quote_ok: bool, news_ok: bool) -> tuple[str, str]:
         if metadata.get("existing_static"):
@@ -846,9 +967,9 @@ class DynamicUniverseEngine:
         if len(bars) < 20:
             return "insufficient", "missing usable EOD price/liquidity data"
         if quote_ok and news_ok:
-            return "medium", "EOD bars, realtime quote, and news available; optional intraday/fundamental/technical endpoints not required for research tier"
+            return "medium", "EOD bars, realtime quote, and optional news available; fundamentals and technical API are not required"
         if quote_ok:
-            return "low", "EOD bars and realtime quote available; news unavailable or neutral"
+            return "medium", "EOD bars and realtime quote available; news unavailable neutral"
         return "low", "EOD bars available; realtime quote unavailable"
 
     def _data_quality_score(self, metadata: dict[str, Any], bars: list[dict[str, Any]]) -> float:
@@ -863,8 +984,12 @@ class DynamicUniverseEngine:
     def _decide_tier(self, symbol: str, metadata: dict[str, Any], score: ResearchScore) -> str:
         if metadata.get("existing_static"):
             return OBSERVATION if metadata.get("observation") else PAPER_TRADABLE
+        if metadata.get("universe_lane") == LANE_EXCLUDED:
+            return RAW_UNIVERSE
+        if metadata.get("universe_lane") != LANE_ALPACA_US and metadata.get("asset_class") not in {"equity", "etf", "fund", "index"}:
+            return RAW_UNIVERSE
         if not self._promotion_allowed:
-            if score.total_score >= float(self.cfg.get("promotion", {}).get("min_research_score", 75)):
+            if score.total_score >= self._research_threshold():
                 self._record_audit("dynamic_universe_promotions_blocked_stale_research", symbol, {"score": score.total_score, "provider_health_status": self._provider_health_status})
             current = self._current_symbol(symbol)
             return current.get("tier") if current else RAW_UNIVERSE
@@ -873,7 +998,7 @@ class DynamicUniverseEngine:
         if score.data_confidence == "insufficient":
             return RAW_UNIVERSE
         promo = self.cfg.get("promotion", {})
-        if score.total_score < float(promo.get("min_research_score", 75)):
+        if score.total_score < self._research_threshold():
             return RAW_UNIVERSE
         current = self._current_symbol(symbol)
         if not current or current.get("tier") == RAW_UNIVERSE:
@@ -881,6 +1006,8 @@ class DynamicUniverseEngine:
                 return RAW_UNIVERSE
             return RESEARCH_CANDIDATE
         if current.get("tier") == RESEARCH_CANDIDATE:
+            if score.total_score < self._observation_threshold() or self._positive_component_count(score) < 2:
+                return RESEARCH_CANDIDATE
             if score.data_confidence not in {"medium", "high"}:
                 return RESEARCH_CANDIDATE
             return OBSERVATION
@@ -890,7 +1017,9 @@ class DynamicUniverseEngine:
             has_shadow = self._has_shadow_tracking(symbol)
             confidence_ok = score.data_confidence == "high" or (score.data_confidence == "medium" and bool(promo.get("allow_medium_confidence_paper_tradable", True)))
             if (
-                cycles >= int(promo.get("min_observation_cycles", 3))
+                metadata.get("universe_lane") == LANE_ALPACA_US
+                and score.total_score >= self._paper_tradable_threshold()
+                and cycles >= int(promo.get("min_observation_cycles", 3))
                 and sessions >= int(promo.get("min_observation_sessions", 1))
                 and has_shadow
                 and metadata.get("cluster") != "unknown_cluster"
@@ -899,6 +1028,30 @@ class DynamicUniverseEngine:
                 return PAPER_TRADABLE
             return OBSERVATION
         return current.get("tier") or RESEARCH_CANDIDATE
+
+    def _research_threshold(self) -> float:
+        promo = self.cfg.get("promotion", {})
+        exploration = self.cfg.get("exploration", {})
+        if exploration.get("enabled", True):
+            return float(exploration.get("min_research_score_for_exploration", promo.get("min_research_score", 55)))
+        return float(promo.get("min_research_score", 55))
+
+    def _observation_threshold(self) -> float:
+        return float(self.cfg.get("promotion", {}).get("min_observation_score", 65))
+
+    def _paper_tradable_threshold(self) -> float:
+        return float(self.cfg.get("promotion", {}).get("min_paper_tradable_score", 75))
+
+    def _positive_component_count(self, score: ResearchScore) -> int:
+        checks = [
+            score.trend_score >= 14.0,
+            score.relative_strength_score >= 8.5,
+            score.liquidity_score >= 12.0,
+            score.intraday_momentum_score >= 9.0,
+            score.screener_mover_score >= 7.0,
+            score.news_score > 2.5,
+        ]
+        return sum(1 for passed in checks if passed)
 
     def _demote_stale_symbols(self, demoted: list[str]) -> None:
         demotion = self.cfg.get("demotion", {})
@@ -948,6 +1101,43 @@ class DynamicUniverseEngine:
         }
         return bool(allowed.get(key_map.get(normalized, normalized), False))
 
+    def _backfill_unclassified_universe_symbols(self) -> None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT symbol, provider_symbol, exchange, asset_class, region, currency, sector, source, reason
+            FROM universe_symbols
+            WHERE universe_lane IS NULL OR universe_lane=''
+            LIMIT 500
+            """
+        )
+        for row in rows:
+            info = {
+                "Code": row["symbol"],
+                "provider_symbol": row["provider_symbol"],
+                "Exchange": row["exchange"],
+                "Type": row["asset_class"],
+                "Country": row["region"],
+                "Currency": row["currency"],
+                "Sector": row["sector"],
+                "source": row["source"],
+                "reason": row["reason"],
+            }
+            metadata = self._metadata(info)
+            self.storage.execute(
+                """
+                UPDATE universe_symbols
+                SET universe_lane=?, alpaca_compatible=?, exclusion_reason=?, updated_at=?
+                WHERE symbol=?
+                """,
+                (
+                    metadata.get("universe_lane"),
+                    metadata.get("alpaca_compatible", 0),
+                    metadata.get("exclusion_reason"),
+                    iso_now(),
+                    row["symbol"],
+                ),
+            )
+
     def _current_symbol(self, symbol: str) -> dict[str, Any] | None:
         rows = self.storage.fetch_all("SELECT * FROM universe_symbols WHERE symbol=?", (symbol.upper(),))
         return rows[0] if rows else None
@@ -967,10 +1157,10 @@ class DynamicUniverseEngine:
             """
             INSERT INTO universe_symbols(
                 id,symbol,provider_symbol,exchange,asset_class,country,region,currency,sector,cluster,tier,state,
-                executable,observation_only,score,reason,source,provider,data_quality,data_confidence,data_confidence_reason,data_freshness_status,
+                universe_lane,alpaca_compatible,exclusion_reason,executable,observation_only,score,reason,source,provider,data_quality,data_confidence,data_confidence_reason,data_freshness_status,
                 last_successful_research_at,provider_health_status,promotion_allowed,demotion_allowed,stale_after_minutes,
                 last_seen_at,last_promoted_at,last_demoted_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 provider_symbol=excluded.provider_symbol,
                 exchange=excluded.exchange,
@@ -982,6 +1172,9 @@ class DynamicUniverseEngine:
                 cluster=excluded.cluster,
                 tier=excluded.tier,
                 state=excluded.state,
+                universe_lane=excluded.universe_lane,
+                alpaca_compatible=excluded.alpaca_compatible,
+                exclusion_reason=excluded.exclusion_reason,
                 executable=excluded.executable,
                 observation_only=excluded.observation_only,
                 score=excluded.score,
@@ -1015,6 +1208,9 @@ class DynamicUniverseEngine:
                 metadata.get("cluster"),
                 tier,
                 tier,
+                metadata.get("universe_lane"),
+                metadata.get("alpaca_compatible", 0),
+                metadata.get("exclusion_reason"),
                 executable,
                 observation_only,
                 score,
@@ -1049,14 +1245,16 @@ class DynamicUniverseEngine:
             """
             INSERT INTO symbol_research_scores(
                 id,run_id,symbol,provider,score,liquidity_score,trend_score,relative_strength_score,
-                volatility_quality_score,news_score,sector_theme_score,data_quality_score,data_confidence,data_confidence_reason,block_reason,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                intraday_momentum_score,volatility_quality_score,screener_mover_score,news_score,sector_theme_score,
+                data_quality_score,data_confidence,data_confidence_reason,universe_lane,block_reason,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, score.symbol.upper(), self.cfg.get("provider", "eodhd"), score.total_score,
-                score.liquidity_score, score.trend_score, score.relative_strength_score, score.volatility_quality_score,
-                score.news_score, score.sector_theme_score, score.data_quality_score, score.data_confidence,
-                score.data_confidence_reason, score.block_reason, iso_now(),
+                score.liquidity_score, score.trend_score, score.relative_strength_score, score.intraday_momentum_score,
+                score.volatility_quality_score, score.screener_mover_score, score.news_score, score.sector_theme_score,
+                score.data_quality_score, score.data_confidence, score.data_confidence_reason, score.universe_lane,
+                score.block_reason, iso_now(),
             ),
         )
 
@@ -1066,23 +1264,25 @@ class DynamicUniverseEngine:
             """
             INSERT INTO research_candidate_block_reasons(
                 id,run_id,symbol,score,data_confidence,block_reason,liquidity_score,trend_score,
-                relative_strength_score,volatility_quality_score,news_score,sector_theme_score,data_quality_score,created_at,payload
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                intraday_momentum_score,relative_strength_score,volatility_quality_score,screener_mover_score,
+                news_score,sector_theme_score,data_quality_score,universe_lane,exclusion_reason,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, score.symbol.upper(), score.total_score, score.data_confidence, reason,
-                score.liquidity_score, score.trend_score, score.relative_strength_score, score.volatility_quality_score,
-                score.news_score, score.sector_theme_score, score.data_quality_score, iso_now(), json_dumps(metadata),
+                score.liquidity_score, score.trend_score, score.intraday_momentum_score, score.relative_strength_score,
+                score.volatility_quality_score, score.screener_mover_score, score.news_score, score.sector_theme_score,
+                score.data_quality_score, score.universe_lane, metadata.get("exclusion_reason"), iso_now(), json_dumps(metadata),
             ),
         )
 
     def _record_near_miss_symbols(self) -> None:
-        threshold = float(self.cfg.get("promotion", {}).get("min_research_score", 75))
+        threshold = self._research_threshold()
         near = sorted(
-            (s for s in self._last_score_candidates if not s.existing_static and s.total_score < threshold),
+            (s for s in self._last_score_candidates if not s.existing_static and s.universe_lane == LANE_ALPACA_US and s.total_score < threshold),
             key=lambda s: s.total_score,
             reverse=True,
-        )[:10]
+        )[:20]
         if near:
             self._record_audit(
                 "dynamic_universe_near_miss_symbols",

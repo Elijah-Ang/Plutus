@@ -124,14 +124,16 @@ Every trade proposal is written to SQLite with `status='pending'`, assigned a Te
 The Dynamic Universe Engine follows `research many -> watch some -> trade few -> measure all`.
 
 - EODHD is the first research/discovery provider behind `app/data_providers`. API keys are read from environment/Keychain, never code.
-- EODHD capability is tracked per endpoint. Plan-limited endpoints are marked and cooled down so unavailable intraday, fundamentals, technicals, or screener endpoints are not called repeatedly every cycle.
-- Research scoring can operate on partial provider coverage. EOD bars plus quote/news can produce research candidates with explicit data confidence; missing optional endpoints reduce confidence but do not automatically block raw-to-research promotion. Missing usable price/liquidity data still blocks promotion.
+- EODHD capability is tracked per endpoint. Plan-limited endpoints are marked and cooled down so unavailable endpoints are not called repeatedly every cycle.
+- Research scoring is tailored to the current EOD+Intraday plan. Screener, EOD bars, realtime quote, and intraday bars are core inputs; most technical values are computed locally from bars. Fundamentals are non-gating, and news is an optional catalyst bonus that is neutral when unavailable or rate-limited.
+- Research scoring can operate on partial provider coverage. EOD bars plus quote can produce research candidates with explicit data confidence; missing optional enrichment reduces confidence or score but does not automatically block raw-to-research promotion. Missing usable price/liquidity data still blocks promotion.
+- Symbol intake is separated into `alpaca_compatible_us`, `global_research_only`, and `excluded_or_low_quality` lanes. Only the Alpaca-compatible US lane can enter the paper scanner after recorded promotion evidence; global and low-quality symbols remain research/reporting-only.
 - Alpaca remains broker-only for paper order submission, reconciliation, positions, fills, and the existing execution-time market truth.
 - Dynamic tiers:
   - `raw_universe`: discovered symbols only, never executable.
-  - `research_candidate`: scored candidates needing more evidence, never executable.
+  - `research_candidate`: scored candidates needing more evidence, never executable. Discovery can be more permissive here than execution when metadata, price, and liquidity data are clean.
   - `observation`: tracked in scanner/Performance Lab as shadow-only, not executable.
-  - `paper_tradable`: allowed into the existing proposal/risk engine only after deterministic promotion and recorded evidence.
+  - `paper_tradable`: allowed into the existing proposal/risk engine only after deterministic promotion, observation evidence, shadow tracking, clean risk classification, and recorded evidence.
   - `demoted`: historical/retired symbols retained for audit.
 - Forex, crypto, options, bonds, and unsupported asset classes are research-only by default.
 - Unknown-cluster symbols cannot become executable until sufficient risk classification exists.
@@ -303,9 +305,9 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `position_management_state`: Per-symbol high-water mark, trailing stop, profit-protection, and handled take-profit level state.
 - `position_management_decisions`: Per-cycle position-management classifications, metrics, actionability, and block reasons.
 - `profit_exit_events`: Lifecycle rows for take-profit, profit-protection, and trailing-stop proposals.
-- `universe_symbols`: Current symbol tier, execution eligibility, observation-only flag, provider symbol, asset class, sector, cluster, and data-quality state.
+- `universe_symbols`: Current symbol tier, symbol intake lane, execution eligibility, observation-only flag, provider symbol, asset class, sector, cluster, and data-quality state.
 - `universe_research_runs`: Dynamic Universe run history for daily deep research, intraday refresh, event refresh, post-market review, and weekly cleanup.
-- `symbol_research_scores`: Deterministic liquidity, trend, relative strength, volatility, news, sector/theme, and data-quality component scores.
+- `symbol_research_scores`: Deterministic liquidity, trend, intraday momentum, relative strength, volatility, screener/mover, optional news, sector/theme, and data-quality component scores.
 - `symbol_news_events`: Redacted, structured news/catalyst event records used for research scoring.
 - `symbol_trend_snapshots`: Trend, relative-strength, volatility, and cluster snapshots.
 - `symbol_promotion_decisions` / `symbol_demotion_decisions`: Recorded deterministic membership changes. GPT cannot promote or demote symbols.
@@ -352,7 +354,7 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Ranked Opportunity Sets**, **Proposal Batches**, **Batch Candidates**, **Risk Budget Decisions**, **Batch Approval Actions**, and **Candidate Allocation Decisions**: Ranked-batch proposal and risk-budget audit views.
 - **Dynamic Universe Summary**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Observation Symbols**, **Paper-Tradable Symbols**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, **Provider Capabilities**, **Endpoint Availability**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, endpoint capability, provider health, and performance audit views.
 - **Dynamic Universe Schedule State**, **Missed Research Cycles**, **Catch-Up Runs**, **Stale Research Guards**, **Dynamic Universe Promotion Blocks**, and **Dynamic Universe Demotion Blocks**: Resilience, missed-run, catch-up, and stale/provider guard reporting.
-- **Research Candidate Blocks**, **Data Confidence**, **Top Near-Miss Symbols**, and **Dynamic Universe Source Coverage**: Partial-data confidence, block-reason, near-miss, and source coverage reporting for Dynamic Universe candidate quality.
+- **Research Candidate Blocks**, **Data Confidence**, **Top Near-Miss Symbols**, **Dynamic Universe Source Coverage**, **Symbol Intake Classification**, **Alpaca-Compatible Candidates**, **Global Research-Only Symbols**, **Excluded Symbols**, **Symbol Exclusion Reasons**, **Near-Miss US Candidates**, **Near-Miss Global Research**, **Candidate Block Reason Summary**, **Research Rule Strictness Audit**, **Exploration Candidates**, **Provider Capability Usage**, and **Optional News Provider Status**: Partial-data confidence, intake lane, exclusion, block-reason, near-miss, source coverage, and optional-news-fallback reporting for Dynamic Universe candidate quality.
 - **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
 ## 15. Testing Strategy

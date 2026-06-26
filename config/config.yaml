@@ -111,6 +111,12 @@ eodhd:
     max_calls_per_day: 1000
     fail_closed_when_exceeded: false
 
+news_providers:
+  marketaux:
+    enabled: false
+    api_key_secret_name: TradingAgent.MARKETAUX_API_KEY
+    usage: shortlisted_dynamic_universe_news_fallback_only
+
 dynamic_universe:
   enabled: true
   provider: eodhd
@@ -158,7 +164,9 @@ dynamic_universe:
     illiquid_symbols: true
     extreme_volatility: true
   promotion:
-    min_research_score: 75
+    min_research_score: 55
+    min_observation_score: 65
+    min_paper_tradable_score: 75
     min_observation_cycles: 3
     min_observation_sessions: 1
     min_liquidity_score: 70
@@ -169,6 +177,17 @@ dynamic_universe:
     allow_fast_track_paper_tradable: false
     allow_medium_confidence_paper_tradable: true
     max_new_paper_tradable_per_day: 3
+  exploration:
+    enabled: true
+    max_new_research_candidates_per_cycle: 20
+    max_new_observation_promotions_per_day: 5
+    max_new_dynamic_paper_tradable_per_day: 1
+    min_research_score_for_exploration: 55
+    require_clean_symbol_metadata: true
+    require_liquidity_pass: true
+    require_price_data: true
+    allow_news_missing: true
+    allow_fundamentals_missing: true
   demotion:
     max_weak_cycles: 5
     max_no_entry_days: 5

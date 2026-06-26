@@ -7,8 +7,12 @@ from typing import Any
 from app.data_providers.base import ProviderResponse
 from app.data_providers.cache import ProviderCache
 from app.data_providers.eodhd import EODHDProvider
+from app.data_providers.marketaux import MarketauxNewsProvider
 from app.dynamic_universe import (
     DEMOTED,
+    LANE_ALPACA_US,
+    LANE_EXCLUDED,
+    LANE_GLOBAL_RESEARCH,
     OBSERVATION,
     PAPER_TRADABLE,
     RAW_UNIVERSE,
@@ -302,26 +306,81 @@ def test_missing_news_is_neutral_and_low_confidence_research_candidate(temp_stor
 
     score = temp_storage.fetch_all("SELECT news_score, data_confidence FROM symbol_research_scores WHERE symbol='SMH'")[0]
     row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='SMH'")[0]
-    assert score["news_score"] == 7.5
-    assert score["data_confidence"] == "low"
+    assert score["news_score"] == 2.5
+    assert score["data_confidence"] == "medium"
     assert row["tier"] == RESEARCH_CANDIDATE
 
 
 def test_missing_price_liquidity_blocks_research_candidate_and_records_reason(temp_storage):
     cfg = dynamic_config()
     provider = PartialProvider(
-        rows=[{"Code": "NODATA", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        rows=[{"Code": "NODT", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
         bars=[],
     )
 
     DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
 
-    row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='NODATA'")[0]
-    block = temp_storage.fetch_all("SELECT block_reason, data_confidence FROM research_candidate_block_reasons WHERE symbol='NODATA'")[0]
+    row = temp_storage.fetch_all("SELECT tier, data_confidence FROM universe_symbols WHERE symbol='NODT'")[0]
+    block = temp_storage.fetch_all("SELECT block_reason, data_confidence FROM research_candidate_block_reasons WHERE symbol='NODT'")[0]
     assert row["tier"] == RAW_UNIVERSE
     assert row["data_confidence"] == "insufficient"
     assert block["block_reason"] in {"missing liquidity data", "missing or stale price data"}
     assert block["data_confidence"] == "insufficient"
+
+
+def test_symbol_intake_lanes_separate_us_global_and_excluded(temp_storage):
+    cfg = dynamic_config()
+    provider = FakeProvider(
+        rows=[
+            {"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"},
+            {"Code": "700", "Type": "Common Stock", "Exchange": "HK"},
+            {"Code": "AKRTF", "Type": "Common Stock", "Exchange": "US", "source": "eodhd_news"},
+            {"Code": "AKRYY", "Type": "Common Stock", "Exchange": "US", "source": "eodhd_news"},
+        ],
+        bars=liquid_bars(),
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    rows = {r["symbol"]: r for r in temp_storage.fetch_all("SELECT symbol, universe_lane, alpaca_compatible, exclusion_reason FROM universe_symbols")}
+    assert rows["SMH"]["universe_lane"] == LANE_ALPACA_US
+    assert rows["SMH"]["alpaca_compatible"] == 1
+    assert rows["700"]["universe_lane"] == LANE_GLOBAL_RESEARCH
+    assert rows["AKRTF"]["universe_lane"] == LANE_EXCLUDED
+    assert rows["AKRTF"]["exclusion_reason"] == "otc_or_adr_like_symbol"
+    assert rows["AKRYY"]["universe_lane"] == LANE_EXCLUDED
+
+
+def test_low_quality_symbols_do_not_pollute_us_near_misses(temp_storage):
+    cfg = dynamic_config()
+    cfg["dynamic_universe"]["exploration"]["min_research_score_for_exploration"] = 80
+    provider = FakeProvider(
+        rows=[
+            {"Code": "CLEAN", "Type": "Common Stock", "Exchange": "US", "Sector": "Financials"},
+            {"Code": "700", "Type": "Common Stock", "Exchange": "HK"},
+            {"Code": "AKRTF", "Type": "Common Stock", "Exchange": "US", "source": "eodhd_news"},
+        ],
+        bars=liquid_bars(close=30.0, volume=500_000.0),
+    )
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
+
+    audit = temp_storage.fetch_all("SELECT detail FROM dynamic_universe_audit WHERE event_type='dynamic_universe_near_miss_symbols'")
+    assert audit
+    detail = audit[-1]["detail"]
+    assert "CLEAN" in detail
+    assert "AKRTF" not in detail
+    assert "700" not in detail
+
+
+def test_optional_marketaux_news_provider_disabled_safely_without_key(monkeypatch):
+    cfg = load_config()
+    monkeypatch.delenv("MARKETAUX_API_KEY", raising=False)
+    provider = MarketauxNewsProvider(cfg, api_key=None)
+
+    assert provider.enabled() is False
+    assert provider.health().status in {"disabled", "disabled_missing_key"}
+    assert provider.get_news("SMH").status == "disabled_missing_key"
 
 
 def test_observation_requires_shadow_tracking_before_paper_tradable(temp_storage):
@@ -448,6 +507,12 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Data Confidence" in sheet_names
     assert "Top Near-Miss Symbols" in sheet_names
     assert "Dynamic Universe Source Coverage" in sheet_names
+    assert "Symbol Intake Classification" in sheet_names
+    assert "Alpaca-Compatible Candidates" in sheet_names
+    assert "Global Research-Only Symbols" in sheet_names
+    assert "Excluded Symbols" in sheet_names
+    assert "Near-Miss US Candidates" in sheet_names
+    assert "Optional News Provider Status" in sheet_names
 
 
 def test_run_due_respects_paper_only_and_schedule(temp_storage, monkeypatch):

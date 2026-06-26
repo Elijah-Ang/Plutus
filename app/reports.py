@@ -78,9 +78,21 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Dynamic Universe Promotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_promotions_blocked_stale_research' ORDER BY created_at DESC"),
     ("Dynamic Universe Demotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable' ORDER BY created_at DESC"),
     ("Research Candidate Blocks", "research_candidate_block_reasons"),
-    ("Data Confidence", "SELECT symbol,tier,score,data_confidence,data_confidence_reason,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM universe_symbols ORDER BY updated_at DESC, score DESC"),
+    ("Data Confidence", "SELECT symbol,tier,universe_lane,score,data_confidence,data_confidence_reason,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM universe_symbols ORDER BY updated_at DESC, score DESC"),
     ("Top Near-Miss Symbols", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_near_miss_symbols' ORDER BY created_at DESC"),
-    ("Dynamic Universe Source Coverage", "SELECT source,tier,data_confidence,COUNT(*) AS symbols,AVG(score) AS avg_score,MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY source,tier,data_confidence ORDER BY source,tier,data_confidence"),
+    ("Dynamic Universe Source Coverage", "SELECT source,tier,universe_lane,data_confidence,COUNT(*) AS symbols,AVG(score) AS avg_score,MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY source,tier,universe_lane,data_confidence ORDER BY source,tier,universe_lane,data_confidence"),
+    ("Symbol Intake Classification", "SELECT symbol, provider_symbol, exchange, asset_class, region, currency, universe_lane, alpaca_compatible, exclusion_reason, tier, source, score, updated_at FROM universe_symbols ORDER BY universe_lane, score DESC, symbol"),
+    ("Alpaca-Compatible Candidates", "SELECT * FROM universe_symbols WHERE universe_lane='alpaca_compatible_us' ORDER BY score DESC, symbol"),
+    ("Global Research-Only Symbols", "SELECT * FROM universe_symbols WHERE universe_lane='global_research_only' ORDER BY score DESC, symbol"),
+    ("Excluded Symbols", "SELECT * FROM universe_symbols WHERE universe_lane='excluded_or_low_quality' ORDER BY updated_at DESC, symbol"),
+    ("Symbol Exclusion Reasons", "SELECT exclusion_reason, COUNT(*) AS symbols, MAX(updated_at) AS latest_update FROM universe_symbols WHERE universe_lane='excluded_or_low_quality' GROUP BY exclusion_reason ORDER BY symbols DESC"),
+    ("Near-Miss US Candidates", "SELECT symbol, score, data_confidence, block_reason, liquidity_score, trend_score, intraday_momentum_score, relative_strength_score, volatility_quality_score, screener_mover_score, news_score, created_at FROM research_candidate_block_reasons WHERE universe_lane='alpaca_compatible_us' ORDER BY score DESC, created_at DESC LIMIT 50"),
+    ("Near-Miss Global Research", "SELECT symbol, score, data_confidence, block_reason, created_at FROM research_candidate_block_reasons WHERE universe_lane='global_research_only' ORDER BY score DESC, created_at DESC LIMIT 50"),
+    ("Candidate Block Reason Summary", "SELECT COALESCE(universe_lane,'unknown') AS universe_lane, block_reason, COUNT(*) AS symbols, AVG(score) AS avg_score, MAX(created_at) AS latest_seen FROM research_candidate_block_reasons GROUP BY COALESCE(universe_lane,'unknown'), block_reason ORDER BY symbols DESC"),
+    ("Research Rule Strictness Audit", "SELECT block_reason, COUNT(*) AS blocked_symbols, CASE WHEN block_reason IN ('missing or stale price data','missing liquidity data','liquidity below minimum','price below minimum') THEN 'hard safety/data gate' WHEN block_reason LIKE '%excluded%' OR block_reason LIKE '%otc%' THEN 'hard intake gate' ELSE 'soft discovery threshold' END AS recommended_gate_type, MAX(created_at) AS latest_seen FROM research_candidate_block_reasons GROUP BY block_reason ORDER BY blocked_symbols DESC"),
+    ("Exploration Candidates", "SELECT * FROM universe_symbols WHERE tier='research_candidate' AND COALESCE(source,'') NOT LIKE 'existing_static%' ORDER BY score DESC, symbol"),
+    ("Provider Capability Usage", "SELECT provider,endpoint_name,available,plan_limited,last_error_category,disabled_until,used_for_scoring,updated_at FROM data_provider_capabilities ORDER BY provider, endpoint_name"),
+    ("Optional News Provider Status", "SELECT 'marketaux' AS provider, 'disabled_until_key_exists' AS status, 'TradingAgent.MARKETAUX_API_KEY' AS key_source, 'news fallback only for shortlisted symbols' AS usage"),
 ]
 
 
