@@ -4875,7 +4875,7 @@ class TradingService:
     def _dynamic_universe_update_since(self, window_start_iso: str) -> str | None:
         promotions = self.storage.fetch_all(
             """
-            SELECT symbol, to_tier, reason
+            SELECT symbol, from_tier, to_tier, reason, payload, created_at
             FROM symbol_promotion_decisions
             WHERE created_at>=?
             ORDER BY created_at DESC
@@ -4914,7 +4914,9 @@ class TradingService:
         )
         schedule_rows = self.storage.fetch_all(
             """
-            SELECT schedule_name, last_skip_reason, missed_count, catchup_status, provider_health_status, internet_status, power_status, updated_at
+            SELECT schedule_name, last_started_at, last_completed_at, last_success_at, last_skipped_at,
+                   last_skip_reason, missed_count, catchup_status, provider_health_status,
+                   internet_status, power_status, data_freshness_status, promotion_allowed, updated_at
             FROM dynamic_universe_schedule_state
             WHERE updated_at>=?
             ORDER BY updated_at DESC
@@ -4922,9 +4924,19 @@ class TradingService:
             """,
             (window_start_iso,),
         )
+        completed_runs = self.storage.fetch_all(
+            """
+            SELECT research_type, symbols_promoted, detail, ended_at
+            FROM universe_research_runs
+            WHERE status='completed' AND ended_at>=?
+            ORDER BY ended_at DESC
+            LIMIT 5
+            """,
+            (window_start_iso,),
+        )
         stale_rows = self.storage.fetch_all(
             """
-            SELECT event_type, detail
+            SELECT event_type, detail, created_at
             FROM dynamic_universe_audit
             WHERE created_at>=?
               AND event_type IN (
@@ -4937,7 +4949,15 @@ class TradingService:
             """,
             (window_start_iso,),
         )
-        if not promotions and not demotions and not health and not schedule_rows and not stale_rows and not capabilities:
+        proposal_rows = self.storage.fetch_all(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM trade_proposals WHERE datetime(created_at)>=datetime(?)) AS proposals,
+                (SELECT COUNT(*) FROM orders WHERE datetime(created_at)>=datetime(?)) AS orders
+            """,
+            (window_start_iso, window_start_iso),
+        )
+        if not promotions and not demotions and not health and not schedule_rows and not stale_rows and not capabilities and not completed_runs:
             return None
         to_observation = sorted({r["symbol"] for r in promotions if r["to_tier"] == "observation"})
         to_tradable = sorted({r["symbol"] for r in promotions if r["to_tier"] == "paper_tradable"})
@@ -4962,17 +4982,59 @@ class TradingService:
                 using = ", ".join(available) if available else "available endpoints"
                 unavailable = ", ".join(limited)
                 parts.append(f"Dynamic universe provider access is partial. Using {using}; plan-limited: {unavailable}.")
+        completed_names = sorted({str(r["research_type"]) for r in completed_runs if r.get("research_type")})
+        if completed_names:
+            readable = ", ".join(name.replace("_", " ") for name in completed_names)
+            parts.append(f"Research subtasks completed: {readable}.")
+        current_skips = []
         if schedule_rows:
-            latest = schedule_rows[0]
-            if latest.get("last_skip_reason"):
+            for latest in schedule_rows:
+                last_skip = latest.get("last_skipped_at")
+                last_success = latest.get("last_success_at")
+                skip_current = bool(latest.get("last_skip_reason") and last_skip)
+                if skip_current and last_success:
+                    try:
+                        skip_current = datetime.fromisoformat(str(last_skip).replace("Z", "+00:00")) > datetime.fromisoformat(str(last_success).replace("Z", "+00:00"))
+                    except Exception:
+                        skip_current = True
+                if skip_current:
+                    current_skips.append(latest)
+            if current_skips and not completed_runs and not promotions:
+                latest = current_skips[0]
                 missed = int(latest.get("missed_count") or 0)
                 suffix = f" Missed count: {missed}." if missed else ""
-                parts.append(f"Research skipped: {latest['schedule_name']} — {latest['last_skip_reason']}.{suffix}")
-            elif latest.get("catchup_status") == "completed":
-                parts.append(f"Research catch-up completed: {latest['schedule_name']}.")
-        if stale_rows:
-            parts.append("Stale research guard active; new dynamic promotions or BUY/ADD eligibility may be blocked until refresh.")
+                parts.append(f"Dynamic Universe research skipped: {latest['last_skip_reason']}.{suffix}")
+            else:
+                for latest in current_skips:
+                    reason = self._digest_skip_reason_label(str(latest.get("last_skip_reason") or "unknown"))
+                    parts.append(f"{str(latest['schedule_name']).replace('_', ' ').capitalize()} skipped: {reason}; existing research state was still used.")
+                catchups = [r for r in schedule_rows if r.get("catchup_status") == "completed"]
+                if catchups and not current_skips:
+                    parts.append(f"Research catch-up completed: {str(catchups[0]['schedule_name']).replace('_', ' ')}.")
+        if to_observation and completed_runs:
+            parts.append("Observation promotions used deterministic candidate state from the latest completed research subtask.")
+        stale_guard_rows = [r for r in stale_rows if r.get("event_type") in {"dynamic_universe_stale_data_guard", "dynamic_universe_promotions_blocked_stale_research"}]
+        demotion_guard_rows = [r for r in stale_rows if r.get("event_type") == "dynamic_universe_demotions_blocked_provider_unavailable"]
+        if stale_guard_rows:
+            parts.append("Stale research guard active: BUY/ADD eligibility and unsafe paper-tradable promotion blocked until fresh refresh; observation-only tracking and SELL/EXIT monitoring may continue.")
+        if demotion_guard_rows:
+            parts.append("Provider guard active: demotions based only on unavailable provider data are paused.")
+        if proposal_rows:
+            counts = proposal_rows[0]
+            if int(counts.get("proposals") or 0) == 0 and int(counts.get("orders") or 0) == 0:
+                parts.append("No dynamic proposals/orders created.")
         return " ".join(parts)
+
+    def _digest_skip_reason_label(self, reason: str) -> str:
+        if reason == "missing_api_key":
+            return "provider key missing"
+        if reason in {"rate_limited", "max_calls_per_run_exceeded"}:
+            return "provider rate-limited"
+        if reason in {"capability_disabled", "cooldown_active"}:
+            return "provider cooldown active"
+        if reason == "no_internet":
+            return "internet unavailable"
+        return reason.replace("_", " ")
 
     def _risk_budget_cfg(self) -> dict[str, Any]:
         rb = self.config.get("risk_budget", {})

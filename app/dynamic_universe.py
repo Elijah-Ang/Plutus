@@ -565,6 +565,7 @@ class DynamicUniverseEngine:
         self._record_audit("dynamic_universe_catchup_started", None, {"run_type": run_type})
 
     def _record_schedule_completed(self, run_type: str, status: str, gate: ResearchGate, is_catchup: bool) -> None:
+        state = self._schedule_state(run_type)
         fields = {
             "last_completed_at": iso_now(),
             "provider_health_status": self._provider_health_status if self._provider_health_status != "unknown" else gate.provider_health_status,
@@ -576,7 +577,17 @@ class DynamicUniverseEngine:
             "data_freshness_status": "fresh" if status == "completed" else "stale",
         }
         if status == "completed":
-            fields.update(last_success_at=iso_now(), catchup_required=0, missed_count=0)
+            fields.update(last_success_at=iso_now(), last_skip_reason=None, catchup_required=0, missed_count=0)
+            if state and state.get("last_skip_reason") == "missing_api_key":
+                self._record_audit(
+                    "provider_missing_key_state_recovered",
+                    None,
+                    {
+                        "run_type": run_type,
+                        "last_skipped_at": state.get("last_skipped_at"),
+                        "recovered_by": "successful_research_completion",
+                    },
+                )
         if is_catchup:
             fields.update(catchup_completed_at=iso_now(), catchup_status=status)
         self._upsert_schedule_state(run_type, fields)

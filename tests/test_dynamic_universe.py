@@ -243,6 +243,56 @@ def test_provider_capability_recovery_marks_available(temp_storage):
     assert capability["disabled_until"] is None
 
 
+def test_eodhd_rate_limited_cooldown_reports_rate_limited_not_missing_key(temp_storage):
+    cfg = load_config()
+    provider = EODHDProvider(cfg, temp_storage, "run-test", api_key="test-secret")
+    cache = ProviderCache(temp_storage)
+    cache.record_capability("eodhd", "intraday_bars", status="rate_limited", run_id="run-old", error_category="rate_limited", cooldown_minutes=60)
+
+    result = provider.get_intraday_bars("SPY.US")
+
+    assert result.status == "rate_limited"
+    assert result.error == "rate_limited"
+    capability = temp_storage.fetch_all("SELECT last_error_category FROM data_provider_capabilities WHERE endpoint_name='intraday_bars'")[0]
+    assert capability["last_error_category"] == "rate_limited"
+
+
+def test_marketaux_disabled_missing_key_does_not_block_eodhd_intraday_gate(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    cfg["news_providers"]["marketaux"]["enabled"] = False
+    cfg["dynamic_universe"]["llm_explanations"]["enabled"] = False
+    provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US"}], bars=liquid_bars())
+    provider.api_key = "configured"
+
+    result = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_due(force=True, run_types=["intraday_light_refresh"])[0]
+
+    assert result["status"] == "completed"
+    state = temp_storage.fetch_all("SELECT last_skip_reason FROM dynamic_universe_schedule_state WHERE schedule_name='intraday_light_refresh'")[0]
+    assert state["last_skip_reason"] is None
+
+
+def test_successful_refresh_records_missing_key_recovery_audit(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    skipped_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    temp_storage.execute(
+        "INSERT INTO dynamic_universe_schedule_state(id,schedule_name,schedule_type,last_skipped_at,last_skip_reason,missed_count,catchup_required,provider_health_status,internet_status,power_status,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("state-1", "intraday_light_refresh", "intraday_light", skipped_at, "missing_api_key", 1, 1, "provider_unavailable", "online", "ac", skipped_at, skipped_at),
+    )
+    provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US"}], bars=liquid_bars())
+    provider.api_key = "configured"
+
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_due(force=True, run_types=["intraday_light_refresh"])
+
+    state = temp_storage.fetch_all("SELECT last_skip_reason, missed_count, catchup_required FROM dynamic_universe_schedule_state WHERE schedule_name='intraday_light_refresh'")[0]
+    audit = temp_storage.fetch_all("SELECT * FROM dynamic_universe_audit WHERE event_type='provider_missing_key_state_recovered'")
+    assert state["last_skip_reason"] is None
+    assert state["missed_count"] == 0
+    assert state["catchup_required"] == 0
+    assert audit
+
+
 def test_eodhd_key_loaded_from_env_without_network(temp_storage, monkeypatch):
     monkeypatch.setenv("EODHD_API_KEY", "test-secret-token")
     provider = EODHDProvider(load_config(), temp_storage, "run-test")
@@ -616,6 +666,13 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Data Provider Health" in sheet_names
     assert "Dynamic Universe Performance" in sheet_names
     assert "Dynamic Universe Schedule State" in sheet_names
+    assert "Latest Dynamic Universe Subtask Status" in sheet_names
+    assert "Research Subtask Skip Reasons" in sheet_names
+    assert "Stale Research Guard Status" in sheet_names
+    assert "Provider State Recovery" in sheet_names
+    assert "Observation Promotion Source" in sheet_names
+    assert "Candidate Promotion Trace" in sheet_names
+    assert "Digest Status Semantics" in sheet_names
     assert "Missed Research Cycles" in sheet_names
     assert "Catch-Up Runs" in sheet_names
     assert "Stale Research Guards" in sheet_names
@@ -798,8 +855,57 @@ def test_dynamic_universe_digest_mentions_schedule_state(temp_storage, monkeypat
     text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
 
     assert text is not None
-    assert "Research skipped: intraday_light_refresh" in text
+    assert "Dynamic Universe research skipped: no_internet" in text
     assert "Missed count: 2" in text
+
+
+def test_digest_does_not_repeat_stale_missing_key_after_success(temp_storage):
+    cfg = dynamic_config()
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    now = datetime.now(UTC)
+    skipped = now - timedelta(hours=1)
+    temp_storage.execute(
+        "INSERT INTO dynamic_universe_schedule_state(id,schedule_name,schedule_type,last_started_at,last_completed_at,last_success_at,last_skipped_at,last_skip_reason,missed_count,catchup_required,provider_health_status,internet_status,power_status,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("state-1", "intraday_light_refresh", "intraday_light", now.isoformat(), now.isoformat(), now.isoformat(), skipped.isoformat(), "missing_api_key", 0, 0, "ok", "online", "ac", now.isoformat(), skipped.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_research_runs(id,run_id,research_type,provider,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run-1", "run-test", "intraday_light_refresh", "fake", "completed", now.isoformat(), now.isoformat(), 10, 0, 0, "{}"),
+    )
+
+    text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
+
+    assert text is not None
+    assert "missing_api_key" not in text
+    assert "provider key missing" not in text
+    assert "Research subtasks completed: intraday light refresh." in text
+
+
+def test_digest_shows_promotions_with_subtask_skip_not_full_research_skip(temp_storage):
+    cfg = dynamic_config()
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO symbol_promotion_decisions(id,run_id,symbol,from_tier,to_tier,score,reason,deterministic_pass,gpt_summary_used,created_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("promo-1", "run-test", "BIIB", RESEARCH_CANDIDATE, OBSERVATION, 84.0, "deterministic promotion rule", 1, 0, now.isoformat(), "{}"),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_research_runs(id,run_id,research_type,provider,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run-1", "run-test", "intraday_light_refresh", "fake", "completed", now.isoformat(), now.isoformat(), 10, 1, 0, "{}"),
+    )
+    temp_storage.execute(
+        "INSERT INTO dynamic_universe_schedule_state(id,schedule_name,schedule_type,last_skipped_at,last_skip_reason,missed_count,catchup_required,provider_health_status,internet_status,power_status,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("state-1", "post_market_review", "post_market", now.isoformat(), "rate_limited", 1, 1, "rate_limited", "online", "ac", now.isoformat(), now.isoformat()),
+    )
+
+    text = service._dynamic_universe_update_since((now - timedelta(minutes=5)).isoformat())
+
+    assert text is not None
+    assert "Promoted to observation: BIIB." in text
+    assert "Post market review skipped: provider rate-limited; existing research state was still used." in text
+    assert "Dynamic Universe research skipped" not in text
+    assert "Observation promotions used deterministic candidate state" in text
+    assert "No dynamic proposals/orders created." in text
 
 
 def test_demote_repeated_weak_scores_preserves_history(temp_storage):

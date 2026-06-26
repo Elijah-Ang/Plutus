@@ -82,8 +82,14 @@ class EODHDProvider:
             return ProviderResponse(self.name, endpoint, "ok", cached, cached=True)
         if self.cache.capability_disabled(self.name, capability, reprobe_after_minutes=self.plan_limited_reprobe_minutes):
             row = self.cache.get_capability(self.name, capability) or {}
-            status = "plan_limited" if int(row.get("plan_limited") or 0) else "provider_unavailable"
-            return ProviderResponse(self.name, endpoint, status, None, row.get("last_error_category") or "capability_disabled")
+            last_error = str(row.get("last_error_category") or "capability_disabled")
+            if int(row.get("plan_limited") or 0):
+                status = "plan_limited"
+            elif last_error == "rate_limited":
+                status = "rate_limited"
+            else:
+                status = "provider_unavailable"
+            return ProviderResponse(self.name, endpoint, status, None, last_error)
 
         if self.calls_this_run >= self.max_calls_per_run:
             self.cache.record_health(self.name, "rate_limited", self.run_id, {"max_calls_per_run": self.max_calls_per_run})
