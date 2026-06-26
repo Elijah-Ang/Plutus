@@ -4386,15 +4386,17 @@ class TradingService:
 
     def _digest_tier_snapshot(self, symbols_list: list[dict[str, Any]], window_start_iso: str, window_end_iso: str) -> dict[str, Any]:
         status_by_symbol = {str(item.get("symbol", "")).upper(): item for item in symbols_list}
+        current_positions = []
         position_symbols = set()
         try:
-            position_symbols = {str(_value(p, "symbol", "")).upper() for p in self.broker.get_positions()}
+            current_positions = list(self.broker.get_positions())
+            position_symbols = {str(_value(p, "symbol", "")).upper() for p in current_positions}
         except Exception:
             rows = self.storage.fetch_all("SELECT symbol FROM positions WHERE created_at=(SELECT MAX(created_at) FROM positions)")
             position_symbols = {str(r.get("symbol", "")).upper() for r in rows}
         universe = self.storage.fetch_all(
             """
-            SELECT symbol,tier,source,universe_lane,score,data_confidence,last_promoted_at,created_at,updated_at
+            SELECT symbol,tier,source,universe_lane,alpaca_compatible,executable,score,data_confidence,last_promoted_at,created_at,updated_at
             FROM universe_symbols
             WHERE tier IN ('paper_tradable','observation','research_candidate')
             ORDER BY tier, score DESC, symbol
@@ -4414,6 +4416,66 @@ class TradingService:
                 """
             )
         }
+        static_symbols: list[str] = []
+        config_observation_symbols: list[str] = []
+        for profile in self.config.get("market_profiles", {}).values():
+            if profile.get("status", "active") != "active":
+                continue
+            if profile.get("broker") not in {None, "alpaca"}:
+                continue
+            if profile.get("execution_enabled") is False:
+                continue
+            static_symbols.extend(str(s).upper() for s in profile.get("watchlist", []))
+            config_observation_symbols.extend(str(s).upper() for s in profile.get("observation_watchlist", []))
+        if not static_symbols:
+            static_symbols.extend(str(s).upper() for s in self.config.get("watchlist", []))
+        static_symbols = list(dict.fromkeys(s for s in static_symbols if s and "." not in s))
+        config_observation_symbols = list(dict.fromkeys(s for s in config_observation_symbols if s and "." not in s))
+        universe_by_symbol = {str(row["symbol"]).upper(): row for row in universe}
+        static_set = set(static_symbols)
+
+        def is_eligible_dynamic_paper_row(row: dict[str, Any]) -> bool:
+            return (
+                str(row["tier"]) == PAPER_TRADABLE
+                and str(row["symbol"]).upper() not in static_set
+                and row.get("universe_lane") == "alpaca_compatible_us"
+                and int(row.get("alpaca_compatible") or 0) == 1
+                and int(row.get("executable") or 0) == 1
+            )
+
+        paper_display_symbols = set(static_symbols)
+        paper_display_symbols.update(str(row["symbol"]).upper() for row in universe if is_eligible_dynamic_paper_row(row))
+        missing_status_symbols = sorted(sym for sym in paper_display_symbols if sym not in status_by_symbol)
+        if missing_status_symbols:
+            placeholders = ",".join("?" for _ in missing_status_symbols)
+            latest_rows = self.storage.fetch_all(
+                f"""
+                SELECT mm.*
+                FROM market_memory mm
+                INNER JOIN (
+                    SELECT symbol, MAX(created_at) AS created_at
+                    FROM market_memory
+                    WHERE symbol IN ({placeholders})
+                    GROUP BY symbol
+                ) latest ON latest.symbol=mm.symbol AND latest.created_at=mm.created_at
+                """,
+                tuple(missing_status_symbols),
+            )
+            cluster_holdings = self._cluster_holdings(current_positions) if current_positions else {}
+            for row in latest_rows:
+                sym = str(row["symbol"]).upper()
+                status_info = self._digest_market_memory_status(sym, row, set(), cluster_holdings)
+                status_by_symbol[sym] = {
+                    "symbol": sym,
+                    "trade_score": row.get("score"),
+                    "trade_classification": row.get("classification"),
+                    "status": status_info.get("status"),
+                    "_event": status_info.get("event"),
+                    "_high_score": status_info.get("high_score", False),
+                    "_cluster_name": status_info.get("cluster_name"),
+                    "_held_symbols": status_info.get("held_symbols", []),
+                    "_blocker": status_info.get("blocker"),
+                }
 
         def proposal_status(symbol: str, tier: str, source: str) -> tuple[str, str]:
             status_item = status_by_symbol.get(symbol, {})
@@ -4440,11 +4502,94 @@ class TradingService:
                 return "blocked", "no ENTRY signal"
             return "blocked", "requires setup, RiskEngine, Telegram approval, and final validation"
 
-        rows_by_tier = {"static_paper_tradable": [], "dynamic_paper_tradable": [], "observation": [], "research_candidate": []}
+        def paper_item(symbol: str, source_label: str, source: str, universe_row: dict[str, Any] | None = None) -> dict[str, Any]:
+            status_item = status_by_symbol.get(symbol, {})
+            universe_score = universe_row.get("score") if universe_row else None
+            trade_score = status_item.get("trade_score")
+            if trade_score is not None:
+                score_val = trade_score
+                score_label = "Trade score"
+            elif universe_score is not None:
+                score_val = universe_score
+                score_label = "Fallback score"
+            else:
+                score_val = None
+                score_label = "Trade score"
+            allowed, block = proposal_status(symbol, PAPER_TRADABLE, source)
+            review = latest_reviews.get(symbol, {})
+            return {
+                "symbol": symbol,
+                "tier": PAPER_TRADABLE,
+                "source": source,
+                "source_label": source_label,
+                "score": universe_score,
+                "score_val": score_val,
+                "score_label": score_label,
+                "data_confidence": universe_row.get("data_confidence") if universe_row else None,
+                "tradable": True,
+                "alpaca_compatible": True,
+                "held": symbol in position_symbols,
+                "proposal_allowed": allowed,
+                "proposal_block_reason": block,
+                "status": status_item.get("status"),
+                "stage_reason": review.get("reason") or ("static core paper-tradable" if source_label == "static" else "dynamic paper-tradable"),
+                "next_check": review.get("next_promotion_review_at") or "next scanner refresh",
+                "decision": review.get("decision"),
+            }
+
+        rows_by_tier = {"paper_tradable": [], "static_paper_tradable": [], "dynamic_paper_tradable": [], "observation": [], "research_candidate": []}
+        for symbol in static_symbols:
+            item = paper_item(symbol, "static", "static_core", universe_by_symbol.get(symbol))
+            rows_by_tier["paper_tradable"].append(item)
+            rows_by_tier["static_paper_tradable"].append(item)
+
+        universe_observation_symbols = {
+            str(row["symbol"]).upper()
+            for row in universe
+            if str(row["tier"]) in {PAPER_TRADABLE, OBSERVATION, RESEARCH_CANDIDATE}
+        }
+        for symbol in config_observation_symbols:
+            if symbol in static_set or symbol in universe_observation_symbols:
+                continue
+            status_item = status_by_symbol.get(symbol, {})
+            score_val = status_item.get("trade_score")
+            rows_by_tier["observation"].append(
+                {
+                    "symbol": symbol,
+                    "tier": OBSERVATION,
+                    "source": "static_observation_watchlist",
+                    "source_label": None,
+                    "score": score_val,
+                    "score_val": score_val,
+                    "score_label": "Trade score" if score_val is not None else "Score",
+                    "data_confidence": None,
+                    "tradable": False,
+                    "alpaca_compatible": True,
+                    "held": symbol in position_symbols,
+                    "proposal_allowed": "no",
+                    "proposal_block_reason": "needs paper-tradable promotion",
+                    "status": status_item.get("status"),
+                    "stage_reason": "configured observation watchlist",
+                    "next_check": "next scanner refresh",
+                    "decision": None,
+                }
+            )
+
         for row in universe:
             symbol = str(row["symbol"]).upper()
             tier = str(row["tier"])
             source = str(row.get("source") or "")
+            if tier == PAPER_TRADABLE and symbol in static_set:
+                continue
+            if (
+                tier == PAPER_TRADABLE
+                and (
+                    row.get("universe_lane") != "alpaca_compatible_us"
+                    or int(row.get("alpaca_compatible") or 0) != 1
+                    or int(row.get("executable") or 0) != 1
+                )
+            ):
+                continue
             allowed, block = proposal_status(symbol, tier, source)
             review = latest_reviews.get(symbol, {})
             status_item = status_by_symbol.get(symbol, {})
@@ -4472,21 +4617,27 @@ class TradingService:
                 "symbol": symbol,
                 "tier": tier,
                 "source": source,
+                "source_label": "dynamic" if tier == PAPER_TRADABLE else None,
                 "score": row.get("score"),
                 "score_val": score_val,
                 "score_label": score_label,
                 "data_confidence": row.get("data_confidence"),
                 "tradable": tier == PAPER_TRADABLE,
+                "alpaca_compatible": bool(row.get("alpaca_compatible", 1)),
                 "held": symbol in position_symbols,
                 "proposal_allowed": allowed,
                 "proposal_block_reason": block,
+                "status": status_item.get("status"),
                 "stage_reason": review.get("reason") or ("static core paper-tradable" if source == "existing_static_watchlist" else "needs next stage promotion"),
                 "next_check": review.get("next_promotion_review_at") or "next scanner refresh",
                 "decision": review.get("decision"),
             }
             if tier == PAPER_TRADABLE and source == "existing_static_watchlist":
+                item["source_label"] = "static"
+                rows_by_tier["paper_tradable"].append(item)
                 rows_by_tier["static_paper_tradable"].append(item)
             elif tier == PAPER_TRADABLE:
+                rows_by_tier["paper_tradable"].append(item)
                 rows_by_tier["dynamic_paper_tradable"].append(item)
             elif tier == OBSERVATION:
                 rows_by_tier["observation"].append(item)

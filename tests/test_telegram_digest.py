@@ -189,8 +189,7 @@ def test_digest_tier_snapshot_is_explicit_and_truncated():
 
     msg = format_digest_message(digest_data, {"mode": "paper"})
 
-    assert "Static paper-tradable:" in msg
-    assert "Dynamic paper-tradable:" in msg
+    assert "Paper-tradable:" in msg
     assert "Observation:" in msg
     assert "Research candidates:" in msg
     assert "* SPY — Tradable | Score 100 | Proposal blocked: broad-market cluster limit due DIA/IWM" in msg
@@ -198,7 +197,7 @@ def test_digest_tier_snapshot_is_explicit_and_truncated():
     assert "* OBS0 — Not tradable | Score 80 | Proposal blocked: observation only; needs paper-tradable promotion" in msg
     assert "* AAL — Not tradable | Score 58 | Proposal blocked: research candidate only; needs observation promotion first" in msg
     assert "* Observation shown: top 6 of 7 by score" in msg
-    assert "Actions:\n* Proposals 0 | Orders 0 | Fills 0 | GPT 0 | Expired 0" in msg
+    assert "Actions:\n* Proposals: 0 | Orders: 0 | Fills: 0 | GPT: 0 | Expired: 0" in msg
 
 def test_digest_throttling_and_market_hours(temp_storage):
     config = {
@@ -422,9 +421,9 @@ def test_digest_explains_exit_first_blocker_and_not_false_threshold(temp_storage
     msg = service.telegram.messages[0]
     assert "Exit-first blocker: DIA EXIT proposal pending" in msg
     assert "Status: Watch — New buy blocked — DIA EXIT proposal pending" in msg
-    assert "DIA — Trade score 90.0" in msg
+    assert "DIA — static | Tradable | Trade score 90" in msg
     assert "Status: Watch — no ENTRY signal" in msg
-    assert "XLV — Trade score 72.0" in msg
+    assert "XLV — Not tradable | Trade score 72 | Proposal blocked: needs paper-tradable promotion" in msg
     assert "Observation only — no proposal allowed" in msg
     assert "no setup crossed the proposal threshold" not in msg.lower()
     assert "No setup crossed the score threshold" not in msg
@@ -929,24 +928,26 @@ def test_digest_tier_sorting_and_score_source_labels(temp_storage):
     service.telegram = MockTelegramBot()
     now = datetime.now(UTC)
 
-    # SPY: static paper-tradable, score = 45.5 in universe_symbols, but scanned with trade_score = 95.0
-    temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
-        ("u-spy", "SPY", "paper_tradable", "existing_static_watchlist", 45.5, now.isoformat(), now.isoformat())
-    )
+    # SPY: static paper-tradable from config, no universe_symbols row required.
     temp_storage.execute(
         "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("run1", "us_equities", "SPY", 400.0, 400.0, "HOLD", 95.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
     )
 
-    # QQQ: static paper-tradable, score = 45.5 in universe, scanned with trade_score = 88.0
-    temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,tier,source,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
-        ("u-qqq", "QQQ", "paper_tradable", "existing_static_watchlist", 45.5, now.isoformat(), now.isoformat())
-    )
+    # QQQ: static paper-tradable from config, no universe_symbols row required.
     temp_storage.execute(
         "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         ("run1", "us_equities", "QQQ", 500.0, 500.0, "HOLD", 88.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
+    )
+
+    # SMH: dynamic paper-tradable only because Dynamic Universe already promoted it.
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,executable,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-smh", "SMH", "paper_tradable", "dynamic_research", "alpaca_compatible_us", 1, 1, 82.0, now.isoformat(), now.isoformat())
+    )
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SMH", 250.0, 250.0, "HOLD", 82.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat())
     )
 
     # AMGN: observation symbol, score = 93.0 in universe
@@ -967,22 +968,89 @@ def test_digest_tier_sorting_and_score_source_labels(temp_storage):
     msg = service.telegram.messages[0]
 
     # Verify score labeling and correct display values
-    assert "* SPY — Tradable | Trade score 95 | Proposal blocked: no ENTRY signal" in msg
-    assert "* QQQ — Tradable | Trade score 88 | Proposal blocked: no ENTRY signal" in msg
+    assert "* SPY — static | Tradable | Trade score 95 | Proposal blocked: no ENTRY signal" in msg
+    assert "* QQQ — static | Tradable | Trade score 88 | Proposal blocked: no ENTRY signal" in msg
+    assert "* SMH — dynamic | Tradable | Trade score 82 | Proposal blocked: no ENTRY signal" in msg
     assert "* AMGN — Not tradable | Research score 93 | Proposal blocked: needs paper-tradable promotion" in msg
     assert "* CFG — Not tradable | Research score 75 | Proposal blocked: needs observation promotion first" in msg
 
     # Verify tier headers in correct order
-    idx_static = msg.index("Static paper-tradable:")
+    idx_static = msg.index("Paper-tradable:")
     idx_obs = msg.index("Observation:")
     idx_cfg = msg.index("Research candidates:")
     assert idx_static < idx_obs < idx_cfg
+    assert "Dynamic paper-tradable:\n* None" not in msg
 
     # Verify no proposals or orders were created during formatting/sorting
     props = temp_storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals")[0]["cnt"]
     orders = temp_storage.fetch_all("SELECT COUNT(*) as cnt FROM orders")[0]["cnt"]
     assert props == 0
     assert orders == 0
+
+
+def test_digest_unified_paper_tradable_excludes_unpromoted_dynamic_symbols(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "execution_enabled": True,
+                "broker": "alpaca",
+                "watchlist": ["SPY"],
+                "observation_watchlist": [],
+            },
+            "global_observation": {
+                "status": "observation_only",
+                "execution_enabled": False,
+                "broker": "none",
+                "watchlist": ["ES3.SI"],
+                "observation_watchlist": [],
+            },
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,executable,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-spy-raw", "SPY", "raw_universe", "existing_static_watchlist", "alpaca_compatible_us", 1, 0, 10.0, now.isoformat(), now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,executable,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-smh-obs", "SMH", "observation", "dynamic_research", "alpaca_compatible_us", 1, 0, 91.0, now.isoformat(), now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,executable,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("u-es3", "ES3.SI", "paper_tradable", "dynamic_research", "global_research_only", 0, 0, 99.0, now.isoformat(), now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 400.0, 400.0, "HOLD", 80.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat()),
+    )
+
+    snapshot = service._digest_tier_snapshot(
+        [{"symbol": "SPY", "trade_score": 80.0, "status": "Watch — no ENTRY signal"}],
+        (now - timedelta(minutes=30)).isoformat(),
+        now.isoformat(),
+    )
+
+    paper_symbols = [item["symbol"] for item in snapshot["paper_tradable"]]
+    assert paper_symbols == ["SPY"]
+    assert snapshot["paper_tradable"][0]["source_label"] == "static"
+    assert "SMH" not in paper_symbols
+    assert "ES3.SI" not in paper_symbols
 
 
 def test_digest_eodhd_provider_status_reporting(temp_storage):
@@ -1127,8 +1195,8 @@ def test_digest_blank_line_formatting():
     # Assert double newline spacing between major sections
     assert "📊 30-min market digest\n\nMarket:\n" in msg
     assert "\n\nActions:\n" in msg
-    assert "\n\nStatic paper-tradable:\n" in msg
-    assert "\n\nDynamic paper-tradable:\n" in msg
+    assert "\n\nPaper-tradable:\n" in msg
+    assert "\n\nDynamic paper-tradable:\n" not in msg
     assert "\n\nObservation:\n" in msg
     assert "\n\nResearch candidates:\n" in msg
     assert "\n\nUniverse update:\n" in msg

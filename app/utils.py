@@ -484,6 +484,8 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
 
     def line_for_symbol(item: dict[str, Any]) -> str:
         held = " | Held" if item.get("held") else ""
+        source_label = item.get("source_label")
+        source_prefix = f"{source_label} | " if source_label else ""
         tradable = "Tradable" if item.get("tradable") else "Not tradable"
         proposal = item.get("proposal_allowed") or "blocked"
         reason = item.get("proposal_block_reason") or "not eligible"
@@ -496,10 +498,16 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         else:
             score_label = score_label or "Trade score"
         score_part = f" | {score_label} {fmt_score(score_val)}" if score_val is not None else ""
-        return f"* {item['symbol']} — {tradable}{held}{score_part} | Proposal {proposal_label}: {reason}"
+        status = item.get("status")
+        status_part = f" | Status: {status}" if status else ""
+        return f"* {item['symbol']} — {source_prefix}{tradable}{held}{score_part} | Proposal {proposal_label}: {reason}{status_part}"
 
     if tier_snapshot_has_items:
         sections = []
+        paper_tradable_items = tier_snapshot.get("paper_tradable")
+        if paper_tradable_items is None:
+            paper_tradable_items = list(tier_snapshot.get("static_paper_tradable") or []) + list(tier_snapshot.get("dynamic_paper_tradable") or [])
+            paper_tradable_items.sort(key=lambda x: (-(x.get("score_val") if x.get("score_val") is not None else x.get("score") if x.get("score") is not None else -1.0), x.get("symbol") or ""))
         
         # 1. Market
         market_sec = (
@@ -515,26 +523,24 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         actions = digest_data.get("actions", {})
         actions_sec = (
             "Actions:\n"
-            f"* Proposals {actions.get('proposals', 0)} | Orders {actions.get('orders', 0)} | "
-            f"Fills {actions.get('fills', 0)} | GPT {actions.get('gpt_calls', 0)} | Expired {actions.get('expired', 0)}"
+            f"* Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | "
+            f"Fills: {actions.get('fills', 0)} | GPT: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}"
         )
         sections.append(actions_sec)
         
         # 3-6. Tiers
         section_specs = [
-            ("Static paper-tradable", "static_paper_tradable", 6),
-            ("Dynamic paper-tradable", "dynamic_paper_tradable", 4),
+            ("Paper-tradable", "paper_tradable", 8),
             ("Observation", "observation", 6),
             ("Research candidates", "research_candidate", 6),
         ]
         trunc_labels = {
-            "static_paper_tradable": "Static paper-tradable",
-            "dynamic_paper_tradable": "Dynamic paper-tradable",
+            "paper_tradable": "Paper-tradable",
             "observation": "Observation",
             "research_candidate": "Research candidates",
         }
         for title, key, limit in section_specs:
-            items = tier_snapshot.get(key) or []
+            items = paper_tradable_items if key == "paper_tradable" else tier_snapshot.get(key) or []
             lines = [f"{title}:"]
             if not items:
                 lines.append("* None")
@@ -544,6 +550,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
                 if len(items) > limit:
                     lines.append(f"* {trunc_labels[key]} shown: top {limit} of {len(items)} by score")
             sections.append("\n".join(lines))
+
+        dynamic_items = tier_snapshot.get("dynamic_paper_tradable") or []
+        if not dynamic_items and paper_tradable_items:
+            sections.append("Dynamic paper-tradable:\n* None")
             
         # 7. Universe update
         uu = digest_data.get("universe_update") or {}
@@ -570,11 +580,13 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             f"* {digest_data.get('provider_status', 'EODHD: ok for current research subtasks')}"
         )
         sections.append(prov_sec)
+
+        exit_first_blocker = digest_data.get("exit_first_blocker")
+        if exit_first_blocker:
+            sections.append(f"Exit-first blocker: {exit_first_blocker}")
         
         # 9. Summary
-        paper_items = []
-        for k in ["static_paper_tradable", "dynamic_paper_tradable"]:
-            paper_items.extend(tier_snapshot.get(k) or [])
+        paper_items = list(paper_tradable_items or [])
         paper_items = [x for x in paper_items if x.get("score_val") is not None]
         if paper_items:
             paper_items.sort(key=lambda x: (x["score_val"], x["symbol"]), reverse=True)
@@ -590,8 +602,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             "Summary:",
             f"* Highest tradable candidate: {highest_str}",
             f"* Main blocker: {blocker_str}",
-            f"* {action_note}"
         ]
+        if digest_data.get("summary"):
+            summary_lines.append(f"Summary: {digest_data.get('summary')}")
+        summary_lines.append(f"* {action_note}")
         sections.append("\n".join(summary_lines))
         
         return "\n\n".join(sections)
