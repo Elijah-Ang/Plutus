@@ -499,19 +499,28 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         return f"* {item['symbol']} — {tradable}{held}{score_part} | Proposal {proposal_label}: {reason}"
 
     if tier_snapshot_has_items:
-        msg_parts = [
-            "📊 30-min market digest\n",
-            "Market:",
-            f"* US market: {digest_data['market_open_status']}",
-            f"* Window: {w_start}–{w_end} SGT",
-            f"* Mode: {mode_str}\n",
-        ]
+        sections = []
+        
+        # 1. Market
+        market_sec = (
+            "📊 30-min market digest\n\n"
+            "Market:\n"
+            f"* US market: {digest_data['market_open_status']}\n"
+            f"* Window: {w_start}–{w_end} SGT\n"
+            f"* Mode: {mode_str}"
+        )
+        sections.append(market_sec)
+        
+        # 2. Actions
         actions = digest_data.get("actions", {})
-        msg_parts.append(
+        actions_sec = (
             "Actions:\n"
             f"* Proposals {actions.get('proposals', 0)} | Orders {actions.get('orders', 0)} | "
-            f"Fills {actions.get('fills', 0)} | GPT {actions.get('gpt_calls', 0)} | Expired {actions.get('expired', 0)}\n"
+            f"Fills {actions.get('fills', 0)} | GPT {actions.get('gpt_calls', 0)} | Expired {actions.get('expired', 0)}"
         )
+        sections.append(actions_sec)
+        
+        # 3-6. Tiers
         section_specs = [
             ("Static paper-tradable", "static_paper_tradable", 6),
             ("Dynamic paper-tradable", "dynamic_paper_tradable", 4),
@@ -526,34 +535,43 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         }
         for title, key, limit in section_specs:
             items = tier_snapshot.get(key) or []
-            msg_parts.append(f"{title}:")
+            lines = [f"{title}:"]
             if not items:
-                msg_parts.append("* None")
-                continue
-            for item in items[:limit]:
-                msg_parts.append(line_for_symbol(item))
-            if len(items) > limit:
-                msg_parts.append(f"* {trunc_labels[key]} shown: top {limit} of {len(items)} by score")
-
+                lines.append("* None")
+            else:
+                for item in items[:limit]:
+                    lines.append(line_for_symbol(item))
+                if len(items) > limit:
+                    lines.append(f"* {trunc_labels[key]} shown: top {limit} of {len(items)} by score")
+            sections.append("\n".join(lines))
+            
+        # 7. Universe update
         uu = digest_data.get("universe_update") or {}
-        msg_parts.append("\nUniverse update:")
         obs_promo = uu.get("promoted_to_observation") or []
         obs_promo_str = ", ".join(obs_promo) if obs_promo else "none"
-        msg_parts.append(f"* Promoted to observation: {obs_promo_str}")
-        
         trade_promo = uu.get("promoted_to_paper_tradable") or []
         trade_promo_str = ", ".join(trade_promo) if trade_promo else "none"
-        msg_parts.append(f"* Promoted to paper-tradable: {trade_promo_str}")
-        
         demoted = uu.get("demoted_retired") or []
         demoted_str = ", ".join(demoted) if demoted else "none"
-        msg_parts.append(f"* Demoted/retired: {demoted_str}")
-        msg_parts.append(f"* {uu.get('actions_created', 'No dynamic proposals/orders created')}\n")
-
-        msg_parts.append("Provider status:")
-        msg_parts.append(f"* {digest_data.get('provider_status', 'EODHD: ok for current research subtasks')}\n")
-
-        msg_parts.append("Summary:")
+        actions_created_str = uu.get('actions_created', 'No dynamic proposals/orders created')
+        
+        uu_lines = [
+            "Universe update:",
+            f"* Promoted to observation: {obs_promo_str}",
+            f"* Promoted to paper-tradable: {trade_promo_str}",
+            f"* Demoted/retired: {demoted_str}",
+            f"* {actions_created_str}"
+        ]
+        sections.append("\n".join(uu_lines))
+        
+        # 8. Provider status
+        prov_sec = (
+            "Provider status:\n"
+            f"* {digest_data.get('provider_status', 'EODHD: ok for current research subtasks')}"
+        )
+        sections.append(prov_sec)
+        
+        # 9. Summary
         paper_items = []
         for k in ["static_paper_tradable", "dynamic_paper_tradable"]:
             paper_items.extend(tier_snapshot.get(k) or [])
@@ -566,13 +584,17 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         else:
             highest_str = "None"
             blocker_str = "None"
-        msg_parts.append(f"* Highest tradable candidate: {highest_str}")
-        msg_parts.append(f"* Main blocker: {blocker_str}")
+            
+        action_note = "No action needed unless approving the active proposal above." if actions.get('proposals', 0) > 0 else "No action needed."
+        summary_lines = [
+            "Summary:",
+            f"* Highest tradable candidate: {highest_str}",
+            f"* Main blocker: {blocker_str}",
+            f"* {action_note}"
+        ]
+        sections.append("\n".join(summary_lines))
         
-        if actions.get('proposals', 0) > 0:
-            msg_parts.append("* No action needed unless approving the active proposal above.")
-        else:
-            msg_parts.append("* No action needed.")
+        return "\n\n".join(sections)
 
     else:
         msg_parts = [

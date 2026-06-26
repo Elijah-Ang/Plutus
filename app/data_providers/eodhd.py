@@ -64,7 +64,7 @@ class EODHDProvider:
         if status_code in {401, 402, 403, 404, 451}:
             return "plan_limited", {401: "unauthorized", 402: "http_402", 403: "forbidden", 404: "not_found", 451: "unavailable_for_legal_reasons"}.get(status_code, "permission")
         if status_code == 429:
-            return "rate_limited", "rate_limited"
+            return "rate_limited", "per_minute_rate_limited"
         if status_code == 422:
             return "provider_unavailable", "no_data"
         return "provider_unavailable", f"http_{status_code}"
@@ -80,12 +80,12 @@ class EODHDProvider:
         cached = self.cache.get(self.name, endpoint, clean_params)
         if cached is not None:
             return ProviderResponse(self.name, endpoint, "ok", cached, cached=True)
-        if self.cache.capability_disabled(self.name, capability, reprobe_after_minutes=self.plan_limited_reprobe_minutes):
+        if self.cache.capability_disabled(self.name, capability, reprobe_after_minutes=self.plan_limited_reprobe_minutes, current_run_id=self.run_id):
             row = self.cache.get_capability(self.name, capability) or {}
             last_error = str(row.get("last_error_category") or "capability_disabled")
             if int(row.get("plan_limited") or 0):
                 status = "plan_limited"
-            elif last_error == "rate_limited":
+            elif last_error in {"rate_limited", "per_minute_rate_limited", "cooldown_active"}:
                 status = "rate_limited"
             else:
                 status = "provider_unavailable"
@@ -93,7 +93,7 @@ class EODHDProvider:
 
         if self.calls_this_run >= self.max_calls_per_run:
             self.cache.record_health(self.name, "rate_limited", self.run_id, {"max_calls_per_run": self.max_calls_per_run})
-            self.cache.record_capability(self.name, capability, status="rate_limited", run_id=self.run_id, error_category="rate_limited", used_for_scoring=used_for_scoring, cooldown_minutes=60, detail={"max_calls_per_run": self.max_calls_per_run})
+            self.cache.record_capability(self.name, capability, status="rate_limited", run_id=self.run_id, error_category="cooldown_active", used_for_scoring=used_for_scoring, cooldown_minutes=60, detail={"max_calls_per_run": self.max_calls_per_run})
             return ProviderResponse(self.name, endpoint, "rate_limited", None, "max_calls_per_run_exceeded")
 
         request_params = {**clean_params, "api_token": self.api_key, "fmt": "json"}

@@ -309,7 +309,7 @@ class TradingService:
         provider = None
         if provider_name == "eodhd" and self.config.get("eodhd", {}).get("enabled", True):
             provider = EODHDProvider(self.config, self.storage, self.run_id)
-        return DynamicUniverseEngine(self.config, self.storage, provider, self.run_id)
+        return DynamicUniverseEngine(self.config, self.storage, provider, self.run_id, self.broker)
 
     def _dynamic_universe_scan_symbols(self) -> tuple[list[str], list[str]]:
         engine = self._dynamic_universe_engine()
@@ -4287,23 +4287,48 @@ class TradingService:
             elif completed_subtasks:
                 provider_status_str = f"EODHD ok for {completed_subtasks[0]}"
         else:
-            if len(active_rate_limits) == 1 and active_rate_limits[0] == "news":
-                provider_status_str = "EODHD partial — optional news endpoint rate-limited"
-            elif len(active_cooldowns) == 1 and active_cooldowns[0] == "news":
-                if "intraday_light_refresh" in completed_subtasks:
-                    provider_status_str = "EODHD partial — intraday ok; news cooldown"
-                else:
-                    provider_status_str = "EODHD partial — news cooldown active"
+            core_endpoints = ["eod_bars", "intraday_bars", "realtime_quote", "screener", "technicals"]
+            core_statuses = {ep: cap_statuses.get(ep, "ok") for ep in core_endpoints}
+            core_issues = [ep for ep, stat in core_statuses.items() if stat not in ("ok", "unknown")]
+            
+            parts = []
+            if not core_issues:
+                parts.append("core ok")
             else:
-                statuses_desc = []
-                for ep in ["eod_bars", "intraday_bars", "realtime_quote", "screener", "technicals", "news", "fundamentals"]:
-                    status = cap_statuses.get(ep)
-                    if status and status != "ok" and status != "unknown":
-                        statuses_desc.append(f"{ep} {status}")
-                if statuses_desc:
-                    provider_status_str = f"EODHD: {'; '.join(statuses_desc)}"
-                else:
-                    provider_status_str = "EODHD rate-limited"
+                ep_names = {
+                    "eod_bars": "eod",
+                    "intraday_bars": "intraday",
+                    "realtime_quote": "realtime",
+                    "screener": "screener",
+                    "technicals": "technicals"
+                }
+                for ep in core_endpoints:
+                    stat = core_statuses[ep]
+                    if stat == "plan-limited":
+                        parts.append(f"{ep_names[ep]} plan-limited")
+                    elif stat == "rate-limited":
+                        parts.append(f"{ep_names[ep]} throttled briefly; using cached data")
+                    elif stat == "cooldown":
+                        parts.append(f"{ep_names[ep]} cooldown_active")
+                    elif stat != "ok" and stat != "unknown":
+                        parts.append(f"{ep_names[ep]} {stat}")
+
+            news_status = cap_statuses.get("news", "ok")
+            if news_status == "plan-limited":
+                parts.append("news plan-limited")
+            elif news_status in ("rate-limited", "cooldown"):
+                parts.append("news optional cooldown")
+
+            fund_status = cap_statuses.get("fundamentals", "ok")
+            if fund_status == "plan-limited":
+                parts.append("fundamentals plan-limited")
+            elif fund_status in ("rate-limited", "cooldown"):
+                parts.append("fundamentals cooldown")
+
+            if parts:
+                provider_status_str = f"EODHD: {'; '.join(parts)}"
+            else:
+                provider_status_str = "EODHD rate-limited"
 
         summary_str = self._build_digest_summary(strongest, symbols_list)
         deferred_rows = self.storage.fetch_all(

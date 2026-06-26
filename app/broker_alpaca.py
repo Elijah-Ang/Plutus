@@ -98,5 +98,11 @@ class AlpacaBroker(BrokerInterface):
     def is_market_open(self) -> bool:
         return bool(self.get_clock().is_open)
 
+    def get_asset(self, symbol: str) -> Any | None:
+        try:
+            return self.trading.get_asset(symbol)
+        except Exception:
+            return None
+
 
 AlpacaPaperBroker = AlpacaBroker

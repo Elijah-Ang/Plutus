@@ -13,6 +13,7 @@ from app.internet import internet_available
 from app.power import get_power_status
 from app.storage import Storage
 from app.utils import iso_now, json_dumps
+from app.broker_interface import BrokerInterface
 
 RAW_UNIVERSE = "raw_universe"
 RESEARCH_CANDIDATE = "research_candidate"
@@ -59,11 +60,12 @@ class ResearchGate:
 
 
 class DynamicUniverseEngine:
-    def __init__(self, config: dict[str, Any], storage: Storage, provider: MarketResearchProvider | None, run_id: str) -> None:
+    def __init__(self, config: dict[str, Any], storage: Storage, provider: MarketResearchProvider | None, run_id: str, broker: BrokerInterface | None = None) -> None:
         self.config = config
         self.storage = storage
         self.provider = provider
         self.run_id = run_id
+        self.broker = broker
         self.cfg = config.get("dynamic_universe", {})
         self.resilience_cfg = config.get("dynamic_universe_resilience", {})
         self.now = datetime.now(UTC)
@@ -928,6 +930,36 @@ class DynamicUniverseEngine:
     def _collect_raw_candidates(self, run_type: str) -> list[dict[str, Any]]:
         max_raw = int(self.cfg.get("max_raw_symbols_per_research_run", 500))
         candidates: list[dict[str, Any]] = []
+        
+        # Collect existing dynamically tracked symbols
+        try:
+            dynamic_rows = self.storage.fetch_all(
+                "SELECT symbol, tier, source, provider_symbol, exchange, asset_class, sector, cluster, country, region, currency FROM universe_symbols WHERE tier IN (?, ?, ?)",
+                (RESEARCH_CANDIDATE, OBSERVATION, PAPER_TRADABLE)
+            )
+            for r in dynamic_rows:
+                candidates.append({
+                    "Code": r["symbol"],
+                    "Exchange": r["exchange"] or "US",
+                    "exchange": r["exchange"] or "US",
+                    "Type": r["asset_class"] or "Common Stock",
+                    "asset_class": r["asset_class"] or "Common Stock",
+                    "Sector": r["sector"],
+                    "sector": r["sector"],
+                    "Cluster": r["cluster"],
+                    "cluster": r["cluster"],
+                    "Country": r["country"] or r["region"] or "US",
+                    "country": r["country"] or r["region"] or "US",
+                    "Currency": r["currency"] or "USD",
+                    "currency": r["currency"] or "USD",
+                    "source": r["source"] or "dynamic_universe",
+                    "existing_static": False,
+                    "observation": r["tier"] == OBSERVATION,
+                    "provider_symbol": r["provider_symbol"],
+                })
+        except Exception:
+            pass
+
         if self.cfg.get("raw_sources", {}).get("existing_static_watchlist", True):
             for profile in self.config.get("market_profiles", {}).values():
                 profile_active = profile.get("status") == "active" and profile.get("execution_enabled", False) and profile.get("proposals_enabled", False)
@@ -946,13 +978,14 @@ class DynamicUniverseEngine:
                 for symbol in profile.get("observation_watchlist", []):
                     candidates.append({"Code": str(symbol).upper(), "Exchange": "US", "Type": "ETF", "source": "existing_static_observation", "existing_static": True, "observation": True})
 
-        if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_screener", True):
-            res = self.provider.get_screener_results(limit=min(max_raw, 100))
-            candidates.extend(self._rows_from_response(res, "eodhd_screener"))
+        if run_type != "intraday_light_refresh":
+            if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_screener", True):
+                res = self.provider.get_screener_results(limit=min(max_raw, 100))
+                candidates.extend(self._rows_from_response(res, "eodhd_screener"))
 
-        if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_news", True):
-            res = self.provider.get_news(limit=min(max_raw, 100))
-            candidates.extend(self._news_candidate_rows(res))
+            if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_news", True):
+                res = self.provider.get_news(limit=min(max_raw, 100))
+                candidates.extend(self._news_candidate_rows(res))
 
         if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_exchange_symbols", True) and run_type == "daily_deep_research":
             res = self.provider.list_symbols("US", limit=max_raw)
@@ -1125,6 +1158,8 @@ class DynamicUniverseEngine:
         return LANE_ALPACA_US, True, None
 
     def _infer_cluster(self, symbol: str, asset_class: str, info: dict[str, Any]) -> str:
+        if info.get("cluster") or info.get("Cluster"):
+            return str(info.get("cluster") or info.get("Cluster"))
         configured = self.config.get("portfolio_optimizer", {}).get("clusters", {})
         for cluster, symbols in configured.items():
             if symbol.upper() in [str(s).upper() for s in symbols]:
@@ -1372,6 +1407,10 @@ class DynamicUniverseEngine:
     def _news_score(self, symbol: str, metadata: dict[str, Any]) -> tuple[float, bool]:
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_news", True) or metadata.get("existing_static"):
             return 2.5, False
+        current = self._current_symbol(symbol)
+        current_tier = current.get("tier") if current else None
+        if current_tier not in {OBSERVATION, PAPER_TRADABLE}:
+            return 2.5, False
         res = self.provider.get_news(symbol=symbol, limit=5)
         if res.status != "ok" or not isinstance(res.data, list):
             metadata["news_unavailable_reason"] = res.status
@@ -1401,6 +1440,9 @@ class DynamicUniverseEngine:
     def _decide_tier(self, symbol: str, metadata: dict[str, Any], score: ResearchScore) -> str:
         if metadata.get("existing_static"):
             return OBSERVATION if metadata.get("observation") else PAPER_TRADABLE
+        if self._provider_failed:
+            current = self._current_symbol(symbol)
+            return current.get("tier") if current else RAW_UNIVERSE
         if metadata.get("universe_lane") == LANE_EXCLUDED:
             return RAW_UNIVERSE
         if metadata.get("universe_lane") != LANE_ALPACA_US and metadata.get("asset_class") not in {"equity", "etf", "fund", "index"}:
@@ -1441,10 +1483,32 @@ class DynamicUniverseEngine:
                 and has_shadow
                 and metadata.get("cluster") != "unknown_cluster"
                 and confidence_ok
+                and self._check_alpaca_compatibility(symbol)
             ):
                 return PAPER_TRADABLE
             return OBSERVATION
         return current.get("tier") or RESEARCH_CANDIDATE
+
+    def _check_alpaca_compatibility(self, symbol: str) -> bool:
+        if not self.broker or not hasattr(self.broker, "get_asset"):
+            return True
+        try:
+            asset = self.broker.get_asset(symbol)
+            if not asset:
+                return False
+            tradable = getattr(asset, "tradable", False)
+            status = getattr(asset, "status", "")
+            ac = getattr(asset, "asset_class", "")
+            exchange = getattr(asset, "exchange", "")
+            if not tradable or status != "active":
+                return False
+            if ac != "us_equity":
+                return False
+            if exchange in {"OTC", "PINK", "OTCQB", "OTCQX"}:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _research_threshold(self) -> float:
         promo = self.cfg.get("promotion", {})

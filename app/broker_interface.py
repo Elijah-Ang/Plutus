@@ -40,3 +40,6 @@ class BrokerInterface(ABC):
 
     @abstractmethod
     def is_market_open(self) -> bool: ...
+
+    @abstractmethod
+    def get_asset(self, symbol: str) -> Any | None: ...

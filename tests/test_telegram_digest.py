@@ -1040,7 +1040,7 @@ def test_digest_eodhd_provider_status_reporting(temp_storage):
 
     service.check_and_send_digest()
     msg = service.telegram.messages[-1]
-    assert "* EODHD partial — optional news endpoint rate-limited" in msg
+    assert "* EODHD: core ok; news optional cooldown" in msg
 
     # Case B: recovered from recent rate-limit
     temp_storage.execute("DELETE FROM telegram_digests")
@@ -1075,7 +1075,7 @@ def test_digest_eodhd_provider_status_reporting(temp_storage):
 
     service.check_and_send_digest()
     msg = service.telegram.messages[-1]
-    assert "* EODHD: fundamentals plan-limited" in msg
+    assert "fundamentals plan-limited" in msg
 
     # Case D: news cooldown active
     temp_storage.execute("DELETE FROM telegram_digests")
@@ -1097,4 +1097,40 @@ def test_digest_eodhd_provider_status_reporting(temp_storage):
 
     service.check_and_send_digest()
     msg = service.telegram.messages[-1]
-    assert "* EODHD partial — intraday ok; news cooldown" in msg
+    assert "* EODHD: core ok; news optional cooldown" in msg
+
+
+def test_digest_blank_line_formatting():
+    from app.utils import format_digest_message
+    from datetime import datetime, UTC
+    digest_data = {
+        "window_start": datetime.now(UTC).isoformat(),
+        "window_end": datetime.now(UTC).isoformat(),
+        "market_open_status": "open",
+        "tier_snapshot": {
+            "static_paper_tradable": [{"symbol": "AAPL", "score": 90.0, "tradable": True, "held": False}],
+            "dynamic_paper_tradable": [{"symbol": "MSFT", "score": 85.0, "tradable": True, "held": False}],
+            "observation": [{"symbol": "GOOGL", "score": 75.0, "tradable": False, "held": False}],
+            "research_candidate": [{"symbol": "AMZN", "score": 60.0, "tradable": False, "held": False}],
+        },
+        "universe_update": {
+            "promoted_to_observation": [],
+            "promoted_to_paper_tradable": [],
+            "demoted_retired": [],
+            "actions_created": "No dynamic proposals/orders created",
+        },
+        "provider_status": "EODHD: ok for current research subtasks",
+        "actions": {"proposals": 0, "orders": 0, "fills": 0, "gpt_calls": 0, "expired": 0},
+    }
+    msg = format_digest_message(digest_data, {"mode": "paper"})
+    
+    # Assert double newline spacing between major sections
+    assert "📊 30-min market digest\n\nMarket:\n" in msg
+    assert "\n\nActions:\n" in msg
+    assert "\n\nStatic paper-tradable:\n" in msg
+    assert "\n\nDynamic paper-tradable:\n" in msg
+    assert "\n\nObservation:\n" in msg
+    assert "\n\nResearch candidates:\n" in msg
+    assert "\n\nUniverse update:\n" in msg
+    assert "\n\nProvider status:\n" in msg
+    assert "\n\nSummary:\n" in msg

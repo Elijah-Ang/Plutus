@@ -76,11 +76,16 @@ class ProviderCache:
         )
         return rows[0] if rows else None
 
-    def capability_disabled(self, provider: str, endpoint_name: str, reprobe_after_minutes: int | None = None) -> bool:
+    def capability_disabled(self, provider: str, endpoint_name: str, reprobe_after_minutes: int | None = None, current_run_id: str | None = None) -> bool:
         row = self.get_capability(provider, endpoint_name)
-        if row and row.get("last_error_category") in {"no_data", "not_found"}:
+        if not row:
             return False
-        if row and int(row.get("plan_limited") or 0) and reprobe_after_minutes:
+        if current_run_id and row.get("run_id") and row.get("run_id") != current_run_id:
+            if row.get("last_error_category") == "cooldown_active":
+                return False
+        if row.get("last_error_category") in {"no_data", "not_found"}:
+            return False
+        if int(row.get("plan_limited") or 0) and reprobe_after_minutes:
             updated_at = row.get("updated_at") or row.get("last_failure_at")
             if updated_at:
                 try:
@@ -89,7 +94,7 @@ class ProviderCache:
                         return False
                 except Exception:
                     pass
-        disabled_until = row.get("disabled_until") if row else None
+        disabled_until = row.get("disabled_until")
         if not disabled_until:
             return False
         try:

@@ -1047,3 +1047,96 @@ def test_configured_static_symbols_are_not_demoted_by_dynamic_cleanup(temp_stora
 
     row = temp_storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol='SPY'")[0]
     assert row["tier"] == PAPER_TRADABLE
+
+
+def test_alpaca_compatibility_check_blocks_promotion(temp_storage):
+    from app.broker_interface import BrokerInterface
+    
+    class MockAsset:
+        def __init__(self, tradable, status, asset_class, exchange):
+            self.tradable = tradable
+            self.status = status
+            self.asset_class = asset_class
+            self.exchange = exchange
+
+    class MockBroker(BrokerInterface):
+        def __init__(self, asset):
+            self.asset = asset
+        def get_asset(self, symbol: str):
+            return self.asset
+        def get_account(self): return None
+        def get_positions(self): return []
+        def get_open_orders(self): return []
+        def get_latest_price(self, symbol: str): return None
+        def get_historical_bars(self, symbol: str, timeframe: str, limit: int): return None
+        def submit_order(self, *args, **kwargs): return None
+        def cancel_order(self, order_id: str): return None
+        def get_order(self, order_id: str): return None
+        def get_order_by_client_order_id(self, client_order_id: str): return None
+        def get_clock(self): return None
+        def get_loss_metrics(self): return {}
+        def is_market_open(self): return True
+
+    cfg = dynamic_config()
+    provider = FakeProvider(
+        rows=[{"Code": "COMP", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+    )
+    
+    # Run 1: Daily Deep Research (discovered as research candidate)
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-1").run_research_cycle("daily_deep_research")
+    
+    # Run 2: Intraday Light Refresh (promoted to observation)
+    DynamicUniverseEngine(cfg, temp_storage, provider, "run-2").run_research_cycle("intraday_light_refresh")
+    
+    # Run 3 and 4: additional cycles to satisfy min cycles/sessions
+    for idx in range(2):
+        DynamicUniverseEngine(cfg, temp_storage, provider, f"run-{idx+3}").run_research_cycle("intraday_light_refresh")
+        
+    temp_storage.execute(
+        "INSERT INTO shadow_trades(id,run_id,setup_id,symbol,side,would_have_entry_price,would_have_entry_time,reason_not_executed,score) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("shadow-comp", "run-1", "setup-comp", "COMP", "buy", 100.0, datetime.now(UTC).isoformat(), "observation only", 90.0),
+    )
+    
+    # CASE A: OTC asset (should block promotion)
+    otc_broker = MockBroker(MockAsset(tradable=True, status="active", asset_class="us_equity", exchange="OTC"))
+    engine_otc = DynamicUniverseEngine(cfg, temp_storage, provider, "run-otc", broker=otc_broker)
+    engine_otc.run_research_cycle("intraday_light_refresh")
+    row = temp_storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol='COMP'")[0]
+    assert row["tier"] == OBSERVATION
+    
+    # CASE B: Non-tradable asset (should block promotion)
+    untradable_broker = MockBroker(MockAsset(tradable=False, status="active", asset_class="us_equity", exchange="NASDAQ"))
+    engine_untradable = DynamicUniverseEngine(cfg, temp_storage, provider, "run-untradable", broker=untradable_broker)
+    engine_untradable.run_research_cycle("intraday_light_refresh")
+    row = temp_storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol='COMP'")[0]
+    assert row["tier"] == OBSERVATION
+
+    # CASE C: Fully compatible asset (should promote to paper_tradable)
+    ok_broker = MockBroker(MockAsset(tradable=True, status="active", asset_class="us_equity", exchange="NASDAQ"))
+    engine_ok = DynamicUniverseEngine(cfg, temp_storage, provider, "run-ok", broker=ok_broker)
+    engine_ok.run_research_cycle("intraday_light_refresh")
+    row = temp_storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol='COMP'")[0]
+    assert row["tier"] == PAPER_TRADABLE
+
+
+def test_eodhd_cooldown_by_run_id(temp_storage):
+    from app.data_providers.cache import ProviderCache
+    cache = ProviderCache(temp_storage)
+    
+    now = datetime.now(UTC)
+    future = (now + timedelta(minutes=10)).isoformat()
+    
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("test-cap-1", "run-A", "eodhd", "news", 0, 0, future, "cooldown_active", now.isoformat())
+    )
+    
+    # Check if disabled with run_id "run-A" -> should be disabled (True)
+    disabled_run_a = cache.capability_disabled("eodhd", "news", current_run_id="run-A")
+    assert disabled_run_a is True
+    
+    # Check if disabled with run_id "run-B" -> should NOT be disabled (False)
+    disabled_run_b = cache.capability_disabled("eodhd", "news", current_run_id="run-B")
+    assert disabled_run_b is False
+
