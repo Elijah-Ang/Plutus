@@ -468,6 +468,12 @@ digest:
   telegram_digest_use_gpt: false
   telegram_digest_min_cycles_required: 2
   telegram_digest_send_when_market_closed: false
+  market_closed_status:
+    suppress_no_change: true
+    max_frequency_minutes: 180
+    always_send_on_change: true
+    always_send_errors: true
+    always_send_catchup_completion: true
 
 # Paper-only Emergency Auto-Exit Config
 emergency_exit:

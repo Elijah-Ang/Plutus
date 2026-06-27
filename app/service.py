@@ -67,6 +67,15 @@ MARKET_PHASE_HOLIDAY = "market_closed_holiday"
 MARKET_PHASE_NON_TRADING = "market_closed_non_trading_day"
 MARKET_PHASE_CATCH_UP = "catch_up"
 MARKET_PHASE_UNKNOWN_CLOSED = "unknown_market_closed"
+MARKET_CLOSED_STATUS_PHASES = {
+    MARKET_PHASE_PRE,
+    MARKET_PHASE_POST,
+    MARKET_PHASE_WEEKEND,
+    MARKET_PHASE_HOLIDAY,
+    MARKET_PHASE_NON_TRADING,
+    MARKET_PHASE_CATCH_UP,
+    MARKET_PHASE_UNKNOWN_CLOSED,
+}
 
 
 def _format_expiry_line(expires_at: str | datetime, now: datetime | None = None) -> str:
@@ -4689,6 +4698,7 @@ class TradingService:
         phase = self._dynamic_universe_market_phase(results, trading_skipped_reason, now=now)
         completed = [r for r in results if r.get("status") == "completed"]
         skipped = [r for r in results if r.get("status") == "skipped"]
+        snapshot: dict[str, Any] | None = None
         if completed:
             run_ids = [str(r.get("run_id")) for r in completed if r.get("run_id")]
             placeholders = ",".join("?" for _ in run_ids)
@@ -4706,29 +4716,68 @@ class TradingService:
                 )
             counts = self._dynamic_universe_compact_counts()
             brief_count = sum(int(r.get("candidate_briefs") or 0) for r in completed)
+            provider_material = self._dynamic_universe_provider_material_status(phase)
             top = ", ".join(
                 f"{row['symbol']} {float(row['research_score'] or 0):.0f} {str(row.get('main_positive_reasons') or 'score').split(',')[0]}"
                 for row in briefs
             )
-            provider_line = self._dynamic_universe_provider_line(phase)
+            provider_line = self._dynamic_universe_provider_line(phase, material_status=provider_material)
+            next_line = self._dynamic_universe_next_line(phase)
             lines = [
                 self._dynamic_universe_compact_header(phase, completed=True),
-                f"Research candidates: {counts['research_candidate']} | Briefs: {brief_count} | Observation: {counts['observation']} | Dynamic paper-tradable: {counts['dynamic_paper_tradable']}",
+                f"Research candidates: {counts['research_candidate']} | Briefs: {brief_count} | Observation total: {counts['observation_total']} | Dynamic paper-tradable: {counts['dynamic_paper_tradable']} | Static paper-tradable: {counts['static_paper_tradable_total']}",
             ]
-            if counts["static_paper_tradable"]:
-                lines[-1] += f" | Static paper-tradable: {counts['static_paper_tradable']}"
+            if counts["global_research_only_observation"]:
+                lines.append(f"Global research-only observation: {counts['global_research_only_observation']}.")
+            if counts["held_static_positions"]:
+                lines.append(f"Held static positions: {counts['held_static_positions']}.")
             if top:
                 lines.append(f"Top: {top}.")
-            lines.extend([provider_line, self._dynamic_universe_next_line(phase), "No trade proposals/orders created."])
+            lines.extend([provider_line, next_line, "No trade proposals/orders created."])
             text = "\n".join(lines)
+            snapshot = self._dynamic_universe_notification_snapshot(
+                phase,
+                counts,
+                provider_material,
+                next_line,
+                completed=completed,
+                skipped=skipped,
+                trading_skipped_reason=trading_skipped_reason,
+            )
         elif skipped:
             reason = skipped[0].get("reason") or "research skipped"
             text = f"{self._dynamic_universe_compact_header(phase, completed=False, reason=reason)}\nNo trade proposals/orders created."
+            provider_material = self._dynamic_universe_provider_material_status(phase)
+            snapshot = self._dynamic_universe_notification_snapshot(
+                phase,
+                self._dynamic_universe_compact_counts(),
+                provider_material,
+                self._dynamic_universe_next_line(phase),
+                completed=completed,
+                skipped=skipped,
+                trading_skipped_reason=trading_skipped_reason,
+            )
         else:
             text = f"Dynamic Universe {self._dynamic_universe_phase_label(phase)} checked. Trading remains blocked: {trading_skipped_reason}.\nNo trade proposals/orders created."
+            provider_material = self._dynamic_universe_provider_material_status(phase)
+            snapshot = self._dynamic_universe_notification_snapshot(
+                phase,
+                self._dynamic_universe_compact_counts(),
+                provider_material,
+                self._dynamic_universe_next_line(phase),
+                completed=completed,
+                skipped=skipped,
+                trading_skipped_reason=trading_skipped_reason,
+            )
+        if self._should_suppress_market_closed_status(phase, snapshot):
+            return
         try:
             self.telegram.send_message(text)
-            self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", {"status": "sent", "trading_skipped_reason": trading_skipped_reason})
+            detail = {"status": "sent", "trading_skipped_reason": trading_skipped_reason, "phase": phase}
+            if snapshot is not None:
+                detail["snapshot"] = snapshot
+            self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", detail)
+            self._record_market_closed_status_snapshot(phase, snapshot)
         except Exception as exc:
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_failed", {"error": type(exc).__name__, "trading_skipped_reason": trading_skipped_reason})
 
@@ -4743,23 +4792,77 @@ class TradingService:
         )
         counts = {
             "research_candidate": 0,
-            "observation": 0,
+            "observation_total": 0,
+            "alpaca_compatible_observation": 0,
+            "global_research_only_observation": 0,
             "dynamic_paper_tradable": 0,
-            "static_paper_tradable": 0,
+            "static_paper_tradable_total": len(self._configured_static_paper_symbols()),
+            "held_static_positions": self._held_static_position_count(),
         }
         for row in rows:
             tier = row.get("tier")
             source = str(row.get("source") or "")
+            lane = str(row.get("universe_lane") or "")
             count = int(row.get("count") or 0)
             if tier == RESEARCH_CANDIDATE:
                 counts["research_candidate"] += count
             elif tier == OBSERVATION:
-                counts["observation"] += count
+                counts["observation_total"] += count
+                if lane == "global_research_only":
+                    counts["global_research_only_observation"] += count
+                elif lane == "alpaca_compatible_us":
+                    counts["alpaca_compatible_observation"] += count
             elif tier == PAPER_TRADABLE and source == "existing_static_watchlist":
-                counts["static_paper_tradable"] += count
+                continue
             elif tier == PAPER_TRADABLE:
                 counts["dynamic_paper_tradable"] += count
+        for symbol in self._configured_observation_symbols():
+            row = self.storage.fetch_all("SELECT 1 FROM universe_symbols WHERE symbol=? AND tier IN ('paper_tradable','observation','research_candidate') LIMIT 1", (symbol,))
+            if not row:
+                counts["observation_total"] += 1
+                counts["alpaca_compatible_observation"] += 1
         return counts
+
+    def _configured_static_paper_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        for profile in self.config.get("market_profiles", {}).values():
+            if profile.get("status", "active") != "active":
+                continue
+            if profile.get("broker") not in {None, "alpaca"}:
+                continue
+            if profile.get("execution_enabled") is False:
+                continue
+            symbols.extend(str(s).upper() for s in profile.get("watchlist", []))
+        if not symbols:
+            symbols.extend(str(s).upper() for s in self.config.get("watchlist", []))
+        return list(dict.fromkeys(s for s in symbols if s and "." not in s))
+
+    def _configured_observation_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        static = set(self._configured_static_paper_symbols())
+        for profile in self.config.get("market_profiles", {}).values():
+            if profile.get("status", "active") != "active":
+                continue
+            if profile.get("broker") not in {None, "alpaca"}:
+                continue
+            if profile.get("execution_enabled") is False:
+                continue
+            symbols.extend(str(s).upper() for s in profile.get("observation_watchlist", []))
+        return list(dict.fromkeys(s for s in symbols if s and "." not in s and s not in static))
+
+    def _held_static_position_count(self) -> int:
+        static = set(self._configured_static_paper_symbols())
+        if not static:
+            return 0
+        try:
+            positions = self.broker.get_positions()
+            return len({str(_value(p, "symbol", "")).upper() for p in positions if str(_value(p, "symbol", "")).upper() in static})
+        except Exception:
+            try:
+                rows = self.storage.fetch_all("SELECT DISTINCT symbol FROM positions")
+                return len({str(r.get("symbol") or "").upper() for r in rows if str(r.get("symbol") or "").upper() in static})
+            except Exception:
+                return 0
 
     def _dynamic_universe_market_phase(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in results):
@@ -4872,7 +4975,7 @@ class TradingService:
             return "Next: next scheduled research review after the market calendar reopens."
         return "Next: next scheduled market-open or research review."
 
-    def _dynamic_universe_provider_line(self, phase: str) -> str:
+    def _dynamic_universe_provider_material_status(self, phase: str) -> dict[str, Any]:
         rows = self.storage.fetch_all(
             "SELECT endpoint_name, available, plan_limited, disabled_until, last_error_category FROM data_provider_capabilities ORDER BY endpoint_name"
         )
@@ -4880,6 +4983,7 @@ class TradingService:
         stale_cooldowns: list[str] = []
         plan_limited: list[str] = []
         available: list[str] = []
+        errors: list[str] = []
         now = datetime.now(UTC)
         for row in rows:
             endpoint = str(row.get("endpoint_name") or "")
@@ -4897,27 +5001,148 @@ class TradingService:
                         stale_cooldowns.append(endpoint)
                 except Exception:
                     stale_cooldowns.append(endpoint)
+            category = str(row.get("last_error_category") or "")
+            if category and category not in {"cooldown_active", "rate_limited", "forbidden", "plan_limited"}:
+                errors.append(f"{endpoint}:{category}")
         market_closed = phase in {MARKET_PHASE_POST, MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING, MARKET_PHASE_UNKNOWN_CLOSED}
+        core_endpoints = {"eod_bars", "screener", "technicals"} if market_closed else {"eod_bars", "intraday_bars", "realtime_quote", "screener", "technicals"}
+        ignored_closed_endpoints = {"intraday_bars", "realtime_quote"} if market_closed else set()
+        active_core_cooldowns = sorted(ep for ep in active_cooldowns if ep in core_endpoints and ep not in ignored_closed_endpoints)
+        optional_cooldowns = sorted(ep for ep in active_cooldowns if ep not in core_endpoints and ep not in ignored_closed_endpoints)
+        status = "ok"
+        if errors or active_core_cooldowns:
+            status = "degraded"
+        return {
+            "status": status,
+            "available": sorted(available),
+            "active_core_cooldowns": active_core_cooldowns,
+            "optional_cooldowns": optional_cooldowns,
+            "plan_limited": sorted(plan_limited),
+            "errors": sorted(errors),
+            "intraday_not_needed": market_closed,
+        }
+
+    def _dynamic_universe_provider_line(self, phase: str, material_status: dict[str, Any] | None = None) -> str:
+        status = material_status or self._dynamic_universe_provider_material_status(phase)
+        available = list(status.get("available") or [])
+        active_core_cooldowns = list(status.get("active_core_cooldowns") or [])
+        optional_cooldowns = list(status.get("optional_cooldowns") or [])
+        plan_limited = list(status.get("plan_limited") or [])
+        errors = list(status.get("errors") or [])
+        market_closed = bool(status.get("intraday_not_needed"))
         if market_closed:
             parts = ["Provider: EODHD"]
             if available:
                 parts.append("core available")
-            if "intraday_bars" in active_cooldowns or phase in {MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING, MARKET_PHASE_POST}:
+            if status.get("intraday_not_needed"):
                 parts.append("intraday not needed while market closed")
-            optional = [ep for ep in active_cooldowns if ep in {"news", "fundamentals"}]
-            if optional:
-                parts.append(f"optional cooldown: {', '.join(optional)}")
+            if active_core_cooldowns:
+                parts.append(f"core cooldown: {', '.join(active_core_cooldowns)}")
+            if optional_cooldowns:
+                parts.append(f"optional cooldown: {', '.join(optional_cooldowns)}")
             if plan_limited:
                 parts.append(f"plan-limited: {', '.join(plan_limited)}")
+            if errors:
+                parts.append(f"errors: {', '.join(errors)}")
             return "; ".join(parts) + "."
-        if active_cooldowns or plan_limited:
+        active_cooldowns = active_core_cooldowns + optional_cooldowns
+        if active_cooldowns or plan_limited or errors:
             parts = [f"Provider: {len(available)} endpoints available"]
             if active_cooldowns:
                 parts.append(f"current cooldown: {', '.join(active_cooldowns)}")
             if plan_limited:
                 parts.append(f"plan-limited: {', '.join(plan_limited)}")
+            if errors:
+                parts.append(f"errors: {', '.join(errors)}")
             return "; ".join(parts) + "."
         return f"Provider: {len(available)} endpoints available, 0 on cooldown."
+
+    def _dynamic_universe_notification_snapshot(
+        self,
+        phase: str,
+        counts: dict[str, int],
+        provider_material: dict[str, Any],
+        next_line: str,
+        *,
+        completed: list[dict[str, Any]],
+        skipped: list[dict[str, Any]],
+        trading_skipped_reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "market_phase": phase,
+            "research_candidate_count": counts.get("research_candidate", 0),
+            "observation_total_count": counts.get("observation_total", 0),
+            "alpaca_compatible_observation_count": counts.get("alpaca_compatible_observation", 0),
+            "global_research_only_observation_count": counts.get("global_research_only_observation", 0),
+            "dynamic_paper_tradable_count": counts.get("dynamic_paper_tradable", 0),
+            "static_paper_tradable_total_count": counts.get("static_paper_tradable_total", 0),
+            "held_static_position_count": counts.get("held_static_positions", 0),
+            "provider_material_status": {
+                "status": provider_material.get("status"),
+                "active_core_cooldowns": provider_material.get("active_core_cooldowns") or [],
+                "optional_cooldowns": provider_material.get("optional_cooldowns") or [],
+                "plan_limited": provider_material.get("plan_limited") or [],
+                "errors": provider_material.get("errors") or [],
+                "intraday_not_needed": bool(provider_material.get("intraday_not_needed")),
+            },
+            "completed_run_types": sorted({str(r.get("run_type") or "") for r in completed if r.get("run_type")}),
+            "skipped_reasons": sorted({str(r.get("reason") or "") for r in skipped if r.get("reason")}),
+            "catchup_completed": any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in completed),
+            "has_error_or_warning": any(str(r.get("status") or "") in {"error", "failed", "warning"} or bool(r.get("error") or r.get("warning")) for r in completed + skipped),
+            "next_expected_check": next_line,
+            "trading_skipped_reason": trading_skipped_reason,
+            "no_proposals_orders": True,
+        }
+
+    def _should_suppress_market_closed_status(self, phase: str, snapshot: dict[str, Any] | None) -> bool:
+        cfg = self.config.get("telegram", {}).get("market_closed_status", {})
+        if not cfg.get("suppress_no_change", True):
+            return False
+        if phase not in MARKET_CLOSED_STATUS_PHASES or snapshot is None:
+            return False
+        if snapshot.get("catchup_completed") and cfg.get("always_send_catchup_completion", True):
+            return False
+        if snapshot.get("has_error_or_warning") and cfg.get("always_send_errors", True):
+            return False
+        previous = self._latest_market_closed_status_snapshot()
+        if not previous:
+            return False
+        if previous == snapshot:
+            self.storage.audit(
+                self.run_id,
+                "market_closed_status_suppressed_no_change",
+                {"phase": phase, "snapshot": snapshot, "suppressed_at": iso_now()},
+            )
+            return True
+        return False
+
+    def _latest_market_closed_status_snapshot(self) -> dict[str, Any] | None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT detail
+            FROM audit_events
+            WHERE event_type='dynamic_universe_market_closed_status_snapshot'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        if not rows:
+            return None
+        try:
+            detail = json.loads(rows[0]["detail"] or "{}")
+            snapshot = detail.get("snapshot")
+            return snapshot if isinstance(snapshot, dict) else None
+        except Exception:
+            return None
+
+    def _record_market_closed_status_snapshot(self, phase: str, snapshot: dict[str, Any] | None) -> None:
+        if phase not in MARKET_CLOSED_STATUS_PHASES or snapshot is None:
+            return
+        self.storage.audit(
+            self.run_id,
+            "dynamic_universe_market_closed_status_snapshot",
+            {"phase": phase, "snapshot": snapshot, "sent_at": iso_now()},
+        )
 
     def _get_symbol_cluster(self, symbol: str) -> str | None:
         clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})

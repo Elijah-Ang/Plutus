@@ -125,12 +125,14 @@ class PromotionBroker:
         asset: MockAsset | None = None,
         open_orders: list[Any] | None = None,
         next_open: datetime | None = None,
+        positions: list[Any] | None = None,
     ) -> None:
         self.price = price
         self.market_open = market_open
         self.asset = asset or MockAsset()
         self.open_orders = open_orders or []
         self.next_open = next_open
+        self.positions = positions or []
 
     def get_asset(self, symbol: str):
         return self.asset
@@ -146,6 +148,9 @@ class PromotionBroker:
 
     def get_clock(self):
         return type("Clock", (), {"is_open": self.market_open, "next_open": self.next_open})()
+
+    def get_positions(self):
+        return self.positions
 
 
 def dynamic_config() -> dict[str, Any]:
@@ -626,6 +631,117 @@ def test_weekend_compact_provider_status_is_phase_aware(temp_storage):
     assert "optional cooldown: news" in msg
     assert "plan-limited: fundamentals" in msg
     assert "1 endpoints available, 6 on cooldown" not in msg
+
+
+def _insert_universe_symbol(temp_storage, symbol: str, tier: str, *, source: str = "eodhd_news", lane: str = LANE_ALPACA_US, executable: int = 0, score: float = 80.0) -> None:
+    now = datetime.now(UTC).isoformat()
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,tier,source,universe_lane,alpaca_compatible,executable,observation_only,score,data_confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (f"u-{symbol}", symbol, "US", "equity", tier, source, lane, 1 if lane == LANE_ALPACA_US else 0, executable, 0 if executable else 1, score, "medium", now, now),
+    )
+
+
+def _weekend_service(temp_storage, cfg: dict[str, Any] | None = None, *, broker: PromotionBroker | None = None) -> TradingService:
+    cfg = cfg or dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    cfg["telegram"]["market_closed_status"] = {
+        "suppress_no_change": True,
+        "always_send_on_change": True,
+        "always_send_errors": True,
+        "always_send_catchup_completion": True,
+    }
+    broker = broker or PromotionBroker(market_open=False, next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC))
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    return service
+
+
+def test_market_closed_status_first_send_then_duplicate_suppressed(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 1
+    audit = temp_storage.fetch_all("SELECT event_type FROM audit_events WHERE event_type='market_closed_status_suppressed_no_change'")
+    assert len(audit) == 1
+
+
+def test_market_closed_status_changed_counts_send(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    _insert_universe_symbol(temp_storage, "AMAT", RESEARCH_CANDIDATE, score=91)
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 2
+    assert "Research candidates: 1" in service.telegram.messages[-1]
+
+
+def test_market_closed_status_provider_material_change_sends_but_cooldown_countdown_does_not(temp_storage):
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-news", "run-test", "eodhd", "news", 0, 0, (now + timedelta(minutes=30)).isoformat(), "cooldown_active", now.isoformat()),
+    )
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    temp_storage.execute(
+        "UPDATE data_provider_capabilities SET disabled_until=?, updated_at=? WHERE endpoint_name='news'",
+        ((now + timedelta(minutes=20)).isoformat(), (now + timedelta(minutes=10)).isoformat()),
+    )
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-eod", "run-test", "eodhd", "eod_bars", 0, 0, (now + timedelta(minutes=60)).isoformat(), "cooldown_active", now.isoformat()),
+    )
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 2
+    assert "core cooldown: eod_bars" in service.telegram.messages[-1]
+
+
+def test_market_closed_status_catchup_and_error_always_send(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+    catchup = {**result, "catchup": True, "run_id": "run-catchup"}
+    warning = {"status": "skipped", "run_type": "intraday_light_refresh", "run_id": "run-warning", "reason": "provider_warning", "warning": True}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    service.notify_premarket_dynamic_universe_status([catchup], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    service.notify_premarket_dynamic_universe_status([warning], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 3
+    assert "research catch-up completed" in service.telegram.messages[1]
+    assert "skipped: provider_warning" in service.telegram.messages[2]
+
+
+def test_compact_counts_use_static_total_and_held_static_separately(temp_storage):
+    cfg = dynamic_config()
+    _insert_universe_symbol(temp_storage, "AMAT", OBSERVATION, score=88)
+    _insert_universe_symbol(temp_storage, "2800.HK", OBSERVATION, source="existing_static_observation", lane=LANE_GLOBAL_RESEARCH, score=75)
+    _insert_universe_symbol(temp_storage, "SMH", PAPER_TRADABLE, executable=1, score=90)
+    broker = PromotionBroker(
+        market_open=False,
+        next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC),
+        positions=[{"symbol": "DIA"}, {"symbol": "IWM"}],
+    )
+    service = _weekend_service(temp_storage, cfg, broker=broker)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "Observation total: 7" in msg
+    assert "Dynamic paper-tradable: 1" in msg
+    assert "Static paper-tradable: 4" in msg
+    assert "Held static positions: 2" in msg
+    assert "Global research-only observation: 1" in msg
+    assert "Static paper-tradable: 2" not in msg
 
 
 def test_market_closed_research_skips_intraday_quote_and_news(temp_storage):
