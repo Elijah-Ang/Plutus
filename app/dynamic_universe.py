@@ -80,6 +80,7 @@ class DynamicUniverseEngine:
         self._provider_health_status = "unknown"
         self._data_freshness_status = "fresh"
         self._last_score_candidates: list[ResearchScore] = []
+        self._current_run_type = ""
 
     def enabled(self) -> bool:
         return bool(self.cfg.get("enabled", False)) and self.config.get("mode") == "paper"
@@ -127,6 +128,7 @@ class DynamicUniverseEngine:
 
     def run_research_cycle(self, run_type: str = "daily_deep_research", is_catchup: bool = False, gate: ResearchGate | None = None) -> dict[str, Any]:
         gate = gate or ResearchGate(True, None, "ok", "online", "ac", None, True, True, "fresh")
+        self._current_run_type = run_type
         self._promotion_allowed = gate.promotion_allowed
         self._demotion_allowed = gate.demotion_allowed
         self._provider_failed = False
@@ -1109,12 +1111,13 @@ class DynamicUniverseEngine:
                 for symbol in profile.get("observation_watchlist", []):
                     candidates.append({"Code": str(symbol).upper(), "Exchange": "US", "Type": "ETF", "source": "existing_static_observation", "existing_static": True, "observation": True})
 
+        skip_live_endpoints = self._skip_live_market_endpoints()
         if run_type != "intraday_light_refresh":
             if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_screener", True):
                 res = self.provider.get_screener_results(limit=min(max_raw, 100))
                 candidates.extend(self._rows_from_response(res, "eodhd_screener"))
 
-            if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_news", True):
+            if self.provider and self.cfg.get("raw_sources", {}).get("eodhd_news", True) and not skip_live_endpoints:
                 res = self.provider.get_news(limit=min(max_raw, 100))
                 candidates.extend(self._news_candidate_rows(res))
 
@@ -1353,12 +1356,16 @@ class DynamicUniverseEngine:
             elif res.status not in {"plan_limited", "rate_limited"}:
                 self._provider_failed = True
                 self._provider_health_status = res.status
-        if self.provider and not metadata.get("existing_static") and bars:
+        skip_live_endpoints = self._skip_live_market_endpoints()
+        if self.provider and not metadata.get("existing_static") and bars and not skip_live_endpoints:
             quote = self.provider.get_latest_quote(metadata.get("provider_symbol") or symbol)
             quote_ok = quote.status == "ok" and bool(quote.data)
             endpoint_coverage["realtime_quote"] = quote_ok
             if quote_ok and isinstance(quote.data, dict):
                 metadata["quote_payload_available"] = True
+        elif skip_live_endpoints:
+            metadata["quote_payload_available"] = False
+            metadata["live_endpoints_skipped_reason"] = "market_closed"
         liquidity, liquidity_block = self._liquidity_score(metadata, bars)
         trend = self._trend_score(bars)
         intraday = self._intraday_momentum_score(symbol, metadata, bars, endpoint_coverage)
@@ -1501,6 +1508,9 @@ class DynamicUniverseEngine:
     def _intraday_momentum_score(self, symbol: str, metadata: dict[str, Any], bars: list[dict[str, Any]], endpoint_coverage: dict[str, bool] | None = None) -> float:
         if metadata.get("existing_static"):
             return 10.0
+        if self._skip_live_market_endpoints():
+            metadata["intraday_skipped_reason"] = "market_closed"
+            return 7.5 if bars else 0.0
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_intraday_bars", True) or not bars:
             return 7.5 if bars else 0.0
         res = self.provider.get_intraday_bars(metadata.get("provider_symbol") or symbol, limit=60)
@@ -1536,6 +1546,9 @@ class DynamicUniverseEngine:
         return 2.5
 
     def _news_score(self, symbol: str, metadata: dict[str, Any]) -> tuple[float, bool]:
+        if self._skip_live_market_endpoints():
+            metadata["news_unavailable_reason"] = "market_closed_not_needed"
+            return 2.5, False
         if not self.provider or not self.cfg.get("raw_sources", {}).get("eodhd_news", True) or metadata.get("existing_static"):
             return 2.5, False
         current = self._current_symbol(symbol)
@@ -1547,6 +1560,31 @@ class DynamicUniverseEngine:
             metadata["news_unavailable_reason"] = res.status
             return 2.5, False
         return min(5.0, 2.5 + len(res.data) * 0.5), True
+
+    def _skip_live_market_endpoints(self) -> bool:
+        if self._current_run_type == "post_market_review":
+            return True
+        now_ny = self.now.astimezone(ZoneInfo("America/New_York"))
+        if self.broker and hasattr(self.broker, "get_clock") and hasattr(self.broker, "is_market_open"):
+            try:
+                if self.broker.is_market_open():
+                    return False
+                if now_ny.weekday() >= 5:
+                    return True
+                clock = self.broker.get_clock()
+                next_open = getattr(clock, "next_open", None)
+                if next_open is not None:
+                    if isinstance(next_open, str):
+                        parsed = datetime.fromisoformat(next_open.replace("Z", "+00:00"))
+                    else:
+                        parsed = next_open
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    if parsed.astimezone(ZoneInfo("America/New_York")).date() != now_ny.date():
+                        return True
+            except Exception:
+                return False
+        return False
 
     def _data_confidence(self, metadata: dict[str, Any], bars: list[dict[str, Any]], quote_ok: bool, news_ok: bool) -> tuple[str, str]:
         if metadata.get("existing_static"):

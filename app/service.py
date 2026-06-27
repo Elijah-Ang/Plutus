@@ -64,6 +64,7 @@ MARKET_PHASE_REGULAR = "regular_market"
 MARKET_PHASE_POST = "post_market"
 MARKET_PHASE_WEEKEND = "market_closed_weekend"
 MARKET_PHASE_HOLIDAY = "market_closed_holiday"
+MARKET_PHASE_NON_TRADING = "market_closed_non_trading_day"
 MARKET_PHASE_CATCH_UP = "catch_up"
 MARKET_PHASE_UNKNOWN_CLOSED = "unknown_market_closed"
 
@@ -4709,11 +4710,7 @@ class TradingService:
                 f"{row['symbol']} {float(row['research_score'] or 0):.0f} {str(row.get('main_positive_reasons') or 'score').split(',')[0]}"
                 for row in briefs
             )
-            provider_rows = self.storage.fetch_all(
-                "SELECT SUM(CASE WHEN available=1 THEN 1 ELSE 0 END) available_count, SUM(CASE WHEN disabled_until IS NOT NULL THEN 1 ELSE 0 END) cooldown_count FROM data_provider_capabilities"
-            )
-            provider = provider_rows[0] if provider_rows else {}
-            provider_line = f"Provider: {int(provider.get('available_count') or 0)} endpoints available, {int(provider.get('cooldown_count') or 0)} on cooldown."
+            provider_line = self._dynamic_universe_provider_line(phase)
             lines = [
                 self._dynamic_universe_compact_header(phase, completed=True),
                 f"Research candidates: {counts['research_candidate']} | Briefs: {brief_count} | Observation: {counts['observation']} | Dynamic paper-tradable: {counts['dynamic_paper_tradable']}",
@@ -4784,13 +4781,50 @@ class TradingService:
         start = dt_time.fromisoformat(start_str)
         end = dt_time.fromisoformat(end_str)
         local_time = local_now.time()
-        if local_time < start:
-            return MARKET_PHASE_PRE
-        if start <= local_time <= end:
-            return MARKET_PHASE_HOLIDAY if trading_skipped_reason == "market_closed" else MARKET_PHASE_UNKNOWN_CLOSED
         if local_time > end:
             return MARKET_PHASE_POST
+        next_open_local = self._next_market_open_local(tz)
+        if next_open_local is not None:
+            if next_open_local.date() != local_now.date():
+                return MARKET_PHASE_HOLIDAY if trading_skipped_reason == "market_closed" else MARKET_PHASE_NON_TRADING
+            if local_time < start:
+                premarket_start = self._configured_premarket_start_time()
+                return MARKET_PHASE_PRE if local_time >= premarket_start else MARKET_PHASE_UNKNOWN_CLOSED
+        if local_time < start:
+            premarket_start = self._configured_premarket_start_time()
+            return MARKET_PHASE_PRE if local_time >= premarket_start else MARKET_PHASE_UNKNOWN_CLOSED
+        if start <= local_time <= end:
+            return MARKET_PHASE_HOLIDAY if trading_skipped_reason == "market_closed" else MARKET_PHASE_UNKNOWN_CLOSED
         return MARKET_PHASE_UNKNOWN_CLOSED
+
+    def _configured_premarket_start_time(self) -> dt_time:
+        configured = (
+            self.config.get("dynamic_universe", {})
+            .get("schedules", {})
+            .get("pre_market_window_start_local", "04:00")
+        )
+        try:
+            return dt_time.fromisoformat(str(configured))
+        except ValueError:
+            return dt_time(hour=4)
+
+    def _next_market_open_local(self, tz: ZoneInfo) -> datetime | None:
+        if not self.broker or not hasattr(self.broker, "get_clock"):
+            return None
+        try:
+            clock = self.broker.get_clock()
+            next_open = getattr(clock, "next_open", None)
+            if next_open is None:
+                return None
+            if isinstance(next_open, str):
+                parsed = datetime.fromisoformat(next_open.replace("Z", "+00:00"))
+            else:
+                parsed = next_open
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(tz)
+        except Exception:
+            return None
 
     def _dynamic_universe_phase_label(self, phase: str) -> str:
         return {
@@ -4799,6 +4833,7 @@ class TradingService:
             MARKET_PHASE_POST: "post-market research",
             MARKET_PHASE_WEEKEND: "market-closed research",
             MARKET_PHASE_HOLIDAY: "market-closed research",
+            MARKET_PHASE_NON_TRADING: "market-closed research",
             MARKET_PHASE_CATCH_UP: "research catch-up",
             MARKET_PHASE_UNKNOWN_CLOSED: "market-closed research",
         }.get(phase, "market-closed research")
@@ -4811,8 +4846,12 @@ class TradingService:
         if phase == MARKET_PHASE_REGULAR:
             return f"Dynamic Universe {label} {verb}. Trading remains paper-only and guarded by normal proposal rules."
         if phase == MARKET_PHASE_POST:
-            return f"Dynamic Universe {label} {verb}. Trading is blocked until next market open."
-        if phase in {MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_UNKNOWN_CLOSED}:
+            return f"Dynamic Universe {label} {verb}. Trading is blocked until the next market open."
+        if phase == MARKET_PHASE_WEEKEND:
+            return f"Dynamic Universe weekend market-closed research {verb}. Trading is blocked until the next regular US market open."
+        if phase in {MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING}:
+            return f"Dynamic Universe {label} {verb}. No regular US session today. Trading remains blocked until the next market open."
+        if phase == MARKET_PHASE_UNKNOWN_CLOSED:
             return f"Dynamic Universe {label} {verb}. Trading remains blocked until the next market open."
         if phase == MARKET_PHASE_CATCH_UP:
             return f"Dynamic Universe {label} {verb}. Trading remains blocked unless market is open and all trading gates pass."
@@ -4827,7 +4866,58 @@ class TradingService:
             return "Next: next scheduled research/promotion review."
         if phase == MARKET_PHASE_CATCH_UP:
             return "Next: resume the configured Dynamic Universe schedule."
+        if phase == MARKET_PHASE_WEEKEND:
+            return "Next: next regular US market session or scheduled research review."
+        if phase in {MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING}:
+            return "Next: next scheduled research review after the market calendar reopens."
         return "Next: next scheduled market-open or research review."
+
+    def _dynamic_universe_provider_line(self, phase: str) -> str:
+        rows = self.storage.fetch_all(
+            "SELECT endpoint_name, available, plan_limited, disabled_until, last_error_category FROM data_provider_capabilities ORDER BY endpoint_name"
+        )
+        active_cooldowns: list[str] = []
+        stale_cooldowns: list[str] = []
+        plan_limited: list[str] = []
+        available: list[str] = []
+        now = datetime.now(UTC)
+        for row in rows:
+            endpoint = str(row.get("endpoint_name") or "")
+            if int(row.get("available") or 0) == 1:
+                available.append(endpoint)
+            if int(row.get("plan_limited") or 0) == 1:
+                plan_limited.append(endpoint)
+            disabled_until = row.get("disabled_until")
+            if disabled_until:
+                try:
+                    disabled_dt = datetime.fromisoformat(str(disabled_until).replace("Z", "+00:00")).astimezone(UTC)
+                    if disabled_dt > now:
+                        active_cooldowns.append(endpoint)
+                    else:
+                        stale_cooldowns.append(endpoint)
+                except Exception:
+                    stale_cooldowns.append(endpoint)
+        market_closed = phase in {MARKET_PHASE_POST, MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING, MARKET_PHASE_UNKNOWN_CLOSED}
+        if market_closed:
+            parts = ["Provider: EODHD"]
+            if available:
+                parts.append("core available")
+            if "intraday_bars" in active_cooldowns or phase in {MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING, MARKET_PHASE_POST}:
+                parts.append("intraday not needed while market closed")
+            optional = [ep for ep in active_cooldowns if ep in {"news", "fundamentals"}]
+            if optional:
+                parts.append(f"optional cooldown: {', '.join(optional)}")
+            if plan_limited:
+                parts.append(f"plan-limited: {', '.join(plan_limited)}")
+            return "; ".join(parts) + "."
+        if active_cooldowns or plan_limited:
+            parts = [f"Provider: {len(available)} endpoints available"]
+            if active_cooldowns:
+                parts.append(f"current cooldown: {', '.join(active_cooldowns)}")
+            if plan_limited:
+                parts.append(f"plan-limited: {', '.join(plan_limited)}")
+            return "; ".join(parts) + "."
+        return f"Provider: {len(available)} endpoints available, 0 on cooldown."
 
     def _get_symbol_cluster(self, symbol: str) -> str | None:
         clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})

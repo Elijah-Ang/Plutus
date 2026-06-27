@@ -117,11 +117,20 @@ class MockAsset:
 
 
 class PromotionBroker:
-    def __init__(self, *, price: float | None = 100.0, market_open: bool = True, asset: MockAsset | None = None, open_orders: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        price: float | None = 100.0,
+        market_open: bool = True,
+        asset: MockAsset | None = None,
+        open_orders: list[Any] | None = None,
+        next_open: datetime | None = None,
+    ) -> None:
         self.price = price
         self.market_open = market_open
         self.asset = asset or MockAsset()
         self.open_orders = open_orders or []
+        self.next_open = next_open
 
     def get_asset(self, symbol: str):
         return self.asset
@@ -134,6 +143,9 @@ class PromotionBroker:
 
     def is_market_open(self):
         return self.market_open
+
+    def get_clock(self):
+        return type("Clock", (), {"is_open": self.market_open, "next_open": self.next_open})()
 
 
 def dynamic_config() -> dict[str, Any]:
@@ -493,7 +505,7 @@ def test_dynamic_universe_market_phase_wording_is_time_aware(temp_storage):
     cases = [
         (datetime(2026, 6, 26, 12, 0, tzinfo=UTC), "pre-market universe scan completed", "Next: market-open refresh/promotion checks."),
         (datetime(2026, 6, 26, 20, 23, tzinfo=UTC), "post-market research completed", "Next: next scheduled research/promotion review."),
-        (datetime(2026, 6, 28, 12, 0, tzinfo=UTC), "market-closed research completed", "Next: next scheduled market-open or research review."),
+        (datetime(2026, 6, 28, 12, 0, tzinfo=UTC), "market-closed research completed", "Next: next regular US market session or scheduled research review."),
     ]
     for now, header, next_line in cases:
         service.telegram.messages.clear()
@@ -503,6 +515,54 @@ def test_dynamic_universe_market_phase_wording_is_time_aware(temp_storage):
         assert next_line in msg
         if "post-market" in header:
             assert "pre-market" not in msg
+
+
+def test_saturday_sgt_market_closed_is_not_premarket(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = PromotionBroker(market_open=False, next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC))
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "pre-market" not in msg
+    assert "weekend market-closed research completed" in msg
+    assert "next regular US market open" in msg
+
+
+def test_holiday_or_non_trading_day_uses_market_closed_wording(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = PromotionBroker(market_open=False, next_open=datetime(2026, 7, 6, 13, 30, tzinfo=UTC))
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "daily_deep_research", "run_id": "run-holiday", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 7, 3, 14, 0, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "pre-market" not in msg
+    assert "No regular US session today" in msg
+    assert "Trading remains blocked until the next market open" in msg
+
+
+def test_post_market_after_friday_close_stays_post_market(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = PromotionBroker(market_open=False, next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC))
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "post_market_review", "run_id": "run-post", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 26, 20, 23, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "post-market research completed" in msg
+    assert "No regular US session today" not in msg
+    assert "Trading is blocked until the next market open" in msg
 
 
 def test_dynamic_universe_catchup_wording_overrides_market_phase(temp_storage):
@@ -536,6 +596,55 @@ def test_dynamic_universe_regular_market_wording_is_guarded_paper_only(temp_stor
     assert "intraday refresh completed" in msg
     assert "Trading remains paper-only and guarded by normal proposal rules" in msg
     assert "No trade proposals/orders created" in msg
+
+
+def test_weekend_compact_provider_status_is_phase_aware(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-intraday", "run-test", "eodhd", "intraday_bars", 0, 0, (now + timedelta(minutes=30)).isoformat(), "cooldown_active", now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-news", "run-test", "eodhd", "news", 0, 0, (now + timedelta(minutes=30)).isoformat(), "cooldown_active", now.isoformat()),
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-fund", "run-test", "eodhd", "fundamentals", 0, 1, None, "forbidden", now.isoformat()),
+    )
+    broker = PromotionBroker(market_open=False, next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC))
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "intraday not needed while market closed" in msg
+    assert "optional cooldown: news" in msg
+    assert "plan-limited: fundamentals" in msg
+    assert "1 endpoints available, 6 on cooldown" not in msg
+
+
+def test_market_closed_research_skips_intraday_quote_and_news(temp_storage):
+    cfg = dynamic_config()
+    provider = FakeProvider(
+        rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US", "Sector": "Semiconductors"}],
+        bars=liquid_bars(),
+    )
+    engine = DynamicUniverseEngine(cfg, temp_storage, provider, "run-weekend", broker=PromotionBroker(market_open=False))
+    engine.now = datetime(2026, 6, 27, 12, 21, tzinfo=UTC)
+
+    engine.run_research_cycle("daily_deep_research")
+
+    assert "historical_bars" in provider.calls
+    assert "intraday_bars" not in provider.calls
+    assert "latest_quote" not in provider.calls
+    assert "news" not in provider.calls
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert temp_storage.fetch_all("SELECT * FROM orders") == []
 
 
 def test_partial_data_eod_quote_news_can_create_research_candidate(temp_storage):
