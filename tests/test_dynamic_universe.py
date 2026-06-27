@@ -464,10 +464,12 @@ def test_premarket_telegram_wording_uses_scan_and_no_orders_line(temp_storage):
         bars=liquid_bars(),
     )
     result = DynamicUniverseEngine(cfg, temp_storage, provider, "run-test").run_research_cycle("daily_deep_research")
-    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    broker = MockBroker()
+    broker.open = False
+    service = TradingService(cfg, temp_storage, broker, "run-test")
     service.telegram = MockTelegramBot()
 
-    service.notify_premarket_dynamic_universe_status([result], "market_closed")
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 26, 12, 0, tzinfo=UTC))
 
     msg = service.telegram.messages[-1]
     assert "pre-market universe scan completed" in msg
@@ -477,6 +479,63 @@ def test_premarket_telegram_wording_uses_scan_and_no_orders_line(temp_storage):
     assert "Trading remains blocked until market open" in msg
     assert "No trade proposals/orders created" in msg
     assert len(msg) < 900
+
+
+def test_dynamic_universe_market_phase_wording_is_time_aware(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = MockBroker()
+    broker.open = False
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "daily_deep_research", "run_id": "run-empty", "candidate_briefs": 0}
+
+    cases = [
+        (datetime(2026, 6, 26, 12, 0, tzinfo=UTC), "pre-market universe scan completed", "Next: market-open refresh/promotion checks."),
+        (datetime(2026, 6, 26, 20, 23, tzinfo=UTC), "post-market research completed", "Next: next scheduled research/promotion review."),
+        (datetime(2026, 6, 28, 12, 0, tzinfo=UTC), "market-closed research completed", "Next: next scheduled market-open or research review."),
+    ]
+    for now, header, next_line in cases:
+        service.telegram.messages.clear()
+        service.notify_premarket_dynamic_universe_status([result], "market_closed", now=now)
+        msg = service.telegram.messages[-1]
+        assert header in msg
+        assert next_line in msg
+        if "post-market" in header:
+            assert "pre-market" not in msg
+
+
+def test_dynamic_universe_catchup_wording_overrides_market_phase(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-catchup", "candidate_briefs": 0, "catchup": True}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 26, 12, 0, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "research catch-up completed" in msg
+    assert "Trading remains blocked unless market is open and all trading gates pass" in msg
+    assert "Next: resume the configured Dynamic Universe schedule." in msg
+    assert "pre-market universe scan" not in msg
+
+
+def test_dynamic_universe_regular_market_wording_is_guarded_paper_only(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = MockBroker()
+    broker.open = True
+    service = TradingService(cfg, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-open", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 26, 15, 0, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "intraday refresh completed" in msg
+    assert "Trading remains paper-only and guarded by normal proposal rules" in msg
+    assert "No trade proposals/orders created" in msg
 
 
 def test_partial_data_eod_quote_news_can_create_research_candidate(temp_storage):

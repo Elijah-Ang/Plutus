@@ -8,7 +8,7 @@ import time
 import dataclasses
 import uuid
 import pandas as pd
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -57,6 +57,15 @@ def _format_small_percent(value: float | int | None) -> str:
     if 0 < abs(numeric) < 0.01:
         return "<0.01%"
     return f"{numeric:.2f}%"
+
+
+MARKET_PHASE_PRE = "pre_market"
+MARKET_PHASE_REGULAR = "regular_market"
+MARKET_PHASE_POST = "post_market"
+MARKET_PHASE_WEEKEND = "market_closed_weekend"
+MARKET_PHASE_HOLIDAY = "market_closed_holiday"
+MARKET_PHASE_CATCH_UP = "catch_up"
+MARKET_PHASE_UNKNOWN_CLOSED = "unknown_market_closed"
 
 
 def _format_expiry_line(expires_at: str | datetime, now: datetime | None = None) -> str:
@@ -4221,7 +4230,7 @@ class TradingService:
         expired_cnt = expired[0]["cnt"] if expired else 0
 
         promotions = self.storage.fetch_all(
-            "SELECT symbol, from_tier, to_tier, reason FROM symbol_promotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
+            "SELECT symbol, from_tier, to_tier, reason, payload FROM symbol_promotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
             (window_start_iso,),
         )
         demotions = self.storage.fetch_all(
@@ -4673,13 +4682,13 @@ class TradingService:
     def run_dynamic_universe_research_only(self) -> list[dict[str, Any]]:
         return self._run_dynamic_universe_due()
 
-    def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str) -> None:
+    def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> None:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
             return
+        phase = self._dynamic_universe_market_phase(results, trading_skipped_reason, now=now)
         completed = [r for r in results if r.get("status") == "completed"]
         skipped = [r for r in results if r.get("status") == "skipped"]
         if completed:
-            promoted = sorted({sym for r in completed for sym in r.get("promoted", [])})
             run_ids = [str(r.get("run_id")) for r in completed if r.get("run_id")]
             placeholders = ",".join("?" for _ in run_ids)
             briefs = []
@@ -4694,10 +4703,8 @@ class TradingService:
                     """,
                     tuple(run_ids),
                 )
-            candidate_count = len(promoted)
+            counts = self._dynamic_universe_compact_counts()
             brief_count = sum(int(r.get("candidate_briefs") or 0) for r in completed)
-            observation_count = len({sym for r in completed for sym in r.get("promoted", []) if self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? AND tier='observation'", (sym,))})
-            paper_count = len({sym for r in completed for sym in r.get("promoted", []) if self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? AND tier='paper_tradable'", (sym,))})
             top = ", ".join(
                 f"{row['symbol']} {float(row['research_score'] or 0):.0f} {str(row.get('main_positive_reasons') or 'score').split(',')[0]}"
                 for row in briefs
@@ -4708,23 +4715,119 @@ class TradingService:
             provider = provider_rows[0] if provider_rows else {}
             provider_line = f"Provider: {int(provider.get('available_count') or 0)} endpoints available, {int(provider.get('cooldown_count') or 0)} on cooldown."
             lines = [
-                "Dynamic Universe pre-market universe scan completed. Trading remains blocked until market open.",
-                f"Research candidates: {candidate_count} | Briefs: {brief_count} | Observation: {observation_count} | Paper-tradable: {paper_count}",
+                self._dynamic_universe_compact_header(phase, completed=True),
+                f"Research candidates: {counts['research_candidate']} | Briefs: {brief_count} | Observation: {counts['observation']} | Dynamic paper-tradable: {counts['dynamic_paper_tradable']}",
             ]
+            if counts["static_paper_tradable"]:
+                lines[-1] += f" | Static paper-tradable: {counts['static_paper_tradable']}"
             if top:
                 lines.append(f"Top: {top}.")
-            lines.extend([provider_line, "Next: market-open refresh/promotion checks.", "No trade proposals/orders created."])
+            lines.extend([provider_line, self._dynamic_universe_next_line(phase), "No trade proposals/orders created."])
             text = "\n".join(lines)
         elif skipped:
             reason = skipped[0].get("reason") or "research skipped"
-            text = f"Dynamic Universe pre-market universe scan skipped: {reason}. Trading remains blocked until market open.\nNo trade proposals/orders created."
+            text = f"{self._dynamic_universe_compact_header(phase, completed=False, reason=reason)}\nNo trade proposals/orders created."
         else:
-            text = f"Dynamic Universe pre-market universe scan checked. Trading remains blocked until market open: {trading_skipped_reason}.\nNo trade proposals/orders created."
+            text = f"Dynamic Universe {self._dynamic_universe_phase_label(phase)} checked. Trading remains blocked: {trading_skipped_reason}.\nNo trade proposals/orders created."
         try:
             self.telegram.send_message(text)
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", {"status": "sent", "trading_skipped_reason": trading_skipped_reason})
         except Exception as exc:
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_failed", {"error": type(exc).__name__, "trading_skipped_reason": trading_skipped_reason})
+
+    def _dynamic_universe_compact_counts(self) -> dict[str, int]:
+        rows = self.storage.fetch_all(
+            """
+            SELECT tier, source, universe_lane, executable, COUNT(*) AS count
+            FROM universe_symbols
+            WHERE tier IN ('research_candidate','observation','paper_tradable')
+            GROUP BY tier, source, universe_lane, executable
+            """
+        )
+        counts = {
+            "research_candidate": 0,
+            "observation": 0,
+            "dynamic_paper_tradable": 0,
+            "static_paper_tradable": 0,
+        }
+        for row in rows:
+            tier = row.get("tier")
+            source = str(row.get("source") or "")
+            count = int(row.get("count") or 0)
+            if tier == RESEARCH_CANDIDATE:
+                counts["research_candidate"] += count
+            elif tier == OBSERVATION:
+                counts["observation"] += count
+            elif tier == PAPER_TRADABLE and source == "existing_static_watchlist":
+                counts["static_paper_tradable"] += count
+            elif tier == PAPER_TRADABLE:
+                counts["dynamic_paper_tradable"] += count
+        return counts
+
+    def _dynamic_universe_market_phase(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
+        if any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in results):
+            return MARKET_PHASE_CATCH_UP
+        try:
+            if self.broker and self.broker.is_market_open():
+                return MARKET_PHASE_REGULAR
+        except Exception:
+            pass
+        now_utc = now or datetime.now(UTC)
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=UTC)
+        profile = self.config.get("market_profiles", {}).get("us_equities", {})
+        tz = ZoneInfo(profile.get("timezone", "America/New_York"))
+        local_now = now_utc.astimezone(tz)
+        if local_now.weekday() >= 5:
+            return MARKET_PHASE_WEEKEND
+        start_str, end_str = str(profile.get("session_hours", "09:30-16:00")).split("-", 1)
+        start = dt_time.fromisoformat(start_str)
+        end = dt_time.fromisoformat(end_str)
+        local_time = local_now.time()
+        if local_time < start:
+            return MARKET_PHASE_PRE
+        if start <= local_time <= end:
+            return MARKET_PHASE_HOLIDAY if trading_skipped_reason == "market_closed" else MARKET_PHASE_UNKNOWN_CLOSED
+        if local_time > end:
+            return MARKET_PHASE_POST
+        return MARKET_PHASE_UNKNOWN_CLOSED
+
+    def _dynamic_universe_phase_label(self, phase: str) -> str:
+        return {
+            MARKET_PHASE_PRE: "pre-market universe scan",
+            MARKET_PHASE_REGULAR: "intraday refresh",
+            MARKET_PHASE_POST: "post-market research",
+            MARKET_PHASE_WEEKEND: "market-closed research",
+            MARKET_PHASE_HOLIDAY: "market-closed research",
+            MARKET_PHASE_CATCH_UP: "research catch-up",
+            MARKET_PHASE_UNKNOWN_CLOSED: "market-closed research",
+        }.get(phase, "market-closed research")
+
+    def _dynamic_universe_compact_header(self, phase: str, completed: bool, reason: str | None = None) -> str:
+        label = self._dynamic_universe_phase_label(phase)
+        verb = "completed" if completed else f"skipped: {reason or 'research skipped'}"
+        if phase == MARKET_PHASE_PRE:
+            return f"Dynamic Universe {label} {verb}. Trading remains blocked until market open."
+        if phase == MARKET_PHASE_REGULAR:
+            return f"Dynamic Universe {label} {verb}. Trading remains paper-only and guarded by normal proposal rules."
+        if phase == MARKET_PHASE_POST:
+            return f"Dynamic Universe {label} {verb}. Trading is blocked until next market open."
+        if phase in {MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_UNKNOWN_CLOSED}:
+            return f"Dynamic Universe {label} {verb}. Trading remains blocked until the next market open."
+        if phase == MARKET_PHASE_CATCH_UP:
+            return f"Dynamic Universe {label} {verb}. Trading remains blocked unless market is open and all trading gates pass."
+        return f"Dynamic Universe {label} {verb}. Trading remains blocked unless all trading gates pass."
+
+    def _dynamic_universe_next_line(self, phase: str) -> str:
+        if phase == MARKET_PHASE_PRE:
+            return "Next: market-open refresh/promotion checks."
+        if phase == MARKET_PHASE_REGULAR:
+            return "Next: next intraday refresh or post-market review."
+        if phase == MARKET_PHASE_POST:
+            return "Next: next scheduled research/promotion review."
+        if phase == MARKET_PHASE_CATCH_UP:
+            return "Next: resume the configured Dynamic Universe schedule."
+        return "Next: next scheduled market-open or research review."
 
     def _get_symbol_cluster(self, symbol: str) -> str | None:
         clusters = self.config.get("portfolio_optimizer", {}).get("clusters", {})

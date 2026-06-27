@@ -220,7 +220,7 @@ class DynamicUniverseEngine:
             None,
             {"run_type": run_type, "status": status, "promoted": promoted, "demoted": demoted},
         )
-        return {"status": status, "considered": considered, "promoted": promoted, "demoted": demoted, "run_id": run_id, "run_type": run_type, "candidate_briefs": len(brief_items)}
+        return {"status": status, "considered": considered, "promoted": promoted, "demoted": demoted, "run_id": run_id, "run_type": run_type, "candidate_briefs": len(brief_items), "catchup": is_catchup}
 
     def dynamic_scan_symbols(self) -> tuple[list[str], list[str]]:
         if not self.enabled():

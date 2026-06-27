@@ -199,6 +199,66 @@ def test_digest_tier_snapshot_is_explicit_and_truncated():
     assert "* Observation shown: top 6 of 7 by score" in msg
     assert "Actions:\n* Proposals: 0 | Orders: 0 | Fills: 0 | GPT: 0 | Expired: 0" in msg
 
+
+def test_runtime_digest_classifies_static_global_and_dynamic_events_from_payload(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "ai": {"ai_review_min_score": 65},
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": False,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 1,
+            "telegram_digest_send_when_market_closed": True,
+        },
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "execution_enabled": True,
+                "broker": "alpaca",
+                "watchlist": ["SPY"],
+                "observation_watchlist": ["XLK"],
+            }
+        },
+        "dynamic_universe": {"enabled": True, "max_observation_symbols": 30, "max_dynamic_paper_tradable_symbols": 12},
+    }
+    broker = MockBroker()
+    service = TradingService(config, temp_storage, broker, "run-test")
+    service.telegram = MockTelegramBot()
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO market_memory(run_id,market_profile,symbol,price,session_start_price,signal,score,classification,proposal_generated,no_action_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("run1", "us_equities", "SPY", 400.0, 400.0, "HOLD", 80.0, "Qualified watch", 0, "no entry/exit signal", now.isoformat()),
+    )
+    events = [
+        ("p-static", "DIA", "raw_universe", "paper_tradable", {"existing_static": True, "universe_lane": "alpaca_compatible_us"}),
+        ("p-global", "2800.HK", "raw_universe", "observation", {"existing_static": True, "universe_lane": "global_research_only"}),
+        ("p-observation", "XLK", "raw_universe", "observation", {"existing_static": True, "universe_lane": "alpaca_compatible_us"}),
+        ("p-dynamic", "SMH", "observation", "paper_tradable", {"existing_static": False, "universe_lane": "alpaca_compatible_us", "promotion_freshness_path": "cached_intraday"}),
+    ]
+    for event_id, symbol, from_tier, to_tier, payload in events:
+        temp_storage.execute(
+            "INSERT INTO symbol_promotion_decisions(id,run_id,symbol,from_tier,to_tier,score,reason,deterministic_pass,gpt_summary_used,created_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, "run-test", symbol, from_tier, to_tier, 80.0, "deterministic promotion rule", 1, 0, now.isoformat(), json.dumps(payload, separators=(',', ':'))),
+        )
+
+    service.check_and_send_digest()
+
+    msg = service.telegram.messages[-1]
+    assert "Static paper-tradable reconciled: DIA" in msg
+    assert "Dynamic paper-tradable promotions: SMH" in msg
+    assert "Global research-only tracked: 2800.HK" in msg
+    assert "Observation promoted: XLK" in msg
+    assert "Promoted to observation" not in msg
+    assert "Promoted to paper-tradable" not in msg
+    assert "No dynamic proposals/orders created" in msg
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert temp_storage.fetch_all("SELECT * FROM orders") == []
+
 def test_digest_throttling_and_market_hours(temp_storage):
     config = {
         "mode": "paper",
