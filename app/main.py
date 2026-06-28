@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from .broker_alpaca import AlpacaBroker
 from .logging_config import configure_logging
-from .preflight import run_core_preflight, run_trading_preflight
+from .preflight import run_core_preflight, run_research_preflight, run_trading_preflight
 from .storage import Storage
 import sys
 import traceback
@@ -53,7 +53,17 @@ def run_once(config_path: str | Path | None = None) -> int:
             broker = None
             logger.warning("Broker initialization unavailable: %s", type(exc).__name__)
         service = TradingService(config, storage, broker, run_id)
-        research_results = service.run_dynamic_universe_research_only()
+        research_result = run_research_preflight(
+            config,
+            storage,
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight"),
+        )
+        research_results = []
+        if research_result.passed:
+            research_results = service.run_dynamic_universe_research_only()
+        else:
+            skipped_reasons = [c.name for c in research_result.checks if not c.passed]
+            storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
         research_ran = any(r.get("status") == "completed" for r in research_results)
         research_status = "not_due"
         if research_results:
@@ -75,7 +85,7 @@ def run_once(config_path: str | Path | None = None) -> int:
             catchup_required = False
         split_detail = {
             "core_preflight_passed": core_result.passed,
-            "research_preflight_passed": bool(research_results) or research_status == "not_due",
+            "research_preflight_passed": research_result.passed,
             "trading_preflight_passed": trading_result.passed,
             "research_ran": research_ran,
             "research_status": research_status,

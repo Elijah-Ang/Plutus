@@ -113,6 +113,11 @@ class EODHDProvider:
             except HTTPError as exc:
                 status, category = self._classify_http_error(exc.code)
                 last_error = category
+                if capability == "eod_bars" and exc.code in {404, 422}:
+                    symbol = endpoint.split("/", 1)[1] if "/" in endpoint else None
+                    symbol_status = "symbol_not_found" if exc.code == 404 else "symbol_no_data"
+                    self.cache.record_health(self.name, "symbol_no_data", self.run_id, {"endpoint": endpoint, "symbol": symbol, "error": symbol_status, "status_code": exc.code})
+                    return ProviderResponse(self.name, endpoint, symbol_status, None, symbol_status)
                 if status in {"plan_limited", "rate_limited"}:
                     cooldown = self.plan_limited_cooldown_minutes if status == "plan_limited" else 60
                     self.cache.record_health(self.name, status, self.run_id, {"endpoint": endpoint, "error": category, "status_code": exc.code})

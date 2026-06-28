@@ -4735,9 +4735,11 @@ class TradingService:
                 lines.append(f"Top: {top}.")
             lines.extend([provider_line, next_line, "No trade proposals/orders created."])
             text = "\n".join(lines)
+            symbol_sets = self._dynamic_universe_compact_symbol_sets()
             snapshot = self._dynamic_universe_notification_snapshot(
                 phase,
                 counts,
+                symbol_sets,
                 provider_material,
                 next_line,
                 completed=completed,
@@ -4748,9 +4750,11 @@ class TradingService:
             reason = skipped[0].get("reason") or "research skipped"
             text = f"{self._dynamic_universe_compact_header(phase, completed=False, reason=reason)}\nNo trade proposals/orders created."
             provider_material = self._dynamic_universe_provider_material_status(phase)
+            symbol_sets = self._dynamic_universe_compact_symbol_sets()
             snapshot = self._dynamic_universe_notification_snapshot(
                 phase,
                 self._dynamic_universe_compact_counts(),
+                symbol_sets,
                 provider_material,
                 self._dynamic_universe_next_line(phase),
                 completed=completed,
@@ -4760,9 +4764,11 @@ class TradingService:
         else:
             text = f"Dynamic Universe {self._dynamic_universe_phase_label(phase)} checked. Trading remains blocked: {trading_skipped_reason}.\nNo trade proposals/orders created."
             provider_material = self._dynamic_universe_provider_material_status(phase)
+            symbol_sets = self._dynamic_universe_compact_symbol_sets()
             snapshot = self._dynamic_universe_notification_snapshot(
                 phase,
                 self._dynamic_universe_compact_counts(),
+                symbol_sets,
                 provider_material,
                 self._dynamic_universe_next_line(phase),
                 completed=completed,
@@ -4782,46 +4788,75 @@ class TradingService:
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_failed", {"error": type(exc).__name__, "trading_skipped_reason": trading_skipped_reason})
 
     def _dynamic_universe_compact_counts(self) -> dict[str, int]:
+        sets = self._dynamic_universe_compact_symbol_sets()
+        return {
+            "research_candidate": len(sets["research_candidate_symbols"]),
+            "observation_total": len(sets["observation_symbols"]),
+            "alpaca_compatible_observation": len(sets["alpaca_compatible_observation_symbols"]),
+            "global_research_only_observation": len(sets["global_research_only_symbols"]),
+            "dynamic_paper_tradable": len(sets["dynamic_paper_tradable_symbols"]),
+            "static_paper_tradable_total": len(sets["static_paper_tradable_symbols"]),
+            "held_static_positions": len(sets["held_static_symbols"]),
+        }
+
+    def _dynamic_universe_compact_symbol_sets(self) -> dict[str, list[str]]:
         rows = self.storage.fetch_all(
             """
-            SELECT tier, source, universe_lane, executable, COUNT(*) AS count
+            SELECT symbol, tier, source, universe_lane, executable, alpaca_compatible
             FROM universe_symbols
             WHERE tier IN ('research_candidate','observation','paper_tradable')
-            GROUP BY tier, source, universe_lane, executable
+            ORDER BY symbol
             """
         )
-        counts = {
-            "research_candidate": 0,
-            "observation_total": 0,
-            "alpaca_compatible_observation": 0,
-            "global_research_only_observation": 0,
-            "dynamic_paper_tradable": 0,
-            "static_paper_tradable_total": len(self._configured_static_paper_symbols()),
-            "held_static_positions": self._held_static_position_count(),
+        symbols: dict[str, set[str]] = {
+            "research_candidate_symbols": set(),
+            "observation_symbols": set(),
+            "alpaca_compatible_observation_symbols": set(),
+            "global_research_only_symbols": set(),
+            "dynamic_paper_tradable_symbols": set(),
+            "static_paper_tradable_symbols": set(self._configured_static_paper_symbols()),
+            "held_static_symbols": set(),
         }
         for row in rows:
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
             tier = row.get("tier")
             source = str(row.get("source") or "")
             lane = str(row.get("universe_lane") or "")
-            count = int(row.get("count") or 0)
             if tier == RESEARCH_CANDIDATE:
-                counts["research_candidate"] += count
+                symbols["research_candidate_symbols"].add(symbol)
             elif tier == OBSERVATION:
-                counts["observation_total"] += count
+                symbols["observation_symbols"].add(symbol)
                 if lane == "global_research_only":
-                    counts["global_research_only_observation"] += count
+                    symbols["global_research_only_symbols"].add(symbol)
                 elif lane == "alpaca_compatible_us":
-                    counts["alpaca_compatible_observation"] += count
+                    symbols["alpaca_compatible_observation_symbols"].add(symbol)
             elif tier == PAPER_TRADABLE and source == "existing_static_watchlist":
                 continue
-            elif tier == PAPER_TRADABLE:
-                counts["dynamic_paper_tradable"] += count
+            elif (
+                tier == PAPER_TRADABLE
+                and lane == "alpaca_compatible_us"
+                and int(row.get("alpaca_compatible") or 0) == 1
+                and int(row.get("executable") or 0) == 1
+            ):
+                symbols["dynamic_paper_tradable_symbols"].add(symbol)
         for symbol in self._configured_observation_symbols():
             row = self.storage.fetch_all("SELECT 1 FROM universe_symbols WHERE symbol=? AND tier IN ('paper_tradable','observation','research_candidate') LIMIT 1", (symbol,))
             if not row:
-                counts["observation_total"] += 1
-                counts["alpaca_compatible_observation"] += 1
-        return counts
+                symbols["observation_symbols"].add(symbol)
+                symbols["alpaca_compatible_observation_symbols"].add(symbol)
+        static = symbols["static_paper_tradable_symbols"]
+        try:
+            positions = self.broker.get_positions()
+            symbols["held_static_symbols"] = {str(_value(p, "symbol", "")).upper() for p in positions if str(_value(p, "symbol", "")).upper() in static}
+        except Exception:
+            try:
+                rows = self.storage.fetch_all("SELECT DISTINCT symbol FROM positions")
+                symbols["held_static_symbols"] = {str(r.get("symbol") or "").upper() for r in rows if str(r.get("symbol") or "").upper() in static}
+            except Exception:
+                symbols["held_static_symbols"] = set()
+        return {key: sorted(value) for key, value in symbols.items()}
 
     def _configured_static_paper_symbols(self) -> list[str]:
         symbols: list[str] = []
@@ -4977,22 +5012,28 @@ class TradingService:
 
     def _dynamic_universe_provider_material_status(self, phase: str) -> dict[str, Any]:
         rows = self.storage.fetch_all(
-            "SELECT endpoint_name, available, plan_limited, disabled_until, last_error_category FROM data_provider_capabilities ORDER BY endpoint_name"
+            "SELECT endpoint_name, available, plan_limited, disabled_until, last_status_code, last_error_category, detail FROM data_provider_capabilities ORDER BY endpoint_name"
         )
         active_cooldowns: list[str] = []
         stale_cooldowns: list[str] = []
         plan_limited: list[str] = []
         available: list[str] = []
         errors: list[str] = []
+        symbol_no_data: dict[str, int] = {}
         now = datetime.now(UTC)
         for row in rows:
             endpoint = str(row.get("endpoint_name") or "")
+            category = str(row.get("last_error_category") or "")
+            status_code = int(row.get("last_status_code") or 0)
+            symbol_level_no_data = endpoint == "eod_bars" and (category in {"not_found", "no_data", "symbol_not_found", "symbol_no_data"} or status_code in {404, 422})
+            if symbol_level_no_data:
+                symbol_no_data[endpoint] = symbol_no_data.get(endpoint, 0) + 1
             if int(row.get("available") or 0) == 1:
                 available.append(endpoint)
-            if int(row.get("plan_limited") or 0) == 1:
+            if int(row.get("plan_limited") or 0) == 1 and not symbol_level_no_data:
                 plan_limited.append(endpoint)
             disabled_until = row.get("disabled_until")
-            if disabled_until:
+            if disabled_until and not symbol_level_no_data:
                 try:
                     disabled_dt = datetime.fromisoformat(str(disabled_until).replace("Z", "+00:00")).astimezone(UTC)
                     if disabled_dt > now:
@@ -5001,8 +5042,7 @@ class TradingService:
                         stale_cooldowns.append(endpoint)
                 except Exception:
                     stale_cooldowns.append(endpoint)
-            category = str(row.get("last_error_category") or "")
-            if category and category not in {"cooldown_active", "rate_limited", "forbidden", "plan_limited"}:
+            if category and category not in {"cooldown_active", "rate_limited", "forbidden", "plan_limited"} and not symbol_level_no_data:
                 errors.append(f"{endpoint}:{category}")
         market_closed = phase in {MARKET_PHASE_POST, MARKET_PHASE_WEEKEND, MARKET_PHASE_HOLIDAY, MARKET_PHASE_NON_TRADING, MARKET_PHASE_UNKNOWN_CLOSED}
         core_endpoints = {"eod_bars", "screener", "technicals"} if market_closed else {"eod_bars", "intraday_bars", "realtime_quote", "screener", "technicals"}
@@ -5019,6 +5059,7 @@ class TradingService:
             "optional_cooldowns": optional_cooldowns,
             "plan_limited": sorted(plan_limited),
             "errors": sorted(errors),
+            "symbol_no_data": dict(sorted(symbol_no_data.items())),
             "intraday_not_needed": market_closed,
         }
 
@@ -5029,6 +5070,7 @@ class TradingService:
         optional_cooldowns = list(status.get("optional_cooldowns") or [])
         plan_limited = list(status.get("plan_limited") or [])
         errors = list(status.get("errors") or [])
+        symbol_no_data = dict(status.get("symbol_no_data") or {})
         market_closed = bool(status.get("intraday_not_needed"))
         if market_closed:
             parts = ["Provider: EODHD"]
@@ -5036,6 +5078,9 @@ class TradingService:
                 parts.append("core available")
             if status.get("intraday_not_needed"):
                 parts.append("intraday not needed while market closed")
+            eod_symbol_no_data = int(symbol_no_data.get("eod_bars") or 0)
+            if eod_symbol_no_data:
+                parts.append(f"EOD had symbol-level no-data for {eod_symbol_no_data} symbol" + ("" if eod_symbol_no_data == 1 else "s"))
             if active_core_cooldowns:
                 parts.append(f"core cooldown: {', '.join(active_core_cooldowns)}")
             if optional_cooldowns:
@@ -5061,6 +5106,7 @@ class TradingService:
         self,
         phase: str,
         counts: dict[str, int],
+        symbol_sets: dict[str, list[str]],
         provider_material: dict[str, Any],
         next_line: str,
         *,
@@ -5077,17 +5123,26 @@ class TradingService:
             "dynamic_paper_tradable_count": counts.get("dynamic_paper_tradable", 0),
             "static_paper_tradable_total_count": counts.get("static_paper_tradable_total", 0),
             "held_static_position_count": counts.get("held_static_positions", 0),
+            "research_candidate_symbols": symbol_sets.get("research_candidate_symbols") or [],
+            "observation_symbols": symbol_sets.get("observation_symbols") or [],
+            "alpaca_compatible_observation_symbols": symbol_sets.get("alpaca_compatible_observation_symbols") or [],
+            "global_research_only_symbols": symbol_sets.get("global_research_only_symbols") or [],
+            "dynamic_paper_tradable_symbols": symbol_sets.get("dynamic_paper_tradable_symbols") or [],
+            "static_paper_tradable_symbols": symbol_sets.get("static_paper_tradable_symbols") or [],
+            "held_static_symbols": symbol_sets.get("held_static_symbols") or [],
             "provider_material_status": {
                 "status": provider_material.get("status"),
                 "active_core_cooldowns": provider_material.get("active_core_cooldowns") or [],
                 "optional_cooldowns": provider_material.get("optional_cooldowns") or [],
                 "plan_limited": provider_material.get("plan_limited") or [],
                 "errors": provider_material.get("errors") or [],
+                "symbol_no_data": provider_material.get("symbol_no_data") or {},
                 "intraday_not_needed": bool(provider_material.get("intraday_not_needed")),
             },
             "completed_run_types": sorted({str(r.get("run_type") or "") for r in completed if r.get("run_type")}),
             "skipped_reasons": sorted({str(r.get("reason") or "") for r in skipped if r.get("reason")}),
             "catchup_completed": any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in completed),
+            "user_requested": any(bool(r.get("user_requested")) for r in completed + skipped),
             "has_error_or_warning": any(str(r.get("status") or "") in {"error", "failed", "warning"} or bool(r.get("error") or r.get("warning")) for r in completed + skipped),
             "next_expected_check": next_line,
             "trading_skipped_reason": trading_skipped_reason,
@@ -5100,6 +5155,8 @@ class TradingService:
             return False
         if phase not in MARKET_CLOSED_STATUS_PHASES or snapshot is None:
             return False
+        if snapshot.get("user_requested"):
+            return False
         if snapshot.get("catchup_completed") and cfg.get("always_send_catchup_completion", True):
             return False
         if snapshot.get("has_error_or_warning") and cfg.get("always_send_errors", True):
@@ -5107,14 +5164,96 @@ class TradingService:
         previous = self._latest_market_closed_status_snapshot()
         if not previous:
             return False
-        if previous == snapshot:
+        previous_key = self._market_closed_material_snapshot(previous)
+        current_key = self._market_closed_material_snapshot(snapshot)
+        if previous_key == current_key:
             self.storage.audit(
                 self.run_id,
                 "market_closed_status_suppressed_no_change",
-                {"phase": phase, "snapshot": snapshot, "suppressed_at": iso_now()},
+                {"phase": phase, "snapshot": snapshot, "material_snapshot": current_key, "suppressed_at": iso_now()},
             )
             return True
+        if self._market_closed_only_count_noise(previous, snapshot) and cfg.get("ignore_minor_count_noise", True):
+            self.storage.audit(
+                self.run_id,
+                "market_closed_status_suppressed_count_noise",
+                {"phase": phase, "previous": previous, "snapshot": snapshot, "suppressed_at": iso_now()},
+            )
+            return True
+        max_minutes = int(cfg.get("max_frequency_minutes", 180) or 0)
+        if max_minutes > 0 and not self._market_closed_material_change(previous, snapshot):
+            last_sent = self._latest_market_closed_status_sent_at()
+            if last_sent is not None and datetime.now(UTC) - last_sent < timedelta(minutes=max_minutes):
+                self.storage.audit(
+                    self.run_id,
+                    "market_closed_status_suppressed_frequency",
+                    {"phase": phase, "snapshot": snapshot, "max_frequency_minutes": max_minutes, "suppressed_at": iso_now()},
+                )
+                return True
         return False
+
+    def _market_closed_material_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        provider = dict(snapshot.get("provider_material_status") or {})
+        return {
+            "market_phase": snapshot.get("market_phase"),
+            "research_candidate_symbols": sorted(snapshot.get("research_candidate_symbols") or []),
+            "observation_symbols": sorted(snapshot.get("observation_symbols") or []),
+            "alpaca_compatible_observation_symbols": sorted(snapshot.get("alpaca_compatible_observation_symbols") or []),
+            "global_research_only_symbols": sorted(snapshot.get("global_research_only_symbols") or []),
+            "dynamic_paper_tradable_symbols": sorted(snapshot.get("dynamic_paper_tradable_symbols") or []),
+            "static_paper_tradable_symbols": sorted(snapshot.get("static_paper_tradable_symbols") or []),
+            "held_static_symbols": sorted(snapshot.get("held_static_symbols") or []),
+            "provider_material_status": {
+                "status": provider.get("status"),
+                "active_core_cooldowns": sorted(provider.get("active_core_cooldowns") or []),
+                "optional_cooldowns": sorted(provider.get("optional_cooldowns") or []),
+                "plan_limited": sorted(provider.get("plan_limited") or []),
+                "errors": sorted(provider.get("errors") or []),
+                "symbol_no_data": dict(sorted((provider.get("symbol_no_data") or {}).items())),
+                "intraday_not_needed": bool(provider.get("intraday_not_needed")),
+            },
+            "completed_run_types": sorted(snapshot.get("completed_run_types") or []),
+            "skipped_reasons": sorted(snapshot.get("skipped_reasons") or []),
+            "catchup_completed": bool(snapshot.get("catchup_completed")),
+            "has_error_or_warning": bool(snapshot.get("has_error_or_warning")),
+            "trading_skipped_reason": snapshot.get("trading_skipped_reason"),
+        }
+
+    def _market_closed_material_change(self, previous: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+        return self._market_closed_material_snapshot(previous) != self._market_closed_material_snapshot(snapshot)
+
+    def _market_closed_only_count_noise(self, previous: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+        noisy_count_fields = {
+            "research_candidate_count",
+            "observation_total_count",
+            "alpaca_compatible_observation_count",
+            "global_research_only_observation_count",
+            "dynamic_paper_tradable_count",
+            "static_paper_tradable_total_count",
+            "held_static_position_count",
+        }
+        keys = set(previous) | set(snapshot)
+        changed = {key for key in keys if previous.get(key) != snapshot.get(key)}
+        return bool(changed) and changed <= noisy_count_fields and self._market_closed_material_snapshot(previous) == self._market_closed_material_snapshot(snapshot)
+
+    def _latest_market_closed_status_sent_at(self) -> datetime | None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT created_at, detail
+            FROM audit_events
+            WHERE event_type='dynamic_universe_market_closed_status_snapshot'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        if not rows:
+            return None
+        try:
+            detail = json.loads(rows[0]["detail"] or "{}")
+            sent_at = detail.get("sent_at") or rows[0].get("created_at")
+            return _parse_datetime(str(sent_at))
+        except Exception:
+            return None
 
     def _latest_market_closed_status_snapshot(self) -> dict[str, Any] | None:
         rows = self.storage.fetch_all(

@@ -8,6 +8,17 @@ broker: alpaca
 scan_interval_minutes: 10
 require_power: true
 require_market_open: true
+preflight:
+  research_only:
+    require_ac_power: false
+    require_internet: true
+    require_broker: false
+    allow_market_closed: true
+  trading:
+    require_ac_power: true
+    require_internet: true
+    require_broker: true
+    require_market_open: true
 watchlist: [SPY, QQQ, DIA, IWM]
 approved_strategy_versions: [rule_based_v1]
 
@@ -331,6 +342,14 @@ telegram:
   telegram_approval_listener_mode: approval_only
   market_scan_processes_telegram_updates: false
   dynamic_universe_premarket_updates_enabled: true
+  market_closed_status:
+    suppress_no_change: true
+    max_frequency_minutes: 180
+    compare_symbol_sets: true
+    ignore_minor_count_noise: true
+    always_send_on_material_symbol_change: true
+    always_send_errors: true
+    always_send_catchup_completion: true
   approval_price_refresh_required: true
   approval_max_price_age_seconds: 60
   approval_max_price_move_bps: 25

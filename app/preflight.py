@@ -54,12 +54,17 @@ def run_core_preflight(config: dict[str, Any], storage: Any, lock_held: bool = T
 
 
 def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | None = None, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
+    trading_cfg = config.get("preflight", {}).get("trading", {})
+
+    def cfg_bool(name: str, fallback: bool) -> bool:
+        return bool(trading_cfg.get(name, fallback))
+
     def build(add: Callable[[str, bool, str], None]) -> None:
         power = get_power_status()
-        add("power", not config.get("require_power", True) or power.connected is True, power.detail)
-        add("internet", internet_available(), "internet connectivity required")
+        add("power", not cfg_bool("require_ac_power", bool(config.get("require_power", True))) or power.connected is True, power.detail)
+        add("internet", not cfg_bool("require_internet", True) or internet_available(), "internet connectivity required")
         if broker is None:
-            add("broker", False, "broker not initialized")
+            add("broker", not cfg_bool("require_broker", True), "broker not initialized")
             market_open = False
         else:
             try:
@@ -72,7 +77,29 @@ def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | No
         add("telegram", secret_present("TELEGRAM_BOT_TOKEN") and secret_present("TELEGRAM_ALLOWED_USER_ID"), "Telegram token and authorized user ID required")
         ai_required = config.get("ai", {}).get("enabled", True)
         add("openai", not ai_required or secret_present("OPENAI_API_KEY"), "OpenAI key required when AI review enabled")
-        add("market_open", not config.get("require_market_open", True) or market_open, "market must be open when required")
+        add("market_open", not cfg_bool("require_market_open", bool(config.get("require_market_open", True))) or market_open, "market must be open when required")
+
+    return _run_checks(build, recorder)
+
+
+def run_research_preflight(config: dict[str, Any], storage: Any, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
+    research_cfg = config.get("preflight", {}).get("research_only", {})
+
+    def cfg_bool(name: str, fallback: bool) -> bool:
+        return bool(research_cfg.get(name, fallback))
+
+    def build(add: Callable[[str, bool, str], None]) -> None:
+        power = get_power_status()
+        require_ac = cfg_bool("require_ac_power", False)
+        add("research_power", not require_ac or power.connected is True, power.detail if require_ac else f"warning-only: {power.detail}")
+        add("research_internet", not cfg_bool("require_internet", True) or internet_available(), "internet connectivity required for provider research")
+        add("research_database", storage.writable(), "SQLite database must be writable")
+        provider_needed = bool(config.get("dynamic_universe", {}).get("enabled", False))
+        provider_cfg = config.get("eodhd", {})
+        provider_key_name = str(provider_cfg.get("api_key_secret_name", "TradingAgent.EODHD_API_KEY")).replace("TradingAgent.", "")
+        add("research_provider_key", not provider_needed or secret_present(provider_key_name) or secret_present(str(provider_cfg.get("api_key_secret_name", ""))), "provider key required when provider calls are needed")
+        add("research_market_closed_allowed", cfg_bool("allow_market_closed", True), "research-only tasks may run while market is closed")
+        add("research_no_trading_actions", True, "research-only preflight does not permit proposals or broker order actions")
 
     return _run_checks(build, recorder)
 

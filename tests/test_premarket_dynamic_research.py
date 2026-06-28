@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from app.preflight import PreflightCheck, PreflightResult, run_core_preflight, run_preflight
+from app.power import PowerStatus
+from app.preflight import PreflightCheck, PreflightResult, run_core_preflight, run_preflight, run_research_preflight, run_trading_preflight
 
 
 class FakeStorage:
@@ -83,6 +84,11 @@ def _config(research_results=None):
         "live_enabled": False,
         "require_market_open": True,
         "storage": {"sqlite_path": "ignored.db"},
+        "dynamic_universe": {"enabled": False},
+        "preflight": {
+            "research_only": {"require_ac_power": False, "require_internet": True, "require_broker": False, "allow_market_closed": True},
+            "trading": {"require_ac_power": True, "require_internet": True, "require_broker": True, "require_market_open": True},
+        },
         "telegram": {"dynamic_universe_premarket_updates_enabled": True},
         "_research_results": research_results or [],
     }
@@ -90,6 +96,10 @@ def _config(research_results=None):
 
 def _ok_core(*args, **kwargs):
     return PreflightResult(True, (PreflightCheck("core_config", True, "ok"),))
+
+
+def _ok_research(*args, **kwargs):
+    return PreflightResult(True, (PreflightCheck("research_internet", True, "ok"),))
 
 
 def _closed_trading(*args, **kwargs):
@@ -110,6 +120,7 @@ def test_market_closed_daily_deep_research_runs_before_trading_block(monkeypatch
     monkeypatch.setattr(main, "AlpacaBroker", lambda config: ClosedBroker())
     monkeypatch.setattr(main, "TradingService", FakeService)
     monkeypatch.setattr(main, "run_core_preflight", _ok_core)
+    monkeypatch.setattr(main, "run_research_preflight", _ok_research)
     monkeypatch.setattr(main, "run_trading_preflight", _closed_trading)
     monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
 
@@ -132,6 +143,7 @@ def test_market_closed_without_research_due_exits_blocked_without_trading(monkey
     monkeypatch.setattr(main, "AlpacaBroker", lambda config: ClosedBroker())
     monkeypatch.setattr(main, "TradingService", FakeService)
     monkeypatch.setattr(main, "run_core_preflight", _ok_core)
+    monkeypatch.setattr(main, "run_research_preflight", _ok_research)
     monkeypatch.setattr(main, "run_trading_preflight", _closed_trading)
     monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
 
@@ -152,6 +164,7 @@ def test_market_open_runs_trading_without_duplicate_dynamic_universe(monkeypatch
     monkeypatch.setattr(main, "AlpacaBroker", lambda config: OpenBroker())
     monkeypatch.setattr(main, "TradingService", FakeService)
     monkeypatch.setattr(main, "run_core_preflight", _ok_core)
+    monkeypatch.setattr(main, "run_research_preflight", _ok_research)
     monkeypatch.setattr(main, "run_trading_preflight", _open_trading)
     monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
 
@@ -177,3 +190,41 @@ def test_legacy_trading_preflight_still_requires_market_open():
 
     assert result.passed is False
     assert any(c.name == "market_open" and not c.passed for c in result.checks)
+
+
+def test_research_only_market_closed_can_run_without_ac_when_config_allows(monkeypatch):
+    config = _config()
+    config["dynamic_universe"]["enabled"] = False
+    monkeypatch.setattr("app.preflight.get_power_status", lambda: PowerStatus(False, "battery", "on battery", 45.0))
+    monkeypatch.setattr("app.preflight.internet_available", lambda: True)
+
+    result = run_research_preflight(config, FakeStorage())
+
+    assert result.passed is True
+    assert any(c.name == "research_power" and c.passed and "warning-only" in c.reason for c in result.checks)
+    assert all(c.name != "broker" for c in result.checks)
+    assert all(c.name != "market_open" for c in result.checks)
+
+
+def test_trading_path_still_requires_ac_power_and_market_open(monkeypatch):
+    config = _config()
+    monkeypatch.setattr("app.preflight.get_power_status", lambda: PowerStatus(False, "battery", "on battery", 45.0))
+    monkeypatch.setattr("app.preflight.internet_available", lambda: True)
+    monkeypatch.setattr("app.preflight.secret_present", lambda name: True)
+
+    result = run_trading_preflight(config, FakeStorage(), ClosedBroker())
+
+    assert result.passed is False
+    assert any(c.name == "power" and not c.passed for c in result.checks)
+    assert any(c.name == "market_open" and not c.passed for c in result.checks)
+
+
+def test_research_only_preflight_does_not_call_broker_or_order_functions(monkeypatch):
+    config = _config()
+    monkeypatch.setattr("app.preflight.get_power_status", lambda: PowerStatus(False, "battery", "on battery", 45.0))
+    monkeypatch.setattr("app.preflight.internet_available", lambda: True)
+
+    result = run_research_preflight(config, FakeStorage())
+
+    assert result.passed is True
+    assert any(c.name == "research_no_trading_actions" and c.passed for c in result.checks)

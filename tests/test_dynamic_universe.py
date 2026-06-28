@@ -284,7 +284,7 @@ def test_eodhd_symbol_not_found_does_not_disable_endpoint(temp_storage, monkeypa
     missing = provider.get_historical_bars("BAD.US")
     recovered = provider.get_historical_bars("SPY.US")
 
-    assert missing.status == "plan_limited"
+    assert missing.status == "symbol_not_found"
     assert recovered.status == "ok"
     assert provider.calls_this_run == 2
     capability = temp_storage.fetch_all("SELECT available, plan_limited, last_error_category, disabled_until FROM data_provider_capabilities WHERE endpoint_name='eod_bars'")[0]
@@ -646,7 +646,10 @@ def _weekend_service(temp_storage, cfg: dict[str, Any] | None = None, *, broker:
     cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
     cfg["telegram"]["market_closed_status"] = {
         "suppress_no_change": True,
-        "always_send_on_change": True,
+        "max_frequency_minutes": 180,
+        "compare_symbol_sets": True,
+        "ignore_minor_count_noise": True,
+        "always_send_on_material_symbol_change": True,
         "always_send_errors": True,
         "always_send_catchup_completion": True,
     }
@@ -668,7 +671,7 @@ def test_market_closed_status_first_send_then_duplicate_suppressed(temp_storage)
     assert len(audit) == 1
 
 
-def test_market_closed_status_changed_counts_send(temp_storage):
+def test_market_closed_status_material_symbol_set_change_sends(temp_storage):
     service = _weekend_service(temp_storage)
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
 
@@ -678,6 +681,34 @@ def test_market_closed_status_changed_counts_send(temp_storage):
 
     assert len(service.telegram.messages) == 2
     assert "Research candidates: 1" in service.telegram.messages[-1]
+
+
+def test_market_closed_status_count_only_flip_suppressed_when_symbol_sets_same(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    rows = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='dynamic_universe_market_closed_status_snapshot' ORDER BY created_at DESC LIMIT 1")
+    detail = json.loads(rows[0]["detail"])
+    snapshot = detail["snapshot"]
+    snapshot["observation_total_count"] = snapshot["observation_total_count"] + 1
+    snapshot["global_research_only_observation_count"] = snapshot["global_research_only_observation_count"] + 1
+    temp_storage.audit("run-test", "dynamic_universe_market_closed_status_snapshot", {"phase": "market_closed_weekend", "snapshot": snapshot, "sent_at": datetime.now(UTC).isoformat()})
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 1
+    assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type IN ('market_closed_status_suppressed_no_change','market_closed_status_suppressed_count_noise')")
+
+
+def test_market_closed_status_timestamp_and_next_check_noise_suppressed(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 1
 
 
 def test_market_closed_status_provider_material_change_sends_but_cooldown_countdown_does_not(temp_storage):
@@ -720,6 +751,17 @@ def test_market_closed_status_catchup_and_error_always_send(temp_storage):
     assert "skipped: provider_warning" in service.telegram.messages[2]
 
 
+def test_market_closed_status_user_requested_always_sends(temp_storage):
+    service = _weekend_service(temp_storage)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+    user_requested = {**result, "user_requested": True}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    service.notify_premarket_dynamic_universe_status([user_requested], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+
+    assert len(service.telegram.messages) == 2
+
+
 def test_compact_counts_use_static_total_and_held_static_separately(temp_storage):
     cfg = dynamic_config()
     _insert_universe_symbol(temp_storage, "AMAT", OBSERVATION, score=88)
@@ -742,6 +784,38 @@ def test_compact_counts_use_static_total_and_held_static_separately(temp_storage
     assert "Held static positions: 2" in msg
     assert "Global research-only observation: 1" in msg
     assert "Static paper-tradable: 2" not in msg
+    rows = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='dynamic_universe_market_closed_status_snapshot' ORDER BY created_at DESC LIMIT 1")
+    snapshot = json.loads(rows[0]["detail"])["snapshot"]
+    assert snapshot["observation_symbols"] == ["2800.HK", "AMAT", "XLE", "XLF", "XLK", "XLV", "XLY"]
+    assert snapshot["global_research_only_symbols"] == ["2800.HK"]
+    assert snapshot["dynamic_paper_tradable_symbols"] == ["SMH"]
+    assert snapshot["static_paper_tradable_symbols"] == ["DIA", "IWM", "QQQ", "SPY"]
+    assert snapshot["held_static_symbols"] == ["DIA", "IWM"]
+
+
+def test_weekend_provider_wording_separates_eod_symbol_no_data_from_endpoint_status(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_status_code,last_error_category,updated_at,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("cap-eod", "run-test", "eodhd", "eod_bars", 0, 1, (now + timedelta(minutes=60)).isoformat(), 404, "not_found", now.isoformat(), json.dumps({"endpoint": "eod/ES3.SI", "status_code": 404})),
+    )
+    temp_storage.execute(
+        "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,last_status_code,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cap-fund", "run-test", "eodhd", "fundamentals", 0, 1, 403, "forbidden", now.isoformat()),
+    )
+    service = _weekend_service(temp_storage, cfg)
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "EOD had symbol-level no-data for 1 symbol" in msg
+    assert "plan-limited: fundamentals" in msg
+    assert "plan-limited: eod_bars" not in msg
+    assert "core cooldown: eod_bars" not in msg
+    assert "eod_bars:not_found" not in msg
 
 
 def test_market_closed_research_skips_intraday_quote_and_news(temp_storage):
