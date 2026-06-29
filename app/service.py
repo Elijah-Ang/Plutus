@@ -1121,10 +1121,36 @@ class TradingService:
 
             # 2. Telegram Bot Utility Commands
             if text.startswith("/"):
-                response = self.telegram.handle_command(text, sender)
-                self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
-                self.telegram.send_message(response, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
-                continue
+                cmd_parts = text.strip().split()
+                cmd = cmd_parts[0].lower() if cmd_parts else ""
+                if cmd == "/status":
+                    from .utils import check_listener_freshness
+                    freshness = check_listener_freshness()
+                    status_text = (
+                        f"Status: Active\n"
+                        f"Mode: {self.config.get('mode')}\n"
+                        f"Live Enabled: {self.config.get('live_enabled')}\n"
+                        f"Auto Execution: {self.config.get('auto_execution_enabled')}\n"
+                        f"HEAD Commit: {freshness['current_head'][:7] if freshness['current_head'] else 'unknown'}\n"
+                    )
+                    if freshness["running"]:
+                        status_text += f"Listener PID: {freshness['pid']}\n"
+                        status_text += f"Listener Startup Commit: {freshness['startup_commit'][:7] if freshness['startup_commit'] else 'unknown'}\n"
+                        if freshness["fresh"]:
+                            status_text += "Listener Freshness: Fresh ✅\n"
+                        else:
+                            status_text += "Listener Freshness: Stale ❌ (Please restart listener)\n"
+                    else:
+                        status_text += "Listener Freshness: Not running ❌\n"
+                    
+                    self.storage.audit(self.run_id, "telegram_command", {"command": "/status", "authorized": self.telegram.is_authorized(sender)})
+                    self.telegram.send_message(status_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
+                    continue
+                else:
+                    response = self.telegram.handle_command(text, sender)
+                    self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
+                    self.telegram.send_message(response, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
+                    continue
 
             # 3. Phase 0: Protect against old queued Telegram approvals (Only for approvals/rejections)
             message_date = message.get("date")
@@ -1469,6 +1495,9 @@ class TradingService:
                 delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
 
+                if self._check_stale_listener_block(prop_symbol, approval_id):
+                    continue
+
                 if not self.storage.consume_approval(parsed.proposal_id, approval_id):
                     self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                     continue
@@ -1492,6 +1521,9 @@ class TradingService:
             ack_sent = iso_now()
             delay_sec = (datetime.fromisoformat(ack_sent.replace("Z", "+00:00")) - datetime.fromisoformat(approval_received_at.replace("Z", "+00:00"))).total_seconds()
             self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
+
+            if self._check_stale_listener_block(prop_symbol, approval_id):
+                continue
 
             if not self.storage.consume_approval(parsed.proposal_id, approval_id):
                 self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
@@ -1825,6 +1857,25 @@ class TradingService:
             self._update_batch_status(batch_id)
         return True
 
+    def _check_stale_listener_block(self, symbol: str | None, approval_id: str) -> bool:
+        from .utils import BOOT_COMMIT, get_git_commit
+        current = get_git_commit()
+        if BOOT_COMMIT != "unknown" and current != "unknown" and BOOT_COMMIT != current:
+            self.storage.audit(self.run_id, "listener_stale_code_blocked_approval", {
+                "boot_commit": BOOT_COMMIT,
+                "current_commit": current,
+                "symbol": symbol,
+                "approval_id": approval_id
+            })
+            self.storage.execute(
+                "UPDATE approvals SET status='blocked', final_order_decision='blocked', final_block_reason='listener is running stale code' WHERE id=?",
+                (approval_id,)
+            )
+            msg = "Approval not processed because Telegram listener is running stale code. Please restart listener and wait for a fresh proposal."
+            self.telegram.send_message(msg)
+            return True
+        return False
+
     def _approve_batch_candidate(self, proposal_id: str, sender: str, raw_text: str, batch_row: dict[str, Any]) -> tuple[bool, str, str | None]:
         rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=? AND status='pending'", (proposal_id,))
         if not rows:
@@ -1855,6 +1906,9 @@ class TradingService:
                 str(batch_row.get("telegram_message_id") or "") or None, "batch", "received", approval_received_at
             ),
         )
+
+        if self._check_stale_listener_block(row.get("symbol", ""), approval_id):
+            return False, "listener_stale_code_blocked_approval", "listener is running stale code"
 
         if not self.storage.consume_approval(proposal_id, approval_id):
             self.telegram.send_message("I did not take any action because this candidate was already handled earlier.")

@@ -30,6 +30,9 @@ def run_once(config_path: str | Path | None = None) -> int:
     storage = Storage(PROJECT_ROOT / config["storage"]["sqlite_path"])
     storage.initialize()
     run_id = storage.start_run(config["mode"])
+    from .utils import record_process_identity
+    identity = record_process_identity("scanner", run_id)
+    storage.audit(run_id, "process_started", identity)
     if os.getenv("TRADING_AGENT_STALE_LOCK_RECOVERED") == "1":
         storage.audit(run_id, "stale_lock_recovered", {"lock": "logs/runtime/agent.lockdir"})
     storage.execute("INSERT INTO config_snapshots(run_id,config_json,created_at) VALUES(?,?,datetime('now'))", (run_id, __import__("json").dumps(redact(config), sort_keys=True)))
@@ -146,6 +149,9 @@ def run_listener(config_path: str | Path | None = None) -> int:
                 poll_interval)
                 
     run_id = storage.start_run("listener")
+    from .utils import record_process_identity
+    identity = record_process_identity("telegram_listener", run_id)
+    storage.audit(run_id, "process_started", identity)
     storage.audit(run_id, "listener_started", {"poll_interval": poll_interval})
     
     try:

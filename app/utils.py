@@ -12,6 +12,107 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def get_git_commit() -> str:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def is_git_clean() -> bool:
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False
+        )
+        if res.returncode == 0:
+            return len(res.stdout.strip()) == 0
+    except Exception:
+        pass
+    return False
+
+
+BOOT_COMMIT = get_git_commit()
+
+
+def record_process_identity(role: str, run_id: str) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    identity = {
+        "role": role,
+        "run_id": run_id,
+        "pid": os.getpid(),
+        "start_time": now.isoformat(),
+        "project_root": str(PROJECT_ROOT),
+        "commit": BOOT_COMMIT,
+        "git_clean": is_git_clean(),
+    }
+    runtime_dir = PROJECT_ROOT / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    json_path = runtime_dir / f"{role}_identity.json"
+    try:
+        with json_path.open("w", encoding="utf-8") as handle:
+            json.dump(identity, handle, indent=2)
+    except Exception:
+        pass
+    return identity
+
+
+def check_listener_freshness() -> dict[str, Any]:
+    current_head = get_git_commit()
+    identity_path = PROJECT_ROOT / "logs" / "runtime" / "telegram_listener_identity.json"
+    status = {
+        "running": False,
+        "pid": None,
+        "start_time": None,
+        "startup_commit": None,
+        "current_head": current_head,
+        "fresh": False,
+        "mismatch": False,
+        "message": "Telegram listener is not running."
+    }
+    if identity_path.exists():
+        try:
+            with identity_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            pid = data.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    status["running"] = True
+                except OSError:
+                    status["running"] = False
+            if status["running"]:
+                status["pid"] = pid
+                status["start_time"] = data.get("start_time")
+                status["startup_commit"] = data.get("commit")
+                if status["startup_commit"] == current_head:
+                    status["fresh"] = True
+                    status["message"] = "Telegram listener is running and fresh."
+                else:
+                    status["mismatch"] = True
+                    status["message"] = "Telegram listener is stale and must be restarted"
+            else:
+                status["message"] = "Telegram listener is not running (stale pid)."
+        except Exception as e:
+            status["message"] = f"Error reading listener status: {e}"
+    return status
+
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
