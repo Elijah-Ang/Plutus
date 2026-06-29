@@ -663,9 +663,11 @@ def test_market_closed_status_first_send_then_duplicate_suppressed(temp_storage)
     service = _weekend_service(temp_storage)
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
 
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    first = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    second = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
 
+    assert first == "sent"
+    assert second == "suppressed"
     assert len(service.telegram.messages) == 1
     audit = temp_storage.fetch_all("SELECT event_type FROM audit_events WHERE event_type='market_closed_status_suppressed_no_change'")
     assert len(audit) == 1
@@ -675,10 +677,12 @@ def test_market_closed_status_material_symbol_set_change_sends(temp_storage):
     service = _weekend_service(temp_storage)
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
 
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
+    first = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
     _insert_universe_symbol(temp_storage, "AMAT", RESEARCH_CANDIDATE, score=91)
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    second = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
 
+    assert first == "sent"
+    assert second == "sent"
     assert len(service.telegram.messages) == 2
     assert "Research candidates: 1" in service.telegram.messages[-1]
 
@@ -695,8 +699,9 @@ def test_market_closed_status_count_only_flip_suppressed_when_symbol_sets_same(t
     snapshot["global_research_only_observation_count"] = snapshot["global_research_only_observation_count"] + 1
     temp_storage.audit("run-test", "dynamic_universe_market_closed_status_snapshot", {"phase": "market_closed_weekend", "snapshot": snapshot, "sent_at": datetime.now(UTC).isoformat()})
 
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    second = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
 
+    assert second == "suppressed"
     assert len(service.telegram.messages) == 1
     assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type IN ('market_closed_status_suppressed_no_change','market_closed_status_suppressed_count_noise')")
 
@@ -706,8 +711,9 @@ def test_market_closed_status_timestamp_and_next_check_noise_suppressed(temp_sto
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
 
     service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    second = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
 
+    assert second == "suppressed"
     assert len(service.telegram.messages) == 1
 
 
@@ -725,13 +731,15 @@ def test_market_closed_status_provider_material_change_sends_but_cooldown_countd
         "UPDATE data_provider_capabilities SET disabled_until=?, updated_at=? WHERE endpoint_name='news'",
         ((now + timedelta(minutes=20)).isoformat(), (now + timedelta(minutes=10)).isoformat()),
     )
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    second = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
     temp_storage.execute(
         "INSERT INTO data_provider_capabilities(id,run_id,provider,endpoint_name,available,plan_limited,disabled_until,last_error_category,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
         ("cap-eod", "run-test", "eodhd", "eod_bars", 0, 0, (now + timedelta(minutes=60)).isoformat(), "cooldown_active", now.isoformat()),
     )
-    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
+    third = service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
 
+    assert second == "suppressed"
+    assert third == "sent"
     assert len(service.telegram.messages) == 2
     assert "core cooldown: eod_bars" in service.telegram.messages[-1]
 
@@ -743,9 +751,11 @@ def test_market_closed_status_catchup_and_error_always_send(temp_storage):
     warning = {"status": "skipped", "run_type": "intraday_light_refresh", "run_id": "run-warning", "reason": "provider_warning", "warning": True}
 
     service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
-    service.notify_premarket_dynamic_universe_status([catchup], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
-    service.notify_premarket_dynamic_universe_status([warning], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
+    catchup_result = service.notify_premarket_dynamic_universe_status([catchup], "market_closed", now=datetime(2026, 6, 27, 12, 51, tzinfo=UTC))
+    warning_result = service.notify_premarket_dynamic_universe_status([warning], "market_closed", now=datetime(2026, 6, 27, 13, 21, tzinfo=UTC))
 
+    assert catchup_result == "sent"
+    assert warning_result == "sent"
     assert len(service.telegram.messages) == 3
     assert "research catch-up completed" in service.telegram.messages[1]
     assert "skipped: provider_warning" in service.telegram.messages[2]

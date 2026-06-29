@@ -99,13 +99,21 @@ def run_once(config_path: str | Path | None = None) -> int:
         storage.audit(run_id, "preflight_split_evaluated", split_detail)
         if not trading_result.passed:
             reasons = "; ".join(failed_trading)
-            if market_open_failed and set(failed_trading) == {"market_open"} and research_results:
-                event_type = "research_completed_trading_blocked_market_closed" if research_ran else "research_checked_trading_blocked_market_closed"
-                storage.audit(run_id, event_type, split_detail)
-                service.notify_premarket_dynamic_universe_status(research_results, "market_closed")
-                storage.finish_run(run_id, event_type, "market_open")
+            if research_ran:
+                market_open_only = market_open_failed and set(failed_trading) == {"market_open"}
+                event_type = "research_completed_trading_blocked_market_closed"
+                notification_result = service.notify_premarket_dynamic_universe_status(research_results, "market_closed" if market_open_failed else reasons)
+                detail = {
+                    **split_detail,
+                    "research_completed": True,
+                    "research_skipped_reason": None,
+                    "research_status_notification_evaluated": True,
+                    "research_status_notification_result": notification_result,
+                }
+                storage.audit(run_id, event_type, detail)
+                storage.finish_run(run_id, event_type if market_open_only else "blocked", reasons)
                 logger.info("%s", event_type)
-                return 0
+                return 0 if market_open_only else 2
             storage.finish_run(run_id, "blocked", reasons)
             logger.warning("Trading preflight blocked run: %s", reasons)
             return 2

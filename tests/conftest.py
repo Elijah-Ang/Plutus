@@ -4,6 +4,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.power import PowerStatus
+
+
+@pytest.fixture(autouse=True)
+def default_service_power_and_internet(monkeypatch):
+    monkeypatch.setattr("app.service.get_power_status", lambda: PowerStatus(True, "test", "AC power connected", 100.0))
+    monkeypatch.setattr("app.service.internet_available", lambda: True)
+
 
 @pytest.fixture
 def safe_config():

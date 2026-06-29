@@ -4692,9 +4692,9 @@ class TradingService:
     def run_dynamic_universe_research_only(self) -> list[dict[str, Any]]:
         return self._run_dynamic_universe_due()
 
-    def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> None:
+    def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
-            return
+            return "not_evaluated"
         phase = self._dynamic_universe_market_phase(results, trading_skipped_reason, now=now)
         completed = [r for r in results if r.get("status") == "completed"]
         skipped = [r for r in results if r.get("status") == "skipped"]
@@ -4776,7 +4776,7 @@ class TradingService:
                 trading_skipped_reason=trading_skipped_reason,
             )
         if self._should_suppress_market_closed_status(phase, snapshot):
-            return
+            return "suppressed"
         try:
             self.telegram.send_message(text)
             detail = {"status": "sent", "trading_skipped_reason": trading_skipped_reason, "phase": phase}
@@ -4784,8 +4784,10 @@ class TradingService:
                 detail["snapshot"] = snapshot
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_sent", detail)
             self._record_market_closed_status_snapshot(phase, snapshot)
+            return "sent"
         except Exception as exc:
             self.storage.audit(self.run_id, "dynamic_universe_premarket_update_failed", {"error": type(exc).__name__, "trading_skipped_reason": trading_skipped_reason})
+            return "failed"
 
     def _dynamic_universe_compact_counts(self) -> dict[str, int]:
         sets = self._dynamic_universe_compact_symbol_sets()
