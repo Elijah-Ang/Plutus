@@ -955,7 +955,7 @@ def test_digest_cluster_summary_names_held_symbols_without_duplicate_strongest(t
     service.check_and_send_digest()
 
     msg = service.telegram.messages[0]
-    assert "Status: Watch — broad-market cluster limit reached: existing DIA and IWM positions" in msg
+    assert "Status: Blocked — broad-market cluster limit reached: existing DIA and IWM positions" in msg
     assert "Summary: SPY scored highest, but it was blocked by the broad-market cluster limit because DIA and IWM are already held." in msg
     assert "SPY was strongest and DIA, IWM, SPY" not in msg
 
@@ -1046,6 +1046,108 @@ def test_digest_tier_sorting_and_score_source_labels(temp_storage):
     orders = temp_storage.fetch_all("SELECT COUNT(*) as cnt FROM orders")[0]["cnt"]
     assert props == 0
     assert orders == 0
+
+
+def test_digest_paper_tradable_blocker_wording_is_specific(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "auto_execution_enabled": False,
+        "auto_execution_mode": "manual_only",
+        "ai": {"ai_review_min_score": 65},
+        "digest": {"telegram_digest_max_symbols": 12},
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "execution_enabled": True,
+                "broker": "alpaca",
+                "watchlist": ["ENTRY", "LOW", "ADD", "STALE", "FRESH", "SIZE", "CLUST", "PORT", "PROF", "UNKN"],
+                "observation_watchlist": [],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+    now = datetime.now(UTC)
+    symbols_list = [
+        {"symbol": "ENTRY", "trade_score": 95.0, "trade_classification": "Watch", "status": "Watch — no ENTRY signal"},
+        {"symbol": "LOW", "trade_score": 50.0, "trade_classification": "Weak", "status": "No proposal — score below threshold"},
+        {"symbol": "ADD", "trade_score": 90.0, "trade_classification": "Watch", "status": "Watch — already held; no valid add setup"},
+        {"symbol": "STALE", "trade_score": 89.0, "trade_classification": "Watch", "status": "Watch — waiting for fresh data"},
+        {"symbol": "FRESH", "trade_score": 88.0, "trade_classification": "Watch", "status": "Watch — waiting for fresh market validation"},
+        {"symbol": "SIZE", "trade_score": 87.0, "trade_classification": "Watch", "status": "Blocked — failed risk sizing"},
+        {"symbol": "CLUST", "trade_score": 86.0, "trade_classification": "Watch", "status": "Blocked — broad-market cluster limit reached: existing DIA and IWM positions"},
+        {"symbol": "PORT", "trade_score": 85.0, "trade_classification": "Watch", "status": "Blocked — portfolio exposure limit"},
+        {"symbol": "PROF", "trade_score": 84.0, "trade_classification": "Watch", "status": "Blocked — dynamic symbol requires active market-profile validation"},
+        {"symbol": "UNKN", "trade_score": 83.0, "trade_classification": "Watch", "status": "Watch — proposal builder returned no candidate"},
+    ]
+
+    snapshot = service._digest_tier_snapshot(symbols_list, (now - timedelta(minutes=30)).isoformat(), now.isoformat())
+    msg = format_digest_message(
+        {
+            "market_open_status": "Open",
+            "window_start": now - timedelta(minutes=30),
+            "window_end": now,
+            "symbols_list": [],
+            "tier_snapshot": snapshot,
+            "weakest_symbol": "LOW",
+            "weakest_score": 50.0,
+            "weakest_classification": "Weak",
+            "actions": {"proposals": 0, "orders": 0, "fills": 0, "gpt_calls": 0, "expired": 0},
+            "summary": "Digest wording test.",
+        },
+        config,
+    )
+
+    by_symbol = {item["symbol"]: item for item in snapshot["paper_tradable"]}
+    assert by_symbol["LOW"]["proposal_block_reason"] == "score below threshold"
+    assert by_symbol["LOW"]["status"] == "No proposal — score below threshold"
+    assert by_symbol["UNKN"]["proposal_block_reason"] == "proposal builder returned no candidate"
+    assert by_symbol["PROF"]["proposal_block_reason"] == "dynamic symbol requires active market-profile validation"
+    assert "Proposal blocked: no proposal" not in msg
+    assert "Status: Watch — no proposal" not in msg
+    assert "ENTRY — static | Tradable | Trade score 95 | Proposal blocked: no ENTRY signal | Status: Watch — no ENTRY signal" in msg
+    assert "ADD — static | Tradable | Trade score 90 | Proposal blocked: already held; no valid add setup | Status: Watch — already held; no valid add setup" in msg
+    assert "STALE — static | Tradable | Trade score 89 | Proposal blocked: stale market data | Status: Watch — waiting for fresh data" in msg
+    assert "FRESH — static | Tradable | Trade score 88 | Proposal blocked: failed freshness validation | Status: Watch — waiting for fresh market validation" in msg
+    assert "SIZE — static | Tradable | Trade score 87 | Proposal blocked: failed risk sizing | Status: Blocked — failed risk sizing" in msg
+    assert "CLUST — static | Tradable | Trade score 86 | Proposal blocked: broad-market cluster limit due DIA/IWM | Status: Blocked — broad-market cluster limit reached: existing DIA and IWM positions" in msg
+    assert "PORT — static | Tradable | Trade score 85 | Proposal blocked: portfolio exposure limit | Status: Blocked — portfolio exposure limit" in msg
+    assert "PROF — static | Tradable | Trade score 84 | Proposal blocked: dynamic symbol requires active market-profile validation | Status: Blocked — dynamic symbol requires active market-profile validation" in msg
+    assert temp_storage.fetch_all("SELECT COUNT(*) AS cnt FROM trade_proposals")[0]["cnt"] == 0
+    assert temp_storage.fetch_all("SELECT COUNT(*) AS cnt FROM proposal_batches")[0]["cnt"] == 0
+    assert temp_storage.fetch_all("SELECT COUNT(*) AS cnt FROM orders")[0]["cnt"] == 0
+
+
+def test_digest_market_memory_status_uses_specific_display_reasons(temp_storage):
+    config = {
+        "mode": "paper",
+        "live_enabled": False,
+        "auto_execution_enabled": False,
+        "auto_execution_mode": "manual_only",
+        "ai": {"ai_review_min_score": 65},
+        "market_profiles": {
+            "us_equities": {
+                "status": "active",
+                "execution_enabled": True,
+                "broker": "alpaca",
+                "watchlist": ["SPY"],
+                "observation_watchlist": ["XLV"],
+            }
+        },
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run_id")
+
+    def status(row):
+        return service._digest_market_memory_status("SPY", row, set(), {})
+
+    assert status({"score": 90.0, "signal": "HOLD", "no_action_reason": "no entry/exit signal (below 50-day MA)"})["status"] == "Watch — no ENTRY signal"
+    assert status({"score": 90.0, "signal": "HOLD", "reason": "position already exists", "no_action_reason": "no entry/exit signal (position already exists)"})["status"] == "Watch — already held; no valid add setup"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: price timestamp must be fresh"})["status"] == "Watch — waiting for fresh market validation"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: notional must be positive and within limit"})["status"] == "Blocked — failed risk sizing"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: total portfolio exposure cap"})["status"] == "Blocked — portfolio exposure limit"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "not actionable - pre-proposal risk check failed: no matching market profile found for symbol ABBV"})["status"] == "Blocked — dynamic symbol requires active market-profile validation"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": ""})["status"] == "Watch — proposal builder returned no candidate"
+    assert service._digest_market_memory_status("XLV", {"score": 90.0, "signal": "ENTRY", "no_action_reason": ""}, {"XLV"}, {})["status"] == "Observation only — no proposal allowed"
 
 
 def test_digest_unified_paper_tradable_excludes_unpromoted_dynamic_symbols(temp_storage):

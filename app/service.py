@@ -4508,7 +4508,7 @@ class TradingService:
                     return "no", "needs paper-tradable promotion"
                 return "no", "needs observation promotion first"
             if "cluster limit" in status.lower():
-                cleaned = status.replace("Watch — ", "").replace("Status: ", "")
+                cleaned = status.replace("Watch — ", "").replace("Blocked — ", "").replace("Status: ", "")
                 if "broad-market cluster limit reached" in cleaned.lower():
                     import re
                     syms = sorted({s for s in re.findall(r'\b[A-Z]{3,4}\b', cleaned) if s != symbol})
@@ -4516,10 +4516,30 @@ class TradingService:
                         return "blocked", f"broad-market cluster limit due {'/'.join(syms)}"
                     return "blocked", "broad-market cluster limit"
                 return "blocked", cleaned
+            if "cluster exposure limit" in status.lower():
+                return "blocked", "cluster exposure limit"
             if status:
-                cleaned = status.replace("Watch — ", "").replace("Watch only — ", "").replace("Status: ", "")
+                cleaned = status.replace("Watch — ", "").replace("Watch only — ", "").replace("Blocked — ", "").replace("Status: ", "")
+                if cleaned.lower() == "no proposal — score below threshold":
+                    return "blocked", "score below threshold"
                 if cleaned.lower() == "no entry signal" or cleaned.lower() == "no entry/exit signal":
                     return "blocked", "no ENTRY signal"
+                if cleaned.lower() == "already held; no valid add setup":
+                    return "blocked", "already held; no valid add setup"
+                if cleaned.lower() == "waiting for fresh data":
+                    return "blocked", "stale market data"
+                if cleaned.lower() == "waiting for fresh market validation":
+                    return "blocked", "failed freshness validation"
+                if cleaned.lower() == "failed risk sizing":
+                    return "blocked", "failed risk sizing"
+                if cleaned.lower() == "portfolio exposure limit":
+                    return "blocked", "portfolio exposure limit"
+                if cleaned.lower() == "provider data unavailable":
+                    return "blocked", "provider data unavailable"
+                if cleaned.lower() == "dynamic symbol requires active market-profile validation":
+                    return "blocked", "dynamic symbol requires active market-profile validation"
+                if cleaned.lower() == "proposal builder returned no candidate":
+                    return "blocked", "proposal builder returned no candidate"
                 return "blocked", cleaned
             if source == "existing_static_watchlist":
                 return "blocked", "no ENTRY signal"
@@ -5700,10 +5720,18 @@ class TradingService:
         latest_signal = latest_row.get("signal")
         no_action_reason = latest_row.get("no_action_reason") or ""
         no_act = no_action_reason.lower()
+        row_reason = str(latest_row.get("reason") or "")
+        row_reason_l = row_reason.lower()
         score_threshold = self.config.get("ai", {}).get("ai_review_min_score", 65)
         cluster_name = self._get_symbol_cluster(symbol)
         held_symbols = [s for s in cluster_holdings.get(cluster_name or "", []) if s != symbol]
         cluster_display = self._digest_display_cluster_name(cluster_name)
+        has_position = bool(
+            latest_row.get("average_entry_price")
+            or latest_row.get("latest_position_price")
+            or "position already exists" in no_act
+            or "position already exists" in row_reason_l
+        )
 
         if symbol in obs_watchlist:
             return {
@@ -5714,6 +5742,8 @@ class TradingService:
         if latest_score < score_threshold:
             return {"status": "No proposal — score below threshold", "event": "below_threshold", "high_score": False}
         if latest_signal not in {"ENTRY", "EXIT"}:
+            if has_position:
+                return {"status": "Watch — already held; no valid add setup", "event": "no_add", "high_score": True}
             return {"status": "Watch — no ENTRY signal", "event": "no_entry", "high_score": True}
         if "sleep" in no_act:
             return {"status": "Watch — BUY suppressed by sleep mode", "event": "sleep", "high_score": True}
@@ -5721,15 +5751,27 @@ class TradingService:
             return {"status": "Watch — cooldown active", "event": "cooldown", "high_score": True}
         if "gpt review" in no_act or "deferred due to ai" in no_act:
             return {"status": "Watch — GPT review unavailable", "event": "gpt_unavailable", "high_score": True}
+        if "provider" in no_act and ("unavailable" in no_act or "missing" in no_act or "cooldown" in no_act):
+            return {"status": "Watch — provider data unavailable", "event": "provider_unavailable", "high_score": True}
+        if "stale" in no_act or "stale" in row_reason_l:
+            return {"status": "Watch — waiting for fresh data", "event": "stale_data", "high_score": True}
+        if "price timestamp must be fresh" in no_act:
+            return {"status": "Watch — waiting for fresh market validation", "event": "freshness_failed", "high_score": True}
+        if "signal/proposal must be current" in no_act or "fresh market validation" in no_act:
+            return {"status": "Watch — waiting for fresh market validation", "event": "freshness_failed", "high_score": True}
+        if "no matching market profile" in no_act or "not in active watchlist" in no_act:
+            return {"status": "Blocked — dynamic symbol requires active market-profile validation", "event": "dynamic_profile_validation", "high_score": True}
+        if "notional" in no_act or "sizing" in no_act or "buying power" in no_act:
+            return {"status": "Blocked — failed risk sizing", "event": "risk_sizing", "high_score": True}
         if "total portfolio exposure" in no_act or "portfolio_total_exposure" in no_act:
-            return {"status": "Watch — total portfolio exposure cap reached", "event": "exposure_cap", "high_score": True}
+            return {"status": "Blocked — portfolio exposure limit", "event": "exposure_cap", "high_score": True}
         if "single symbol exposure" in no_act or "portfolio_single_symbol_exposure" in no_act:
-            return {"status": "Watch — single-symbol exposure cap reached", "event": "single_symbol_cap", "high_score": True}
+            return {"status": "Blocked — portfolio exposure limit", "event": "single_symbol_cap", "high_score": True}
         if "cluster positions limit" in no_act or "portfolio_cluster_positions_limit" in no_act:
             if held_symbols:
-                status = f"Watch — {cluster_display} cluster limit reached: existing {' and '.join(held_symbols)} positions"
+                status = f"Blocked — {cluster_display} cluster limit reached: existing {' and '.join(held_symbols)} positions"
             else:
-                status = f"Watch — {cluster_display} cluster limit reached"
+                status = f"Blocked — {cluster_display} cluster limit reached"
             return {
                 "status": status,
                 "event": "cluster_limit",
@@ -5739,7 +5781,7 @@ class TradingService:
             }
         if "cluster exposure limit" in no_act or "portfolio_cluster_exposure_limit" in no_act:
             return {
-                "status": f"Watch — {cluster_display} cluster exposure cap reached",
+                "status": f"Blocked — {cluster_display} cluster exposure limit",
                 "event": "cluster_exposure",
                 "cluster_name": cluster_display,
                 "held_symbols": held_symbols,
@@ -5756,12 +5798,14 @@ class TradingService:
         if "emergency exit score is" in no_act or "block_new_buy_if_emergency_exit_score_above" in no_act:
             return {"status": "Watch — new buy blocked due to emergency exit risk", "event": "emergency_risk", "high_score": True}
         if "pyramiding check failed" in no_act or "add_on_check_failed" in no_act or "position not sufficiently profitable" in no_act or "cannot average down" in no_act:
-            return {"status": "Watch — pyramiding check failed", "event": "pyramiding", "high_score": True}
+            return {"status": "Watch — already held; no valid add setup", "event": "no_add", "high_score": True}
         if "no entry/exit signal" in no_act:
+            if has_position or "position already exists" in no_act:
+                return {"status": "Watch — already held; no valid add setup", "event": "no_add", "high_score": True}
             return {"status": "Watch — no ENTRY signal", "event": "no_entry", "high_score": True}
         if "blocked by risk checks" in no_act:
-            return {"status": "Watch — blocked by risk checks", "event": "risk_blocked", "high_score": True}
-        return {"status": "Watch — no proposal", "event": "no_proposal", "high_score": True}
+            return {"status": "Blocked — failed risk sizing", "event": "risk_blocked", "high_score": True}
+        return {"status": "Watch — proposal builder returned no candidate", "event": "proposal_builder_no_candidate", "high_score": True}
 
     def _build_digest_summary(self, strongest: dict[str, Any], symbols_list: list[dict[str, Any]]) -> str:
         filled_syms = [x["symbol"] for x in symbols_list if x.get("_event") == "filled"]
