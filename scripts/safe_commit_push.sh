@@ -111,7 +111,7 @@ done <<< "$CHANGED_FILES"
 
 if [[ "$AFFECTS_RUNTIME" == "true" ]]; then
     # Check if listener is currently running
-    if launchctl list | grep -q "com.elijah.tradingagent.telegram"; then
+    if launchctl print "gui/$(id -u)/com.elijah.tradingagent.telegram" >/dev/null 2>&1; then
         if [[ "$RESTART_LISTENER" == "true" ]]; then
             echo "=== Option --restart-listener specified; restarting Telegram listener ==="
             "$ROOT/scripts/restart_telegram_listener.sh"

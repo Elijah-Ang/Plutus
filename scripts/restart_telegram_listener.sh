@@ -11,7 +11,7 @@ IDENTITY_FILE="$ROOT/logs/runtime/telegram_listener_identity.json"
 echo "=== Safely Restarting Telegram Listener ==="
 
 # 1. Stop/unload old listener safely
-if launchctl list | grep -q "com.elijah.tradingagent.telegram"; then
+if launchctl print "gui/$(id -u)/com.elijah.tradingagent.telegram" >/dev/null 2>&1; then
   echo "Unloading com.elijah.tradingagent.telegram..."
   launchctl bootout "gui/$(id -u)" "$PLIST" || true
   sleep 2
