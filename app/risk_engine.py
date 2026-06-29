@@ -193,6 +193,21 @@ class RiskEngine:
                 check("forex_futures_blocked", proposal.get("asset_class") not in {"forex", "future"}, "forex and futures are blocked")
                 leveraged_inverse = {"TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "UDOW", "TNA"}
                 check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
+            elif proposal.get("approved_dynamic_paper_tradable") is True and proposal.get("universe_source") == "dynamic":
+                approved_profile_key = proposal.get("approved_market_profile")
+                approved_profile = profiles.get(approved_profile_key) if approved_profile_key else None
+                profile_name = approved_profile_key or "dynamic_paper_tradable"
+                check("active_profile", bool(approved_profile and approved_profile.get("status") == "active"), f"profile {profile_name} is not active")
+                check("approved_universe", True, f"symbol {symbol} is approved dynamic paper-tradable")
+                check("profile_execution_enabled", bool(approved_profile and approved_profile.get("execution_enabled", False) is True), f"execution disabled for profile {profile_name}")
+                check("profile_proposals_enabled", bool(approved_profile and approved_profile.get("proposals_enabled", False) is True), f"proposals disabled for profile {profile_name}")
+                check("profile_broker_alpaca", bool(approved_profile and approved_profile.get("broker") == "alpaca"), "broker must be alpaca for execution")
+                check("asset_class", proposal.get("asset_class", "equity") == "equity", "only equities are allowed")
+                check("options_blocked", proposal.get("asset_class") != "option", "options are blocked")
+                check("crypto_blocked", proposal.get("asset_class") != "crypto" and not symbol.endswith("USD"), "crypto is blocked")
+                check("forex_futures_blocked", proposal.get("asset_class") not in {"forex", "future"}, "forex and futures are blocked")
+                leveraged_inverse = {"TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "UDOW", "TNA"}
+                check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
             else:
                 check("approved_universe", False, f"no matching market profile found for symbol {symbol}")
         daily_loss = context.get("daily_loss")

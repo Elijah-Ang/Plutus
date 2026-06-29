@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 from urllib.error import HTTPError
 from typing import Any
+from unittest.mock import patch
 
 from app.data_providers.base import ProviderResponse
 from app.data_providers.cache import ProviderCache
@@ -23,6 +24,7 @@ from app.dynamic_universe import (
 from app.power import PowerStatus
 from app.reports import SHEETS
 from app.service import TradingService
+from app.strategy_rule_based import Signal
 from app.utils import load_config
 from test_scoring_and_throttling import MockBroker, MockTelegramBot, temp_storage
 
@@ -1088,8 +1090,8 @@ def test_static_dynamic_scan_lists_and_cluster_lookup(temp_storage):
     service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
     service.telegram = MockTelegramBot()
     temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,asset_class,cluster,tier,executable,observation_only,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        ("u1", "SMH", "etf", "semiconductors", PAPER_TRADABLE, 1, 0, 90.0, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+        "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,source,universe_lane,alpaca_compatible,executable,observation_only,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u1", "SMH", "US", "etf", "semiconductors", PAPER_TRADABLE, "eodhd_screener", LANE_ALPACA_US, 1, 1, 0, 90.0, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
     )
     temp_storage.execute(
         "INSERT INTO universe_symbols(id,symbol,exchange,asset_class,cluster,tier,executable,observation_only,score,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -1298,7 +1300,7 @@ def test_catchup_runs_once_and_does_not_replay_intraday_cycles(temp_storage, mon
     assert state["catchup_status"] == "completed"
 
 
-def test_stale_dynamic_paper_tradable_blocked_from_buy_scan_but_static_kept(temp_storage, monkeypatch):
+def test_stale_dynamic_research_does_not_block_promoted_dynamic_scan(temp_storage, monkeypatch):
     allow_resilience_environment(monkeypatch)
     cfg = dynamic_config()
     cfg["dynamic_universe_resilience"]["stale_data_policy"]["max_age_minutes_for_trade_eligibility"] = 30
@@ -1306,23 +1308,115 @@ def test_stale_dynamic_paper_tradable_blocked_from_buy_scan_but_static_kept(temp
     old = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     fresh = datetime.now(UTC).isoformat()
     temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        ("u-dyn-old", "SMH", PAPER_TRADABLE, "eodhd_screener", 1, 0, 95.0, old, old, old),
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn-old", "SMH", PAPER_TRADABLE, "eodhd_screener", LANE_ALPACA_US, 1, "US", "etf", 1, 0, 95.0, old, old, old),
     )
     temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        ("u-static", "SPY", PAPER_TRADABLE, "existing_static_watchlist", 1, 0, 90.0, old, old, old),
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-static", "SPY", PAPER_TRADABLE, "existing_static_watchlist", LANE_ALPACA_US, 1, "US", "etf", 1, 0, 90.0, old, old, old),
     )
     temp_storage.execute(
-        "INSERT INTO universe_symbols(id,symbol,tier,source,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        ("u-dyn-fresh", "JPM", PAPER_TRADABLE, "eodhd_screener", 1, 0, 80.0, fresh, fresh, fresh),
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn-fresh", "JPM", PAPER_TRADABLE, "eodhd_screener", LANE_ALPACA_US, 1, "US", "equity", 1, 0, 80.0, fresh, fresh, fresh),
+    )
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-global", "2800.HK", PAPER_TRADABLE, "eodhd_screener", LANE_GLOBAL_RESEARCH, 0, "HK", "etf", 1, 0, 99.0, fresh, fresh, fresh),
     )
 
     active, _ = service._dynamic_universe_scan_symbols()
 
-    assert "SMH" not in active
-    assert "SPY" in active
+    assert "SMH" in active
+    assert "SPY" not in active
     assert "JPM" in active
+    assert "2800.HK" not in active
+
+
+class RecordingBroker(MockBroker):
+    def __init__(self, *, stale_price: bool = False) -> None:
+        super().__init__()
+        self.price_calls: list[str] = []
+        self.bar_calls: list[str] = []
+        self.stale_price = stale_price
+
+    def get_latest_price(self, symbol):
+        self.price_calls.append(symbol)
+        ts = datetime.now(UTC) - timedelta(minutes=10) if self.stale_price else datetime.now(UTC)
+        return type("T", (), {"price": self.price, "timestamp": ts})()
+
+    def get_historical_bars(self, symbol, timeframe, limit):
+        self.bar_calls.append(symbol)
+        return super().get_historical_bars(symbol, timeframe, limit)
+
+
+def test_static_and_dynamic_proposal_path_use_alpaca_scanner_data(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    cfg["risk"]["require_gpt_review_for_buy_proposals"] = False
+    cfg["ai"]["ai_review_min_score"] = 65
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn", "SMH", PAPER_TRADABLE, "eodhd_screener", LANE_ALPACA_US, 1, "US", "etf", 1, 0, 95.0, (now - timedelta(days=3)).isoformat(), now.isoformat(), now.isoformat()),
+    )
+    ProviderCache(temp_storage).record_capability("eodhd", "eod_bars", status="rate_limited", run_id="run-provider", error_category="cooldown_active", cooldown_minutes=60)
+    broker = RecordingBroker()
+    service = TradingService(cfg, temp_storage, broker, "run-scan")
+    service.telegram = MockTelegramBot()
+
+    def signal_for(sym, *args, **kwargs):
+        if sym in {"SPY", "SMH"}:
+            return Signal("ENTRY", "buy", sym, "trend filters passed", 0.8, {"close": 500.0, "ma_50": 450.0, "volatility_20": 0.1})
+        return Signal("HOLD", None, sym, "not selected", 0.0, {})
+
+    with patch("app.service.evaluate_symbol", side_effect=signal_for):
+        service.scan()
+
+    assert "SPY" in broker.price_calls
+    assert "SPY" in broker.bar_calls
+    assert "SMH" in broker.price_calls
+    assert "SMH" in broker.bar_calls
+    dynamic_memory = temp_storage.fetch_all("SELECT proposal_allowed,no_action_reason FROM market_memory WHERE symbol='SMH' AND run_id='run-scan'")[0]
+    assert "no matching market profile" not in (dynamic_memory["no_action_reason"] or "")
+    proposals = temp_storage.fetch_all("SELECT symbol,payload FROM trade_proposals WHERE run_id='run-scan'")
+    assert any(row["symbol"] == "SMH" and json.loads(row["payload"])["universe_source"] == "dynamic" for row in proposals)
+
+
+def test_dynamic_with_stale_alpaca_price_blocked_even_when_eodhd_fresh(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    cfg["risk"]["require_gpt_review_for_buy_proposals"] = False
+    now = datetime.now(UTC)
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-dyn", "SMH", PAPER_TRADABLE, "eodhd_screener", LANE_ALPACA_US, 1, "US", "etf", 1, 0, 95.0, now.isoformat(), now.isoformat(), now.isoformat()),
+    )
+    broker = RecordingBroker(stale_price=True)
+    service = TradingService(cfg, temp_storage, broker, "run-stale-price")
+    service.telegram = MockTelegramBot()
+
+    with patch("app.service.evaluate_symbol", return_value=Signal("ENTRY", "buy", "SMH", "trend filters passed", 0.8, {"close": 500.0, "ma_50": 450.0, "volatility_20": 0.1})):
+        service.scan()
+
+    row = temp_storage.fetch_all("SELECT proposal_allowed,no_action_reason FROM market_memory WHERE symbol='SMH' AND run_id='run-stale-price'")[0]
+    assert row["proposal_allowed"] == 0
+    assert "price timestamp must be fresh" in row["no_action_reason"]
+    assert temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SMH'") == []
+
+
+def test_dynamic_without_alpaca_compatibility_cannot_enter_proposal_path(temp_storage, monkeypatch):
+    allow_resilience_environment(monkeypatch)
+    cfg = dynamic_config()
+    now = datetime.now(UTC).isoformat()
+    temp_storage.execute(
+        "INSERT INTO universe_symbols(id,symbol,tier,source,universe_lane,alpaca_compatible,exchange,asset_class,executable,observation_only,score,last_successful_research_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("u-bad", "AKRTF", PAPER_TRADABLE, "eodhd_screener", LANE_EXCLUDED, 0, "OTC", "equity", 1, 0, 99.0, now, now, now),
+    )
+    service = TradingService(cfg, temp_storage, MockBroker(), "run-bad")
+
+    active, _ = service._dynamic_universe_scan_symbols()
+
+    assert "AKRTF" not in active
 
 
 def test_provider_unavailable_blocks_demotions_from_missing_data(temp_storage):

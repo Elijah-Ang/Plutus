@@ -227,22 +227,21 @@ class DynamicUniverseEngine:
     def dynamic_scan_symbols(self) -> tuple[list[str], list[str]]:
         if not self.enabled():
             return [], []
-        max_stale = int(self.resilience_cfg.get("stale_data_policy", {}).get("max_age_minutes_for_trade_eligibility", 30))
-        freshness_cutoff = (self.now - timedelta(minutes=max_stale)).isoformat()
         paper = self.storage.fetch_all(
             """
             SELECT symbol
             FROM universe_symbols
             WHERE tier=?
               AND executable=1
-              AND (
-                COALESCE(source, '')='existing_static_watchlist'
-                OR COALESCE(last_successful_research_at, last_seen_at, updated_at) >= ?
-              )
+              AND COALESCE(source, '')!='existing_static_watchlist'
+              AND COALESCE(universe_lane, 'alpaca_compatible_us')='alpaca_compatible_us'
+              AND COALESCE(alpaca_compatible, 0)=1
+              AND symbol NOT LIKE '%.%'
+              AND asset_class IN ('equity','etf')
             ORDER BY score DESC, symbol
             LIMIT ?
             """,
-            (PAPER_TRADABLE, freshness_cutoff, int(self.cfg.get("max_dynamic_paper_tradable_symbols", 12))),
+            (PAPER_TRADABLE, int(self.cfg.get("max_dynamic_paper_tradable_symbols", 12))),
         )
         obs = self.storage.fetch_all(
             """

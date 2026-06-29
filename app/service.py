@@ -2598,6 +2598,7 @@ class TradingService:
             active_watchlist = [str(s).upper() for s in profile.get("watchlist", [])]
             obs_watchlist = [str(s).upper() for s in profile.get("observation_watchlist", [])]
             dynamic_active, dynamic_observation = self._dynamic_universe_scan_symbols()
+            dynamic_active_set = set(dynamic_active)
             active_watchlist = list(dict.fromkeys(active_watchlist + dynamic_active))
             obs_watchlist = list(dict.fromkeys(obs_watchlist + [s for s in dynamic_observation if s not in active_watchlist]))
             proposals_enabled = profile.get("proposals_enabled", True)
@@ -3110,6 +3111,9 @@ class TradingService:
 
                 profile_results.append({
                     "symbol": symbol,
+                    "universe_source": "dynamic" if symbol in dynamic_active_set else "static",
+                    "approved_dynamic_paper_tradable": symbol in dynamic_active_set,
+                    "approved_market_profile": profile_key,
                     "price": price,
                     "price_at": price_at,
                     "bars": bars,
@@ -3356,6 +3360,9 @@ class TradingService:
                 })
                 mock_prop = {
                     "symbol": symbol,
+                    "universe_source": res.get("universe_source"),
+                    "approved_dynamic_paper_tradable": res.get("approved_dynamic_paper_tradable", False),
+                    "approved_market_profile": res.get("approved_market_profile"),
                     "side": "buy",
                     "action": "add" if res.get("is_add") else "entry",
                     "is_add": res.get("is_add", False),
@@ -3665,6 +3672,9 @@ class TradingService:
                                 "run_id": self.run_id,
                                 "signal_id": signal_id,
                                 "symbol": symbol,
+                                "universe_source": res.get("universe_source"),
+                                "approved_dynamic_paper_tradable": res.get("approved_dynamic_paper_tradable", False),
+                                "approved_market_profile": res.get("approved_market_profile"),
                                 "side": signal.side,
                                 "action": "add" if res.get("is_add") else ("entry" if signal.action == "ENTRY" else "exit"),
                                 "is_add": 1 if res.get("is_add") else 0,
@@ -4536,8 +4546,8 @@ class TradingService:
                     return "blocked", "portfolio exposure limit"
                 if cleaned.lower() == "provider data unavailable":
                     return "blocked", "provider data unavailable"
-                if cleaned.lower() == "dynamic symbol requires active market-profile validation":
-                    return "blocked", "dynamic symbol requires active market-profile validation"
+                if cleaned.lower() == "dynamic symbol missing alpaca-approved scanner profile":
+                    return "blocked", "Alpaca trading-data/profile block: missing approved scanner profile"
                 if cleaned.lower() == "proposal builder returned no candidate":
                     return "blocked", "proposal builder returned no candidate"
                 return "blocked", cleaned
@@ -5760,7 +5770,7 @@ class TradingService:
         if "signal/proposal must be current" in no_act or "fresh market validation" in no_act:
             return {"status": "Watch — waiting for fresh market validation", "event": "freshness_failed", "high_score": True}
         if "no matching market profile" in no_act or "not in active watchlist" in no_act:
-            return {"status": "Blocked — dynamic symbol requires active market-profile validation", "event": "dynamic_profile_validation", "high_score": True}
+            return {"status": "Blocked — dynamic symbol missing Alpaca-approved scanner profile", "event": "dynamic_profile_validation", "high_score": True}
         if "notional" in no_act or "sizing" in no_act or "buying power" in no_act:
             return {"status": "Blocked — failed risk sizing", "event": "risk_sizing", "high_score": True}
         if "total portfolio exposure" in no_act or "portfolio_total_exposure" in no_act:

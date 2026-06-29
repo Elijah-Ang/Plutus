@@ -1145,7 +1145,7 @@ def test_digest_market_memory_status_uses_specific_display_reasons(temp_storage)
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: price timestamp must be fresh"})["status"] == "Watch — waiting for fresh market validation"
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: notional must be positive and within limit"})["status"] == "Blocked — failed risk sizing"
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: total portfolio exposure cap"})["status"] == "Blocked — portfolio exposure limit"
-    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "not actionable - pre-proposal risk check failed: no matching market profile found for symbol ABBV"})["status"] == "Blocked — dynamic symbol requires active market-profile validation"
+    assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "not actionable - pre-proposal risk check failed: no matching market profile found for symbol ABBV"})["status"] == "Blocked — dynamic symbol missing Alpaca-approved scanner profile"
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": ""})["status"] == "Watch — proposal builder returned no candidate"
     assert service._digest_market_memory_status("XLV", {"score": 90.0, "signal": "ENTRY", "no_action_reason": ""}, {"XLV"}, {})["status"] == "Observation only — no proposal allowed"
 
