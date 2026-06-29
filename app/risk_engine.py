@@ -64,7 +64,11 @@ class RiskEngine:
         check("valid_price", isinstance(price, (int, float)) and price > 0, "latest price must be positive")
         price_at = _dt(proposal.get("price_at"))
         age = (now - price_at).total_seconds() if price_at else float("inf")
-        check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "price timestamp must be fresh")
+        is_dynamic = proposal.get("approved_dynamic_paper_tradable") is True and proposal.get("universe_source") == "dynamic"
+        if is_dynamic and final:
+            check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "dynamic symbol failed final Alpaca price freshness check")
+        else:
+            check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "price timestamp must be fresh")
         check("historical_data", int(proposal.get("historical_bars", 0)) >= self.risk.get("min_historical_bars", 50), "sufficient history required")
         check("volume", proposal.get("volume") is not None and proposal.get("volume", 0) >= 0, "volume must be present")
         check("price_gap", abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious price gap blocked")
@@ -197,8 +201,36 @@ class RiskEngine:
                 approved_profile_key = proposal.get("approved_market_profile")
                 approved_profile = profiles.get(approved_profile_key) if approved_profile_key else None
                 profile_name = approved_profile_key or "dynamic_paper_tradable"
-                check("active_profile", bool(approved_profile and approved_profile.get("status") == "active"), f"profile {profile_name} is not active")
-                check("approved_universe", True, f"symbol {symbol} is approved dynamic paper-tradable")
+                if not approved_profile:
+                    check("active_profile", False, "dynamic symbol missing active scanner profile at final validation")
+                else:
+                    check("active_profile", approved_profile.get("status") == "active", f"profile {profile_name} is not active")
+
+                sym_info = context.get("universe_symbol_info")
+                active_dynamic = context.get("active_dynamic_paper_tradable_symbols")
+
+                if sym_info is not None or active_dynamic is not None:
+                    tier = sym_info.get("tier") if sym_info else None
+                    alpaca_compatible = sym_info.get("alpaca_compatible") == 1 if sym_info else False
+                    universe_lane = sym_info.get("universe_lane") if sym_info else None
+                    
+                    if not sym_info:
+                        check("approved_universe", False, "dynamic symbol missing active scanner profile at final validation")
+                    elif tier != "paper_tradable":
+                        check("approved_universe", False, "dynamic symbol no longer paper-tradable at final validation")
+                    elif universe_lane == "global_research_only":
+                        check("approved_universe", False, "global research-only symbol cannot pass final validation")
+                    elif universe_lane == "excluded_or_low_quality":
+                        check("approved_universe", False, "unsupported/OTC-like symbol cannot pass final validation")
+                    elif not alpaca_compatible:
+                        check("approved_universe", False, "dynamic symbol failed final Alpaca compatibility check")
+                    elif active_dynamic is not None and symbol not in active_dynamic:
+                        check("approved_universe", False, "dynamic symbol no longer paper-tradable at final validation")
+                    else:
+                        check("approved_universe", True, f"symbol {symbol} is approved dynamic paper-tradable")
+                else:
+                    check("approved_universe", True, f"symbol {symbol} is approved dynamic paper-tradable")
+
                 check("profile_execution_enabled", bool(approved_profile and approved_profile.get("execution_enabled", False) is True), f"execution disabled for profile {profile_name}")
                 check("profile_proposals_enabled", bool(approved_profile and approved_profile.get("proposals_enabled", False) is True), f"proposals disabled for profile {profile_name}")
                 check("profile_broker_alpaca", bool(approved_profile and approved_profile.get("broker") == "alpaca"), "broker must be alpaca for execution")
@@ -209,7 +241,20 @@ class RiskEngine:
                 leveraged_inverse = {"TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDOW", "UDOW", "TNA"}
                 check("leveraged_inverse_blocked", symbol not in leveraged_inverse, "leveraged/inverse ETFs are blocked")
             else:
-                check("approved_universe", False, f"no matching market profile found for symbol {symbol}")
+                sym_info = context.get("universe_symbol_info")
+                if sym_info:
+                    tier = sym_info.get("tier")
+                    universe_lane = sym_info.get("universe_lane")
+                    if tier == "research_candidate" or universe_lane == "global_research_only":
+                        check("approved_universe", False, "research candidate cannot pass final validation" if tier == "research_candidate" else "global research-only symbol cannot pass final validation")
+                    elif tier == "observation" or sym_info.get("observation_only") == 1:
+                        check("approved_universe", False, "observation-only symbol cannot pass final validation")
+                    elif universe_lane == "excluded_or_low_quality" or sym_info.get("alpaca_compatible") == 0:
+                        check("approved_universe", False, "unsupported/OTC-like symbol cannot pass final validation")
+                    else:
+                        check("approved_universe", False, "symbol not found in static or dynamic paper-tradable profiles")
+                else:
+                    check("approved_universe", False, "symbol not found in static or dynamic paper-tradable profiles")
         daily_loss = context.get("daily_loss")
         weekly_loss = context.get("weekly_loss")
         check("daily_loss_known", isinstance(daily_loss, (int, float)), "daily loss must come from an authoritative source")

@@ -951,6 +951,24 @@ class TradingService:
 
         today_orders = self.storage.fetch_all("SELECT id FROM orders WHERE substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
         today_buy_orders = self.storage.fetch_all("SELECT id FROM orders WHERE side='buy' AND substr(created_at,1,10)=?", (datetime.now(UTC).date().isoformat(),))
+
+        universe_symbol_info = None
+        active_dynamic = []
+        if getattr(self, "storage", None):
+            try:
+                universe_symbol_row = self.storage.fetch_all(
+                    "SELECT * FROM universe_symbols WHERE symbol=?", (symbol.upper(),)
+                )
+                if universe_symbol_row:
+                    universe_symbol_info = dict(universe_symbol_row[0])
+            except Exception:
+                pass
+
+            try:
+                active_dynamic, _ = self._dynamic_universe_scan_symbols()
+            except Exception:
+                pass
+
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -979,6 +997,8 @@ class TradingService:
             "exit_pending_status": exit_blocker.get("status"),
             "exit_pending_stale": bool(exit_blocker.get("stale")),
             "max_emergency_exit_score": max_emergency_exit_score,
+            "universe_symbol_info": universe_symbol_info,
+            "active_dynamic_paper_tradable_symbols": active_dynamic,
         }
 
     def process_telegram(self) -> None:
