@@ -302,11 +302,50 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         stop_dist_dollars = proposal.get("stop_distance_dollars")
         stop_model = proposal.get("stop_model_used", "default")
 
+        risk_budget = proposal.get("risk_budget")
+        score_multiplier = proposal.get("score_multiplier")
+        volatility_multiplier = proposal.get("volatility_multiplier")
+        caps_applied = proposal.get("caps_applied")
+
+        # Account context
+        equity = proposal.get("portfolio_equity") or proposal.get("indicators", {}).get("portfolio_equity")
+        cash = proposal.get("cash") or proposal.get("indicators", {}).get("cash")
+        buying_power = proposal.get("buying_power") or proposal.get("indicators", {}).get("buying_power")
+
+        account_section = ""
+        if equity is not None:
+            account_section += f"Account Equity: ${float(equity):,.2f}\n"
+        if cash is not None:
+            account_section += f"Available Cash: ${float(cash):,.2f}\n"
+        if buying_power is not None:
+            account_section += f"Buying Power: ${float(buying_power):,.2f} (includes margin leverage)\n"
+
+        if account_section:
+            account_section = f"Account Context:\n{account_section}\n"
+
         sizing_section = ""
         if stop_price is not None:
             sizing_section += f"Stop price: ${stop_price:.2f} ({stop_model})\n"
         if stop_dist_pct is not None:
             sizing_section += f"Stop distance: {stop_dist_pct:.2f}% (${stop_dist_dollars:.2f})\n"
+        if risk_budget is not None:
+            sizing_section += f"Risk budget: ${risk_budget:.2f}\n"
+
+        sizing_basis_parts = []
+        if risk_budget is not None:
+            sizing_basis_parts.append(f"risk budget (${risk_budget:.2f})")
+        if stop_dist_pct is not None:
+            sizing_basis_parts.append(f"stop distance ({stop_dist_pct:.1f}%)")
+        if score_multiplier is not None:
+            sizing_basis_parts.append(f"score multiplier ({score_multiplier:.2f}x)")
+        if volatility_multiplier is not None:
+            sizing_basis_parts.append(f"volatility multiplier ({volatility_multiplier:.2f}x)")
+
+        if sizing_basis_parts:
+            sizing_section += f"Sizing basis: {', '.join(sizing_basis_parts)}\n"
+
+        if caps_applied and caps_applied != "none":
+            sizing_section += f"Main cap applied: {caps_applied}\n"
 
         proposed_total_exposure = proposal.get("proposed_total_exposure_pct")
         proposed_cluster_exposure = proposal.get("proposed_cluster_exposure_pct")
@@ -318,7 +357,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         if sizing_section:
             sizing_section = f"Sizing & Risk:\n{sizing_section}\n"
 
-        scores_section = f"{confidence_line}{score_line}{rank_line}\n{sizing_section}"
+        scores_section = f"{confidence_line}{score_line}{rank_line}\n{account_section}{sizing_section}"
 
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
@@ -398,7 +437,8 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"yes = approve this {symbol} paper {side_lower_instr}\n"
             f"no = reject this {symbol} paper {side_lower_instr}\n\n"
             f"No reply = expires and no order is placed.\n"
-            f"yes means permission to attempt, not guaranteed order. A final safety check still runs after yes."
+            f"yes means permission to attempt, not guaranteed order. A final safety check still runs after yes.\n"
+            f"Final order size will be revalidated before placement."
         )
 
         return (

@@ -45,3 +45,58 @@ During the June 2026 deployment:
 - The Telegram listener was not restarted and ran old code in-memory, causing the final validation path for the approval to fail with `no matching market profile found for symbol AMX`.
 - Stale process restarts are now guarded programmatically and integrated into commit checks.
 
+## Position Sizing and Portfolio Constraints
+
+The system uses a multi-constraint, risk-budgeted position sizing engine when `mode: risk_portfolio` is enabled. It ensures that trades scale dynamically with account equity while protecting cash reserves.
+
+### 1. Risk-Based Sizing Formula
+
+The base trade size is driven by account equity and the configured per-trade risk percentage, rather than buying power:
+
+$$\text{risk\_budget} = \text{equity} \times \frac{\text{risk\_per\_trade\_pct}}{100}$$
+
+$$\text{raw\_risk\_based\_notional} = \frac{\text{risk\_budget}}{\text{stop\_distance\_pct} / 100}$$
+
+*   **Equity**: Derived from broker account equity (e.g. `$100,000.00`).
+*   **Risk per trade**: Configured in percentage terms (e.g., `0.05` means $0.05\%$, or a multiplier of $0.0005$).
+*   **Stop Distance**: Calculated dynamically using the maximum of ATR-based volatility or technical levels (capped between `min_stop_pct` and `max_stop_pct`).
+
+### 2. Sizing Multipliers (Quality Adjustments)
+
+The raw risk-based size is adjusted based on signal setup quality (Score) and volatility regime:
+
+$$\text{target\_notional} = \text{raw\_risk\_based\_notional} \times \text{score\_multiplier} \times \text{volatility\_multiplier}$$
+
+*   **Score Multipliers**:
+    *   95–100: `1.50x`
+    *   85–94: `1.25x`
+    *   75–84: `1.00x`
+    *   65–74: `0.50x`
+*   **Volatility Multipliers**:
+    *   normal: `1.00x`
+    *   too quiet: `0.75x`
+    *   elevated: `0.50x`
+    *   high: `0.25x`
+    *   extreme: `0.00x` (blocks entry)
+
+### 3. Sizing Constraints and Caps
+
+The final notional is sequentially constrained to protect the portfolio:
+
+1.  **Cash Reserve Cap**: Sizing is strictly limited by available cash minus a configured minimum reserve percentage:
+    $$\text{usable\_cash} = \text{cash} - (\text{equity} \times \text{min\_cash\_reserve\_pct})$$
+    $$\text{cash\_cap} = \min(\text{usable\_cash}, \text{equity} \times \text{max\_cash\_usage\_pct})$$
+    Buying power/margin is ignored for cash reserves (`max_margin_usage_pct = 0.0`).
+2.  **Single Position Cap**: Limits maximum symbol exposure (e.g., `2.0%` of equity).
+3.  **Portfolio Exposure Cap**: Limits total active portfolio exposure (e.g., `6.0%` of equity).
+4.  **Cluster Exposure Cap**: Limits total exposure to a single sector/cluster (e.g., `5.0%` of equity).
+5.  **Stage Dollar Cap**: Enforces staging guardrails (e.g., `smoke_test` max $25.00, `moderate_paper` max $250.00).
+
+### 4. Small-Account and Clamping Rules
+
+To facilitate testing on small accounts:
+*   A minimum trade clamp allows scaling down to `$5.00` if it is safe under cash/reserve rules.
+*   Fractional shares are supported down to `$1.00`.
+*   If the finalized trade notional is below `$1.00` or breaches cash reserves, the trade is blocked.
+
+

@@ -999,6 +999,8 @@ class TradingService:
             "max_emergency_exit_score": max_emergency_exit_score,
             "universe_symbol_info": universe_symbol_info,
             "active_dynamic_paper_tradable_symbols": active_dynamic,
+            "portfolio_equity": equity,
+            "cash": snapshot["cash"]
         }
 
     def process_telegram(self) -> None:
@@ -5459,8 +5461,16 @@ class TradingService:
         for c in cluster_values:
             cluster_exposures[c] = (cluster_values[c] / equity) * 100
 
+        cash = float(_value(account, "cash", equity) or equity)
+        if cash <= 0:
+            cash = equity
+        buying_power = float(_value(account, "buying_power", cash * 4) or (cash * 4))
+        if buying_power <= 0:
+            buying_power = cash * 4
         return {
             "portfolio_equity": equity,
+            "cash": cash,
+            "buying_power": buying_power,
             "total_exposure_dollars": total_val,
             "total_exposure_pct": (total_val / equity) * 100,
             "single_exposures": single_exposures,
@@ -5496,12 +5506,27 @@ class TradingService:
                 "risk_based_shares": 0.0,
                 "score_adjusted_notional": base_notional,
                 "vol_adjusted_notional": base_notional,
-                "base_notional": base_notional
+                "base_notional": base_notional,
+                "raw_risk_based_notional": 0.0,
+                "quality_adjusted_notional": base_notional,
+                "cash_cap": 0.0,
+                "position_cap": 0.0,
+                "portfolio_cap": 0.0,
+                "cluster_cap": 0.0,
+                "stage_cap": 0.0,
+                "caps_applied": "none",
+                "blocked_reason": "sizing disabled" if base_notional == 0.0 else None
             }
 
-        equity = snapshot["portfolio_equity"]
+        equity = snapshot.get("portfolio_equity", 10000.0)
+        cash = snapshot.get("cash", 0.0)
+        buying_power = snapshot.get("buying_power", 0.0)
+        mode = sizing_cfg.get("mode", "fixed")
+
+
+
         risk_per_trade_pct = float(sizing_cfg.get("risk_per_trade_pct", 0.05))
-        risk_budget = equity * risk_per_trade_pct / 100
+        risk_budget = equity * (risk_per_trade_pct / 100.0)
 
         stop_model = sizing_cfg.get("stop_model", {})
         atr_multiple = float(stop_model.get("atr_multiple", 2.0))
@@ -5575,9 +5600,9 @@ class TradingService:
         score_mult = 1.0
         score_mult_map = sizing_cfg.get("score_multiplier", {})
         if score >= 95:
-            score_mult = float(score_mult_map.get("95_100", 2.0))
+            score_mult = float(score_mult_map.get("95_100", 1.5))
         elif score >= 85:
-            score_mult = float(score_mult_map.get("85_94", 1.5))
+            score_mult = float(score_mult_map.get("85_94", 1.25))
         elif score >= 75:
             score_mult = float(score_mult_map.get("75_84", 1.0))
         elif score >= 65:
@@ -5592,45 +5617,139 @@ class TradingService:
         elif volatility_regime == "elevated":
             vol_mult = float(vol_mult_map.get("elevated", 0.5))
         elif volatility_regime == "high":
-            vol_mult = float(vol_mult_map.get("high", 0.0))
+            vol_mult = float(vol_mult_map.get("high", 0.25))
         elif volatility_regime == "extreme":
             vol_mult = float(vol_mult_map.get("extreme", 0.0))
 
-        base_paper_notional = float(sizing_cfg.get("base_paper_notional", 10.0))
-        score_adjusted_notional = base_paper_notional * score_mult
-        vol_adjusted_notional = score_adjusted_notional * vol_mult
+        if mode == "risk_portfolio":
+            target_notional = risk_based_notional * score_mult * vol_mult
+            if is_add:
+                add_size_multiplier = float(sizing_cfg.get("add_size_multiplier", 0.5))
+                target_notional = target_notional * add_size_multiplier
 
-        final_notional = min(risk_based_notional, vol_adjusted_notional)
+            # Cash reserve and usage limit
+            min_cash_reserve_pct = float(sizing_cfg.get("min_cash_reserve_pct", 20.0))
+            min_cash_reserve = equity * (min_cash_reserve_pct / 100.0)
+            usable_cash = max(0.0, cash - min_cash_reserve)
+            max_cash_usage_pct = float(sizing_cfg.get("max_cash_usage_pct", 10.0))
+            max_cash_per_trade = equity * (max_cash_usage_pct / 100.0)
+            cash_cap = min(usable_cash, max_cash_per_trade)
 
+            # Single position cap
+            max_position_notional_pct_of_equity = float(sizing_cfg.get("max_position_notional_pct_of_equity", 2.0))
+            max_single_exposure = equity * (max_position_notional_pct_of_equity / 100.0)
+            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity
+            allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
+
+            # Portfolio total exposure cap
+            max_total_portfolio_exposure_pct = float(sizing_cfg.get("max_total_portfolio_exposure_pct", 6.0))
+            max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
+            current_total_value = snapshot["total_exposure_dollars"]
+            allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
+
+            # Cluster exposure cap
+            allowed_additional_cluster = float("inf")
+            c_name = self._get_symbol_cluster(symbol)
+            if c_name:
+                max_cluster_exposure_pct = float(sizing_cfg.get("max_cluster_exposure_pct", 5.0))
+                max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
+                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity
+                allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
+
+            # Stage Dollar Cap
+            stage_cap = float("inf")
+            if sizing_cfg.get("use_stage_dollar_cap", True):
+                stage = sizing_cfg.get("stage", "moderate_paper")
+                if is_add:
+                    stage_cap = float(sizing_cfg.get("stage_max_add_notional", {}).get(stage) or 0.0)
+                else:
+                    stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or 0.0)
+                if stage_cap <= 0.0:
+                    stage_cap = float("inf")
+
+            # Max trade notional limit
+            max_trade_notional_pct_of_equity = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
+            max_trade_notional = equity * (max_trade_notional_pct_of_equity / 100.0)
+        else:
+            base_paper_notional = float(sizing_cfg.get("base_paper_notional", 10.0))
+            suggested_add_notional = float(sizing_cfg.get("suggested_add_notional", 50.0))
+            base_target = suggested_add_notional if is_add else base_paper_notional
+            target_notional = base_target * score_mult * vol_mult
+
+            # Cash cap (disabled in fixed mode)
+            cash_cap = float("inf")
+
+            # Single position cap
+            max_single_symbol_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_symbol_exposure_pct", 5.0))
+            max_single_exposure = equity * (max_single_symbol_exposure_pct / 100.0)
+            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity
+            allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
+
+            # Portfolio total exposure cap
+            max_total_portfolio_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_total_portfolio_exposure_pct", 15.0))
+            max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
+            current_total_value = snapshot["total_exposure_dollars"]
+            allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
+
+            # Cluster exposure cap
+            allowed_additional_cluster = float("inf")
+            c_name = self._get_symbol_cluster(symbol)
+            if c_name:
+                max_cluster_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0))
+                max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
+                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity
+                allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
+
+            # Stage cap is disabled in fixed mode
+            stage_cap = float("inf")
+
+            # Max trade limits
+            if is_add:
+                max_trade_notional = float(sizing_cfg.get("max_add_paper_notional", 100.0))
+            else:
+                max_trade_notional = float(sizing_cfg.get("max_initial_paper_notional", 50.0))
+
+        # Apply constraints
+        final_notional = target_notional
+        final_notional = min(final_notional, cash_cap)
+        final_notional = min(final_notional, allowed_additional_single)
+        final_notional = min(final_notional, allowed_additional_total)
+        final_notional = min(final_notional, allowed_additional_cluster)
+        final_notional = min(final_notional, stage_cap)
+        final_notional = min(final_notional, max_trade_notional)
+
+        caps_applied = []
+        if target_notional > 0.0:
+            if final_notional == stage_cap and stage_cap < target_notional:
+                caps_applied.append("stage_cap")
+            if final_notional == cash_cap and cash_cap < target_notional:
+                caps_applied.append("cash_cap")
+            if final_notional == allowed_additional_single and allowed_additional_single < target_notional:
+                caps_applied.append("position_cap")
+            if final_notional == allowed_additional_total and allowed_additional_total < target_notional:
+                caps_applied.append("portfolio_cap")
+            if final_notional == allowed_additional_cluster and allowed_additional_cluster < target_notional:
+                caps_applied.append("cluster_cap")
+            if final_notional == max_trade_notional and max_trade_notional < target_notional:
+                caps_applied.append("max_trade_notional_cap")
+
+        # Minimum paper trade notional clamp
         min_notional = float(sizing_cfg.get("min_paper_notional", 5.0))
-        max_notional_cap = float(sizing_cfg.get("max_initial_paper_notional", 50.0))
-        if is_add:
-            max_notional_cap = float(sizing_cfg.get("max_add_paper_notional", 25.0))
+        blocked_reason = None
 
         if final_notional < min_notional:
-            final_notional = min_notional
-        if final_notional > max_notional_cap:
-            final_notional = max_notional_cap
+            # Check if clamping to min_notional is safe under hard constraints
+            if min_notional <= cash_cap and min_notional <= allowed_additional_single and min_notional <= allowed_additional_total and min_notional <= allowed_additional_cluster:
+                final_notional = min_notional
+                caps_applied.append("min_trade_clamp")
+            else:
+                if final_notional < 1.0:
+                    blocked_reason = "notional too small after constraints"
+                    final_notional = 0.0
 
-        if vol_mult == 0.0:
+        if volatility_regime == "extreme" or vol_mult == 0.0:
             final_notional = 0.0
-
-        max_single_exposure_pct = float(self.config.get("portfolio_behavior", {}).get("max_single_symbol_exposure_pct", 2.5))
-        current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100 * equity
-        allowed_additional_single = max(0.0, (equity * max_single_exposure_pct / 100) - current_symbol_value)
-        final_notional = min(final_notional, allowed_additional_single)
-
-        max_total_exposure_pct = float(self.config.get("portfolio_behavior", {}).get("max_total_portfolio_exposure_pct", 6.0))
-        current_total_value = snapshot["total_exposure_dollars"]
-        allowed_additional_total = max(0.0, (equity * max_total_exposure_pct / 100) - current_total_value)
-        final_notional = min(final_notional, allowed_additional_total)
-
-        c_name = self._get_symbol_cluster(symbol)
-        if c_name:
-            max_cluster_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0))
-            current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100 * equity
-            allowed_additional_cluster = max(0.0, (equity * max_cluster_exposure_pct / 100) - current_cluster_value)
-            final_notional = min(final_notional, allowed_additional_cluster)
+            blocked_reason = f"blocked by volatility multiplier: {volatility_regime}"
 
         final_notional = max(0.0, final_notional)
         suggested_shares = final_notional / price if price > 0 else 0.0
@@ -5646,9 +5765,18 @@ class TradingService:
             "volatility_multiplier": vol_mult,
             "stop_model_used": stop_method,
             "risk_based_shares": risk_based_shares,
-            "score_adjusted_notional": score_adjusted_notional,
-            "vol_adjusted_notional": vol_adjusted_notional,
-            "base_notional": base_paper_notional
+            "score_adjusted_notional": target_notional,
+            "vol_adjusted_notional": target_notional,
+            "base_notional": float(sizing_cfg.get("base_paper_notional", 50.0)),
+            "raw_risk_based_notional": risk_based_notional,
+            "quality_adjusted_notional": target_notional,
+            "cash_cap": cash_cap,
+            "position_cap": allowed_additional_single,
+            "portfolio_cap": allowed_additional_total,
+            "cluster_cap": allowed_additional_cluster,
+            "stage_cap": stage_cap,
+            "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
+            "blocked_reason": blocked_reason
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6141,6 +6269,8 @@ class TradingService:
             "daily_realized_loss_pct": 0.0,
             "max_open_risk_pct": cfg["max_open_risk_pct"],
             "buying_power": buying_power,
+            "portfolio_equity": float(snapshot.get("portfolio_equity", 10000.0) or 10000.0),
+            "cash": float(snapshot.get("cash", 0.0) or 0.0),
         }
         self.storage.execute(
             "INSERT INTO risk_budget_snapshots(id,run_id,timestamp,total_exposure_pct,open_risk_pct,daily_realized_loss_pct,max_open_risk_pct,buying_power,payload) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -6312,7 +6442,9 @@ class TradingService:
             "Portfolio room:",
             f"- Total exposure after proposed trades: {_format_small_percent(risk_snapshot.get('total_exposure_pct', 0.0))} / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
             f"- Open risk after proposed trades: {_format_small_percent(risk_snapshot.get('open_risk_pct', 0.0))} / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
-            f"- Available paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f}",
+            f"- Available paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f} (includes margin leverage)",
+            f"- Account Equity: ${risk_snapshot.get('portfolio_equity', 0.0):,.2f}",
+            f"- Available Cash: ${risk_snapshot.get('cash', 0.0):,.2f}",
             "Actionable:",
         ]
         for idx, proposal in enumerate(proposals, start=1):
@@ -6329,13 +6461,48 @@ class TradingService:
             qty = float(proposal.get("qty") or 0.0)
             pm = proposal.get("position_management_decision") or {}
             candidate_expiry = proposal.get("candidate_expires_at") or proposal.get("expires_at")
+
+            action_type_label = "NEW ENTRY"
+            if proposal.get("is_add") or pm_type == "HEALTHY_PULLBACK_ADD":
+                action_type_label = "ADD TO WINNER"
+            elif pm_type or proposal.get("side") == "sell":
+                action_type_label = "EXIT"
+
             lines.extend([
                 f"{idx}. {action_word} {proposal['symbol']} - ${float(proposal.get('notional') or 0.0):.2f} / approx. {qty:.6f} shares",
+                f"   Action: {action_type_label}",
                 f"   Score: {float(proposal.get('score') or 0.0):.0f}",
-                "   Risk: normal",
-                "   Portfolio fit: passes risk budget",
-                f"   Reason: {_normalize_ranked_candidate_reason(proposal.get('selection_reason') or proposal.get('reason'), idx)}",
             ])
+
+            if proposal.get("side") == "buy":
+                risk_bud = proposal.get("risk_budget")
+                stop_dist_d = proposal.get("stop_distance_dollars")
+                stop_dist_p = proposal.get("stop_distance_pct")
+                score_mult = proposal.get("score_multiplier")
+                vol_mult = proposal.get("volatility_multiplier")
+                caps = proposal.get("caps_applied")
+
+                sizing_basis_parts = []
+                if risk_bud is not None:
+                    sizing_basis_parts.append(f"risk budget: ${risk_bud:.2f}")
+                if stop_dist_d is not None and stop_dist_p is not None:
+                    sizing_basis_parts.append(f"stop: ${stop_dist_d:.2f} ({stop_dist_p:.1f}%)")
+                if score_mult is not None:
+                    sizing_basis_parts.append(f"score mult: {score_mult:.2f}x")
+                if vol_mult is not None:
+                    sizing_basis_parts.append(f"vol mult: {vol_mult:.2f}x")
+
+                if sizing_basis_parts:
+                    lines.append(f"   Sizing Basis: {', '.join(sizing_basis_parts)}")
+                if caps and caps != "none":
+                    lines.append(f"   Caps Applied: {caps}")
+            else:
+                lines.extend([
+                    "   Risk: normal",
+                    "   Portfolio fit: passes risk budget",
+                ])
+
+            lines.append(f"   Reason: {_normalize_ranked_candidate_reason(proposal.get('selection_reason') or proposal.get('reason'), idx)}")
             if batch_expiry and candidate_expiry and _parse_datetime(candidate_expiry) != batch_expiry:
                 lines.append(f"   Candidate expiry: {_format_expiry_line(candidate_expiry, now_dt).replace('Expires: ', '')}")
             if pm_type:
@@ -6368,6 +6535,8 @@ class TradingService:
         if symbols:
             lines.append("no all = reject all actionable candidates")
             lines.append("Plain yes is ambiguous when more than one candidate is pending.")
+        lines.append("")
+        lines.append("⚠️ Final order size will be revalidated before placement.")
         return "\n".join(lines)
 
     def _send_ranked_batch_if_needed(

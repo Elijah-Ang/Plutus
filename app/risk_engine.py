@@ -114,10 +114,21 @@ class RiskEngine:
             check("block_new_buy_if_emergency_exit_score_above", False, f"new buy blocked because max emergency exit score is {context.get('max_emergency_exit_score', 0.0):.1f} (> {block_if_emergency_exit_score_above})")
 
         limit = self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5)
-        # Sizing engine overrides limit if enabled, so we fetch limit from proposal size dict or max limit
-        sizing_enabled = self.config.get("position_sizing", {}).get("enabled", True)
+        sizing_cfg = self.config.get("position_sizing", {})
+        sizing_enabled = sizing_cfg.get("enabled", True)
         if sizing_enabled:
-            limit = max(limit, self.config.get("position_sizing", {}).get("max_initial_paper_notional", 50.0))
+            sizing_mode = sizing_cfg.get("mode", "fixed")
+            if sizing_mode == "risk_portfolio":
+                equity = float(context.get("portfolio_equity") or 100000.0)
+                max_pct = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
+                limit = equity * (max_pct / 100.0)
+                stage = sizing_cfg.get("stage", "moderate_paper")
+                stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or 0.0)
+                if stage_cap > 0.0:
+                    limit = min(limit, stage_cap)
+                limit = max(limit, self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5))
+            else:
+                limit = max(limit, sizing_cfg.get("max_initial_paper_notional", 50.0))
 
         notional = proposal.get("notional")
         check("notional", isinstance(notional, (int, float)) and 0 < notional <= limit, "notional must be positive and within limit")
