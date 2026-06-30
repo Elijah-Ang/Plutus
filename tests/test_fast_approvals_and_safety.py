@@ -228,15 +228,14 @@ def test_yes_acknowledgement_and_stale_price_block(temp_storage, base_config):
     # Verify YES receipt was immediately acknowledged first
     service.telegram.send_message.assert_any_call("✅ Received: YES for DIA paper buy proposal. I will now run the final safety check. No order will be placed unless the final check passes.")
     
-    # Verify order was blocked due to stale price and the exact warning message was sent
-    expected_block_msg = "Approved, but no order was placed. The proposal price is no longer fresh, so the system refused to trade on stale data. A new proposal is required."
+    expected_block_msg = "No order placed for DIA. Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
     service.telegram.send_message.assert_any_call(expected_block_msg)
     
     # Verify approvals row was updated with audit details
     approval = temp_storage.fetch_all("SELECT * FROM approvals WHERE proposal_id=?", (pid,))[0]
     assert approval["acknowledgement_status"] == "blocked"
     assert approval["final_order_decision"] == "blocked"
-    assert "refused to trade on stale data" in approval["final_block_reason"]
+    assert "could not get a fresh Alpaca price" in approval["final_block_reason"]
     assert approval["refreshed_price"] == 100.0
     assert approval["refreshed_price_age_seconds"] >= 70.0
 
@@ -318,7 +317,7 @@ def test_yes_acknowledgement_and_successful_execution(temp_storage, base_config)
     service.telegram.send_message.assert_any_call("✅ Received: YES for DIA paper buy proposal. I will now run the final safety check. No order will be placed unless the final check passes.")
     
     approval = temp_storage.fetch_all("SELECT * FROM approvals WHERE proposal_id=?", (pid,))[0]
-    service.telegram.send_message.assert_any_call("✅ Paper order submitted: Buy DIA for $5. Mode: paper only.")
+    service.telegram.send_message.assert_any_call("✅ Paper order submitted: NEW ENTRY DIA for $5.00. Approved: $5.00. Final: $5.00. Price: $100.10 (approx 0.0500 shares). Mode: paper only.")
     
     # Verify approvals row fields
     assert approval["final_order_decision"] == "submitted"

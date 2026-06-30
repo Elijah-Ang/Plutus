@@ -351,8 +351,10 @@ telegram:
     always_send_errors: true
     always_send_catchup_completion: true
   approval_price_refresh_required: true
-  approval_max_price_age_seconds: 60
+  approval_max_price_age_seconds: 120
   approval_max_price_move_bps: 25
+  approval_max_price_move_hard_cap_bps: 75
+  proposal_price_freshness_threshold_seconds: 60
 
 ai:
   enabled: true

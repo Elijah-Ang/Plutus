@@ -1532,110 +1532,12 @@ class TradingService:
                 continue
 
             final_revalidation_started_at = iso_now()
+            proposal = {**json.loads(row.get("payload") or "{}"), **row}
+            is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
 
-            # Retrieve parameters from config
-            telegram_cfg = self.config.get("telegram", {})
-            refresh_required = telegram_cfg.get("approval_price_refresh_required", True)
-            max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 60)
-            max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
-
-            refreshed_price_val = None
-            refreshed_price_at = None
-            price_refreshed_at = None
-            refreshed_price_age_seconds = None
-            price_move_bps_since_proposal = None
-            block_reason = None
-
-            now_dt = datetime.now(UTC)
-
-            # Fetch latest price
-            if self.broker is not None:
-                try:
-                    trade = self.broker.get_latest_price(prop_symbol)
-                    refreshed_price_val = float(_value(trade, "price", 0) or 0)
-                    refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
-                    if refreshed_price_at:
-                        price_refreshed_at = refreshed_price_at.isoformat()
-                        refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
-                except Exception as e:
-                    logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
-
-            # Check market open status
-            market_open = False
-            if self.broker is not None:
-                try:
-                    market_open = self.broker.is_market_open()
-                except Exception:
-                    market_open = False
-
-            # Get the proposal price
-            proposal_price = None
-            try:
-                proposal_payload = json.loads(row.get("payload") or "{}")
-                proposal_price = proposal_payload.get("latest_price")
-            except Exception:
-                pass
-            if proposal_price is None:
-                proposal_price = row.get("price")
-
-            # Perform revalidation checks
-            if refresh_required:
-                if refreshed_price_val is None or refreshed_price_val <= 0:
-                    block_reason = "Price refresh failed or price is unavailable"
-                elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
-                    block_reason = "The proposal price is no longer fresh, so the system refused to trade on stale data. A new proposal is required."
-                elif not market_open:
-                    block_reason = "Market is closed"
-                elif proposal_price is not None and proposal_price > 0:
-                    price_move_bps_since_proposal = (abs(refreshed_price_val - proposal_price) / proposal_price) * 10000
-                    # Apply price movement limit
-                    if price_move_bps_since_proposal > max_price_move_bps:
-                        block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {max_price_move_bps} bps)"
-            else:
-                if not market_open:
-                    block_reason = "Market is closed"
-
-            proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
-            if block_reason is None:
-                block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
-            if block_reason:
-                # Set up mock Executor result for blocked order
-                result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
-            else:
-                # Get authoritative account & positions to compute fresh snapshot
-                try:
-                    state = self._authoritative_runtime_state(force=True)
-                    positions_fresh = state["positions"]
-                    account_fresh = state["account"]
-                    snapshot_fresh = self._get_exposure_snapshot(positions_fresh, account_fresh)
-                except Exception as e:
-                    logger.warning("Failed to retrieve authoritative snapshot during revalidation: %s", e)
-                    snapshot_fresh = None
-
-                # Update proposal dict with fresh price data so risk engine evaluates using it
-                if refreshed_price_val is not None:
-                    proposal["latest_price"] = refreshed_price_val
-                if refreshed_price_at is not None:
-                    proposal["price_at"] = refreshed_price_at.isoformat()
-
-                # Recalculate dynamic sizing if sizing enabled and is buy
-                if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and proposal.get("side") == "buy":
-                    try:
-                        bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
-                        volatility_regime = proposal.get("volatility_regime", "normal")
-                        score = proposal.get("score", 70.0)
-                        is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
-                        size_dict = self._calculate_dynamic_size(prop_symbol, score, volatility_regime, refreshed_price_val, bars_fresh, snapshot_fresh, is_add=is_add)
-
-                        proposal["notional"] = size_dict["final_notional"]
-                        proposal["qty"] = size_dict["suggested_shares"]
-                    except Exception as e:
-                        logger.warning("Recalculate dynamic size failed during revalidation: %s", e)
-
-                context = self._portfolio_context(proposal, approval_valid=True)
-
-                # Execute
-                result = Executor(self.broker, self._risk_engine(parsed.proposal_id, "final")).execute(proposal, context)
+            result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal = self._execute_final_revalidation(
+                row, proposal, prop_symbol, prop_side, is_add, approval_id
+            )
 
             final_revalidation_completed_at = iso_now()
 
@@ -1667,13 +1569,23 @@ class TradingService:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
                 self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (parsed.proposal_id,))
                 self._mark_position_management_proposal_handled(proposal, "submitted")
-                notional_val = proposal.get("notional", 5)
-                qty_val = proposal.get("qty")
+                
+                # Format success message
+                price_used = refreshed_price_val or proposal.get("latest_price") or 0.0
+                qty_est = proposal.get("qty") or 0.0
+                
                 if prop_side == "buy":
-                    self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${notional_val:.0f}. Mode: paper only.")
+                    action_type = "ADD TO WINNER" if is_add else "NEW ENTRY"
+                    approved_notional = float(row.get("notional") or 0.0)
+                    final_notional = float(proposal.get("notional") or 0.0)
+                    if final_notional < approved_notional:
+                        msg = f"Paper order submitted: {action_type} {prop_symbol} for ${final_notional:.2f}. Approved: ${approved_notional:.2f}. Final size reduced by validation. Price: ${price_used:.2f} (approx {qty_est:.4f} shares). Mode: paper only."
+                    else:
+                        msg = f"Paper order submitted: {action_type} {prop_symbol} for ${final_notional:.2f}. Approved: ${approved_notional:.2f}. Final: ${final_notional:.2f}. Price: ${price_used:.2f} (approx {qty_est:.4f} shares). Mode: paper only."
                 else:
-                    qty_str = f"{qty_val} shares" if qty_val is not None else f"${notional_val:.0f}"
-                    self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {qty_str}. Mode: paper only.")
+                    qty_str = f"{qty_est:.4f} shares" if qty_est > 0 else (f"{proposal.get('qty')} shares" if proposal.get('qty') is not None else "all shares")
+                    msg = f"Paper order submitted: EXIT {prop_symbol} for {qty_str}. Price: ${price_used:.2f}. Mode: paper only."
+                self.telegram.send_message("✅ " + msg)
 
                 if prop_side == "buy":
                     other_buys = self.storage.fetch_all("SELECT id FROM trade_proposals WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
@@ -1684,10 +1596,16 @@ class TradingService:
             else:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
                 self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (parsed.proposal_id,))
-                if "refused to trade on stale data" in result.reason:
+                
+                # Format failure message
+                if "could not get a fresh Alpaca price" in result.reason:
+                    self.telegram.send_message(result.reason)
+                elif "Price moved too much" in result.reason:
+                    self.telegram.send_message(f"No order placed for {prop_symbol}. {result.reason}. A refreshed proposal is required.")
+                elif "no longer fresh" in result.reason:
                     self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
                 else:
-                    self.telegram.send_message(f"⚠️ Approved, but no order was placed. Reason: {result.reason}.")
+                    self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
                 continue
         self.notify_expired_proposals()
         self._expire_pending_batches(notify=True)
@@ -1878,6 +1796,155 @@ class TradingService:
             return True
         return False
 
+    def _calculate_volatility_aware_bps_limit(self, proposal_payload: dict[str, Any], base_bps: float, hard_cap_bps: float) -> float:
+        stop_distance_pct = float(proposal_payload.get("stop_distance_pct") or 2.0)
+        volatility_adjusted_bps = base_bps * (stop_distance_pct / 2.0)
+        return min(max(base_bps, volatility_adjusted_bps), hard_cap_bps)
+
+    def _execute_final_revalidation(
+        self,
+        row: dict[str, Any],
+        proposal: dict[str, Any],
+        prop_symbol: str,
+        prop_side: str,
+        is_add: bool,
+        approval_id: str,
+        batch_row: dict[str, Any] = None
+    ) -> tuple[Any, float | None, Any, str | None, float | None, float | None]:
+        refreshed_price_val = None
+        refreshed_price_at = None
+        price_refreshed_at = None
+        refreshed_price_age_seconds = None
+        price_move_bps_since_proposal = None
+        block_reason = None
+        now_dt = datetime.now(UTC)
+
+        # General safety pre-flights
+        if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
+            block_reason = "this build supports paper mode only"
+        elif (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+            block_reason = "kill switch active"
+        elif not self.storage.writable():
+            block_reason = "database is not writable"
+
+        # Expiry check
+        if block_reason is None and batch_row is not None:
+            if self._proposal_or_candidate_expired(row, batch_row):
+                block_reason = "Proposal expired"
+
+        # Retrieve parameters from config
+        telegram_cfg = self.config.get("telegram", {})
+        refresh_required = telegram_cfg.get("approval_price_refresh_required", True)
+        max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 120)
+        max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
+
+        # Fetch latest price
+        if block_reason is None and self.broker is not None:
+            try:
+                trade = self.broker.get_latest_price(prop_symbol)
+                refreshed_price_val = float(_value(trade, "price", 0) or 0)
+                refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
+                if refreshed_price_at:
+                    price_refreshed_at = refreshed_price_at.isoformat()
+                    refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
+            except Exception as e:
+                logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
+
+        # Check market open status
+        market_open = False
+        if block_reason is None and self.broker is not None:
+            try:
+                market_open = self.broker.is_market_open()
+            except Exception:
+                market_open = False
+
+        # Get the proposal price
+        proposal_price = proposal.get("latest_price") or row.get("current_price") or row.get("price")
+        if proposal_price is not None:
+            proposal_price = float(proposal_price)
+
+        # Perform revalidation checks
+        if block_reason is None:
+            if refresh_required:
+                if refreshed_price_val is None or refreshed_price_val <= 0:
+                    block_reason = "Price refresh failed or price is unavailable"
+                elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
+                    block_reason = "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
+                elif not market_open:
+                    block_reason = "Market is closed"
+                elif proposal_price is not None and proposal_price > 0:
+                    price_move_bps_since_proposal = (abs(refreshed_price_val - proposal_price) / proposal_price) * 10000
+                    # Make price movement limit volatility-aware
+                    hard_cap_bps = float(telegram_cfg.get("approval_max_price_move_hard_cap_bps", 75.0))
+                    volatility_aware_limit_bps = self._calculate_volatility_aware_bps_limit(proposal, float(max_price_move_bps), hard_cap_bps)
+                    
+                    # Store final limit used in proposal dict
+                    proposal["approval_price_move_limit_bps"] = volatility_aware_limit_bps
+                    
+                    if price_move_bps_since_proposal > volatility_aware_limit_bps:
+                        block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {volatility_aware_limit_bps:.1f} bps)"
+            else:
+                if not market_open:
+                    block_reason = "Market is closed"
+
+        if block_reason is None:
+            block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
+
+        if block_reason:
+            result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
+            return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
+
+        # Get authoritative runtime state to evaluate fresh exposure snapshot
+        try:
+            state = self._authoritative_runtime_state(force=True)
+            snapshot_fresh = self._get_exposure_snapshot(state["positions"], state["account"])
+        except Exception as e:
+            logger.warning("Failed to retrieve authoritative snapshot during revalidation: %s", e)
+            snapshot_fresh = None
+
+        if refreshed_price_val is not None:
+            proposal["latest_price"] = refreshed_price_val
+        if refreshed_price_at is not None:
+            proposal["price_at"] = refreshed_price_at.isoformat()
+
+        approved_notional = float(row.get("notional") or 0.0)
+        proposal["approved_notional"] = approved_notional
+
+        # Recalculate dynamic size if sizing enabled and buy
+        if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
+            try:
+                bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
+                size_dict = self._calculate_dynamic_size(
+                    prop_symbol,
+                    float(proposal.get("score", 70.0) or 70.0),
+                    proposal.get("volatility_regime", "normal"),
+                    refreshed_price_val,
+                    bars_fresh,
+                    snapshot_fresh,
+                    is_add=is_add
+                )
+
+                recalc_notional = size_dict["final_notional"]
+                
+                # Cap recalculated size at approved notional to satisfy approved-notional invariant
+                if approved_notional > 0.0 and recalc_notional > approved_notional:
+                    final_notional = approved_notional
+                    proposal["notional_reduced_by_cap"] = True
+                else:
+                    final_notional = recalc_notional
+                    
+                proposal["notional"] = final_notional
+                proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val > 0 else size_dict["suggested_shares"]
+            except Exception as e:
+                logger.warning("Recalculate dynamic size failed during revalidation: %s", e)
+
+        # Execute
+        proposal["status"] = "approved"
+        context = self._portfolio_context(proposal, approval_valid=True)
+        result = Executor(self.broker, self._risk_engine(row.get("id"), "final")).execute(proposal, context)
+
+        return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
+
     def _approve_batch_candidate(self, proposal_id: str, sender: str, raw_text: str, batch_row: dict[str, Any]) -> tuple[bool, str, str | None]:
         rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=? AND status='pending'", (proposal_id,))
         if not rows:
@@ -1920,91 +1987,12 @@ class TradingService:
         prop_side = row.get("side", "").lower()
         proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
         final_revalidation_started_at = iso_now()
-        block_reason = None
-        refreshed_price_val = None
-        refreshed_price_at = None
-        price_refreshed_at = None
-        refreshed_price_age_seconds = None
-        price_move_bps_since_proposal = None
-        now_dt = datetime.now(UTC)
+        proposal = {**json.loads(row.get("payload") or "{}"), **row}
+        is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
 
-        if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
-            block_reason = "not in paper mode / live enabled"
-        elif (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
-            block_reason = "kill switch active"
-        elif not self.storage.writable():
-            block_reason = "database is not writable"
-
-        telegram_cfg = self.config.get("telegram", {})
-        refresh_required = telegram_cfg.get("approval_price_refresh_required", True)
-        max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 60)
-        max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
-
-        if block_reason is None and self.broker is not None:
-            try:
-                trade = self.broker.get_latest_price(prop_symbol)
-                refreshed_price_val = float(_value(trade, "price", 0) or 0)
-                refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
-                if refreshed_price_at:
-                    price_refreshed_at = refreshed_price_at.isoformat()
-                    refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
-            except Exception as e:
-                logger.warning("Failed to refresh price for batch candidate %s: %s", prop_symbol, e)
-
-        market_open = False
-        if block_reason is None and self.broker is not None:
-            try:
-                market_open = self.broker.is_market_open()
-            except Exception:
-                market_open = False
-
-        proposal_price = proposal.get("latest_price") or row.get("current_price")
-        if block_reason is None:
-            if self._proposal_or_candidate_expired(row, batch_row):
-                block_reason = "Proposal expired"
-            if refresh_required:
-                if refreshed_price_val is None or refreshed_price_val <= 0:
-                    block_reason = "Price refresh failed or price is unavailable"
-                elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
-                    block_reason = "The proposal price is no longer fresh, so the system refused to trade on stale data. A new proposal is required."
-                elif not market_open:
-                    block_reason = "Market is closed"
-                elif proposal_price is not None and float(proposal_price) > 0:
-                    price_move_bps_since_proposal = (abs(refreshed_price_val - float(proposal_price)) / float(proposal_price)) * 10000
-                    if price_move_bps_since_proposal > max_price_move_bps:
-                        block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {max_price_move_bps} bps)"
-            elif not market_open:
-                block_reason = "Market is closed"
-        if block_reason is None:
-            block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
-
-        if block_reason:
-            result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
-        else:
-            try:
-                state = self._authoritative_runtime_state(force=True)
-                snapshot_fresh = self._get_exposure_snapshot(state["positions"], state["account"])
-                if refreshed_price_val is not None:
-                    proposal["latest_price"] = refreshed_price_val
-                if refreshed_price_at is not None:
-                    proposal["price_at"] = refreshed_price_at.isoformat()
-                if self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
-                    bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
-                    size_dict = self._calculate_dynamic_size(
-                        prop_symbol,
-                        float(proposal.get("score", 70.0) or 70.0),
-                        proposal.get("volatility_regime", "normal"),
-                        float(refreshed_price_val or proposal.get("latest_price") or 0.0),
-                        bars_fresh,
-                        snapshot_fresh,
-                        is_add=proposal.get("action") == "add" or bool(proposal.get("is_add", False)),
-                    )
-                    proposal["notional"] = size_dict["final_notional"]
-                    proposal["qty"] = size_dict["suggested_shares"]
-                context = self._portfolio_context(proposal, approval_valid=True)
-                result = Executor(self.broker, self._risk_engine(proposal_id, "final")).execute(proposal, context)
-            except Exception as e:
-                result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=str(e))
+        result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal = self._execute_final_revalidation(
+            row, proposal, prop_symbol, prop_side, is_add, approval_id, batch_row
+        )
 
         final_revalidation_completed_at = iso_now()
         self.storage.execute(
@@ -2032,17 +2020,37 @@ class TradingService:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
             self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
             self._mark_position_management_proposal_handled(proposal, "submitted")
+            
+            # Format success message
+            price_used = refreshed_price_val or proposal.get("latest_price") or 0.0
+            qty_est = proposal.get("qty") or 0.0
+            
             if prop_side == "buy":
-                self.telegram.send_message(f"✅ Paper order submitted: Buy {prop_symbol} for ${float(proposal.get('notional') or 0.0):.0f}. Mode: paper only.")
+                action_type = "ADD TO WINNER" if is_add else "NEW ENTRY"
+                approved_notional = float(row.get("notional") or 0.0)
+                final_notional = float(proposal.get("notional") or 0.0)
+                if final_notional < approved_notional:
+                    msg = f"Paper order submitted: {action_type} {prop_symbol} for ${final_notional:.2f}. Approved: ${approved_notional:.2f}. Final size reduced by validation. Price: ${price_used:.2f} (approx {qty_est:.4f} shares). Mode: paper only."
+                else:
+                    msg = f"Paper order submitted: {action_type} {prop_symbol} for ${final_notional:.2f}. Approved: ${approved_notional:.2f}. Final: ${final_notional:.2f}. Price: ${price_used:.2f} (approx {qty_est:.4f} shares). Mode: paper only."
             else:
-                qty_val = proposal.get("qty")
-                qty_str = f"{qty_val} shares" if qty_val is not None else f"${float(proposal.get('notional') or 0.0):.0f}"
-                self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {qty_str}. Mode: paper only.")
+                qty_str = f"{qty_est:.4f} shares" if qty_est > 0 else (f"{proposal.get('qty')} shares" if proposal.get('qty') is not None else "all shares")
+                msg = f"Paper order submitted: EXIT {prop_symbol} for {qty_str}. Price: ${price_used:.2f}. Mode: paper only."
+            self.telegram.send_message("✅ " + msg)
             return True, "submitted", None
 
         self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
         self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (proposal_id,))
-        self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
+        
+        # Format failure message
+        if "could not get a fresh Alpaca price" in result.reason:
+            self.telegram.send_message(result.reason)
+        elif "Price moved too much" in result.reason:
+            self.telegram.send_message(f"No order placed for {prop_symbol}. {result.reason}. A refreshed proposal is required.")
+        elif "no longer fresh" in result.reason:
+            self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
+        else:
+            self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
         return False, "blocked", result.reason
 
     def _should_auto_execute(self, proposal: dict[str, Any]) -> bool:
@@ -3649,8 +3657,44 @@ class TradingService:
                         "symbol": symbol, "reason": "suppressed_due_to_exit_priority", "score": score
                     })
 
+                # Check proposal send-time freshness
+                price_age_seconds = None
+                if price_at:
+                    try:
+                        if hasattr(price_at, "timestamp"):
+                            if price_at.tzinfo is None:
+                                price_at_utc = price_at.replace(tzinfo=UTC)
+                            else:
+                                price_at_utc = price_at.astimezone(UTC)
+                            price_age_seconds = (now - price_at_utc).total_seconds()
+                        else:
+                            price_at_dt = datetime.fromisoformat(str(price_at).replace("Z", "+00:00"))
+                            if price_at_dt.tzinfo is None:
+                                price_at_dt = price_at_dt.replace(tzinfo=UTC)
+                            price_age_seconds = (now - price_at_dt).total_seconds()
+                    except Exception as e:
+                        logger.warning("Error calculating price age for symbol %s: %s", symbol, e)
+
+                send_time_threshold = float(self.config.get("telegram", {}).get("proposal_price_freshness_threshold_seconds", 60.0))
+                price_is_stale_at_send = False
+                if price <= 0.0 or price_at is None or price_age_seconds is None or price_age_seconds > send_time_threshold or price_age_seconds < -5:
+                    price_is_stale_at_send = True
+
+                if proposal_allowed and price_is_stale_at_send:
+                    proposal_allowed = False
+                    no_action_reason = "proposal not sent: stale Alpaca price at proposal creation (price timestamp must be fresh)"
+                    self.storage.audit(self.run_id, "proposal_blocked", {
+                        "symbol": symbol,
+                        "reasons": [no_action_reason],
+                        "price": price,
+                        "price_at": str(price_at),
+                        "price_age_seconds": price_age_seconds
+                    })
+
                 if not proposal_allowed:
-                    if is_buy and suppressed_by_sleep_mode == 1:
+                    if no_action_reason:
+                        pass
+                    elif is_buy and suppressed_by_sleep_mode == 1:
                         pass
                     elif is_buy and candidate_suppression_reason == "suppressed_due_to_exit_priority":
                         pass # Reason already set
@@ -3759,6 +3803,10 @@ class TradingService:
                                 "notional_adjustment_note": notional_adjustment_note,
                                 "latest_price": price,
                                 "price_at": str(price_at),
+                                "proposal_price": price,
+                                "proposal_price_timestamp": price_at.isoformat() if hasattr(price_at, "isoformat") else str(price_at),
+                                "proposal_price_source": "alpaca",
+                                "proposal_price_age_seconds_at_send": price_age_seconds,
                                 "historical_bars": len(bars),
                                 "volume": volume,
                                 "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,

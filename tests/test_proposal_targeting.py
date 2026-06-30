@@ -244,7 +244,7 @@ def test_telegram_process_reply_to_and_acknowledgements(temp_storage, mock_confi
 
     # Verify initial and final check success messages
     assert any("Received: YES for SPY paper buy proposal" in m for m in bot.messages)
-    assert any("Paper order submitted: Buy SPY for $5" in m for m in bot.messages)
+    assert any("Paper order submitted: NEW ENTRY SPY for $5.00" in m for m in bot.messages)
 
     # Verify database updates
     app_rows = temp_storage.fetch_all("SELECT * FROM approvals WHERE proposal_id='spy-prop'")
