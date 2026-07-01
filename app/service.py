@@ -4373,6 +4373,18 @@ class TradingService:
         )
         expired_cnt = expired[0]["cnt"] if expired else 0
 
+        active_proposals = self.storage.fetch_all(
+            """
+            SELECT COUNT(*) as cnt
+            FROM trade_proposals
+            WHERE status IN ('pending','approved')
+              AND datetime(created_at) <= datetime(?)
+              AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        active_proposal_cnt = active_proposals[0]["cnt"] if active_proposals else 0
+
         promotions = self.storage.fetch_all(
             "SELECT symbol, from_tier, to_tier, reason, payload FROM symbol_promotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
             (window_start_iso,),
@@ -4508,7 +4520,8 @@ class TradingService:
                 "orders": order_cnt,
                 "fills": fill_cnt,
                 "gpt_calls": gpt_calls,
-                "expired": expired_cnt
+                "expired": expired_cnt,
+                "active_proposals": active_proposal_cnt,
             },
             "exit_first_blocker": "; ".join(sorted({x.get("_blocker") for x in symbols_list if x.get("_blocker")} - {None})),
             "summary": summary_str,
@@ -4883,8 +4896,11 @@ class TradingService:
             ]
             if counts["global_research_only_observation"]:
                 lines.append(f"Global research-only observation: {counts['global_research_only_observation']}.")
-            if counts["held_static_positions"]:
-                lines.append(f"Held static positions: {counts['held_static_positions']}.")
+            if counts["held_positions"]:
+                lines.append(
+                    f"Held positions: {counts['held_positions']} total "
+                    f"({counts['held_static_positions']} static, {counts['held_dynamic_positions']} dynamic)."
+                )
             if top:
                 lines.append(f"Top: {top}.")
             lines.extend([provider_line, next_line, "No trade proposals/orders created."])
@@ -4952,7 +4968,9 @@ class TradingService:
             "global_research_only_observation": len(sets["global_research_only_symbols"]),
             "dynamic_paper_tradable": len(sets["dynamic_paper_tradable_symbols"]),
             "static_paper_tradable_total": len(sets["static_paper_tradable_symbols"]),
+            "held_positions": len(sets["held_symbols"]),
             "held_static_positions": len(sets["held_static_symbols"]),
+            "held_dynamic_positions": len(sets["held_dynamic_symbols"]),
         }
 
     def _dynamic_universe_compact_symbol_sets(self) -> dict[str, list[str]]:
@@ -4971,7 +4989,9 @@ class TradingService:
             "global_research_only_symbols": set(),
             "dynamic_paper_tradable_symbols": set(),
             "static_paper_tradable_symbols": set(self._configured_static_paper_symbols()),
+            "held_symbols": set(),
             "held_static_symbols": set(),
+            "held_dynamic_symbols": set(),
         }
         for row in rows:
             symbol = str(row.get("symbol") or "").upper()
@@ -5003,15 +5023,24 @@ class TradingService:
                 symbols["observation_symbols"].add(symbol)
                 symbols["alpaca_compatible_observation_symbols"].add(symbol)
         static = symbols["static_paper_tradable_symbols"]
+        dynamic = symbols["dynamic_paper_tradable_symbols"]
         try:
             positions = self.broker.get_positions()
-            symbols["held_static_symbols"] = {str(_value(p, "symbol", "")).upper() for p in positions if str(_value(p, "symbol", "")).upper() in static}
+            held = {str(_value(p, "symbol", "")).upper() for p in positions if str(_value(p, "symbol", "")).upper()}
+            symbols["held_symbols"] = held
+            symbols["held_static_symbols"] = held & static
+            symbols["held_dynamic_symbols"] = held & dynamic
         except Exception:
             try:
                 rows = self.storage.fetch_all("SELECT DISTINCT symbol FROM positions")
-                symbols["held_static_symbols"] = {str(r.get("symbol") or "").upper() for r in rows if str(r.get("symbol") or "").upper() in static}
+                held = {str(r.get("symbol") or "").upper() for r in rows if str(r.get("symbol") or "").upper()}
+                symbols["held_symbols"] = held
+                symbols["held_static_symbols"] = held & static
+                symbols["held_dynamic_symbols"] = held & dynamic
             except Exception:
+                symbols["held_symbols"] = set()
                 symbols["held_static_symbols"] = set()
+                symbols["held_dynamic_symbols"] = set()
         return {key: sorted(value) for key, value in symbols.items()}
 
     def _configured_static_paper_symbols(self) -> list[str]:
@@ -5278,14 +5307,18 @@ class TradingService:
             "global_research_only_observation_count": counts.get("global_research_only_observation", 0),
             "dynamic_paper_tradable_count": counts.get("dynamic_paper_tradable", 0),
             "static_paper_tradable_total_count": counts.get("static_paper_tradable_total", 0),
+            "held_position_count": counts.get("held_positions", 0),
             "held_static_position_count": counts.get("held_static_positions", 0),
+            "held_dynamic_position_count": counts.get("held_dynamic_positions", 0),
             "research_candidate_symbols": symbol_sets.get("research_candidate_symbols") or [],
             "observation_symbols": symbol_sets.get("observation_symbols") or [],
             "alpaca_compatible_observation_symbols": symbol_sets.get("alpaca_compatible_observation_symbols") or [],
             "global_research_only_symbols": symbol_sets.get("global_research_only_symbols") or [],
             "dynamic_paper_tradable_symbols": symbol_sets.get("dynamic_paper_tradable_symbols") or [],
             "static_paper_tradable_symbols": symbol_sets.get("static_paper_tradable_symbols") or [],
+            "held_symbols": symbol_sets.get("held_symbols") or [],
             "held_static_symbols": symbol_sets.get("held_static_symbols") or [],
+            "held_dynamic_symbols": symbol_sets.get("held_dynamic_symbols") or [],
             "provider_material_status": {
                 "status": provider_material.get("status"),
                 "active_core_cooldowns": provider_material.get("active_core_cooldowns") or [],
@@ -5358,7 +5391,9 @@ class TradingService:
             "global_research_only_symbols": sorted(snapshot.get("global_research_only_symbols") or []),
             "dynamic_paper_tradable_symbols": sorted(snapshot.get("dynamic_paper_tradable_symbols") or []),
             "static_paper_tradable_symbols": sorted(snapshot.get("static_paper_tradable_symbols") or []),
+            "held_symbols": sorted(snapshot.get("held_symbols") or []),
             "held_static_symbols": sorted(snapshot.get("held_static_symbols") or []),
+            "held_dynamic_symbols": sorted(snapshot.get("held_dynamic_symbols") or []),
             "provider_material_status": {
                 "status": provider.get("status"),
                 "active_core_cooldowns": sorted(provider.get("active_core_cooldowns") or []),
@@ -5386,7 +5421,9 @@ class TradingService:
             "global_research_only_observation_count",
             "dynamic_paper_tradable_count",
             "static_paper_tradable_total_count",
+            "held_position_count",
             "held_static_position_count",
+            "held_dynamic_position_count",
         }
         keys = set(previous) | set(snapshot)
         changed = {key for key in keys if previous.get(key) != snapshot.get(key)}

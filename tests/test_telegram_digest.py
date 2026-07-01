@@ -904,6 +904,8 @@ def test_digest_uses_authoritative_expired_state(temp_storage):
     msg = service.telegram.messages[0]
     assert "Status: Proposal expired — no order" in msg
     assert "Expired with no order: XLV." in msg
+    assert "No active proposal remains; previous proposal expired with no order." in msg
+    assert "No action needed unless approving the active proposal above." not in msg
 
 
 def test_digest_cluster_summary_names_held_symbols_without_duplicate_strongest(temp_storage):

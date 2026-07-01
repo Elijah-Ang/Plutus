@@ -744,7 +744,12 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             highest_str = "None"
             blocker_str = "None"
             
-        action_note = "No action needed unless approving the active proposal above." if actions.get('proposals', 0) > 0 else "No action needed."
+        if actions.get("active_proposals", 0) > 0:
+            action_note = "No action needed unless approving the active proposal above."
+        elif actions.get("expired", 0) > 0 and actions.get("orders", 0) == 0:
+            action_note = "No active proposal remains; previous proposal expired with no order."
+        else:
+            action_note = "No action needed."
         summary_lines = [
             "Summary:",
             f"* Highest tradable candidate: {highest_str}",
@@ -798,8 +803,10 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
 
         msg_parts.append(f"Summary: {digest_data.get('summary', '')}\n")
 
-        if actions.get('proposals', 0) > 0:
+        if actions.get("active_proposals", 0) > 0:
             msg_parts.append("No action needed unless approving the active proposal above.")
+        elif actions.get("expired", 0) > 0 and actions.get("orders", 0) == 0:
+            msg_parts.append("No active proposal remains; previous proposal expired with no order.")
         else:
             msg_parts.append("No action needed.")
 

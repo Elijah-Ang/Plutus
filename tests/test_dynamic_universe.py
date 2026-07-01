@@ -782,7 +782,7 @@ def test_compact_counts_use_static_total_and_held_static_separately(temp_storage
     broker = PromotionBroker(
         market_open=False,
         next_open=datetime(2026, 6, 29, 13, 30, tzinfo=UTC),
-        positions=[{"symbol": "DIA"}, {"symbol": "IWM"}],
+        positions=[{"symbol": "DIA"}, {"symbol": "IWM"}, {"symbol": "SMH"}],
     )
     service = _weekend_service(temp_storage, cfg, broker=broker)
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-weekend", "candidate_briefs": 0}
@@ -793,7 +793,8 @@ def test_compact_counts_use_static_total_and_held_static_separately(temp_storage
     assert "Observation total: 7" in msg
     assert "Dynamic paper-tradable: 1" in msg
     assert "Static paper-tradable: 4" in msg
-    assert "Held static positions: 2" in msg
+    assert "Held positions: 3 total (2 static, 1 dynamic)." in msg
+    assert "Held static positions:" not in msg
     assert "Global research-only observation: 1" in msg
     assert "Static paper-tradable: 2" not in msg
     rows = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='dynamic_universe_market_closed_status_snapshot' ORDER BY created_at DESC LIMIT 1")
@@ -802,7 +803,9 @@ def test_compact_counts_use_static_total_and_held_static_separately(temp_storage
     assert snapshot["global_research_only_symbols"] == ["2800.HK"]
     assert snapshot["dynamic_paper_tradable_symbols"] == ["SMH"]
     assert snapshot["static_paper_tradable_symbols"] == ["DIA", "IWM", "QQQ", "SPY"]
+    assert snapshot["held_symbols"] == ["DIA", "IWM", "SMH"]
     assert snapshot["held_static_symbols"] == ["DIA", "IWM"]
+    assert snapshot["held_dynamic_symbols"] == ["SMH"]
 
 
 def test_weekend_provider_wording_separates_eod_symbol_no_data_from_endpoint_status(temp_storage):
