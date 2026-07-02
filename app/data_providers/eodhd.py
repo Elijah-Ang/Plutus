@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import time
 import urllib.parse
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from typing import Any
 
 from app.data_providers.base import ProviderResponse
@@ -26,6 +28,7 @@ class EODHDProvider:
         self.api_key = api_key or get_secret(env_name) or get_secret(str(secret_name))
         self.base_url = str(self.provider_cfg.get("base_url", "https://eodhd.com/api")).rstrip("/")
         self.timeout = float(self.provider_cfg.get("timeout_seconds", 10))
+        self.total_timeout = float(self.provider_cfg.get("total_timeout_seconds", max(self.timeout, 15)))
         self.max_retries = int(self.provider_cfg.get("max_retries", 2))
         self.backoff = float(self.provider_cfg.get("retry_backoff_seconds", 2))
         self.cache = ProviderCache(storage)
@@ -69,6 +72,31 @@ class EODHDProvider:
             return "provider_unavailable", "no_data"
         return "provider_unavailable", f"http_{status_code}"
 
+    def _classify_network_error(self, exc: BaseException) -> tuple[str, str, str]:
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(reason, (socket.timeout, TimeoutError)) or isinstance(exc, (socket.timeout, TimeoutError)):
+            return "provider_timeout", "timeout", "provider_unavailable"
+        if isinstance(reason, socket.gaierror):
+            return "provider_dns_error", "dns_error", "provider_unavailable"
+        if isinstance(reason, ssl.SSLError) or isinstance(exc, ssl.SSLError):
+            return "provider_tls_error", "tls_error", "provider_unavailable"
+        return "provider_unavailable", type(reason).__name__, "provider_unavailable"
+
+    def _record_provider_network_event(self, event_type: str, capability: str, endpoint: str, error_category: str, attempt: int) -> None:
+        if not self.run_id:
+            return
+        self.storage.audit(
+            self.run_id,
+            event_type,
+            {
+                "provider": self.name,
+                "capability": capability,
+                "endpoint": endpoint.split("/", 1)[0],
+                "error_category": error_category,
+                "attempt": attempt,
+            },
+        )
+
     def _request(self, endpoint: str, params: dict[str, Any], cache_ttl: int, *, used_for_scoring: bool = False) -> ProviderResponse:
         capability = self._capability_name(endpoint)
         if not self.api_key:
@@ -99,11 +127,17 @@ class EODHDProvider:
         request_params = {**clean_params, "api_token": self.api_key, "fmt": "json"}
         url = f"{self.base_url}/{endpoint.lstrip('/')}?{urllib.parse.urlencode(request_params, doseq=True)}"
         last_error = None
+        deadline = time.monotonic() + self.total_timeout
         for attempt in range(max(1, self.max_retries + 1)):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = "total_timeout"
+                self._record_provider_network_event("provider_timeout", capability, endpoint, last_error, attempt + 1)
+                break
             self.calls_this_run += 1
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "TradingAgent/1.0"})
-                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                with urllib.request.urlopen(req, timeout=min(self.timeout, remaining)) as response:
                     raw = response.read().decode("utf-8")
                 data = json.loads(raw) if raw else None
                 self.cache.set(self.name, endpoint, clean_params, data, cache_ttl)
@@ -134,11 +168,16 @@ class EODHDProvider:
                     )
                     return ProviderResponse(self.name, endpoint, status, None, category)
                 if attempt < self.max_retries:
-                    time.sleep(self.backoff)
+                    time.sleep(min(self.backoff, max(0.0, deadline - time.monotonic())))
             except Exception as exc:
-                last_error = type(exc).__name__
+                event_type, last_error, status = self._classify_network_error(exc)
+                self._record_provider_network_event(event_type, capability, endpoint, last_error, attempt + 1)
+                if event_type in {"provider_dns_error", "provider_tls_error"}:
+                    self.cache.record_health(self.name, status, self.run_id, {"endpoint": endpoint, "error": last_error})
+                    self.cache.record_capability(self.name, capability, status=status, run_id=self.run_id, error_category=str(last_error), used_for_scoring=used_for_scoring, cooldown_minutes=15, detail={"endpoint": endpoint})
+                    return ProviderResponse(self.name, endpoint, status, None, last_error)
                 if attempt < self.max_retries:
-                    time.sleep(self.backoff)
+                    time.sleep(min(self.backoff, max(0.0, deadline - time.monotonic())))
         self.cache.record_health(self.name, "provider_unavailable", self.run_id, {"endpoint": endpoint, "error": last_error})
         cooldown = None if last_error == "no_data" else 15
         self.cache.record_capability(self.name, capability, status="provider_unavailable", run_id=self.run_id, error_category=str(last_error), used_for_scoring=used_for_scoring, cooldown_minutes=cooldown, detail={"endpoint": endpoint})

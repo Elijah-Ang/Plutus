@@ -106,6 +106,7 @@ eodhd:
   api_key_secret_name: TradingAgent.EODHD_API_KEY
   base_url: https://eodhd.com/api
   timeout_seconds: 10
+  total_timeout_seconds: 15
   max_retries: 2
   retry_backoff_seconds: 2
   plan_limited_cooldown_minutes: 1440
@@ -132,6 +133,11 @@ dynamic_universe:
   enabled: true
   provider: eodhd
   paper_only: true
+  runtime_orchestration:
+    research_wall_clock_timeout_seconds: 240
+    market_open_research_timeout_seconds: 60
+    stale_research_timeout_seconds: 900
+    max_forward_outcome_updates_per_cycle: 25
   llm_explanations:
     enabled: false
     max_candidates_per_run: 5

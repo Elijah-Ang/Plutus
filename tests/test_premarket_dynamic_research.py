@@ -66,9 +66,14 @@ class FakeService:
         self.run_cycle_called = False
         self.notify_called = False
         self.notify_reason = None
+        self.research_calls = []
         FakeService.instances.append(self)
 
-    def run_dynamic_universe_research_only(self):
+    def cleanup_stale_research_runs(self):
+        return 0
+
+    def run_dynamic_universe_research_only(self, **kwargs):
+        self.research_calls.append(kwargs)
         return self.config.get("_research_results", [])
 
     def notify_premarket_dynamic_universe_status(self, results, trading_skipped_reason):
@@ -300,6 +305,29 @@ def test_market_open_runs_trading_without_duplicate_dynamic_universe(monkeypatch
     service = FakeService.instances[0]
     assert service.run_cycle_called is True
     assert service.run_dynamic_universe is False
+    assert service.research_calls[0]["run_types"] == ["intraday_light_refresh", "event_triggered_refresh"]
+    assert "daily_deep_research" in service.research_calls[0]["skip_run_types"]
+    assert FakeStorage.last_instance.finished[0] == "completed"
+
+
+def test_market_open_research_timeout_does_not_block_cycle_completion(monkeypatch):
+    from app import main
+
+    FakeService.instances = []
+    monkeypatch.setattr(main, "load_config", lambda config_path=None: _config([{"status": "timeout", "run_type": "dynamic_universe", "reason": "research_wall_clock_timeout"}]))
+    monkeypatch.setattr(main, "Storage", FakeStorage)
+    monkeypatch.setattr(main, "AlpacaBroker", lambda config: OpenBroker())
+    monkeypatch.setattr(main, "TradingService", FakeService)
+    monkeypatch.setattr(main, "run_core_preflight", _ok_core)
+    monkeypatch.setattr(main, "run_research_preflight", _ok_research)
+    monkeypatch.setattr(main, "run_trading_preflight", _open_trading)
+    monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
+
+    assert main.run_once() == 0
+
+    service = FakeService.instances[0]
+    assert service.run_cycle_called is True
+    assert service.research_calls
     assert FakeStorage.last_instance.finished[0] == "completed"
 
 

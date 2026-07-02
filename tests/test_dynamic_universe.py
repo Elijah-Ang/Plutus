@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
-from urllib.error import HTTPError
+import socket
+import ssl
+from urllib.error import HTTPError, URLError
 from typing import Any
 from unittest.mock import patch
 
@@ -1709,3 +1711,52 @@ def test_eodhd_cooldown_by_run_id(temp_storage):
     # Check if disabled with run_id "run-B" -> should NOT be disabled (False)
     disabled_run_b = cache.capability_disabled("eodhd", "news", current_run_id="run-B")
     assert disabled_run_b is False
+
+
+def test_stale_running_research_rows_are_marked_timeout(temp_storage):
+    run_id = "run-stale-cleanup"
+    old_started = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    temp_storage.execute(
+        "INSERT INTO universe_research_runs(id,run_id,research_type,provider,status,started_at,ended_at,symbols_considered,symbols_promoted,symbols_demoted,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        ("research-stale", run_id, "daily_deep_research", "eodhd", "running", old_started, None, 0, 0, 0, "{}"),
+    )
+    cfg = load_config()
+    cfg["dynamic_universe"]["runtime_orchestration"] = {"stale_research_timeout_seconds": 60}
+    service = TradingService(cfg, temp_storage, MockBroker(), run_id)
+
+    cleaned = service.cleanup_stale_research_runs()
+
+    assert cleaned == 1
+    row = temp_storage.fetch_all("SELECT status,ended_at,detail FROM universe_research_runs WHERE id='research-stale'")[0]
+    assert row["status"] == "timeout"
+    assert row["ended_at"] is not None
+    assert json.loads(row["detail"])["reason"] == "stale_running_timeout"
+    audit = temp_storage.fetch_all("SELECT event_type FROM audit_events WHERE event_type='research_timed_out'")
+    assert audit
+
+
+def test_eodhd_provider_records_dns_tls_and_timeout_events(temp_storage, monkeypatch):
+    cfg = load_config()
+    cfg["eodhd"]["max_retries"] = 0
+    cfg["eodhd"]["timeout_seconds"] = 1
+    cfg["eodhd"]["total_timeout_seconds"] = 1
+
+    def _run_with_error(exc):
+        temp_storage.execute("DELETE FROM audit_events")
+        temp_storage.execute("DELETE FROM data_provider_health")
+        temp_storage.execute("DELETE FROM data_provider_capabilities")
+        monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(exc))
+        provider = EODHDProvider(cfg, temp_storage, run_id="run-provider", api_key="test-token")
+        return provider.get_historical_bars("SPY.US")
+
+    dns = _run_with_error(URLError(socket.gaierror("temporary failure")))
+    assert dns.error == "dns_error"
+    assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type='provider_dns_error'")
+
+    tls = _run_with_error(URLError(ssl.SSLError("tls failed")))
+    assert tls.error == "tls_error"
+    assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type='provider_tls_error'")
+
+    timeout = _run_with_error(TimeoutError("timed out"))
+    assert timeout.error == "timeout"
+    assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type='provider_timeout'")

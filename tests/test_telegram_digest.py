@@ -76,6 +76,34 @@ def test_digest_config_defaults():
     assert config["digest"]["telegram_digest_enabled"] is True
     assert config["digest"]["telegram_digest_interval_minutes"] == 30
 
+
+def test_digest_records_blocked_reason_when_cycle_count_too_low(temp_storage):
+    config = {
+        "mode": "paper",
+        "digest": {
+            "telegram_digest_enabled": True,
+            "telegram_digest_interval_minutes": 30,
+            "telegram_digest_market_hours_only": True,
+            "telegram_digest_include_observation_symbols": True,
+            "telegram_digest_max_symbols": 6,
+            "telegram_digest_use_gpt": False,
+            "telegram_digest_min_cycles_required": 2,
+            "telegram_digest_send_when_market_closed": False,
+        },
+        "market_profiles": {"core": {"status": "active", "watchlist": ["SPY"], "observation_watchlist": []}},
+        "dynamic_universe": {"enabled": False},
+        "telegram": {},
+    }
+    service = TradingService(config, temp_storage, MockBroker(), "run-digest-blocked")
+    service.telegram = MockTelegramBot()
+
+    service.check_and_send_digest()
+
+    rows = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='digest_blocked_reason'")
+    assert rows
+    assert json.loads(rows[-1]["detail"])["reason"] == "insufficient_cycles"
+    assert temp_storage.fetch_all("SELECT * FROM telegram_digests") == []
+
 def test_digest_wording_and_structure():
     digest_data = {
         "market_open_status": "Open",

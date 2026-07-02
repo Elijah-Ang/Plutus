@@ -30,6 +30,7 @@ from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
 from .risk_engine import RiskCheck, RiskEngine, _dt
 from .reconciliation import BrokerReconciler
+from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
 from .telegram_bot import TelegramBot
 from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason, format_sgt
@@ -357,18 +358,91 @@ class TradingService:
         )
         return bool(rows)
 
-    def _run_dynamic_universe_due(self) -> list[dict[str, Any]]:
+    def _runtime_orchestration_cfg(self) -> dict[str, Any]:
+        return self.config.get("runtime_orchestration") or self.config.get("dynamic_universe", {}).get("runtime_orchestration", {})
+
+    def _run_dynamic_universe_due(self, run_types: list[str] | None = None, skip_run_types: list[str] | None = None) -> list[dict[str, Any]]:
         engine = self._dynamic_universe_engine()
         if not engine:
             return []
-        run_types = ["daily_deep_research", "intraday_light_refresh", "post_market_review", "weekly_cleanup"]
+        run_types = run_types or ["daily_deep_research", "intraday_light_refresh", "post_market_review", "weekly_cleanup"]
         if self._dynamic_universe_event_refresh_due():
             run_types.append("event_triggered_refresh")
+        if skip_run_types:
+            skip_set = set(skip_run_types)
+            run_types = [run_type for run_type in run_types if run_type not in skip_set]
         try:
             return engine.run_due(run_types=run_types)
+        except WallClockTimeout:
+            raise
         except Exception as exc:
             self.storage.audit(self.run_id, "dynamic_universe_due_failed", {"error": type(exc).__name__})
             return []
+
+    def cleanup_stale_research_runs(self, timeout_seconds: int | None = None, reason: str = "stale_running_timeout", run_id: str | None = None) -> int:
+        cfg = self._runtime_orchestration_cfg()
+        timeout = int(cfg.get("stale_research_timeout_seconds", 900) if timeout_seconds is None else timeout_seconds)
+        cutoff = (datetime.now(UTC) - timedelta(seconds=timeout)).isoformat()
+        if run_id:
+            rows = self.storage.fetch_all(
+                "SELECT * FROM universe_research_runs WHERE status='running' AND run_id=? AND datetime(started_at) <= datetime(?)",
+                (run_id, cutoff),
+            )
+        else:
+            rows = self.storage.fetch_all(
+                "SELECT * FROM universe_research_runs WHERE status='running' AND datetime(started_at) <= datetime(?)",
+                (cutoff,),
+            )
+        for row in rows:
+            detail = {}
+            try:
+                detail = json.loads(row.get("detail") or "{}")
+            except Exception:
+                detail = {}
+            detail.update({"reason": reason, "timeout_seconds": timeout})
+            self.storage.execute(
+                "UPDATE universe_research_runs SET status=?, ended_at=?, detail=? WHERE id=?",
+                ("timeout", iso_now(), json_dumps(detail), row["id"]),
+            )
+            self.storage.audit(
+                row.get("run_id") or self.run_id,
+                "research_timed_out",
+                {
+                    "research_run_id": row["id"],
+                    "research_type": row.get("research_type"),
+                    "started_at": row.get("started_at"),
+                    "reason": reason,
+                    "timeout_seconds": timeout,
+                },
+            )
+        return len(rows)
+
+    def run_dynamic_universe_research_only(
+        self,
+        timeout_seconds: int | None = None,
+        run_types: list[str] | None = None,
+        skip_run_types: list[str] | None = None,
+        label: str = "dynamic_universe_research",
+    ) -> list[dict[str, Any]]:
+        cfg = self._runtime_orchestration_cfg()
+        timeout = int(timeout_seconds or cfg.get("research_wall_clock_timeout_seconds", 240))
+        self.cleanup_stale_research_runs()
+        detail = {"timeout_seconds": timeout, "run_types": run_types, "skip_run_types": skip_run_types}
+        self.storage.audit(self.run_id, "research_started", detail)
+        try:
+            with wall_clock_timeout(timeout, label):
+                results = self._run_dynamic_universe_due(run_types=run_types, skip_run_types=skip_run_types)
+        except WallClockTimeout:
+            timed_out = self.cleanup_stale_research_runs(timeout_seconds=0, reason="research_wall_clock_timeout", run_id=self.run_id)
+            self.storage.audit(
+                self.run_id,
+                "research_timed_out",
+                {**detail, "reason": "research_wall_clock_timeout", "timed_out_rows": timed_out},
+            )
+            return [{"status": "timeout", "run_type": "dynamic_universe", "reason": "research_wall_clock_timeout"}]
+        statuses = sorted({str(r.get("status") or "unknown") for r in results}) if results else ["not_due"]
+        self.storage.audit(self.run_id, "research_completed", {**detail, "statuses": statuses, "results": len(results)})
+        return results
 
     def _sleep_mode_blocks_approval(self, proposal: dict[str, Any]) -> bool:
         side = str(proposal.get("side") or proposal.get("candidate_side") or "").lower()
@@ -4199,6 +4273,7 @@ class TradingService:
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
         if not digest_config.get("telegram_digest_enabled", True):
+            self.storage.audit(self.run_id, "digest_blocked_reason", {"reason": "disabled"})
             return
 
         now = datetime.now(UTC)
@@ -4210,6 +4285,7 @@ class TradingService:
             market_open = False
 
         if not market_open and not digest_config.get("telegram_digest_send_when_market_closed", False):
+            self.storage.audit(self.run_id, "digest_blocked_reason", {"reason": "market_closed"})
             return
 
         # 1. Throttling
@@ -4220,6 +4296,11 @@ class TradingService:
             last_sent_dt = datetime.fromisoformat(last_sent[0]["sent_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)
             elapsed_mins = (now - last_sent_dt).total_seconds() / 60
             if elapsed_mins < (interval_minutes - 2):
+                self.storage.audit(
+                    self.run_id,
+                    "digest_blocked_reason",
+                    {"reason": "throttle", "elapsed_minutes": elapsed_mins, "interval_minutes": interval_minutes},
+                )
                 return
 
         # 2. Minimum cycles
@@ -4233,6 +4314,11 @@ class TradingService:
         cycle_count = cycles[0]["cnt"] if cycles else 0
         min_cycles = digest_config.get("telegram_digest_min_cycles_required", 2)
         if cycle_count < min_cycles:
+            self.storage.audit(
+                self.run_id,
+                "digest_blocked_reason",
+                {"reason": "insufficient_cycles", "cycle_count": cycle_count, "min_cycles": min_cycles, "window_start": window_start_iso, "window_end": now.isoformat()},
+            )
             return
 
         # 3. Retrieve rows
@@ -4257,6 +4343,7 @@ class TradingService:
             (window_start_iso,)
         )
         if not rows:
+            self.storage.audit(self.run_id, "digest_blocked_reason", {"reason": "no_market_memory_rows", "window_start": window_start_iso, "window_end": now.isoformat()})
             return
 
         import collections
@@ -4268,7 +4355,13 @@ class TradingService:
             symbol_rows[sym].append(row)
 
         if not symbol_rows:
+            self.storage.audit(self.run_id, "digest_blocked_reason", {"reason": "no_allowed_symbols", "window_start": window_start_iso, "window_end": now.isoformat()})
             return
+        self.storage.audit(
+            self.run_id,
+            "digest_eligible",
+            {"cycle_count": cycle_count, "min_cycles": min_cycles, "symbol_count": len(symbol_rows), "window_start": window_start_iso, "window_end": now.isoformat()},
+        )
 
         try:
             current_positions = list(self.broker.get_positions())
@@ -4545,6 +4638,7 @@ class TradingService:
             status = "sent"
         except Exception as e:
             status = "error"
+            self.storage.audit(self.run_id, "digest_send_failed", {"error": type(e).__name__})
             self.storage.record_check(self.run_id, "digest_send", False, str(e), stage="digest")
 
         symbols_str = ", ".join(f"{x['symbol']}:{x['status']}" for x in top_watched)
@@ -4840,7 +4934,7 @@ class TradingService:
         return rows_by_tier
 
     def run_cycle(self, run_dynamic_universe: bool = True) -> None:
-        self._update_forward_outcomes()
+        self.storage.audit(self.run_id, "scan_cycle_started", {"run_dynamic_universe": run_dynamic_universe})
         BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
@@ -4855,9 +4949,8 @@ class TradingService:
         if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
             self.scan()
         self.check_and_send_digest()
-
-    def run_dynamic_universe_research_only(self) -> list[dict[str, Any]]:
-        return self._run_dynamic_universe_due()
+        self.storage.audit(self.run_id, "scan_cycle_completed", {"run_dynamic_universe": run_dynamic_universe})
+        self._update_forward_outcomes()
 
     def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
@@ -6788,7 +6881,13 @@ class TradingService:
         if not pending:
             return
 
-        logger.info("Updating %d pending trade outcomes...", len(pending))
+        cfg = self._runtime_orchestration_cfg()
+        max_updates = int(cfg.get("max_forward_outcome_updates_per_cycle", 25))
+        total_pending = len(pending)
+        if max_updates > 0:
+            pending = pending[:max_updates]
+        logger.info("Updating %d of %d pending trade outcomes...", len(pending), total_pending)
+        self.storage.audit(self.run_id, "forward_outcomes_update_started", {"pending": total_pending, "processing": len(pending)})
         for out in pending:
             out_id = out["id"]
             trade_id = out["trade_id"]
@@ -6891,6 +6990,7 @@ class TradingService:
                     max_shadow = max([float(s["forward_return_20d"]) for s in shadows if s["forward_return_20d"] is not None] + [-999.0])
                     beat = 1 if ret_20d > max_shadow else 0
                     self.storage.execute("UPDATE trade_outcomes SET beat_shadow_alternatives=? WHERE id=?", (beat, out_id))
+        self.storage.audit(self.run_id, "forward_outcomes_update_completed", {"pending": total_pending, "processed": len(pending)})
 
     def _create_shadow_trade_from_proposal(self, prop_row: dict[str, Any], reason: str) -> None:
         exists = self.storage.fetch_all("SELECT 1 FROM shadow_trades WHERE id=?", (prop_row["id"],))
