@@ -1097,9 +1097,67 @@ class TradingService:
             "cash": snapshot["cash"]
         }
 
+    def _process_sleep_mode_emergency_timeouts(self) -> None:
+        timed_out = self.storage.fetch_all(
+            """
+            SELECT *
+            FROM trade_proposals
+            WHERE status='pending'
+              AND emergency_exit_triggered=1
+              AND emergency_exit_mode='sleep'
+              AND emergency_exit_auto_execute_due_at IS NOT NULL
+              AND emergency_exit_auto_execute_due_at <= ?
+            """,
+            (iso_now(),),
+        )
+        for row in timed_out:
+            proposal_id = row["id"]
+            symbol = row["symbol"]
+            proposal = {**json.loads(row["payload"] or "{}"), **row}
+            qty = proposal.get("qty", 0)
+
+            self.storage.execute(
+                "UPDATE trade_proposals SET status='approved', emergency_exit_auto_execute_attempted_at=? WHERE id=?",
+                (iso_now(), proposal_id),
+            )
+            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_reached", {"symbol": symbol, "proposal_id": proposal_id, "mode": "sleep"})
+
+            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
+            if success:
+                self.storage.execute("UPDATE trade_proposals SET emergency_exit_final_decision='submitted' WHERE id=?", (proposal_id,))
+                self.telegram.send_message(f"✅ Sleep-mode emergency paper order submitted: Sell {symbol} for {qty} shares. Mode: paper only.")
+                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "proposal_id": proposal_id, "mode": "sleep"})
+            else:
+                self.storage.execute(
+                    "UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=?, emergency_exit_final_decision='blocked' WHERE id=?",
+                    (err_reason, proposal_id),
+                )
+                self.telegram.send_message(f"⚠️ Sleep-mode emergency exit was blocked by final validation. Reason: {err_reason}. No order was placed.")
+                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "proposal_id": proposal_id, "reason": err_reason, "mode": "sleep"})
+
+        stale_timed = self.storage.fetch_all(
+            """
+            SELECT id, symbol
+            FROM trade_proposals
+            WHERE status='pending'
+              AND emergency_exit_triggered=1
+              AND COALESCE(emergency_exit_mode,'')!='sleep'
+              AND emergency_exit_auto_execute_due_at IS NOT NULL
+              AND emergency_exit_auto_execute_due_at <= ?
+            """,
+            (iso_now(),),
+        )
+        for row in stale_timed:
+            self.storage.execute(
+                "UPDATE trade_proposals SET emergency_exit_auto_execute_due_at=NULL, emergency_exit_auto_execute_attempted_at=? WHERE id=?",
+                (iso_now(), row["id"]),
+            )
+            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {"symbol": row["symbol"], "proposal_id": row["id"], "reason": "non_sleep_mode"})
+
     def process_telegram(self) -> None:
         self.storage.expire_proposals()
         self._expire_pending_batches(notify=False)
+        self._process_sleep_mode_emergency_timeouts()
         updates = self.telegram.get_updates(timeout=0)
         if not updates:
             self.notify_expired_proposals()
@@ -1706,18 +1764,7 @@ class TradingService:
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
-        # Emergency exits are approval-only. Stale timeout metadata from older
-        # builds must never submit or approve an order automatically.
-        timed_out = self.storage.fetch_all(
-            "SELECT id, symbol FROM trade_proposals WHERE status='pending' AND emergency_exit_triggered=1 AND emergency_exit_auto_execute_due_at IS NOT NULL AND emergency_exit_auto_execute_due_at <= ?",
-            (iso_now(),),
-        )
-        for row in timed_out:
-            self.storage.execute(
-                "UPDATE trade_proposals SET emergency_exit_auto_execute_due_at=NULL, emergency_exit_auto_execute_attempted_at=? WHERE id=?",
-                (iso_now(), row["id"]),
-            )
-            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {"symbol": row["symbol"], "proposal_id": row["id"], "reason": "approval_required"})
+        self._process_sleep_mode_emergency_timeouts()
 
     def _update_batch_status(self, batch_id: str) -> None:
         rows = self.storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE batch_id=?", (batch_id,))
@@ -2924,14 +2971,21 @@ class TradingService:
 
                                 if total_score >= 95 or position_drawdown_pct <= -0.12:
                                     emergency_exit_mode = "extreme"
+                                    emergency_exit_wait_seconds = 0
                                 elif sleep_mode_active:
                                     emergency_exit_mode = "sleep"
+                                    emergency_exit_wait_seconds = 15
                                 else:
                                     emergency_exit_mode = "normal"
+                                    emergency_exit_wait_seconds = None
 
-                                emergency_exit_wait_seconds = None
-                                emergency_exit_auto_execute_due_at = None
-                                emergency_exit_final_decision = "approval_required"
+                                if emergency_exit_wait_seconds is not None:
+                                    due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
+                                    emergency_exit_auto_execute_due_at = due_at.isoformat()
+                                    emergency_exit_final_decision = "auto_final_validation_pending"
+                                else:
+                                    emergency_exit_auto_execute_due_at = None
+                                    emergency_exit_final_decision = "approval_required"
 
                                 signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
 
@@ -4063,17 +4117,35 @@ class TradingService:
                                             proposal["status"] = "blocked"
                                             proposal["emergency_exit_block_reason"] = "emergency_drawdown_unavailable"
                                             proposal["emergency_exit_final_decision"] = "blocked"
+                                        elif emergency_exit_mode == "extreme":
+                                            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
+                                            if success:
+                                                emergency_exit_final_decision = "submitted"
+                                                proposal["status"] = "approved"
+                                                proposal["emergency_exit_final_decision"] = "submitted"
+                                                self.telegram.send_message(
+                                                    f"🚨 [EXTREME EMERGENCY EXIT] Immediate paper market order submitted for {symbol} ({qty_held} shares) after final validation. Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}."
+                                                )
+                                                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "score": emergency_exit_score, "mode": "extreme"})
+                                            else:
+                                                emergency_exit_block_reason = err_reason
+                                                emergency_exit_final_decision = "blocked"
+                                                proposal["status"] = "blocked"
+                                                proposal["emergency_exit_block_reason"] = err_reason
+                                                proposal["emergency_exit_final_decision"] = "blocked"
+                                                self.telegram.send_message(
+                                                    f"🚨 [EXTREME EMERGENCY EXIT] Triggered for {symbol} but final validation blocked execution: {err_reason}."
+                                                )
+                                                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason, "mode": "extreme"})
                                         else:
                                             proposal["status"] = "pending"
-                                            proposal["emergency_exit_final_decision"] = "approval_required"
-                                            emergency_exit_final_decision = "approval_required"
+                                            proposal["emergency_exit_final_decision"] = emergency_exit_final_decision
                                         if emergency_exit_mode == "extreme":
-                                            self.telegram.send_message(
-                                                f"🚨 [EXTREME EMERGENCY EXIT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. Approval required; no order will be submitted without Telegram approval and final validation."
-                                            )
+                                            pass
                                         elif emergency_exit_mode == "sleep":
                                             self.telegram.send_message(
-                                                f"🚨 [SLEEP MODE EMERGENCY EXIT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. Approval required; no automatic sell will occur."
+                                                f"🚨 [SLEEP MODE EMERGENCY EXIT] Triggered for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. "
+                                                f"Auto-submitting a paper sell in 15 seconds unless cancelled. Final validation still runs before any order."
                                             )
                                         else:
                                             self.telegram.send_message(

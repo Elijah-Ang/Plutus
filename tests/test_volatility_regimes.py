@@ -164,6 +164,7 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
 
 def test_state_based_proposal_deduplication(temp_storage):
     config = load_config()
+    config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()

@@ -267,7 +267,7 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
 - **GPT Reviews and Timeout Explanations**:
   - BUY Proposals: GPT review is required by default. Missing/throttled GPT review defers the buy proposal.
   - EXIT Proposals: GPT explanation is optional and attempted with a 3-second timeout limit. If GPT is slow or unavailable, the exit proposal immediately falls back to rule-based explanation without delay. GPT cannot decide or block a deterministic exit.
-  - Exit proposals may bypass GPT delays, but never bypass Telegram approval, unused-approval consumption, RiskEngine/final validation, price freshness checks, or paper-only/live-disabled gates.
+  - Normal exit proposals may bypass GPT delays, but never bypass Telegram approval, unused-approval consumption, RiskEngine/final validation, price freshness checks, or paper-only/live-disabled gates. Emergency exits are the guarded exception: sleep-mode and extreme emergency exits can auto-submit paper sells only after final validation passes.
   - structured fields are stored and format message shows plain English descriptions of the reviews.
 - **Dynamic Expiry Rules**:
   - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
@@ -626,10 +626,10 @@ To support the bot's current 10-minute schedule during trading hours:
   - Close < MA200 and position losing
   - Adverse move >= 1.5 ATR and drawdown <= -6%
 - **Proposal Modes**:
-  - **Extreme Mode** (score >= 95 or drawdown <= -12%): urgent approval-gated emergency paper sell proposal.
-  - **Sleep Mode**: approval-gated emergency paper sell proposal, alerts sent to Telegram.
+  - **Extreme Mode** (score >= 95 or drawdown <= -12%): immediate emergency paper sell submission after final validation.
+  - **Sleep Mode**: timed emergency paper sell submission after final validation, so protective exits can still occur while the operator is asleep.
   - **Normal Mode**: approval-gated emergency paper sell proposal.
-- **Revalidation**: A sell order can be submitted only after Telegram approval. Final validation then enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
+- **Revalidation**: Normal sells require Telegram approval before submission. Sleep-mode and extreme emergency exits are the protective exception, but still enforce paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence before any order.
 - **GPT Exit Explanations**: Exit reviews are optionally explained by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout. GPT unavailability does not block deterministic exit proposal creation and never authorizes an order.
 
 ## 30. Change Log
@@ -645,6 +645,6 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.
 - **2026-06-23**: Implemented Telegram reply-to proposal targeting, ambiguity resolution, instant acknowledgements, simultaneous BUY limits with 6-tier tie-breaking, and GPT review requirement/deferral logic.
 - **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
-- **2026-07-03**: Strengthened exit/sell measurement with drawdown-from-entry, drawdown-from-peak, peak/giveback, trailing-stop, and time-stop reporting. Emergency and deterministic exits are proposal-only before Telegram approval and final validation; no automatic selling path is enabled.
+- **2026-07-03**: Strengthened exit/sell measurement with drawdown-from-entry, drawdown-from-peak, peak/giveback, trailing-stop, and time-stop reporting. Normal deterministic exits remain proposal-only before Telegram approval and final validation; sleep-mode and extreme emergency exits retain guarded paper auto-submit after final validation for loss protection.
 - **2026-06-24**: Added paper-only portfolio intelligence: Performance Lab setup/shadow/outcome tables, dynamic position sizing, ETF cluster exposure controls, add-to-winner eligibility, richer BUY proposal explanations, actual-vs-shadow Excel sheets, and regression tests.
 - **2026-06-29**: Aligned final validation profile resolution for dynamic paper-tradable symbols, ensuring Telegram-approved dynamic candidates are correctly evaluated against active dynamic watchlists rather than static config watchlists, with specific final validation rules and error messages for demoted, unsupported, or stale dynamic symbols.
