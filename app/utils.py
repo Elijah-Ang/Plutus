@@ -678,6 +678,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         exit_watch = digest_data.get("exit_watch")
         if exit_watch:
             actions_sec += f"\n* {exit_watch}"
+        proposal_capacity = digest_data.get("proposal_capacity")
+        if proposal_capacity:
+            actions_sec += f"\n* {proposal_capacity}"
         sections.append(actions_sec)
         
         # 3-6. Tiers
@@ -815,6 +818,8 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             )
         if digest_data.get("exit_watch"):
             msg_parts.append(f"{digest_data['exit_watch']}\n")
+        if digest_data.get("proposal_capacity"):
+            msg_parts.append(f"{digest_data['proposal_capacity']}\n")
 
         exit_first_blocker = digest_data.get("exit_first_blocker")
         if exit_first_blocker:

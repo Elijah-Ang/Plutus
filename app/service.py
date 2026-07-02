@@ -4370,6 +4370,44 @@ class TradingService:
 
                 self._run_performance_lab(profile_results, active_watchlist, positions, now, snapshot)
 
+    def _proposal_capacity_digest_line(self, window_start_iso: str, window_end_iso: str, performance_lab: dict[str, Any]) -> str:
+        portfolio_cfg = self.config.get("portfolio_behavior", {})
+        risk_cfg = self.config.get("risk", {})
+        max_session = (
+            portfolio_cfg.get("max_new_buy_proposals_per_session")
+            or portfolio_cfg.get("max_new_buy_orders_per_day")
+            or risk_cfg.get("max_trades_per_day")
+            or 0
+        )
+        try:
+            max_session_int = int(max_session)
+        except (TypeError, ValueError):
+            max_session_int = 0
+
+        used_rows = self.storage.fetch_all(
+            "SELECT COUNT(*) AS cnt FROM trade_proposals WHERE side='buy' AND date(created_at)=date('now')"
+        )
+        used = int(used_rows[0].get("cnt") or 0) if used_rows else 0
+        remaining = max(0, max_session_int - used) if max_session_int > 0 else 0
+
+        top_blocker_rows = self.storage.fetch_all(
+            """
+            SELECT blocker, COUNT(*) AS cnt
+            FROM performance_blockers
+            WHERE datetime(created_at) >= datetime(?)
+              AND datetime(created_at) <= datetime(?)
+            GROUP BY blocker
+            ORDER BY cnt DESC, blocker
+            LIMIT 1
+            """,
+            (window_start_iso, window_end_iso),
+        )
+        top_blocker = top_blocker_rows[0]["blocker"] if top_blocker_rows else "none"
+        suppressed = int(performance_lab.get("suppressed") or 0)
+        if max_session_int <= 0:
+            return f"Proposal capacity: daily cap not configured. Suppressed setups tracked: {suppressed}. Top blocker: {top_blocker}."
+        return f"Proposal capacity: {used}/{max_session_int} used today, {remaining} remaining. Suppressed setups tracked: {suppressed}. Top blocker: {top_blocker}."
+
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
         if not digest_config.get("telegram_digest_enabled", True):
@@ -4749,6 +4787,8 @@ class TradingService:
                 reason = watch_rows[0].get("reason") or watch_rows[0].get("review_type") or "exit review"
                 exit_watch = f"Exit watch: {watch_rows[0]['symbol']} {reason}; no proposal yet."
 
+        proposal_capacity = self._proposal_capacity_digest_line(window_start_iso, now.isoformat(), performance_lab)
+
         digest_data = {
             "market_open_status": "Open" if market_open else "Closed",
             "window_start": window_start,
@@ -4780,6 +4820,7 @@ class TradingService:
             "provider_status": provider_status_str,
             "performance_lab": performance_lab,
             "exit_watch": exit_watch,
+            "proposal_capacity": proposal_capacity,
         }
 
         from .utils import format_digest_message

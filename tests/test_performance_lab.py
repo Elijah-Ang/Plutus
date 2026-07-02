@@ -8,6 +8,7 @@ import pandas as pd
 from app.service import TradingService
 from app.storage import Storage
 from app.utils import format_digest_message, load_config
+from app.reports import SHEETS
 
 
 @dataclass(frozen=True)
@@ -197,13 +198,43 @@ def test_performance_lab_digest_line_is_compact():
             "summary": "No proposals.",
             "performance_lab": {"tracked": 42, "proposed": 1, "suppressed": 41, "outcome_status": "outcomes pending"},
             "exit_watch": "Exit watch: no exit triggers.",
+            "proposal_capacity": "Proposal capacity: 1/3 used today, 2 remaining. Suppressed setups tracked: 18. Top blocker: no_entry_signal.",
         },
         {"mode": "paper"},
     )
 
     assert "Performance Lab: tracked 42 setups, proposed 1, suppressed 41, outcomes pending." in msg
     assert "Exit watch: no exit triggers." in msg
+    assert "Proposal capacity: 1/3 used today, 2 remaining. Suppressed setups tracked: 18. Top blocker: no_entry_signal." in msg
     assert "approve" not in msg.lower()
+
+
+def test_proposal_frequency_report_sheets_exist():
+    sheet_names = {name for name, _query in SHEETS}
+
+    assert "Proposal Capacity Status" in sheet_names
+    assert "Proposal Bottleneck Summary" in sheet_names
+    assert "Suppressed Setup Blockers" in sheet_names
+    assert "Capacity-Limited Candidates" in sheet_names
+    assert "Proposal Frequency Audit" in sheet_names
+
+
+def test_performance_lab_capacity_blockers_are_classified(tmp_path):
+    service, _storage, _broker = _service(tmp_path)
+    signal = LabSignal("ENTRY", "buy", "SPY", "trend passed")
+    res = _result("SPY", signal, score=80.0, cooldown_applied=1, cooldown_reason="pending_proposal_exists")
+
+    blockers = service._performance_lab_blockers(
+        res,
+        signal,
+        "suppressed due to pending proposal limit and cooldown",
+        {"SPY"},
+        "fresh",
+    )
+    blocker_names = {name for name, _reason in blockers}
+
+    assert "pending_proposal_limit" in blocker_names
+    assert "cooldown" in blocker_names
 
 
 def test_performance_lab_safety_config_invariants():
