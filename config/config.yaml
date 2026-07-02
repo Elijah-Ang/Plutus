@@ -101,6 +101,14 @@ risk_budget:
 data_providers:
   dynamic_universe_provider: eodhd
 
+alpaca:
+  timeouts:
+    read_seconds: 10
+    market_data_seconds: 10
+    reconcile_seconds: 10
+    order_lookup_seconds: 10
+    order_submission_seconds: 20
+
 eodhd:
   enabled: true
   api_key_secret_name: TradingAgent.EODHD_API_KEY

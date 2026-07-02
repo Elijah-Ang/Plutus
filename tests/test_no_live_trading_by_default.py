@@ -1,6 +1,6 @@
 import pytest
 
-from app.broker_alpaca import AlpacaBroker
+from app.broker_alpaca import AlpacaBroker, AlpacaBrokerError
 from app.utils import load_config
 
 
@@ -46,17 +46,16 @@ def test_missing_alpaca_credentials_fail_safely(monkeypatch):
 
 def test_invalid_alpaca_credentials_fail_safely():
     broker = AlpacaBroker({"mode": "paper"}, "invalid_key", "invalid_secret")
-    from alpaca.common.exceptions import APIError
-    with pytest.raises(APIError):
+    with pytest.raises(AlpacaBrokerError) as exc_info:
         broker.get_account()
+    assert exc_info.value.category == "alpaca_auth_error"
 
 
 def test_no_broker_secrets_are_logged():
     key = "super_secret_alpaca_key_12345"
     secret = "super_secret_alpaca_secret_67890"
     broker = AlpacaBroker({"mode": "paper"}, key, secret)
-    from alpaca.common.exceptions import APIError
-    with pytest.raises(APIError) as exc_info:
+    with pytest.raises(AlpacaBrokerError) as exc_info:
         broker.get_account()
     
     err_str = str(exc_info.value)

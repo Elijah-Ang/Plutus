@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import os
+import socket
+import ssl
 from datetime import datetime, timedelta
 from typing import Any
 
 from .broker_interface import BrokerInterface
 from .capabilities import require_live_trading_support
+from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .utils import get_secret
+
+
+class AlpacaBrokerError(RuntimeError):
+    def __init__(self, category: str, operation: str, original: BaseException | None = None) -> None:
+        self.category = category
+        self.operation = operation
+        self.original = original
+        super().__init__(f"{category}: Alpaca {operation} failed")
 
 
 class AlpacaBroker(BrokerInterface):
@@ -21,6 +32,7 @@ class AlpacaBroker(BrokerInterface):
         secret = secret_key or get_secret("ALPACA_SECRET_KEY")
         if not key or not secret:
             raise RuntimeError("Alpaca credentials are not configured")
+        self.timeout_cfg = config.get("alpaca", {}).get("timeouts", {})
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.trading.client import TradingClient
@@ -29,27 +41,68 @@ class AlpacaBroker(BrokerInterface):
         self.trading = TradingClient(key, secret, paper=self.mode == "paper")
         self.data = StockHistoricalDataClient(key, secret)
 
+    def _timeout_seconds(self, kind: str) -> float:
+        defaults = {
+            "read": 10.0,
+            "market_data": 10.0,
+            "reconcile": 10.0,
+            "order_submission": 20.0,
+            "order_lookup": 10.0,
+        }
+        return float(self.timeout_cfg.get(f"{kind}_seconds", defaults[kind]))
+
+    def _classify_error(self, exc: BaseException) -> str:
+        if isinstance(exc, WallClockTimeout):
+            return "alpaca_timeout"
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)) or isinstance(exc, (socket.timeout, TimeoutError)):
+            return "alpaca_timeout"
+        if isinstance(reason, socket.gaierror):
+            return "alpaca_dns_error"
+        if isinstance(reason, ssl.SSLError) or isinstance(exc, ssl.SSLError):
+            return "alpaca_tls_error"
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        message = str(exc).lower()
+        if status_code == 429 or "rate limit" in message or "too many requests" in message:
+            return "alpaca_rate_limit"
+        if status_code in {401, 403} or "unauthorized" in message or "forbidden" in message:
+            return "alpaca_auth_error"
+        if exc.__class__.__name__.lower().endswith("apierror") or status_code is not None:
+            return "alpaca_api_error"
+        return "alpaca_unknown_error"
+
+    def _call(self, operation: str, kind: str, func: Any) -> Any:
+        try:
+            with wall_clock_timeout(self._timeout_seconds(kind), f"alpaca_{operation}"):
+                return func()
+        except AlpacaBrokerError:
+            raise
+        except WallClockTimeout as exc:
+            raise AlpacaBrokerError(self._classify_error(exc), operation, exc) from None
+        except Exception as exc:
+            raise AlpacaBrokerError(self._classify_error(exc), operation, exc) from None
+
     def get_account(self) -> Any:
-        return self.trading.get_account()
+        return self._call("get_account", "read", self.trading.get_account)
 
     def get_positions(self) -> list[Any]:
-        return list(self.trading.get_all_positions())
+        return list(self._call("get_positions", "read", self.trading.get_all_positions))
 
     def get_open_orders(self) -> list[Any]:
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
-        return list(self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)))
+        return list(self._call("get_open_orders", "read", lambda: self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))))
 
     def get_latest_price(self, symbol: str) -> Any:
         from alpaca.data.requests import StockLatestTradeRequest
-        return self.data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol]
+        return self._call("get_latest_price", "market_data", lambda: self.data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol])
 
     def get_historical_bars(self, symbol: str, timeframe: str = "1Day", limit: int = 250) -> Any:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
         tf = TimeFrame.Day if timeframe.lower() in {"1day", "day", "1d"} else TimeFrame.Hour
         request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=datetime.now().astimezone() - timedelta(days=max(limit * 2, 365)), limit=limit)
-        return self.data.get_stock_bars(request).df
+        return self._call("get_historical_bars", "market_data", lambda: self.data.get_stock_bars(request).df)
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":
@@ -60,19 +113,19 @@ class AlpacaBroker(BrokerInterface):
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         common = dict(symbol=symbol, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=client_order_id, **notional_or_qty)
         request = LimitOrderRequest(limit_price=limit_price, **common) if order_type == "limit" else MarketOrderRequest(**common)
-        return self.trading.submit_order(order_data=request)
+        return self._call("submit_order", "order_submission", lambda: self.trading.submit_order(order_data=request))
 
     def cancel_order(self, order_id: str) -> Any:
-        return self.trading.cancel_order_by_id(order_id)
+        return self._call("cancel_order", "order_submission", lambda: self.trading.cancel_order_by_id(order_id))
 
     def get_order(self, order_id: str) -> Any:
-        return self.trading.get_order_by_id(order_id)
+        return self._call("get_order", "order_lookup", lambda: self.trading.get_order_by_id(order_id))
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Any:
-        return self.trading.get_order_by_client_id(client_order_id)
+        return self._call("get_order_by_client_order_id", "order_lookup", lambda: self.trading.get_order_by_client_id(client_order_id))
 
     def get_clock(self) -> Any:
-        return self.trading.get_clock()
+        return self._call("get_clock", "read", self.trading.get_clock)
 
     def get_loss_metrics(self) -> dict[str, float | None]:
         """Return positive loss amounts from authoritative Alpaca data."""
@@ -85,8 +138,12 @@ class AlpacaBroker(BrokerInterface):
         try:
             from alpaca.trading.requests import GetPortfolioHistoryRequest
 
-            history = self.trading.get_portfolio_history(
-                GetPortfolioHistoryRequest(period="1W", timeframe="1D", extended_hours=False)
+            history = self._call(
+                "get_portfolio_history",
+                "read",
+                lambda: self.trading.get_portfolio_history(
+                    GetPortfolioHistoryRequest(period="1W", timeframe="1D", extended_hours=False)
+                ),
             )
             equities = [float(value) for value in (getattr(history, "equity", None) or []) if value is not None and float(value) > 0]
             if len(equities) >= 2:
@@ -100,7 +157,7 @@ class AlpacaBroker(BrokerInterface):
 
     def get_asset(self, symbol: str) -> Any | None:
         try:
-            return self.trading.get_asset(symbol)
+            return self._call("get_asset", "read", lambda: self.trading.get_asset(symbol))
         except Exception:
             return None
 
