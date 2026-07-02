@@ -324,10 +324,23 @@ position_management:
     enabled: true
     activate_at_r: 1.0
     fallback_activate_at_profit_pct: 2.0
+    trailing_stop_start_gain_pct: 2.0
+    trailing_stop_giveback_pct: 1.5
     atr_multiplier: 2.0
     fallback_trailing_pct: 1.5
     require_close_below_stop: true
     sell_fraction: 0.50
+    require_telegram_approval: true
+  time_stop:
+    enabled: true
+    min_hold_cycles_before_time_stop: 12
+    min_hold_days_before_time_stop: 3.0
+    max_unrealized_gain_pct: 0.5
+    max_peak_gain_pct: 1.0
+    weak_trade_score_below: 60
+    deteriorating_score_delta_below: -5
+    proposal_enabled: true
+    sell_fraction: 1.0
     require_telegram_approval: true
   healthy_pullback_add:
     enabled: true

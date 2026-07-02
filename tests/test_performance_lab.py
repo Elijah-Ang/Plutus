@@ -196,11 +196,13 @@ def test_performance_lab_digest_line_is_compact():
             "actions": {"proposals": 0, "orders": 0, "fills": 0, "gpt_calls": 0, "expired": 0},
             "summary": "No proposals.",
             "performance_lab": {"tracked": 42, "proposed": 1, "suppressed": 41, "outcome_status": "outcomes pending"},
+            "exit_watch": "Exit watch: no exit triggers.",
         },
         {"mode": "paper"},
     )
 
     assert "Performance Lab: tracked 42 setups, proposed 1, suppressed 41, outcomes pending." in msg
+    assert "Exit watch: no exit triggers." in msg
     assert "approve" not in msg.lower()
 
 

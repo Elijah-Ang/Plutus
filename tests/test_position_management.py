@@ -104,11 +104,36 @@ def test_position_state_calculations_and_r_multiple():
     decision = classify(current_price=104.0, avg_entry_price=100.0, initial_stop_price=98.0, previous_state={"highest_price_since_entry": 105.0})
 
     assert round(decision.unrealized_profit_pct, 2) == 4.0
+    assert round(decision.drawdown_from_entry_pct, 2) == 0.0
+    assert round(decision.drawdown_from_peak_pct, 2) == -0.95
     assert decision.highest_price_since_entry == 105.0
     assert round(decision.max_unrealized_profit_pct, 2) == 5.0
     assert round(decision.pullback_from_peak_pct, 2) == 0.95
     assert round(decision.profit_giveback_ratio, 2) == 0.20
     assert round(decision.current_r_multiple, 2) == 2.0
+
+
+def test_drawdown_from_entry_computed_for_losing_position():
+    cfg = config()
+    cfg["position_management"]["profit_protection"]["enabled"] = False
+    cfg["position_management"]["profit_taking"]["enabled"] = False
+    cfg["position_management"]["trailing_stop"]["enabled"] = False
+    decision = classify(current_price=96.0, avg_entry_price=100.0, initial_stop_price=None, previous_state={"highest_price_since_entry": 101.0}, config=cfg)
+
+    assert round(decision.unrealized_profit_pct, 2) == -4.0
+    assert round(decision.drawdown_from_entry_pct, 2) == -4.0
+    assert round(decision.drawdown_from_peak_pct, 2) == -4.95
+
+
+def test_drawdown_from_peak_computed_after_winner_gives_back():
+    cfg = config()
+    cfg["position_management"]["profit_protection"]["enabled"] = False
+    cfg["position_management"]["profit_taking"]["enabled"] = False
+    cfg["position_management"]["trailing_stop"]["enabled"] = False
+    decision = classify(current_price=104.0, avg_entry_price=100.0, initial_stop_price=None, previous_state={"highest_price_since_entry": 110.0}, config=cfg)
+
+    assert round(decision.drawdown_from_entry_pct, 2) == 0.0
+    assert round(decision.drawdown_from_peak_pct, 2) == -5.45
 
 
 def test_trailing_stop_only_moves_upward():
@@ -180,6 +205,52 @@ def test_trailing_stop_breach_creates_exit():
     assert decision.is_actionable is True
 
 
+def test_trailing_stop_does_not_trigger_before_real_gain():
+    cfg = config()
+    cfg["position_management"]["profit_protection"]["enabled"] = False
+    cfg["position_management"]["profit_taking"]["enabled"] = False
+    decision = classify(current_price=99.0, avg_entry_price=100.0, previous_state={"highest_price_since_entry": 100.0, "trailing_stop_price": 98.5}, initial_stop_price=None, config=cfg)
+
+    assert decision.decision_type != "TRAILING_STOP_EXIT"
+    assert decision.action != "sell"
+
+
+def test_time_stop_review_creates_exit_candidate_after_stale_hold():
+    cfg = config()
+    cfg["position_management"]["profit_protection"]["enabled"] = False
+    cfg["position_management"]["profit_taking"]["enabled"] = False
+    cfg["position_management"]["trailing_stop"]["enabled"] = False
+    cfg["position_management"]["healthy_pullback_add"]["enabled"] = False
+    cfg["position_management"]["time_stop"] = {
+        "enabled": True,
+        "min_hold_cycles_before_time_stop": 12,
+        "min_hold_days_before_time_stop": 3.0,
+        "max_unrealized_gain_pct": 0.5,
+        "max_peak_gain_pct": 1.0,
+        "weak_trade_score_below": 60,
+        "deteriorating_score_delta_below": -5,
+        "proposal_enabled": True,
+        "sell_fraction": 1.0,
+    }
+
+    decision = classify(
+        current_price=100.2,
+        avg_entry_price=100.0,
+        previous_state={"highest_price_since_entry": 100.7},
+        initial_stop_price=None,
+        trade_score=55.0,
+        score_improvement=-6.0,
+        position_age_cycles=15,
+        position_age_days=4.0,
+        config=cfg,
+    )
+
+    assert decision.decision_type == "TIME_STOP_EXIT"
+    assert decision.action == "sell"
+    assert decision.is_actionable is True
+    assert decision.exit_review_needed is True
+
+
 def test_healthy_pullback_add_requires_winner_and_trend():
     decision = classify(
         current_price=101.2,
@@ -211,6 +282,8 @@ def test_position_management_tables_and_report_sheets_exist(tmp_path):
     assert "profit_exit_events" in tables
     assert "Position Management State" in sheet_names
     assert "Healthy Pullback Adds" in sheet_names
+    assert "Exit Review Status" in sheet_names
+    assert "Position Drawdown Metrics" in sheet_names
 
 
 class Broker:
@@ -282,6 +355,30 @@ def test_position_management_proposal_wording():
     assert "Paper profit-taking proposal" in msg
     assert "Current gain: +3.40%" in msg
     assert "Suggested action: Sell 25%" in msg
+
+
+def test_time_stop_proposal_wording():
+    msg = format_proposal_message(
+        {
+            "symbol": "SPY",
+            "side": "sell",
+            "qty": 1.0,
+            "notional": 100.0,
+            "expires_at": datetime.now(UTC).isoformat(),
+            "reason": "time stop review: no meaningful gain after hold period",
+            "position_management_decision_type": "TIME_STOP_EXIT",
+            "position_management_sell_fraction": 1.0,
+            "position_management_decision": {
+                "unrealized_profit_pct": 0.1,
+                "max_unrealized_profit_pct": 0.5,
+                "suggested_sell_fraction": 1.0,
+            },
+        },
+        {"mode": "paper", "live_enabled": False},
+    )
+
+    assert "Paper time-stop exit proposal" in msg
+    assert "Suggested action: Sell 100%" in msg
 
 
 def test_r_multiple_falls_back_safely_when_stop_equals_entry():

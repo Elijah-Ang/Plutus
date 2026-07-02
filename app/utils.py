@@ -463,6 +463,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 "TAKE_PROFIT_PARTIAL": "💰 Paper profit-taking proposal",
                 "PROFIT_PROTECT_EXIT": "🛡️ Paper profit-protection proposal",
                 "TRAILING_STOP_EXIT": "📉 Paper trailing-stop exit proposal",
+                "TIME_STOP_EXIT": "⏱️ Paper time-stop exit proposal",
             }
             header = f"{title_map.get(pm_type, '📄 Paper position-management proposal')}: {symbol}\n"
             current_gain = pm.get("unrealized_profit_pct")
@@ -674,6 +675,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
                 f"proposed {perf.get('proposed', 0)}, suppressed {perf.get('suppressed', 0)}, "
                 f"{perf.get('outcome_status', 'outcomes pending')}."
             )
+        exit_watch = digest_data.get("exit_watch")
+        if exit_watch:
+            actions_sec += f"\n* {exit_watch}"
         sections.append(actions_sec)
         
         # 3-6. Tiers
@@ -809,6 +813,8 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
                 f"Performance Lab: tracked {perf.get('tracked', 0)} setups, proposed {perf.get('proposed', 0)}, "
                 f"suppressed {perf.get('suppressed', 0)}, {perf.get('outcome_status', 'outcomes pending')}.\n"
             )
+        if digest_data.get("exit_watch"):
+            msg_parts.append(f"{digest_data['exit_watch']}\n")
 
         exit_first_blocker = digest_data.get("exit_first_blocker")
         if exit_first_blocker:

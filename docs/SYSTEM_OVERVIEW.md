@@ -256,14 +256,18 @@ The strategy generates trades, which are reviewed by OpenAI `gpt-5.4-mini` (or t
     7. Stable alphabetical symbol fallback
 - **Position Management Engine**:
   - Existing held positions are classified each scanner cycle before unrelated new BUY opportunities are proposed.
-  - Decision priority is deterministic: `EMERGENCY_EXIT`, `NORMAL_RISK_EXIT`, `PROFIT_PROTECT_EXIT`, `TAKE_PROFIT_PARTIAL`, `TRAILING_STOP_EXIT`, `HEALTHY_PULLBACK_ADD`, then `HOLD`.
-  - The engine tracks high-water price, peak unrealized profit, pullback from peak, profit giveback, R-multiple when an initial stop is known, ATR-based trailing stop, and dip-vs-trap classification.
-  - TAKE_PROFIT / PROFIT_PROTECT / TRAILING_STOP proposals are normal paper sell proposals and require Telegram approval plus final revalidation. They reduce exposure and are not blocked by BUY exposure caps.
+  - Decision priority is deterministic: `EMERGENCY_EXIT`, `NORMAL_RISK_EXIT`, `PROFIT_PROTECT_EXIT`, `TAKE_PROFIT_PARTIAL`, `TRAILING_STOP_EXIT`, `TIME_STOP_EXIT`, `HEALTHY_PULLBACK_ADD`, then `HOLD`.
+  - The engine tracks high-water price, peak unrealized profit, drawdown from entry, drawdown from peak, pullback from peak, profit giveback, position age/cycles, R-multiple when an initial stop is known, ATR-based trailing stop, and dip-vs-trap classification.
+  - MA50/MA200 trend breaks and configured drawdown stops can create deterministic sell candidates. Emergency drawdown uses real broker/local position price and entry data; if entry data cannot be trusted, the exit is blocked and audited rather than defaulting drawdown to zero.
+  - Trailing stops activate only after a real gain, then watch ATR/fallback trailing levels and peak giveback. A trailing stop breach creates a paper sell proposal, not an order.
+  - Time stops review older/no-progress positions after configured hold cycles or days. Weak score, deterioration, weak trend, or no meaningful gain can create a measurable `TIME_STOP_EXIT` candidate without making the rule overly aggressive.
+  - TAKE_PROFIT / PROFIT_PROTECT / TRAILING_STOP / TIME_STOP proposals are normal paper sell proposals and require Telegram approval plus final revalidation. They reduce exposure and are not blocked by BUY exposure caps.
   - HEALTHY_PULLBACK_ADD is allowed only for profitable positions with trend intact, acceptable giveback, low emergency risk, no exit/profit-protection warning, no open order conflict, and risk-budget room. It is explicitly blocked from averaging down.
   - GPT may explain or caution on position-management proposals but cannot approve, execute, override risk, or bypass Telegram approval.
 - **GPT Reviews and Timeout Explanations**:
   - BUY Proposals: GPT review is required by default. Missing/throttled GPT review defers the buy proposal.
   - EXIT Proposals: GPT explanation is optional and attempted with a 3-second timeout limit. If GPT is slow or unavailable, the exit proposal immediately falls back to rule-based explanation without delay. GPT cannot decide or block a deterministic exit.
+  - Exit proposals may bypass GPT delays, but never bypass Telegram approval, unused-approval consumption, RiskEngine/final validation, price freshness checks, or paper-only/live-disabled gates.
   - structured fields are stored and format message shows plain English descriptions of the reviews.
 - **Dynamic Expiry Rules**:
   - Expiry durations are calculated dynamically per cycle (never below 5 minutes, never above 20 minutes).
@@ -328,7 +332,8 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `add_on_opportunities`: Add-to-winner eligibility checks and block reasons.
 - `position_management_state`: Per-symbol high-water mark, trailing stop, profit-protection, and handled take-profit level state.
 - `position_management_decisions`: Per-cycle position-management classifications, metrics, actionability, and block reasons.
-- `profit_exit_events`: Lifecycle rows for take-profit, profit-protection, and trailing-stop proposals.
+- `profit_exit_events`: Lifecycle rows for take-profit, profit-protection, trailing-stop, and time-stop proposals.
+- `exit_review_events`: Per-cycle exit review rows for held positions, including drawdown from entry, drawdown from peak, peak/giveback state, trailing stop state, time-stop state, age/cycles, proposal linkage, and block/watch reason.
 - `universe_symbols`: Current symbol tier, symbol intake lane, execution eligibility, observation-only flag, provider symbol, asset class, sector, cluster, and data-quality state.
 - `universe_research_runs`: Dynamic Universe run history for daily deep research, intraday refresh, event refresh, post-market review, and weekly cleanup.
 - `symbol_research_scores`: Deterministic liquidity, trend, intraday momentum, relative strength, volatility, screener/mover, optional news, sector/theme, and data-quality component scores.
@@ -383,7 +388,7 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Dynamic Universe Summary**, **Dynamic Research Summary**, **Tier Summary**, **Stage Semantics**, **Universe Membership**, **Raw Universe Snapshot**, **Research Candidates**, **Research Candidate Briefs**, **Candidate Scores**, **Candidate Data Coverage**, **Candidate Endpoint Coverage**, **Static Paper-Tradable Symbols**, **Dynamic Paper-Tradable Symbols**, **Observation Symbols**, **Paper-Tradable Symbols**, **XL Sector Observation Audit**, **Observation Maturity Review**, **Promotion Review Status**, **Demotion Review Status**, **Demoted Symbols**, **Symbol Research Scores**, **News Events**, **Trend Snapshots**, **Sector Regime**, **Promotion Decisions**, **Demotion Decisions**, **Dynamic Universe Audit**, **Data Provider Health**, **Provider Health Deduped**, **Provider Capabilities**, **Endpoint Availability**, and **Dynamic Universe Performance**: Dynamic Universe research, tiering, candidate brief, maturity review, endpoint capability, provider health, and performance audit views.
 - **Dynamic Universe Schedule State**, **Missed Research Cycles**, **Catch-Up Runs**, **Stale Research Guards**, **Dynamic Universe Promotion Blocks**, and **Dynamic Universe Demotion Blocks**: Resilience, missed-run, catch-up, and stale/provider guard reporting.
 - **Candidate Promotion Requirements**, **Candidate Block Reasons**, **Candidate Next Steps**, **Candidate Chart Data**, **Research Funnel Chart Data**, **Data Confidence Chart Data**, **Candidate Score Chart Data**, **Block Reason Chart Data**, **Research Candidate Blocks**, **Data Confidence**, **Top Near-Miss Symbols**, **Dynamic Universe Source Coverage**, **Symbol Intake Classification**, **Alpaca-Compatible Candidates**, **Global Research-Only Symbols**, **Excluded Symbols**, **Symbol Exclusion Reasons**, **Near-Miss US Candidates**, **Near-Miss Global Research**, **Candidate Block Reason Summary**, **Research Rule Strictness Audit**, **Exploration Candidates**, **Provider Capability Usage**, and **Optional News Provider Status**: Partial-data confidence, intake lane, exclusion, block-reason, next-step, chart-data, source coverage, and optional-news-fallback reporting for Dynamic Universe candidate quality.
-- **Position Management State**, **Position Management Decisions**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
+- **Position Management State**, **Position Management Decisions**, **Exit Review Status**, **Exit Candidates**, **Exit Block Reasons**, **Trailing Stop State**, **Time Stop State**, **Position Drawdown Metrics**, **Position Peak Giveback Metrics**, **Profit Exit Events**, **Healthy Pullback Adds**, **Profit Protection Events**, and **Trailing Stop Events**: Existing-position management audit views.
 
 ## 15. Testing Strategy
 - Unit and integration tests protect all core components (risk limits, config settings, parser gates, double-spend blocking, and credentials leakage).
@@ -620,12 +625,12 @@ To support the bot's current 10-minute schedule during trading hours:
   - Drawdown <= -10%
   - Close < MA200 and position losing
   - Adverse move >= 1.5 ATR and drawdown <= -6%
-- **Execution Modes**:
-  - **Extreme Mode** (score >= 95 or drawdown <= -12%): Immediate execution with no wait.
-  - **Sleep Mode**: 15 seconds auto-exit wait, alerts sent to Telegram.
-  - **Normal Mode**: 60 seconds auto-exit wait, allowing Telegram user override.
-- **Revalidation**: Execution enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
-- **GPT Exit Explanations**: Exit reviews are executed by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout to avoid delaying execution.
+- **Proposal Modes**:
+  - **Extreme Mode** (score >= 95 or drawdown <= -12%): urgent approval-gated emergency paper sell proposal.
+  - **Sleep Mode**: approval-gated emergency paper sell proposal, alerts sent to Telegram.
+  - **Normal Mode**: approval-gated emergency paper sell proposal.
+- **Revalidation**: A sell order can be submitted only after Telegram approval. Final validation then enforces paper mode, matches position qty, market open, fresh price (< 60s), low price move (< 25 bps), and KILL_SWITCH absence.
+- **GPT Exit Explanations**: Exit reviews are optionally explained by GPT with a strict 3-second timeout, falling back to rule-based reasons on timeout. GPT unavailability does not block deterministic exit proposal creation and never authorizes an order.
 
 ## 30. Change Log
 - **2026-06-18**: Initial system overview created documenting safety gates, flows, milestone completions, and Mermaid diagrams.
@@ -639,6 +644,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-22**: Repaired authoritative final-risk context, hard-disabled live/auto capabilities, added read-only order/fill reconciliation, safe stale-lock recovery, report/Telegram redaction, and functional near-close clock handling.
 - **2026-06-23**: Implemented graded volatility regime scoring calibration, watch-only restricts, paper size adjustments, state-based proposal deduplication checks, and updated tests.
 - **2026-06-23**: Implemented Telegram reply-to proposal targeting, ambiguity resolution, instant acknowledgements, simultaneous BUY limits with 6-tier tie-breaking, and GPT review requirement/deferral logic.
-- **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, paper-only emergency auto-exit wait triggers (Normal, Sleep, and Extreme), GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
+- **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
+- **2026-07-03**: Strengthened exit/sell measurement with drawdown-from-entry, drawdown-from-peak, peak/giveback, trailing-stop, and time-stop reporting. Emergency and deterministic exits are proposal-only before Telegram approval and final validation; no automatic selling path is enabled.
 - **2026-06-24**: Added paper-only portfolio intelligence: Performance Lab setup/shadow/outcome tables, dynamic position sizing, ETF cluster exposure controls, add-to-winner eligibility, richer BUY proposal explanations, actual-vs-shadow Excel sheets, and regression tests.
 - **2026-06-29**: Aligned final validation profile resolution for dynamic paper-tradable symbols, ensuring Telegram-approved dynamic candidates are correctly evaluated against active dynamic watchlists rather than static config watchlists, with specific final validation rules and error messages for demoted, unsupported, or stale dynamic symbols.

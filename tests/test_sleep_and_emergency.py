@@ -349,7 +349,7 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         "ma_200": 105.0
     }])
 
-    # 1. Extreme Mode: drawdown <= -12% -> triggers immediate execution
+    # 1. Extreme Mode: drawdown <= -12% -> creates approval-gated proposal only
     with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
         service.scan()
         
@@ -357,12 +357,13 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
         assert props[0]["emergency_exit_mode"] == "extreme"
-        assert props[0]["emergency_exit_wait_seconds"] == 0
-        assert props[0]["emergency_exit_final_decision"] == "submitted"
-        assert props[0]["status"] == "approved"
+        assert props[0]["emergency_exit_wait_seconds"] is None
+        assert props[0]["emergency_exit_auto_execute_due_at"] is None
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
+        assert props[0]["status"] == "pending"
         
-        mock_exec.assert_called_once()
-        assert any("EXTREME EMERGENCY EXIT" in m[0] for m in service.telegram.sent_messages)
+        mock_exec.assert_not_called()
+        assert any("EXTREME EMERGENCY EXIT" in m[0] and "Approval required" in m[0] for m in service.telegram.sent_messages)
 
     # Reset
     temp_storage.execute("DELETE FROM trade_proposals")
@@ -378,17 +379,19 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         "ma_200": 105.0
     }])
     
-    # 2. Normal Mode: wait 60s
+    # 2. Normal Mode: approval-gated proposal, no timed auto-exit
     with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features_normal):
         service.scan()
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
         assert props[0]["emergency_exit_mode"] == "normal"
-        assert props[0]["emergency_exit_wait_seconds"] == 60
+        assert props[0]["emergency_exit_wait_seconds"] is None
+        assert props[0]["emergency_exit_auto_execute_due_at"] is None
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
         assert props[0]["status"] == "pending"
-        assert any("auto-execute in 60 seconds" in m[0] for m in service.telegram.sent_messages)
+        assert any("Final validation is still required" in m[0] for m in service.telegram.sent_messages)
 
-    # 3. Sleep Mode: sleep_mode_active = 1 -> wait 15s
+    # 3. Sleep Mode: sleep_mode_active = 1 -> approval-gated proposal only
     temp_storage.execute("DELETE FROM trade_proposals")
     service.telegram.sent_messages.clear()
     temp_storage.set_control_state("sleep_mode_active", "1", "test", "test", "test", 1, 1, int(time.time()))
@@ -397,9 +400,11 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
         assert props[0]["emergency_exit_mode"] == "sleep"
-        assert props[0]["emergency_exit_wait_seconds"] == 15
+        assert props[0]["emergency_exit_wait_seconds"] is None
+        assert props[0]["emergency_exit_auto_execute_due_at"] is None
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
         assert props[0]["status"] == "pending"
-        assert any("Auto-executing in 15 seconds" in m[0] for m in service.telegram.sent_messages)
+        assert any("Approval required" in m[0] and "no automatic sell" in m[0] for m in service.telegram.sent_messages)
 
 def test_gpt_exit_explanation_timeout(temp_storage, base_config):
     broker = MockBroker()
@@ -515,14 +520,15 @@ def test_emergency_exit_missing_entry_price(temp_storage, base_config):
     with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
         service.scan()
         
-        # Since avg_entry_price fallback found (100.0) -> drawdown is calculated -> triggers extreme auto-exit
+        # Since avg_entry_price fallback found (100.0) -> drawdown is calculated -> triggers an approval-gated proposal
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
-        assert props[0]["status"] == "approved"
+        assert props[0]["status"] == "pending"
         assert props[0]["emergency_exit_mode"] == "extreme"
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
         
-        mock_exec.assert_called_once()
-        assert any("EXTREME EMERGENCY EXIT" in m[0] for m in service.telegram.sent_messages)
+        mock_exec.assert_not_called()
+        assert any("EXTREME EMERGENCY EXIT" in m[0] and "Approval required" in m[0] for m in service.telegram.sent_messages)
 
     # 3. Broker average entry price is preferred over fills fallback
     temp_storage.execute("DELETE FROM trade_proposals")

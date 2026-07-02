@@ -633,21 +633,41 @@ class TradingService:
             INSERT INTO position_management_decisions(
                 id,run_id,symbol,decision_type,priority,action,reason,current_price,avg_entry_price,quantity,
                 unrealized_profit_pct,highest_price_since_entry,max_unrealized_profit_pct,pullback_from_peak_pct,
-                profit_giveback_ratio,current_r_multiple,trailing_stop_price,suggested_sell_fraction,
-                suggested_add_notional,blocking_reasons,is_actionable,dip_trap_classification,created_at,payload
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                drawdown_from_entry_pct,drawdown_from_peak_pct,profit_giveback_ratio,current_r_multiple,
+                trailing_stop_price,suggested_sell_fraction,suggested_add_notional,blocking_reasons,is_actionable,
+                dip_trap_classification,position_age_days,position_age_cycles,exit_review_needed,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, symbol, decision.decision_type, decision.priority, decision.action,
                 decision.reason, decision.current_price, decision.avg_entry_price, decision.quantity,
                 decision.unrealized_profit_pct, decision.highest_price_since_entry, decision.max_unrealized_profit_pct,
-                decision.pullback_from_peak_pct, decision.profit_giveback_ratio, decision.current_r_multiple,
+                decision.pullback_from_peak_pct, decision.drawdown_from_entry_pct, decision.drawdown_from_peak_pct,
+                decision.profit_giveback_ratio, decision.current_r_multiple,
                 decision.trailing_stop_price, decision.suggested_sell_fraction, decision.suggested_add_notional,
                 "; ".join(decision.blocking_reasons), int(decision.is_actionable), decision.dip_trap_classification,
+                decision.position_age_days, decision.position_age_cycles, int(decision.exit_review_needed),
                 now.isoformat(), json_dumps(dataclasses.asdict(decision)),
             ),
         )
-        if decision.decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+        self.storage.execute(
+            """
+            INSERT INTO exit_review_events(
+                id,run_id,symbol,review_type,status,reason,drawdown_from_entry_pct,drawdown_from_peak_pct,
+                unrealized_pl_pct,peak_price_since_entry,peak_unrealized_pct,trailing_stop_price,time_stop_status,
+                position_age_days,position_age_cycles,created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(uuid.uuid4()), self.run_id, symbol, decision.decision_type,
+                "exit_candidate" if decision.action == "sell" and decision.is_actionable else ("exit_review_needed" if decision.exit_review_needed else "watch"),
+                decision.reason, decision.drawdown_from_entry_pct, decision.drawdown_from_peak_pct,
+                decision.unrealized_profit_pct, decision.highest_price_since_entry, decision.max_unrealized_profit_pct,
+                decision.trailing_stop_price, "triggered" if decision.decision_type == "TIME_STOP_EXIT" else "not_triggered",
+                decision.position_age_days, decision.position_age_cycles, now.isoformat(), json_dumps(dataclasses.asdict(decision)),
+            ),
+        )
+        if decision.decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
             sell_fraction = decision.suggested_sell_fraction or 0.0
             estimated_shares = decision.quantity * sell_fraction
             estimated_notional = estimated_shares * decision.current_price
@@ -692,7 +712,7 @@ class TradingService:
                     f"UPDATE position_management_state SET {column}=1, updated_at=? WHERE symbol=?",
                     (resolved_at, symbol),
                 )
-        if pm_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+        if pm_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
             self.storage.execute(
                 "UPDATE profit_exit_events SET status=?, resolved_at=? WHERE proposal_id=?",
                 (status, resolved_at, proposal_id),
@@ -1686,33 +1706,18 @@ class TradingService:
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
-        # Check for timed out emergency exit proposals
-        now_str = iso_now()
+        # Emergency exits are approval-only. Stale timeout metadata from older
+        # builds must never submit or approve an order automatically.
         timed_out = self.storage.fetch_all(
-            "SELECT * FROM trade_proposals WHERE status='pending' AND emergency_exit_triggered=1 AND emergency_exit_auto_execute_due_at <= ?",
-            (now_str,)
+            "SELECT id, symbol FROM trade_proposals WHERE status='pending' AND emergency_exit_triggered=1 AND emergency_exit_auto_execute_due_at IS NOT NULL AND emergency_exit_auto_execute_due_at <= ?",
+            (iso_now(),),
         )
         for row in timed_out:
-            proposal_id = row["id"]
-            symbol = row["symbol"]
-            qty = row["qty"]
-            total_score = row["emergency_exit_score"]
-            proposal = {**json.loads(row["payload"] or "{}"), **row}
-
-            # Consume first to prevent race condition
-            self.storage.execute("UPDATE trade_proposals SET status='approved', emergency_exit_auto_execute_attempted_at=? WHERE id=?", (iso_now(), proposal_id))
-
-            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_reached", {"symbol": symbol, "proposal_id": proposal_id})
-
-            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
-            if success:
-                self.storage.execute("UPDATE trade_proposals SET emergency_exit_final_decision='submitted' WHERE id=?", (proposal_id,))
-                self.telegram.send_message(f"✅ Paper order submitted: Sell {symbol} for {qty} shares. Mode: paper only.")
-                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "score": total_score})
-            else:
-                self.storage.execute("UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=? WHERE id=?", (err_reason, proposal_id))
-                self.telegram.send_message(f"⚠️ Emergency exit was blocked. Reason: {err_reason}. No order was placed.")
-                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason})
+            self.storage.execute(
+                "UPDATE trade_proposals SET emergency_exit_auto_execute_due_at=NULL, emergency_exit_auto_execute_attempted_at=? WHERE id=?",
+                (iso_now(), row["id"]),
+            )
+            self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {"symbol": row["symbol"], "proposal_id": row["id"], "reason": "approval_required"})
 
     def _update_batch_status(self, batch_id: str) -> None:
         rows = self.storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE batch_id=?", (batch_id,))
@@ -2919,16 +2924,14 @@ class TradingService:
 
                                 if total_score >= 95 or position_drawdown_pct <= -0.12:
                                     emergency_exit_mode = "extreme"
-                                    emergency_exit_wait_seconds = 0
                                 elif sleep_mode_active:
                                     emergency_exit_mode = "sleep"
-                                    emergency_exit_wait_seconds = 15
                                 else:
                                     emergency_exit_mode = "normal"
-                                    emergency_exit_wait_seconds = 60
 
-                                due_at = now + timedelta(seconds=emergency_exit_wait_seconds)
-                                emergency_exit_auto_execute_due_at = due_at.isoformat()
+                                emergency_exit_wait_seconds = None
+                                emergency_exit_auto_execute_due_at = None
+                                emergency_exit_final_decision = "approval_required"
 
                                 signal = dataclasses.replace(signal, action="EXIT", side="sell", reason=f"Emergency exit triggered: {hard_trigger_reason}")
 
@@ -3191,6 +3194,19 @@ class TradingService:
                 position_management_add_notional = None
                 if has_position and self.config.get("position_management", {}).get("enabled", True):
                     previous_pm_state = self._position_management_state(symbol)
+                    position_age_days = None
+                    if previous_pm_state and previous_pm_state.get("created_at"):
+                        try:
+                            created_dt = datetime.fromisoformat(str(previous_pm_state["created_at"]).replace("Z", "+00:00"))
+                            created_dt = created_dt.replace(tzinfo=UTC) if created_dt.tzinfo is None else created_dt.astimezone(UTC)
+                            position_age_days = max(0.0, (now - created_dt).total_seconds() / 86400.0)
+                        except Exception:
+                            position_age_days = None
+                    position_age_cycles_rows = self.storage.fetch_all(
+                        "SELECT COUNT(*) AS cnt FROM position_management_decisions WHERE symbol=?",
+                        (symbol,),
+                    )
+                    position_age_cycles = int(position_age_cycles_rows[0]["cnt"] or 0) if position_age_cycles_rows else 0
                     pm_engine = PositionManagementEngine(self.config).with_previous_state(previous_pm_state)
                     normal_exit_signal = signal.action == "EXIT" and signal.side == "sell" and emergency_exit_triggered != 1
                     position_management_decision = pm_engine.classify(
@@ -3207,6 +3223,8 @@ class TradingService:
                         normal_exit_signal=normal_exit_signal,
                         volatility_regime=volatility_regime,
                         has_open_order=has_order,
+                        position_age_days=position_age_days,
+                        position_age_cycles=position_age_cycles,
                         now=now,
                     )
                     self._record_position_management(position_management_decision, now)
@@ -3836,7 +3854,7 @@ class TradingService:
                             # Size adjustment calculation from res
                             notional = res.get("final_notional", 5.0)
                             qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else (res.get("position_management_sell_qty") or qty_held)
-                            if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+                            if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
                                 notional = float(qty_val or 0.0) * price
 
                             stop_price = res.get("stop_price")
@@ -4016,7 +4034,7 @@ class TradingService:
                                             proposal["ai_caution"] = review.get("gpt_caution", "Low")
                                 elif is_exit:
                                     if emergency_exit_triggered == 1:
-                                        # Special emergency exit review & immediate execution check
+                                        # Emergency exits create approval-gated paper sell proposals.
                                         gpt_explanation = self.get_gpt_exit_explanation(proposal)
                                         gpt_exit_explanation_status = gpt_explanation["status"]
                                         gpt_exit_confidence = gpt_explanation["confidence"]
@@ -4045,33 +4063,22 @@ class TradingService:
                                             proposal["status"] = "blocked"
                                             proposal["emergency_exit_block_reason"] = "emergency_drawdown_unavailable"
                                             proposal["emergency_exit_final_decision"] = "blocked"
-                                        elif emergency_exit_mode == "extreme":
-                                            success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
-                                            if success:
-                                                emergency_exit_final_decision = "submitted"
-                                                proposal["status"] = "approved"
-                                                proposal["emergency_exit_final_decision"] = "submitted"
-                                                self.telegram.send_message(
-                                                    f"🚨 [EXTREME EMERGENCY EXIT] Immediate paper market order submitted for {symbol} ({qty_held} shares) due to high risk score {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}."
-                                                )
-                                                self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": symbol, "score": emergency_exit_score})
-                                            else:
-                                                emergency_exit_block_reason = err_reason
-                                                proposal["status"] = "blocked"
-                                                proposal["emergency_exit_block_reason"] = err_reason
-                                                self.telegram.send_message(
-                                                    f"🚨 [EXTREME EMERGENCY EXIT] Triggered for {symbol} but execution was blocked: {err_reason}."
-                                                )
-                                                self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": symbol, "reason": err_reason})
+                                        else:
+                                            proposal["status"] = "pending"
+                                            proposal["emergency_exit_final_decision"] = "approval_required"
+                                            emergency_exit_final_decision = "approval_required"
+                                        if emergency_exit_mode == "extreme":
+                                            self.telegram.send_message(
+                                                f"🚨 [EXTREME EMERGENCY EXIT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. Approval required; no order will be submitted without Telegram approval and final validation."
+                                            )
                                         elif emergency_exit_mode == "sleep":
                                             self.telegram.send_message(
-                                                f"🚨 [SLEEP MODE EMERGENCY EXIT] Triggered for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. "
-                                                f"Auto-executing in 15 seconds unless cancelled."
+                                                f"🚨 [SLEEP MODE EMERGENCY EXIT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}. Approval required; no automatic sell will occur."
                                             )
                                         else:
                                             self.telegram.send_message(
-                                                f"🚨 [EMERGENCY EXIT ALERT] Triggered for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}.\n\n"
-                                                f"I will auto-execute in 60 seconds. Reply YES to execute immediately, or NO to cancel."
+                                                f"🚨 [EMERGENCY EXIT ALERT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}.\n\n"
+                                                f"Reply YES to approve or NO to reject. Final validation is still required before any paper order."
                                             )
                                     else:
                                         # Normal exit GPT explanation check
@@ -4225,9 +4232,13 @@ class TradingService:
                         sleep_mode_ended_at
                     )
                 )
-                if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT"}:
+                if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
                     self.storage.execute(
                         "UPDATE profit_exit_events SET proposal_id=?, status='proposal_created' WHERE run_id=? AND symbol=? AND event_type=? AND proposal_id IS NULL",
+                        (proposal_id, self.run_id, symbol, pm_decision_type),
+                    )
+                    self.storage.execute(
+                        "UPDATE exit_review_events SET proposal_id=? WHERE run_id=? AND symbol=? AND review_type=? AND proposal_id IS NULL",
                         (proposal_id, self.run_id, symbol, pm_decision_type),
                     )
 
@@ -4633,6 +4644,39 @@ class TradingService:
             deferred_syms = ", ".join(r["symbol"] for r in deferred_rows)
             summary_str += f" Candidates deferred due to AI review throttling: {deferred_syms}."
 
+        exit_watch = "Exit watch: no exit triggers."
+        pending_exit = self.storage.fetch_all(
+            """
+            SELECT symbol, exit_trigger_reason, emergency_exit_trigger_reason, created_at
+            FROM trade_proposals
+            WHERE side='sell'
+              AND status='pending'
+              AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+            ORDER BY datetime(created_at) DESC
+            LIMIT 1
+            """,
+            (now.isoformat(),),
+        )
+        if pending_exit:
+            reason = pending_exit[0].get("exit_trigger_reason") or pending_exit[0].get("emergency_exit_trigger_reason") or "exit rule triggered"
+            exit_watch = f"Exit proposal: {pending_exit[0]['symbol']} {reason}; approval required."
+        else:
+            watch_rows = self.storage.fetch_all(
+                """
+                SELECT symbol, review_type, status, reason
+                FROM exit_review_events
+                WHERE datetime(created_at) >= datetime(?)
+                  AND datetime(created_at) <= datetime(?)
+                  AND status IN ('exit_candidate','exit_review_needed')
+                ORDER BY datetime(created_at) DESC
+                LIMIT 1
+                """,
+                (window_start_iso, now.isoformat()),
+            )
+            if watch_rows:
+                reason = watch_rows[0].get("reason") or watch_rows[0].get("review_type") or "exit review"
+                exit_watch = f"Exit watch: {watch_rows[0]['symbol']} {reason}; no proposal yet."
+
         digest_data = {
             "market_open_status": "Open" if market_open else "Closed",
             "window_start": window_start,
@@ -4663,6 +4707,7 @@ class TradingService:
             },
             "provider_status": provider_status_str,
             "performance_lab": performance_lab,
+            "exit_watch": exit_watch,
         }
 
         from .utils import format_digest_message

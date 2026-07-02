@@ -13,8 +13,9 @@ PRIORITY = {
     "PROFIT_PROTECT_EXIT": 3,
     "TAKE_PROFIT_PARTIAL": 4,
     "TRAILING_STOP_EXIT": 5,
-    "HEALTHY_PULLBACK_ADD": 6,
-    "HOLD": 7,
+    "TIME_STOP_EXIT": 6,
+    "HEALTHY_PULLBACK_ADD": 7,
+    "HOLD": 8,
 }
 
 
@@ -32,6 +33,8 @@ class PositionManagementDecision:
     highest_price_since_entry: float | None
     max_unrealized_profit_pct: float | None
     pullback_from_peak_pct: float | None
+    drawdown_from_entry_pct: float | None
+    drawdown_from_peak_pct: float | None
     profit_giveback_ratio: float | None
     current_r_multiple: float | None
     trailing_stop_price: float | None
@@ -43,6 +46,9 @@ class PositionManagementDecision:
     atr_pct: float | None = None
     dip_trap_classification: str = "not_applicable"
     take_profit_level: int | None = None
+    position_age_days: float | None = None
+    position_age_cycles: int | None = None
+    exit_review_needed: bool = False
 
 
 def _cfg(config: dict[str, Any]) -> dict[str, Any]:
@@ -98,10 +104,11 @@ class PositionManagementEngine:
         normal_exit_signal: bool = False,
         volatility_regime: str = "normal",
         has_open_order: bool = False,
+        position_age_days: float | None = None,
+        position_age_cycles: int | None = None,
         now: datetime | None = None,
     ) -> PositionManagementDecision:
         now = now or datetime.now(UTC)
-        del now
         config = _cfg(self.config)
         if not config.get("enabled", True):
             return self._decision(symbol, "HOLD", "hold", "position management disabled", current_price, avg_entry_price, quantity)
@@ -120,6 +127,8 @@ class PositionManagementEngine:
         highest = max(previous_high or current_price, current_price)
         max_profit_pct = (highest - avg_entry_price) / avg_entry_price * 100.0
         pullback_pct = (highest - current_price) / highest * 100.0 if highest > 0 else None
+        drawdown_from_entry_pct = min(0.0, unrealized_pct)
+        drawdown_from_peak_pct = ((current_price - highest) / highest * 100.0) if highest > 0 else None
         giveback = None
         if max_profit_pct > 0:
             giveback = max(0.0, (max_profit_pct - unrealized_pct) / max_profit_pct)
@@ -136,9 +145,9 @@ class PositionManagementEngine:
         ma200 = _latest_ma(bars, 200)
 
         if emergency_exit_score is not None and emergency_exit_score >= 85:
-            return self._decision(symbol, "EMERGENCY_EXIT", "sell", "emergency exit risk overrides profit logic", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, atr=atr, atr_pct=atr_pct)
+            return self._decision(symbol, "EMERGENCY_EXIT", "sell", "emergency exit risk overrides profit logic", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, drawdown_from_entry_pct=drawdown_from_entry_pct, drawdown_from_peak_pct=drawdown_from_peak_pct, giveback=giveback, current_r=current_r, atr=atr, atr_pct=atr_pct, position_age_days=position_age_days, position_age_cycles=position_age_cycles, exit_review_needed=True)
         if normal_exit_signal:
-            return self._decision(symbol, "NORMAL_RISK_EXIT", "sell", "normal risk exit signal overrides profit logic", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, atr=atr, atr_pct=atr_pct)
+            return self._decision(symbol, "NORMAL_RISK_EXIT", "sell", "normal risk exit signal overrides profit logic", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, drawdown_from_entry_pct=drawdown_from_entry_pct, drawdown_from_peak_pct=drawdown_from_peak_pct, giveback=giveback, current_r=current_r, atr=atr, atr_pct=atr_pct, position_age_days=position_age_days, position_age_cycles=position_age_cycles, exit_review_needed=True)
 
         trailing_stop = self._trailing_stop(previous_state, highest, current_price, atr)
 
@@ -154,6 +163,14 @@ class PositionManagementEngine:
         if trailing:
             return trailing
 
+        time_stop = self._time_stop_decision(
+            symbol, current_price, avg_entry_price, quantity, unrealized_pct, highest, max_profit_pct,
+            pullback_pct, drawdown_from_entry_pct, drawdown_from_peak_pct, giveback, current_r, trailing_stop,
+            atr, atr_pct, ma50, ma200, trade_score, score_improvement, position_age_days, position_age_cycles,
+        )
+        if time_stop:
+            return time_stop
+
         pullback = self._healthy_pullback_decision(
             symbol, current_price, avg_entry_price, quantity, unrealized_pct, highest,
             max_profit_pct, pullback_pct, giveback, current_r, trailing_stop, atr, atr_pct,
@@ -165,8 +182,10 @@ class PositionManagementEngine:
         return self._decision(
             symbol, "HOLD", "hold", "no position-management action qualified", current_price, avg_entry_price, quantity,
             unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct,
+            drawdown_from_entry_pct=drawdown_from_entry_pct, drawdown_from_peak_pct=drawdown_from_peak_pct,
             giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, atr=atr, atr_pct=atr_pct,
             dip_trap_classification=self._classify_dip_trap(unrealized_pct, current_price, avg_entry_price, ma50, ma200, giveback, trailing_stop, emergency_exit_score, volatility_regime),
+            position_age_days=position_age_days, position_age_cycles=position_age_cycles,
         )
 
     def _take_profit_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, giveback: float | None, current_r: float | None, atr: float | None, atr_pct: float | None) -> PositionManagementDecision | None:
@@ -194,8 +213,8 @@ class PositionManagementEngine:
                 notional = quantity * current_price * fraction
                 min_notional = float(cfg.get("minimum_notional_to_sell", 1.0))
                 if notional < min_notional:
-                    return self._decision(symbol, "TAKE_PROFIT_PARTIAL", "hold", "not actionable - below minimum sell notional", current_price, avg_entry_price, quantity, ["below minimum sell notional"], unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, take_profit_level=level)
-                return self._decision(symbol, "TAKE_PROFIT_PARTIAL", "sell", f"level {level} profit target reached; sell a partial position to lock gains", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, take_profit_level=level)
+                    return self._decision(symbol, "TAKE_PROFIT_PARTIAL", "hold", "not actionable - below minimum sell notional", current_price, avg_entry_price, quantity, ["below minimum sell notional"], unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, take_profit_level=level, exit_review_needed=True)
+                return self._decision(symbol, "TAKE_PROFIT_PARTIAL", "sell", f"level {level} profit target reached; sell a partial position to lock gains", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, take_profit_level=level, exit_review_needed=True)
         return None
 
     def _profit_protect_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, giveback: float | None, current_r: float | None, trailing_stop: float | None, atr: float | None, atr_pct: float | None) -> PositionManagementDecision | None:
@@ -210,10 +229,10 @@ class PositionManagementEngine:
         warn_ratio = float(cfg.get("giveback_warning_ratio", 0.40))
         if giveback >= exit_ratio:
             fraction = float(cfg.get("exit_sell_fraction", 0.50))
-            return self._decision(symbol, "PROFIT_PROTECT_EXIT", "sell", f"profitable trade gave back {giveback:.1%} of peak profit", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct)
+            return self._decision(symbol, "PROFIT_PROTECT_EXIT", "sell", f"profitable trade gave back {giveback:.1%} of peak profit", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, exit_review_needed=True)
         if giveback >= warn_ratio:
             fraction = float(cfg.get("protect_sell_fraction", 0.25))
-            return self._decision(symbol, "PROFIT_PROTECT_EXIT", "sell", f"profit protection warning: trade gave back {giveback:.1%} of peak profit", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct)
+            return self._decision(symbol, "PROFIT_PROTECT_EXIT", "sell", f"profit protection warning: trade gave back {giveback:.1%} of peak profit", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=fraction, atr=atr, atr_pct=atr_pct, exit_review_needed=True)
         return None
 
     def _trailing_stop(self, previous_state: dict[str, Any] | None, highest: float, current_price: float, atr: float | None) -> float | None:
@@ -238,10 +257,52 @@ class PositionManagementEngine:
         cfg = _nested(self.config, "trailing_stop")
         if not cfg.get("enabled", True) or trailing_stop is None:
             return None
-        active = _fallback_unrealized_threshold(current_r, max_profit_pct, float(cfg.get("activate_at_r", 1.0)), float(cfg.get("fallback_activate_at_profit_pct", 2.0)))
+        start_gain = float(cfg.get("trailing_stop_start_gain_pct", cfg.get("fallback_activate_at_profit_pct", 2.0)))
+        active = _fallback_unrealized_threshold(current_r, max_profit_pct, float(cfg.get("activate_at_r", 1.0)), start_gain)
         if active and current_price < trailing_stop:
-            return self._decision(symbol, "TRAILING_STOP_EXIT", "sell", "trailing stop was breached after the trade moved in our favor", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=float(cfg.get("sell_fraction", 0.50)), atr=atr, atr_pct=atr_pct)
+            return self._decision(symbol, "TRAILING_STOP_EXIT", "sell", "trailing stop was breached after the trade moved in our favor", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, drawdown_from_entry_pct=min(0.0, unrealized_pct), drawdown_from_peak_pct=((current_price - highest) / highest * 100.0) if highest > 0 else None, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_sell_fraction=float(cfg.get("sell_fraction", 0.50)), atr=atr, atr_pct=atr_pct, exit_review_needed=True)
         return None
+
+    def _time_stop_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, drawdown_from_entry_pct: float | None, drawdown_from_peak_pct: float | None, giveback: float | None, current_r: float | None, trailing_stop: float | None, atr: float | None, atr_pct: float | None, ma50: float | None, ma200: float | None, trade_score: float, score_improvement: float, position_age_days: float | None, position_age_cycles: int | None) -> PositionManagementDecision | None:
+        cfg = _nested(self.config, "time_stop")
+        if not cfg.get("enabled", False):
+            return None
+        min_cycles = int(cfg.get("min_hold_cycles_before_time_stop", 12))
+        min_days = float(cfg.get("min_hold_days_before_time_stop", 3.0))
+        cycles_ok = position_age_cycles is not None and position_age_cycles >= min_cycles
+        days_ok = position_age_days is not None and position_age_days >= min_days
+        if not cycles_ok and not days_ok:
+            return None
+
+        max_gain = float(cfg.get("max_unrealized_gain_pct", 0.5))
+        weak_score = float(cfg.get("weak_trade_score_below", 60.0))
+        deterioration = float(cfg.get("deteriorating_score_delta_below", -5.0))
+        weak_trend = (ma50 is not None and current_price < ma50) or (ma200 is not None and current_price < ma200)
+        no_progress = unrealized_pct <= max_gain and max_profit_pct <= max(max_gain, float(cfg.get("max_peak_gain_pct", 1.0)))
+        deteriorating = score_improvement <= deterioration
+        weak_score_hit = trade_score < weak_score
+        if not any((no_progress, weak_trend, deteriorating, weak_score_hit)):
+            return None
+
+        blockers = []
+        if no_progress:
+            blockers.append("no meaningful gain after hold period")
+        if weak_trend:
+            blockers.append("trend weakened")
+        if deteriorating:
+            blockers.append("score deteriorated")
+        if weak_score_hit:
+            blockers.append("trade score is weak")
+        sell_fraction = float(cfg.get("sell_fraction", 1.0))
+        return self._decision(
+            symbol, "TIME_STOP_EXIT", "sell", "time stop review: " + "; ".join(blockers),
+            current_price, avg_entry_price, quantity, blockers, is_actionable=bool(cfg.get("proposal_enabled", True)),
+            unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct,
+            pullback_pct=pullback_pct, drawdown_from_entry_pct=drawdown_from_entry_pct,
+            drawdown_from_peak_pct=drawdown_from_peak_pct, giveback=giveback, current_r=current_r,
+            trailing_stop=trailing_stop, suggested_sell_fraction=sell_fraction, atr=atr, atr_pct=atr_pct,
+            position_age_days=position_age_days, position_age_cycles=position_age_cycles, exit_review_needed=True,
+        )
 
     def _healthy_pullback_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, giveback: float | None, current_r: float | None, trailing_stop: float | None, atr: float | None, atr_pct: float | None, ma50: float | None, ma200: float | None, trade_score: float, score_improvement: float, emergency_exit_score: float | None, volatility_regime: str, has_open_order: bool) -> PositionManagementDecision | None:
         cfg = _nested(self.config, "healthy_pullback_add")
@@ -299,7 +360,9 @@ class PositionManagementEngine:
             return "trap_volatility"
         return "healthy_pullback"
 
-    def _decision(self, symbol: str, decision_type: str, action: str, reason: str, current_price: float, avg_entry_price: float, quantity: float, blocking_reasons: list[str] | None = None, *, is_actionable: bool = False, unrealized_pct: float | None = None, highest: float | None = None, max_profit_pct: float | None = None, pullback_pct: float | None = None, giveback: float | None = None, current_r: float | None = None, trailing_stop: float | None = None, suggested_sell_fraction: float | None = None, suggested_add_notional: float | None = None, atr: float | None = None, atr_pct: float | None = None, dip_trap_classification: str = "not_applicable", take_profit_level: int | None = None) -> PositionManagementDecision:
+    def _decision(self, symbol: str, decision_type: str, action: str, reason: str, current_price: float, avg_entry_price: float, quantity: float, blocking_reasons: list[str] | None = None, *, is_actionable: bool = False, unrealized_pct: float | None = None, highest: float | None = None, max_profit_pct: float | None = None, pullback_pct: float | None = None, drawdown_from_entry_pct: float | None = None, drawdown_from_peak_pct: float | None = None, giveback: float | None = None, current_r: float | None = None, trailing_stop: float | None = None, suggested_sell_fraction: float | None = None, suggested_add_notional: float | None = None, atr: float | None = None, atr_pct: float | None = None, dip_trap_classification: str = "not_applicable", take_profit_level: int | None = None, position_age_days: float | None = None, position_age_cycles: int | None = None, exit_review_needed: bool = False) -> PositionManagementDecision:
+        actual_unrealized = unrealized_pct if unrealized_pct is not None else ((current_price - avg_entry_price) / avg_entry_price * 100.0 if avg_entry_price > 0 else 0.0)
+        actual_highest = highest if highest is not None else current_price
         return PositionManagementDecision(
             symbol=symbol,
             decision_type=decision_type,
@@ -309,10 +372,12 @@ class PositionManagementEngine:
             current_price=current_price,
             avg_entry_price=avg_entry_price,
             quantity=quantity,
-            unrealized_profit_pct=unrealized_pct if unrealized_pct is not None else ((current_price - avg_entry_price) / avg_entry_price * 100.0 if avg_entry_price > 0 else 0.0),
-            highest_price_since_entry=highest,
+            unrealized_profit_pct=actual_unrealized,
+            highest_price_since_entry=actual_highest,
             max_unrealized_profit_pct=max_profit_pct,
             pullback_from_peak_pct=pullback_pct,
+            drawdown_from_entry_pct=drawdown_from_entry_pct if drawdown_from_entry_pct is not None else min(0.0, actual_unrealized),
+            drawdown_from_peak_pct=drawdown_from_peak_pct if drawdown_from_peak_pct is not None else (((current_price - actual_highest) / actual_highest * 100.0) if actual_highest and actual_highest > 0 else None),
             profit_giveback_ratio=giveback,
             current_r_multiple=current_r,
             trailing_stop_price=trailing_stop,
@@ -324,6 +389,9 @@ class PositionManagementEngine:
             atr_pct=atr_pct,
             dip_trap_classification=dip_trap_classification,
             take_profit_level=take_profit_level,
+            position_age_days=position_age_days,
+            position_age_cycles=position_age_cycles,
+            exit_review_needed=exit_review_needed,
         )
 
     def with_previous_state(self, state: dict[str, Any] | None) -> "PositionManagementEngine":
