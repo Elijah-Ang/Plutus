@@ -314,7 +314,12 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `daily_summaries`: Daily equity audits.
 - `market_memory`: Logs of scheduled observation telemetry (currently a 10-minute target interval), indicators, and recommendation scores.
 - `telegram_digests`: History of 30-minute Telegram informational digests.
-- `trade_setups`: Performance Lab records for meaningful setups, including active/observation status, score, proposal eligibility, and no-proposal reason.
+- `performance_setups`: Durable Performance Lab event rows for every meaningful qualified, near-qualified, suppressed, proposed, add, exit, or hold-watch setup. Rows include tier, setup type, action decision, score components, signal state, price/freshness, trend/volatility/liquidity/relative-strength metrics, exposure/risk context, notional fields, proposal links, and order/fill links when available.
+- `performance_blockers`: Normalized blocker labels for non-proposed or blocked setups, such as score threshold, no ENTRY/ADD signal, exposure/risk/cluster gate, stale price, cooldown, pending proposal limit, market closed, provider guard, observation-only, research-only, or other.
+- `performance_outcomes`: Measurement-only outcome placeholders linked one-to-one with Performance Lab setup rows. These hold actual/shadow status and later proposal/order/fill linkage without creating proposals or orders.
+- `performance_forward_returns`: 1D/5D/20D forward return, MFE, MAE, stop-hit, and target-hit placeholders. Updates are eligible only after the horizon has elapsed; future data is never available to live decisions.
+- `performance_counterfactuals`: Counterfactual entry/add/exit records for suppressed setups, including reason, hypothetical price/notional, and pending comparison status.
+- `trade_setups`: Legacy Performance Lab records for meaningful setups, including active/observation status, score, proposal eligibility, and no-proposal reason.
 - `shadow_trades`: Measurement-only trades for setups that were not actually executed. These never create broker orders or Telegram actionable proposals.
 - `trade_outcomes`: Forward-return, MAE/MFE, stop/target, and actual-vs-shadow outcome labels. Filled ranked-batch paper trades create an `actual` outcome row linked to batch, candidate, proposal, order, broker order, fill, risk-budget decision, sizing decision, approval, and matched shadow row when available.
 - `position_sizing_decisions`: Deterministic paper sizing calculations and stop model inputs. Ranked-batch rows are backfilled with batch, candidate, proposal, order, broker order, and fill IDs as those lifecycle records become available.
@@ -339,7 +344,7 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `research_candidate_block_reasons`: Dynamic Universe near-miss and block reasons, including confidence and score components.
 - `dynamic_universe_performance`: Scanner/Performance Lab metrics for dynamic symbols and tier outcomes.
 - `dynamic_universe_schedule_state`: Due, skipped, missed, catch-up, provider health, internet, power, battery, freshness, and promotion/demotion permission state for each research schedule.
-- `performance_lab_summaries`: Per-run counts of qualified setups, shadow trades, and actual trades.
+- `performance_lab_summaries`: Per-run counts of qualified setup events, shadow-only/counterfactual rows, and proposed/actual rows.
 
 ## 14. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
@@ -361,6 +366,10 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Config Snapshot**: Directly database-backed (`config_snapshots`).
 - **Market Memory**: Telemetry comparison logs (`market_memory`).
 - **Performance Lab Summary**: Per-run setup/shadow/actual counts.
+- **Setup Events / Suppressed Setups / Counterfactual Trades**: Measurement-only setup, blocker, and counterfactual rows. These sheets do not imply proposal eligibility and do not create broker actions.
+- **Forward Returns 1D / 5D / 20D**: Horizon-specific forward outcome placeholders and completed values after enough time has elapsed.
+- **MFE MAE Summary**: Max favorable/adverse excursion and hypothetical stop/target labels by horizon.
+- **Proposal vs Suppressed Outcomes / Score Band Outcomes / Blocker Outcome Analysis / Add-to-Winner Outcomes / Exit Signal Outcomes**: Aggregated views for comparing deterministic proposal decisions against shadow-only and suppressed setups.
 - **Shadow Trades**: Measurement-only suppressed or non-executed opportunities.
 - **Actual vs Shadow**: Outcome rows comparing actual and shadow trades.
 - **Forward Returns**: 1-day, 5-day, and 20-day forward return labels where available.
@@ -546,11 +555,14 @@ To support the bot's current 10-minute schedule during trading hours:
 
 ## 26. Portfolio Intelligence and Performance Lab
 - **Paper-only scope**: The upgrade changes proposal sizing, measurement, ranking, and reporting only. Live trading and live auto-execution remain unsupported and disabled.
-- **Performance Lab**: Meaningful setups are recorded even when no proposal is sent. Suppressed candidates, observation-only candidates, cooldown blocks, sleep-mode blocks, GPT deferrals, exposure blocks, rejected proposals, and expired proposals can become shadow trades for later analysis.
+- **Performance Lab purpose**: Performance Lab records evidence before changing trading behavior. It captures qualified setups, near misses, suppressed candidates, actual proposals, order/fill links, counterfactual entry/add/exit labels, and forward-return placeholders for later analysis.
+- **Performance Lab**: Meaningful setups are recorded even when no proposal is sent. Suppressed candidates, observation-only candidates, research-only candidates, cooldown blocks, sleep-mode blocks, GPT deferrals, stale-price blocks, provider guards, exposure/cluster/risk blocks, rejected proposals, and expired proposals can become counterfactual rows for later analysis.
+- **Measurement only**: Performance Lab writes SQLite/report rows only. It must not create trade proposals, Telegram approval prompts, broker orders, approvals, sizing overrides, RiskEngine bypasses, or final-validation bypasses.
 - **Shadow trades**: Shadow records are measurement-only. They do not create broker orders, do not create actionable Telegram proposals, and do not alter broker state.
 - **Actual-vs-shadow lifecycle**: A ranked opportunity may first be measured as a shadow row while waiting for user approval. If the user approves the candidate and broker reconciliation confirms a fill, the system creates or updates an `actual` outcome row keyed by the order/fill and marks the matching shadow row as `executed_as_actual` instead of deleting it.
 - **Risk/sizing linkage**: Batch-candidate creation backfills `batch_id`, `candidate_id`, and `proposal_id` into ranked opportunity, risk-budget, allocation, and sizing rows. Fill reconciliation adds `order_id`, `broker_order_id`, and `fill_id` where applicable so reports can trace candidate -> risk/sizing -> approval -> order -> fill -> actual outcome.
-- **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives once enough future bars exist.
+- **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives only after the relevant horizon has elapsed. These outcomes are for after-the-fact measurement and are not inputs to live proposal, approval, sizing, exit, or override decisions.
+- **Report redaction**: Performance Lab report exports use the same redaction path as other sheets. API keys, provider secrets, tokens, raw Telegram text, sender IDs, raw provider dumps, and sensitive OpenAI prompt text must not be exported.
 - **Dynamic sizing**: Initial BUY proposals use `position_sizing` rules: score multiplier, volatility multiplier, risk budget, ATR/technical stop distance, min/max paper notional, single-symbol exposure cap, total exposure cap, and cluster exposure cap. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
 - **Portfolio exposure controls**: `portfolio_behavior`, `portfolio_optimizer`, and `risk_budget` cap single-symbol exposure, total exposure, open risk, same-cluster exposure, and paper buying power use. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.
 - **Add-to-winner**: `add_to_position` permits add-on BUY proposals only when an existing paper position is profitable, the setup score is strong enough, the setup improves, add counts remain within limits, exposure caps pass, and no exit/emergency warning blocks the add. Averaging down is blocked.
@@ -630,4 +642,3 @@ To support the bot's current 10-minute schedule during trading hours:
 - **2026-06-23**: Implemented manual Telegram sleep mode, sleep mode persistence, overnight wake summaries, 6-point emergency exit risk scoring, paper-only emergency auto-exit wait triggers (Normal, Sleep, and Extreme), GPT review executors with 3-second timeouts, Excel sheets export modifications, and comprehensive unit tests.
 - **2026-06-24**: Added paper-only portfolio intelligence: Performance Lab setup/shadow/outcome tables, dynamic position sizing, ETF cluster exposure controls, add-to-winner eligibility, richer BUY proposal explanations, actual-vs-shadow Excel sheets, and regression tests.
 - **2026-06-29**: Aligned final validation profile resolution for dynamic paper-tradable symbols, ensuring Telegram-approved dynamic candidates are correctly evaluated against active dynamic watchlists rather than static config watchlists, with specific final validation rules and error messages for demoted, unsupported, or stale dynamic symbols.
-

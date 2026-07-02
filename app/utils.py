@@ -667,6 +667,13 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             f"* Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | "
             f"Fills: {actions.get('fills', 0)} | GPT: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}"
         )
+        perf = digest_data.get("performance_lab") or {}
+        if perf:
+            actions_sec += (
+                f"\n* Performance Lab: tracked {perf.get('tracked', 0)} setups, "
+                f"proposed {perf.get('proposed', 0)}, suppressed {perf.get('suppressed', 0)}, "
+                f"{perf.get('outcome_status', 'outcomes pending')}."
+            )
         sections.append(actions_sec)
         
         # 3-6. Tiers
@@ -796,6 +803,12 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             f"Past 30 min actions:\n"
             f"Proposals: {actions.get('proposals', 0)} | Orders: {actions.get('orders', 0)} | Fills: {actions.get('fills', 0)} | GPT calls: {actions.get('gpt_calls', 0)} | Expired: {actions.get('expired', 0)}\n"
         )
+        perf = digest_data.get("performance_lab") or {}
+        if perf:
+            msg_parts.append(
+                f"Performance Lab: tracked {perf.get('tracked', 0)} setups, proposed {perf.get('proposed', 0)}, "
+                f"suppressed {perf.get('suppressed', 0)}, {perf.get('outcome_status', 'outcomes pending')}.\n"
+            )
 
         exit_first_blocker = digest_data.get("exit_first_blocker")
         if exit_first_blocker:

@@ -4131,6 +4131,23 @@ class TradingService:
                 else:
                     final_proposal_message_category = "suppressed"
 
+                res["proposal_allowed"] = proposal_allowed
+                res["proposal_generated"] = proposal_generated
+                res["proposal_id"] = proposal_id
+                res["performance_action_decision"] = (
+                    "proposed" if proposal_generated else
+                    ("failed_final_validation" if no_action_reason and "final validation" in no_action_reason.lower() else
+                     "blocked" if no_action_reason and "blocked" in no_action_reason.lower() else
+                     "suppressed" if no_action_reason else "shadow_only")
+                )
+                res["performance_not_proposed_reason"] = None if proposal_generated else (no_action_reason or signal.reason)
+                res["performance_candidate_suppression_reason"] = candidate_suppression_reason
+                res["performance_price_age_seconds"] = price_age_seconds
+                res["performance_decision_reasons"] = list(decision.reasons) if decision is not None and not decision.passed else []
+                res["performance_proposed_notional"] = proposal.get("notional") if proposal else None
+                res["performance_batch_id"] = None
+                res["performance_proposal_payload"] = proposal or {}
+
                 self.storage.execute(
                     "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, emergency_exit_hard_trigger, emergency_exit_mode, emergency_exit_wait_seconds, None, emergency_exit_auto_execute_due_at, None, emergency_exit_final_decision, emergency_exit_block_reason, price, atr_value, adverse_move_atr, minutes_to_close, 1 if sleep_mode_active else 0, suppressed_by_sleep_mode, sleep_mode_reason, sleep_mode_suppressed_candidate, sleep_mode_started_at, sleep_mode_ended_at)
@@ -4477,6 +4494,23 @@ class TradingService:
             (now.isoformat(), now.isoformat()),
         )
         active_proposal_cnt = active_proposals[0]["cnt"] if active_proposals else 0
+        performance_lab_rows = self.storage.fetch_all(
+            """
+            SELECT COUNT(*) AS tracked,
+                   SUM(CASE WHEN proposed=1 THEN 1 ELSE 0 END) AS proposed,
+                   SUM(CASE WHEN proposed=0 THEN 1 ELSE 0 END) AS suppressed
+            FROM performance_setups
+            WHERE datetime(created_at) >= datetime(?)
+              AND datetime(created_at) <= datetime(?)
+            """,
+            (window_start_iso, now.isoformat()),
+        )
+        performance_lab = {
+            "tracked": int(performance_lab_rows[0].get("tracked") or 0) if performance_lab_rows else 0,
+            "proposed": int(performance_lab_rows[0].get("proposed") or 0) if performance_lab_rows else 0,
+            "suppressed": int(performance_lab_rows[0].get("suppressed") or 0) if performance_lab_rows else 0,
+            "outcome_status": "outcomes pending",
+        }
 
         promotions = self.storage.fetch_all(
             "SELECT symbol, from_tier, to_tier, reason, payload FROM symbol_promotion_decisions WHERE created_at>=? ORDER BY created_at DESC LIMIT 12",
@@ -4628,6 +4662,7 @@ class TradingService:
                 "actions_created": universe_actions_str
             },
             "provider_status": provider_status_str,
+            "performance_lab": performance_lab,
         }
 
         from .utils import format_digest_message
@@ -6771,75 +6806,119 @@ class TradingService:
         qualified_setups_cnt = 0
         shadow_trades_cnt = 0
         actual_trades_cnt = 0
+        active_set = {s.upper() for s in active_watchlist}
+        held = {str(_value(p, "symbol", "")).upper() for p in positions}
 
         for res in profile_results:
-            score = res["score"]
-            symbol = res["symbol"]
+            score = float(res.get("score") or 0.0)
+            symbol = str(res["symbol"]).upper()
             signal = res["signal"]
-
-            is_qualified = (score >= 65 or signal.action in ("ENTRY", "EXIT"))
-            if not is_qualified:
+            reason = res.get("performance_not_proposed_reason") or res.get("no_action_reason") or signal.reason
+            is_near_miss = score >= 55 or bool(res.get("performance_candidate_suppression_reason")) or symbol not in active_set
+            is_meaningful = score >= 65 or signal.action in ("ENTRY", "EXIT") or is_near_miss
+            if not is_meaningful:
                 continue
 
             qualified_setups_cnt += 1
             setup_id = str(uuid.uuid4())
-            is_active = 1 if symbol in active_watchlist else 0
+            tier_rows = self.storage.fetch_all("SELECT tier, asset_class FROM universe_symbols WHERE symbol=? LIMIT 1", (symbol,))
+            tier = tier_rows[0]["tier"] if tier_rows else ("held_position" if symbol in held else ("paper_tradable" if symbol in active_set else "observation"))
+            asset_class = str((tier_rows[0].get("asset_class") if tier_rows else None) or "equity").lower()
+            if asset_class in {"us_equity", "common_stock", "stock"}:
+                asset_class = "equity"
+            elif asset_class in {"fund", "etf"} or symbol in {"SPY", "QQQ", "DIA", "IWM", "XLK", "XLF", "XLV", "XLE", "XLY"}:
+                asset_class = "etf"
 
+            if signal.action == "ENTRY" and res.get("is_add"):
+                setup_type = "add_to_winner"
+            elif signal.action == "ENTRY":
+                setup_type = "new_entry"
+            elif signal.action == "EXIT":
+                setup_type = "exit"
+            elif score >= 55:
+                setup_type = "near_miss"
+            elif reason:
+                setup_type = "suppressed_candidate"
+            else:
+                setup_type = "hold_watch"
+
+            proposed = int(bool(res.get("proposal_generated")))
+            action_decision = res.get("performance_action_decision") or ("proposed" if proposed else "shadow_only")
+            proposed_notional = res.get("performance_proposed_notional")
+            hypothetical_notional = proposed_notional if proposed_notional is not None else res.get("final_notional", 5.0)
+            price_age = res.get("performance_price_age_seconds")
+            data_freshness = "fresh" if isinstance(price_age, (int, float)) and -5 <= price_age <= self.config.get("risk", {}).get("max_price_age_seconds", 120) else "stale_or_unknown"
+
+            score_components = {
+                "asset_score": res.get("asset_score"),
+                "trade_score": score,
+                "volatility_score_contribution": res.get("score_vol"),
+                "setup_quality_score": res.get("setup_quality_score"),
+                "portfolio_fit_score": res.get("portfolio_fit_score"),
+                "diversification_score": res.get("diversification_score"),
+                "sizing_score": res.get("sizing_score"),
+            }
+            signal_state = {"action": signal.action, "side": signal.side, "reason": signal.reason, "confidence": signal.confidence}
+            trend_metrics = {k: signal.indicators.get(k) for k in ("ma_50", "ma_200", "close") if signal.indicators and k in signal.indicators}
+            volatility_metrics = {
+                "volatility_20": res.get("vol_20"),
+                "volatility_regime": res.get("volatility_regime"),
+                "atr_value": res.get("atr_value"),
+                "adverse_move_atr": res.get("adverse_move_atr"),
+            }
+            liquidity_metrics = {"volume": res.get("volume")}
+            relative_strength_metrics = {"asset_score": res.get("asset_score"), "true_score_rank": res.get("true_score_rank")}
+            portfolio_exposure = {
+                "portfolio_equity": snapshot.get("portfolio_equity"),
+                "total_exposure_pct": snapshot.get("total_exposure_pct"),
+                "single_symbol_exposure_pct": (snapshot.get("single_exposures") or {}).get(symbol, 0.0),
+            }
+            cluster_exposure = {"cluster_exposures": snapshot.get("cluster_exposures")}
+            risk_budget = {"risk_budget": res.get("risk_budget"), "dedupe_status": res.get("dedupe_status"), "cooldown_reason": res.get("cooldown_reason")}
+
+            proposal_id = res.get("proposal_id")
+            batch_id = res.get("performance_batch_id")
             self.storage.execute(
-                """INSERT INTO trade_setups(
-                    id, run_id, symbol, timestamp, side, action, setup_key, is_active,
-                    price, score, asset_score, volatility_regime, trend_state, gpt_status,
-                    proposal_eligible, proposal_sent, block_reason
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """
+                INSERT INTO performance_setups(
+                    id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,proposed,proposal_id,batch_id,
+                    not_proposed_reason,score,score_components,signal_state,entry_signal,exit_signal,add_signal,current_price,
+                    price_timestamp,data_freshness,trend_metrics,volatility_metrics,liquidity_metrics,relative_strength_metrics,
+                    portfolio_exposure,cluster_exposure,risk_budget,proposed_notional,hypothetical_notional,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
                 (
-                    setup_id, self.run_id, symbol, now.isoformat(), signal.side, signal.action, res.get("setup_key"), is_active,
-                    res["price"], score, res["asset_score"], res["volatility_regime"], signal.reason,
-                    "Completed" if res.get("gpt_called") else "Not called",
-                    1 if res.get("proposal_allowed") else 0,
-                    1 if res.get("proposal_generated") else 0,
-                    res.get("no_action_reason")
-                )
+                    setup_id, now.isoformat(), self.run_id, symbol, asset_class, tier, setup_type, action_decision,
+                    proposed, proposal_id, batch_id, None if proposed else reason, score, json_dumps(score_components),
+                    json_dumps(signal_state), int(signal.action == "ENTRY" and signal.side == "buy"),
+                    int(signal.action == "EXIT"), int(bool(res.get("is_add"))), res.get("price"),
+                    str(res.get("price_at")) if res.get("price_at") is not None else None, data_freshness,
+                    json_dumps(trend_metrics), json_dumps(volatility_metrics), json_dumps(liquidity_metrics),
+                    json_dumps(relative_strength_metrics), json_dumps(portfolio_exposure), json_dumps(cluster_exposure),
+                    json_dumps(risk_budget), proposed_notional, hypothetical_notional, now.isoformat(), now.isoformat(),
+                ),
             )
-            tier_rows = self.storage.fetch_all("SELECT tier FROM universe_symbols WHERE symbol=? LIMIT 1", (symbol,))
-            if tier_rows:
+
+            blockers = self._performance_lab_blockers(res, signal, reason, active_set, data_freshness)
+            for blocker, blocker_reason in blockers:
                 self.storage.execute(
-                    "INSERT INTO dynamic_universe_performance(id,run_id,symbol,tier,metric,value,created_at,payload) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        str(uuid.uuid4()),
-                        self.run_id,
-                        symbol,
-                        tier_rows[0]["tier"],
-                        "scan_score",
-                        score,
-                        now.isoformat(),
-                        json_dumps(
-                            {
-                                "setup_id": setup_id,
-                                "action": signal.action,
-                                "proposal_eligible": 1 if res.get("proposal_allowed") else 0,
-                                "proposal_sent": 1 if res.get("proposal_generated") else 0,
-                            }
-                        ),
-                    ),
+                    "INSERT INTO performance_blockers(id,setup_id,run_id,symbol,blocker,reason,severity,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), setup_id, self.run_id, symbol, blocker, blocker_reason, "blocking", now.isoformat()),
                 )
 
-            is_tradable_buy = (score >= 65 and signal.side == "buy" and signal.action == "ENTRY")
-            if is_tradable_buy:
-                actual_proposal = self.storage.fetch_all(
-                    "SELECT id, status FROM trade_proposals WHERE run_id=? AND symbol=? AND side='buy' AND status IN ('submitted', 'approved', 'filled')",
-                    (self.run_id, symbol)
-                )
-                if not actual_proposal:
-                    shadow_trades_cnt += 1
+            actual_or_shadow = "actual" if proposed else "shadow"
+            if proposed:
+                actual_trades_cnt += 1
+            else:
+                shadow_trades_cnt += 1
+                if signal.action == "ENTRY" and signal.side == "buy" and score >= float(self.config.get("ai", {}).get("ai_review_min_score", 65)):
                     shadow_id = str(uuid.uuid4())
-
                     port_state = {
-                        "portfolio_equity": snapshot["portfolio_equity"],
-                        "total_exposure_pct": snapshot["total_exposure_pct"],
-                        "single_exposure_pct": snapshot["single_exposures"].get(symbol, 0.0),
-                        "cluster_exposures": snapshot["cluster_exposures"]
+                        "portfolio_equity": snapshot.get("portfolio_equity"),
+                        "total_exposure_pct": snapshot.get("total_exposure_pct"),
+                        "single_exposure_pct": (snapshot.get("single_exposures") or {}).get(symbol, 0.0),
+                        "cluster_exposures": snapshot.get("cluster_exposures"),
                     }
-
                     self.storage.execute(
                         """INSERT INTO shadow_trades(
                             id, run_id, setup_id, symbol, side, would_have_entry_price, would_have_entry_time,
@@ -6848,35 +6927,170 @@ class TradingService:
                             portfolio_state_json, sleep_mode_active, cooldown_state, selected_actual_trade_this_cycle
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            shadow_id, self.run_id, setup_id, symbol, "buy", res["price"], now.isoformat(),
-                            res.get("final_notional", 5.0), res.get("suggested_shares", 0.0), res.get("stop_price"), res.get("stop_distance_pct"),
-                            res.get("no_action_reason") or "suppressed", score, res["volatility_regime"],
+                            shadow_id, self.run_id, setup_id, symbol, "buy", res.get("price"), now.isoformat(),
+                            hypothetical_notional, res.get("suggested_shares", 0.0), res.get("stop_price"),
+                            res.get("stop_distance_pct"), reason or "suppressed", score, res.get("volatility_regime"),
                             res.get("gpt_confidence"), res.get("gpt_caution"), res.get("setup_key"),
-                            json.dumps(port_state), res.get("sleep_mode_active", 0),
-                            res.get("dedupe_status"), 0
-                        )
+                            json_dumps(port_state), res.get("sleep_mode_active", 0), res.get("dedupe_status"), 0,
+                        ),
                     )
-
                     self.storage.execute(
                         """INSERT INTO trade_outcomes(
                             id, trade_id, actual_or_shadow, symbol, entry_time, entry_price, outcome_status,
                             stop_hit, target_reached, add_on_improved, beat_shadow_alternatives, updated_at
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            str(uuid.uuid4()), shadow_id, "shadow", symbol, now.isoformat(), res["price"], "pending",
-                            0, 0, None, None, now.isoformat()
-                        )
+                            str(uuid.uuid4()), shadow_id, "shadow", symbol, now.isoformat(), res.get("price"),
+                            "pending", 0, 0, None, None, now.isoformat(),
+                        ),
                     )
-                else:
-                    actual_trades_cnt += 1
+            self.storage.execute(
+                """
+                INSERT INTO performance_outcomes(
+                    id,setup_id,run_id,symbol,proposal_id,batch_id,actual_or_shadow,entry_time,entry_price,
+                    entry_notional,entry_qty,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(uuid.uuid4()), setup_id, self.run_id, symbol, proposal_id, batch_id, actual_or_shadow,
+                    now.isoformat(), res.get("price"), hypothetical_notional, res.get("suggested_shares"),
+                    "pending_forward_returns", now.isoformat(), now.isoformat(),
+                ),
+            )
+            for horizon in (1, 5, 20):
+                due_at = now + timedelta(days=horizon)
+                self.storage.execute(
+                    """
+                    INSERT INTO performance_forward_returns(
+                        id,setup_id,run_id,symbol,horizon_days,due_at,eligible_to_update,status,reason
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (str(uuid.uuid4()), setup_id, self.run_id, symbol, horizon, due_at.isoformat(), 0, "pending", "waiting_for_elapsed_horizon"),
+                )
+            if not proposed:
+                self.storage.execute(
+                    """
+                    INSERT INTO performance_counterfactuals(
+                        id,setup_id,run_id,symbol,counterfactual_type,would_enter,would_add,would_exit,
+                        hypothetical_entry_price,hypothetical_notional,reason,comparison_status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(uuid.uuid4()), setup_id, self.run_id, symbol, setup_type,
+                        int(signal.action == "ENTRY" and not res.get("is_add")), int(bool(res.get("is_add"))),
+                        int(signal.action == "EXIT"), res.get("price"), hypothetical_notional, reason,
+                        "pending_forward_outcome", now.isoformat(), now.isoformat(),
+                    ),
+                )
 
+            if tier_rows:
+                self.storage.execute(
+                    "INSERT INTO dynamic_universe_performance(id,run_id,symbol,tier,metric,value,created_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        str(uuid.uuid4()), self.run_id, symbol, tier, "performance_lab_setup_score", score,
+                        now.isoformat(), json_dumps({"setup_id": setup_id, "setup_type": setup_type, "action_decision": action_decision}),
+                    ),
+                )
+
+        self._sync_performance_lab_order_links()
         self.storage.execute(
             "INSERT INTO performance_lab_summaries(id, run_id, timestamp, total_qualified_setups, total_shadow_trades, total_actual_trades) VALUES(?,?,?,?,?,?)",
-            (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt)
+            (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt),
         )
+
+    def _performance_lab_blockers(self, res: dict[str, Any], signal: Any, reason: str | None, active_set: set[str], data_freshness: str) -> list[tuple[str, str]]:
+        blockers: list[tuple[str, str]] = []
+        symbol = str(res.get("symbol", "")).upper()
+        score = float(res.get("score") or 0.0)
+        threshold = float(self.config.get("ai", {}).get("ai_review_min_score", 65))
+        reason_text = str(reason or "")
+        lower_reason = reason_text.lower()
+        if score < threshold:
+            blockers.append(("score_below_threshold", reason_text or f"score {score:.2f} below {threshold:.2f}"))
+        if signal.action != "ENTRY" and "entry" in lower_reason:
+            blockers.append(("no_entry_signal", reason_text))
+        if res.get("has_position") and signal.action != "ENTRY" and not res.get("is_add"):
+            blockers.append(("already_held_no_valid_add", reason_text or "already held without valid add setup"))
+        if res.get("is_add") and not res.get("proposal_generated"):
+            blockers.append(("no_add_signal", reason_text or "add setup did not pass all add gates"))
+        if "risk" in lower_reason:
+            blockers.append(("risk_gate", reason_text))
+        if "cluster" in lower_reason:
+            blockers.append(("cluster_gate", reason_text))
+        if "exposure" in lower_reason:
+            blockers.append(("exposure_gate", reason_text))
+        if data_freshness != "fresh" or "stale" in lower_reason:
+            blockers.append(("stale_price", reason_text or "price timestamp stale or unknown"))
+        if "missing" in lower_reason or "insufficient" in lower_reason:
+            blockers.append(("missing_data", reason_text))
+        if "cooldown" in lower_reason or res.get("cooldown_applied"):
+            blockers.append(("cooldown", reason_text or str(res.get("cooldown_reason") or "cooldown applied")))
+        if "pending" in lower_reason:
+            blockers.append(("pending_proposal_limit", reason_text))
+        if "max daily" in lower_reason or "trades_today" in lower_reason:
+            blockers.append(("max_daily_trades", reason_text))
+        if "market closed" in lower_reason:
+            blockers.append(("market_closed", reason_text))
+        if "provider" in lower_reason or "alpaca" in lower_reason:
+            blockers.append(("provider_guard", reason_text))
+        if symbol not in active_set:
+            blockers.append(("observation_only", reason_text or "symbol not in active paper-tradable scanner set"))
+        if str(res.get("tier") or "").lower() == "research_candidate":
+            blockers.append(("research_only", reason_text or "research candidate only"))
+        if not blockers and not res.get("proposal_generated"):
+            blockers.append(("other", reason_text or "measurement-only setup was not proposed"))
+        return blockers
+
+    def _sync_performance_lab_order_links(self) -> None:
+        rows = self.storage.fetch_all(
+            """
+            SELECT ps.id AS setup_id, ps.proposal_id, o.id AS order_id, o.broker_order_id, o.status AS order_status,
+                   o.notional AS submitted_notional, f.id AS fill_id, f.price AS fill_price, f.qty AS fill_qty,
+                   c.batch_id
+            FROM performance_setups ps
+            LEFT JOIN orders o ON o.proposal_id=ps.proposal_id
+            LEFT JOIN fills f ON f.order_id=o.id
+            LEFT JOIN proposal_batch_candidates c ON c.proposal_id=ps.proposal_id
+            WHERE ps.proposal_id IS NOT NULL
+            """
+        )
+        now_iso = iso_now()
+        for row in rows:
+            self.storage.execute(
+                """
+                UPDATE performance_setups
+                SET batch_id=COALESCE(?, batch_id), final_submitted_notional=COALESCE(?, final_submitted_notional),
+                    order_id=COALESCE(?, order_id), broker_order_id=COALESCE(?, broker_order_id),
+                    fill_id=COALESCE(?, fill_id), order_status=COALESCE(?, order_status),
+                    fill_price=COALESCE(?, fill_price), fill_qty=COALESCE(?, fill_qty), updated_at=?
+                WHERE id=?
+                """,
+                (
+                    row.get("batch_id"), row.get("submitted_notional"), row.get("order_id"), row.get("broker_order_id"),
+                    str(row.get("fill_id")) if row.get("fill_id") is not None else None, row.get("order_status"),
+                    row.get("fill_price"), row.get("fill_qty"), now_iso, row.get("setup_id"),
+                ),
+            )
+            self.storage.execute(
+                """
+                UPDATE performance_outcomes
+                SET batch_id=COALESCE(?, batch_id), order_id=COALESCE(?, order_id),
+                    broker_order_id=COALESCE(?, broker_order_id), fill_id=COALESCE(?, fill_id),
+                    entry_price=COALESCE(?, entry_price), entry_qty=COALESCE(?, entry_qty),
+                    entry_notional=COALESCE(?, entry_notional), updated_at=?
+                WHERE setup_id=?
+                """,
+                (
+                    row.get("batch_id"), row.get("order_id"), row.get("broker_order_id"),
+                    str(row.get("fill_id")) if row.get("fill_id") is not None else None,
+                    row.get("fill_price"), row.get("fill_qty"), row.get("submitted_notional"), now_iso, row.get("setup_id"),
+                ),
+            )
 
     def _update_forward_outcomes(self) -> None:
         now = datetime.now(UTC)
+        self._sync_performance_lab_order_links()
+        self._update_performance_forward_returns(now)
         pending = self.storage.fetch_all("SELECT * FROM trade_outcomes WHERE outcome_status IN ('pending','pending_forward_returns')")
         if not pending:
             return
@@ -6899,6 +7113,8 @@ class TradingService:
             try:
                 entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00")).replace(tzinfo=UTC)
             except Exception:
+                continue
+            if now < entry_dt + timedelta(days=1):
                 continue
 
             stop_price = None
@@ -6991,6 +7207,82 @@ class TradingService:
                     beat = 1 if ret_20d > max_shadow else 0
                     self.storage.execute("UPDATE trade_outcomes SET beat_shadow_alternatives=? WHERE id=?", (beat, out_id))
         self.storage.audit(self.run_id, "forward_outcomes_update_completed", {"pending": total_pending, "processed": len(pending)})
+
+    def _update_performance_forward_returns(self, now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        cfg = self._runtime_orchestration_cfg()
+        max_updates = int(cfg.get("max_forward_outcome_updates_per_cycle", 25))
+        pending = self.storage.fetch_all(
+            """
+            SELECT fr.*, ps.current_price AS setup_price, ps.timestamp AS setup_timestamp
+            FROM performance_forward_returns fr
+            JOIN performance_setups ps ON ps.id=fr.setup_id
+            WHERE fr.status='pending' AND datetime(fr.due_at) <= datetime(?)
+            ORDER BY fr.due_at
+            LIMIT ?
+            """,
+            (now.isoformat(), max_updates if max_updates > 0 else 1000000),
+        )
+        for row in pending:
+            symbol = row["symbol"]
+            entry_price = float(row.get("setup_price") or 0.0)
+            if entry_price <= 0:
+                self.storage.execute(
+                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='blocked',reason=?,updated_at=? WHERE id=?",
+                    ("missing_entry_price", now.isoformat(), row["id"]),
+                )
+                continue
+            try:
+                setup_dt = datetime.fromisoformat(str(row["setup_timestamp"]).replace("Z", "+00:00"))
+                setup_dt = setup_dt.replace(tzinfo=UTC) if setup_dt.tzinfo is None else setup_dt.astimezone(UTC)
+            except Exception:
+                self.storage.execute(
+                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='blocked',reason=?,updated_at=? WHERE id=?",
+                    ("invalid_setup_timestamp", now.isoformat(), row["id"]),
+                )
+                continue
+            horizon = int(row["horizon_days"])
+            try:
+                bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", max(60, horizon + 5)), symbol) if self.broker else pd.DataFrame()
+            except Exception as exc:
+                self.storage.execute(
+                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='pending',reason=?,updated_at=? WHERE id=?",
+                    (f"historical_bars_unavailable:{type(exc).__name__}", now.isoformat(), row["id"]),
+                )
+                continue
+            future_bars = []
+            for idx, bar in bars.iterrows():
+                bar_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                if not isinstance(bar_dt, datetime):
+                    continue
+                bar_dt = bar_dt.replace(tzinfo=UTC) if bar_dt.tzinfo is None else bar_dt.astimezone(UTC)
+                if bar_dt > setup_dt:
+                    future_bars.append((bar_dt, bar))
+            if len(future_bars) < horizon:
+                self.storage.execute(
+                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='pending',reason=?,updated_at=? WHERE id=?",
+                    ("waiting_for_provider_horizon_bars", now.isoformat(), row["id"]),
+                )
+                continue
+            window = future_bars[:horizon]
+            close_price = float(window[-1][1]["close"])
+            high = max(float(bar["high"]) if "high" in bar else float(bar["close"]) for _, bar in window)
+            low = min(float(bar["low"]) if "low" in bar else float(bar["close"]) for _, bar in window)
+            forward_return = (close_price / entry_price - 1.0) * 100.0
+            mfe = (high / entry_price - 1.0) * 100.0
+            mae = (low / entry_price - 1.0) * 100.0
+            stop_price = entry_price * 0.92
+            target_price = entry_price + 2.0 * (entry_price - stop_price)
+            self.storage.execute(
+                """
+                UPDATE performance_forward_returns
+                SET eligible_to_update=1, updated_at=?, forward_return=?, max_favorable_excursion=?,
+                    max_adverse_excursion=?, hypothetical_stop_hit=?, hypothetical_target_hit=?,
+                    status='complete', reason='updated_after_elapsed_horizon'
+                WHERE id=?
+                """,
+                (now.isoformat(), forward_return, mfe, mae, int(low <= stop_price), int(high >= target_price), row["id"]),
+            )
 
     def _create_shadow_trade_from_proposal(self, prop_row: dict[str, Any], reason: str) -> None:
         exists = self.storage.fetch_all("SELECT 1 FROM shadow_trades WHERE id=?", (prop_row["id"],))

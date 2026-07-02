@@ -72,6 +72,11 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "llm_explanation_usage": "id TEXT PRIMARY KEY, run_id TEXT, enabled INTEGER DEFAULT 0, attempted_calls INTEGER DEFAULT 0, successful_calls INTEGER DEFAULT 0, failed_calls INTEGER DEFAULT 0, discarded_invalid INTEGER DEFAULT 0, conflicts_ignored INTEGER DEFAULT 0, total_estimated_cost REAL DEFAULT 0, status TEXT, created_at TEXT, detail TEXT",
     "dynamic_universe_stage_reviews": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, current_tier TEXT, review_type TEXT, decision TEXT, reason TEXT, score REAL, data_confidence TEXT, observation_since TEXT, observation_cycles INTEGER, market_open_refreshes INTEGER, latest_price REAL, price_freshness TEXT, eod_available INTEGER DEFAULT 0, intraday_available INTEGER DEFAULT 0, trend_summary TEXT, intraday_summary TEXT, liquidity_summary TEXT, volatility_summary TEXT, relative_strength_spy TEXT, relative_strength_qqq TEXT, cluster TEXT, cluster_exposure_blocker TEXT, promotion_requirements_met TEXT, promotion_requirements_missing TEXT, demotion_risk_reasons TEXT, demotion_guard_active INTEGER DEFAULT 0, current_stage_reason TEXT, next_stage_blocker TEXT, tradable_status TEXT, proposal_allowed_status TEXT, proposal_block_reason TEXT, last_promotion_review_at TEXT, last_demotion_review_at TEXT, next_promotion_review_at TEXT, next_demotion_review_at TEXT, created_at TEXT, payload TEXT, promotion_freshness_path TEXT, promotion_confidence_adjustment TEXT, promotion_data_limitations TEXT, proposal_block_reason_after_promotion TEXT, fallback_used TEXT, next_review_time TEXT, alpaca_quote_freshness TEXT, alpaca_tradability_result TEXT, intraday_freshness TEXT, eod_freshness TEXT",
     "dynamic_universe_performance": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, tier TEXT, metric TEXT, value REAL, created_at TEXT, payload TEXT",
+    "performance_setups": "id TEXT PRIMARY KEY, timestamp TEXT, run_id TEXT, symbol TEXT, asset_class TEXT, tier TEXT, setup_type TEXT, action_decision TEXT, proposed INTEGER DEFAULT 0, proposal_id TEXT, batch_id TEXT, not_proposed_reason TEXT, score REAL, score_components TEXT, signal_state TEXT, entry_signal INTEGER DEFAULT 0, exit_signal INTEGER DEFAULT 0, add_signal INTEGER DEFAULT 0, current_price REAL, price_timestamp TEXT, data_freshness TEXT, trend_metrics TEXT, volatility_metrics TEXT, liquidity_metrics TEXT, relative_strength_metrics TEXT, portfolio_exposure TEXT, cluster_exposure TEXT, risk_budget TEXT, proposed_notional REAL, hypothetical_notional REAL, actual_approved_notional REAL, final_submitted_notional REAL, order_id TEXT, broker_order_id TEXT, fill_id TEXT, order_status TEXT, fill_price REAL, fill_qty REAL, created_at TEXT, updated_at TEXT",
+    "performance_blockers": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, blocker TEXT, reason TEXT, severity TEXT, created_at TEXT",
+    "performance_outcomes": "id TEXT PRIMARY KEY, setup_id TEXT UNIQUE, run_id TEXT, symbol TEXT, proposal_id TEXT, batch_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, actual_or_shadow TEXT, entry_time TEXT, entry_price REAL, entry_notional REAL, entry_qty REAL, status TEXT, actual_proposal_execution_helped INTEGER, add_to_winner_improved_position INTEGER, exit_signal_avoided_loss INTEGER, created_at TEXT, updated_at TEXT",
+    "performance_forward_returns": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, horizon_days INTEGER, due_at TEXT, eligible_to_update INTEGER DEFAULT 0, updated_at TEXT, forward_return REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, hypothetical_stop_hit INTEGER, hypothetical_target_hit INTEGER, status TEXT, reason TEXT",
+    "performance_counterfactuals": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, counterfactual_type TEXT, would_enter INTEGER DEFAULT 0, would_add INTEGER DEFAULT 0, would_exit INTEGER DEFAULT 0, hypothetical_entry_price REAL, hypothetical_notional REAL, reason TEXT, comparison_status TEXT, created_at TEXT, updated_at TEXT",
     "dynamic_universe_schedule_state": "id TEXT PRIMARY KEY, schedule_name TEXT UNIQUE, schedule_type TEXT, due_at TEXT, last_started_at TEXT, last_completed_at TEXT, last_success_at TEXT, last_skipped_at TEXT, last_skip_reason TEXT, missed_count INTEGER DEFAULT 0, catchup_required INTEGER DEFAULT 0, catchup_attempted_at TEXT, catchup_completed_at TEXT, catchup_status TEXT, data_freshness_status TEXT, provider_health_status TEXT, internet_status TEXT, power_status TEXT, battery_pct REAL, stale_after_minutes INTEGER, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, notes TEXT, created_at TEXT, updated_at TEXT",
 }
 
@@ -108,6 +113,10 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_candidate_briefs_symbol ON research_candidate_briefs(symbol, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dynamic_stage_reviews_symbol ON dynamic_universe_stage_reviews(symbol, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dynamic_schedule_state ON dynamic_universe_schedule_state(schedule_type, catchup_required, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_setups_run_symbol ON performance_setups(run_id, symbol, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_setups_proposal ON performance_setups(proposal_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_blockers_setup ON performance_blockers(setup_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_forward_due ON performance_forward_returns(status, due_at)")
             stage_rows = [
                 (
                     "raw_universe",
@@ -513,6 +522,33 @@ class Storage:
                     "exclusion_reason": "TEXT",
                 },
             )
+            add_missing_columns(
+                "performance_setups",
+                {
+                    "batch_id": "TEXT",
+                    "actual_approved_notional": "REAL",
+                    "final_submitted_notional": "REAL",
+                    "order_id": "TEXT",
+                    "broker_order_id": "TEXT",
+                    "fill_id": "TEXT",
+                    "order_status": "TEXT",
+                    "fill_price": "REAL",
+                    "fill_qty": "REAL",
+                    "updated_at": "TEXT",
+                },
+            )
+            add_missing_columns(
+                "performance_outcomes",
+                {
+                    "batch_id": "TEXT",
+                    "order_id": "TEXT",
+                    "broker_order_id": "TEXT",
+                    "fill_id": "TEXT",
+                    "actual_proposal_execution_helped": "INTEGER",
+                    "add_to_winner_improved_position": "INTEGER",
+                    "exit_signal_avoided_loss": "INTEGER",
+                },
+            )
                 
             cursor = conn.execute("PRAGMA table_info(market_memory)")
             cols_mem = [row["name"] for row in cursor.fetchall()]
@@ -699,6 +735,22 @@ class Storage:
         self.execute(
             "UPDATE position_sizing_decisions SET order_id=?, broker_order_id=?, fill_id=? WHERE proposal_id=?",
             params,
+        )
+        self.execute(
+            """
+            UPDATE performance_setups
+            SET order_id=?, broker_order_id=?, fill_id=?, updated_at=?
+            WHERE proposal_id=?
+            """,
+            (row.get("order_id"), row.get("broker_order_id"), str(row.get("fill_id")) if row.get("fill_id") is not None else None, iso_now(), row.get("proposal_id")),
+        )
+        self.execute(
+            """
+            UPDATE performance_outcomes
+            SET order_id=?, broker_order_id=?, fill_id=?, updated_at=?
+            WHERE proposal_id=?
+            """,
+            (row.get("order_id"), row.get("broker_order_id"), str(row.get("fill_id")) if row.get("fill_id") is not None else None, iso_now(), row.get("proposal_id")),
         )
 
     def upsert_actual_trade_outcome_for_order(self, order_id: str, source: str = "ranked_batch_approval") -> str | None:
