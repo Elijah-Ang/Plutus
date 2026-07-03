@@ -7172,15 +7172,19 @@ class TradingService:
             (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt),
         )
 
-    def _run_crypto_research_due(self) -> None:
+    def _run_crypto_research_due(self) -> list[Any]:
         crypto_cfg = self.config.get("crypto") or {}
         if not crypto_cfg.get("enabled", False):
-            return
+            return []
         try:
-            CryptoResearchEngine(self.config, self.storage, self.broker, self.telegram, self.run_id).run_due(datetime.now(UTC))
+            return CryptoResearchEngine(self.config, self.storage, self.broker, self.telegram, self.run_id).run_due(datetime.now(UTC))
         except Exception as exc:
             logger.warning("crypto_research_due_failed: %s", exc)
             self.storage.audit(self.run_id, "crypto_research_due_failed", {"error": type(exc).__name__})
+            return []
+
+    def run_crypto_research_due(self) -> list[Any]:
+        return self._run_crypto_research_due()
 
     def _performance_lab_blockers(self, res: dict[str, Any], signal: Any, reason: str | None, active_set: set[str], data_freshness: str) -> list[tuple[str, str]]:
         blockers: list[tuple[str, str]] = []

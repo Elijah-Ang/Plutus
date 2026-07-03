@@ -43,9 +43,14 @@ class CryptoResearchResult:
 
 def normalize_crypto_symbol(symbol: str) -> str | None:
     raw = str(symbol or "").strip().upper().replace("-", "/")
-    if not raw or "/" not in raw:
+    if not raw:
         return None
-    base, quote = raw.split("/", 1)
+    if "/" in raw:
+        base, quote = raw.split("/", 1)
+    elif raw.endswith("USD"):
+        base, quote = raw[:-3], "USD"
+    else:
+        return None
     if not base.isalpha() or quote != "USD":
         return None
     if base not in {"BTC", "ETH", "SOL"}:
@@ -299,10 +304,14 @@ class CryptoResearchEngine:
                 (self.config.get("crypto") or {}).get("max_notional_per_trade"), now.isoformat(), now.isoformat(),
             ),
         )
-        self.storage.execute(
-            "INSERT INTO performance_blockers(id,setup_id,run_id,symbol,blocker,reason,severity,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), setup_id, self.run_id, result.symbol, "research_only", "crypto proposals disabled by default", "blocking", now.isoformat()),
-        )
+        blockers = [("research_only", "crypto proposals disabled by default")]
+        if result.price is None or result.data_freshness == "missing" or "provider_unavailable" in result.reason or "missing_crypto_bars" in result.reason:
+            blockers.append(("crypto_data_unavailable", result.reason))
+        for blocker, reason in blockers:
+            self.storage.execute(
+                "INSERT INTO performance_blockers(id,setup_id,run_id,symbol,blocker,reason,severity,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), setup_id, self.run_id, result.symbol, blocker, reason, "blocking", now.isoformat()),
+            )
         self.storage.execute(
             """
             INSERT INTO performance_outcomes(

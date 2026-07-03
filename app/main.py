@@ -57,6 +57,18 @@ def run_once(config_path: str | Path | None = None) -> int:
             logger.warning("Broker initialization unavailable: %s", type(exc).__name__)
         service = TradingService(config, storage, broker, run_id)
         service.cleanup_stale_research_runs()
+        research_result = run_research_preflight(
+            config,
+            storage,
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight"),
+        )
+        crypto_results = []
+        if research_result.passed:
+            crypto_results = service.run_crypto_research_due()
+        else:
+            skipped_reasons = [c.name for c in research_result.checks if not c.passed]
+            storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
+
         trading_result = run_trading_preflight(
             config,
             storage,
@@ -67,14 +79,8 @@ def run_once(config_path: str | Path | None = None) -> int:
         market_open_failed = "market_open" in failed_trading
 
         research_results = []
-        research_result = None
         if trading_result.passed:
             service.run_cycle(run_dynamic_universe=False)
-            research_result = run_research_preflight(
-                config,
-                storage,
-                recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight"),
-            )
             if research_result.passed:
                 runtime_cfg = config.get("runtime_orchestration") or config.get("dynamic_universe", {}).get("runtime_orchestration", {})
                 research_results = service.run_dynamic_universe_research_only(
@@ -83,9 +89,6 @@ def run_once(config_path: str | Path | None = None) -> int:
                     skip_run_types=["daily_deep_research", "post_market_review", "weekly_cleanup"],
                     label="market_open_dynamic_universe_research",
                 )
-            else:
-                skipped_reasons = [c.name for c in research_result.checks if not c.passed]
-                storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
             research_status = "not_due"
             if research_results:
                 research_status = ",".join(sorted({str(r.get("status") or "unknown") for r in research_results}))
@@ -98,6 +101,7 @@ def run_once(config_path: str | Path | None = None) -> int:
                     "trading_preflight_passed": True,
                     "research_ran": any(r.get("status") == "completed" for r in research_results),
                     "research_status": research_status,
+                    "crypto_research_ran": bool(crypto_results),
                     "trading_skipped_reason": None,
                     "market_open_required_for_trading": bool(config.get("require_market_open", True)),
                     "market_open_required_for_research": False,
@@ -109,16 +113,8 @@ def run_once(config_path: str | Path | None = None) -> int:
             storage.finish_run(run_id, "completed", "bounded paper cycle complete")
             return 0
 
-        research_result = run_research_preflight(
-            config,
-            storage,
-            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight"),
-        )
         if research_result.passed:
             research_results = service.run_dynamic_universe_research_only(label="market_closed_dynamic_universe_research")
-        else:
-            skipped_reasons = [c.name for c in research_result.checks if not c.passed]
-            storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
         research_ran = any(r.get("status") == "completed" for r in research_results)
         research_status = "not_due"
         if research_results:
@@ -136,6 +132,7 @@ def run_once(config_path: str | Path | None = None) -> int:
             "trading_preflight_passed": trading_result.passed,
             "research_ran": research_ran,
             "research_status": research_status,
+            "crypto_research_ran": bool(crypto_results),
             "trading_skipped_reason": "; ".join(failed_trading) if failed_trading else None,
             "market_open_required_for_trading": bool(config.get("require_market_open", True)),
             "market_open_required_for_research": False,

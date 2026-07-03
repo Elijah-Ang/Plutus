@@ -67,6 +67,7 @@ class FakeService:
         self.notify_called = False
         self.notify_reason = None
         self.research_calls = []
+        self.crypto_calls = 0
         FakeService.instances.append(self)
 
     def cleanup_stale_research_runs(self):
@@ -75,6 +76,10 @@ class FakeService:
     def run_dynamic_universe_research_only(self, **kwargs):
         self.research_calls.append(kwargs)
         return self.config.get("_research_results", [])
+
+    def run_crypto_research_due(self):
+        self.crypto_calls += 1
+        return self.config.get("_crypto_results", [])
 
     def notify_premarket_dynamic_universe_status(self, results, trading_skipped_reason):
         self.notify_called = True
@@ -93,12 +98,21 @@ def _config(research_results=None):
         "require_market_open": True,
         "storage": {"sqlite_path": "ignored.db"},
         "dynamic_universe": {"enabled": False},
+        "crypto": {
+            "enabled": True,
+            "mode": "research_only",
+            "paper_trading_enabled": False,
+            "proposals_enabled": False,
+            "live_enabled": False,
+            "schedule": {"enabled": True},
+        },
         "preflight": {
             "research_only": {"require_ac_power": False, "require_internet": True, "require_broker": False, "allow_market_closed": True},
             "trading": {"require_ac_power": True, "require_internet": True, "require_broker": True, "require_market_open": True},
         },
         "telegram": {"dynamic_universe_premarket_updates_enabled": True},
         "_research_results": research_results or [],
+        "_crypto_results": [{"symbol": "BTC/USD"}, {"symbol": "ETH/USD"}],
     }
 
 
@@ -155,6 +169,7 @@ def test_market_closed_daily_deep_research_runs_before_trading_block(monkeypatch
     storage = FakeStorage.last_instance
     service = FakeService.instances[0]
     assert service.run_cycle_called is False
+    assert service.crypto_calls == 1
     assert service.notify_called is True
     assert service.notify_reason == "market_closed"
     assert storage.finished[0] == "research_completed_trading_blocked_market_closed"
@@ -183,6 +198,7 @@ def test_research_notification_evaluated_when_trading_blocked_by_power(monkeypat
     service = FakeService.instances[0]
     storage = FakeStorage.last_instance
     assert service.run_cycle_called is False
+    assert service.crypto_calls == 1
     assert service.notify_called is True
     assert service.notify_reason == "power"
     assert storage.finished == ("blocked", "power")
@@ -212,6 +228,7 @@ def test_research_notification_evaluated_when_trading_blocked_by_power_and_marke
     service = FakeService.instances[0]
     storage = FakeStorage.last_instance
     assert service.run_cycle_called is False
+    assert service.crypto_calls == 1
     assert service.notify_called is True
     assert service.notify_reason == "market_closed"
     assert storage.finished == ("blocked", "power; market_open")
@@ -242,6 +259,7 @@ def test_research_notification_evaluated_when_trading_blocked_by_broker(monkeypa
     assert service.notify_called is True
     assert service.notify_reason == "broker"
     assert storage.finished == ("blocked", "broker")
+    assert service.crypto_calls == 1
 
 
 def test_research_incomplete_does_not_emit_completed_notification(monkeypatch):
@@ -262,6 +280,7 @@ def test_research_incomplete_does_not_emit_completed_notification(monkeypatch):
 
     service = FakeService.instances[0]
     assert service.run_cycle_called is False
+    assert service.crypto_calls == 1
     assert service.notify_called is False
     assert not any(e[0] == "research_completed_trading_blocked_market_closed" for e in FakeStorage.last_instance.audit_events)
 
@@ -283,6 +302,7 @@ def test_market_closed_without_research_due_exits_blocked_without_trading(monkey
 
     service = FakeService.instances[0]
     assert service.run_cycle_called is False
+    assert service.crypto_calls == 1
     assert service.notify_called is False
     assert FakeStorage.last_instance.finished == ("blocked", "market_open")
 
@@ -304,6 +324,7 @@ def test_market_open_runs_trading_without_duplicate_dynamic_universe(monkeypatch
 
     service = FakeService.instances[0]
     assert service.run_cycle_called is True
+    assert service.crypto_calls == 1
     assert service.run_dynamic_universe is False
     assert service.research_calls[0]["run_types"] == ["intraday_light_refresh", "event_triggered_refresh"]
     assert "daily_deep_research" in service.research_calls[0]["skip_run_types"]

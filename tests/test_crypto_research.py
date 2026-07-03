@@ -9,6 +9,7 @@ from app.crypto_research import (
     configured_crypto_symbols,
     crypto_quiet_hours_active,
     format_crypto_digest,
+    normalize_crypto_symbol,
 )
 from app.reports import SHEETS
 from app.service import TradingService
@@ -52,6 +53,20 @@ class CryptoBroker:
     def submit_order(self, *args, **kwargs):
         self.submitted_orders.append((args, kwargs))
         raise AssertionError("crypto research must not submit orders")
+
+    def get_positions(self):
+        raise AssertionError("crypto research must not fetch equity positions")
+
+    def get_open_orders(self):
+        raise AssertionError("crypto research must not fetch equity orders")
+
+    def get_account(self):
+        raise AssertionError("crypto research must not fetch equity account")
+
+
+class FailingCryptoBroker(CryptoBroker):
+    def get_crypto_historical_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 500):
+        raise RuntimeError("provider unavailable")
 
 
 class TelegramSink:
@@ -117,6 +132,14 @@ def test_btc_and_eth_enter_crypto_research_lane_sol_optional_by_default(tmp_path
     assert all(result.lane in {"crypto_research_candidate", "crypto_observation"} for result in results)
 
 
+def test_crypto_symbols_are_normalized_consistently():
+    assert normalize_crypto_symbol("BTC/USD") == "BTC/USD"
+    assert normalize_crypto_symbol("BTCUSD") == "BTC/USD"
+    assert normalize_crypto_symbol("BTC-USD") == "BTC/USD"
+    assert normalize_crypto_symbol("ETHUSD") == "ETH/USD"
+    assert normalize_crypto_symbol("DOGE/USD") is None
+
+
 def test_crypto_research_does_not_require_us_market_open_and_creates_no_proposals_or_orders(tmp_path):
     storage = _storage(tmp_path)
     broker = CryptoBroker()
@@ -141,6 +164,7 @@ def test_crypto_quiet_hours_suppress_telegram_but_record_data(tmp_path):
     assert results
     assert telegram.messages == []
     assert len(storage.fetch_all("SELECT * FROM crypto_research_snapshots")) == 2
+    assert len(storage.fetch_all("SELECT * FROM performance_setups WHERE asset_class='crypto'")) == 2
 
 
 def test_crypto_digest_line_is_compact_and_research_only(tmp_path):
@@ -169,6 +193,8 @@ def test_crypto_uses_separate_risk_limits_and_does_not_affect_equity_watchlist(t
     assert "BTC/USD" not in config["watchlist"]
     assert "ETH/USD" not in config["watchlist"]
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM position_sizing_decisions") == []
+    assert storage.fetch_all("SELECT * FROM portfolio_exposure_snapshots") == []
 
 
 def test_stale_crypto_data_blocks_future_proposal_path_and_records_shadow_only(tmp_path):
@@ -185,6 +211,25 @@ def test_stale_crypto_data_blocks_future_proposal_path_and_records_shadow_only(t
     assert {row["asset_class"] for row in perf} == {"crypto"}
     assert {row["action_decision"] for row in perf} == {"research_only"}
     assert {row["proposed"] for row in perf} == {0}
+
+
+def test_crypto_provider_failure_records_data_unavailable_blocker_and_no_orders(tmp_path):
+    storage = _storage(tmp_path)
+    broker = FailingCryptoBroker()
+
+    results = CryptoResearchEngine(_config(), storage, broker, TelegramSink(), "run-provider-fail").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    assert {result.symbol for result in results} == {"BTC/USD", "ETH/USD"}
+    assert {result.data_freshness for result in results} == {"missing"}
+    assert all(result.reason.startswith("provider_unavailable") for result in results)
+    assert len(storage.fetch_all("SELECT * FROM crypto_research_snapshots WHERE data_freshness='missing'")) == 2
+    blockers = storage.fetch_all("SELECT symbol,blocker,reason FROM performance_blockers WHERE blocker='crypto_data_unavailable'")
+    assert {row["symbol"] for row in blockers} == {"BTC/USD", "ETH/USD"}
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+    assert broker.submitted_orders == []
 
 
 def test_crypto_report_sheets_are_registered():
