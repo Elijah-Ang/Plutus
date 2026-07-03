@@ -42,7 +42,30 @@ crypto:
   max_crypto_exposure_pct: 1.0
   require_fresh_price: true
   max_price_age_seconds: 300
+  min_score_for_paper_watch: 70
+  min_score_for_proposal: 80
+  min_risk_reward_ratio: 1.5
+  min_stop_distance_pct: 0.01
+  max_stop_distance_pct: 0.08
+  max_spread_bps: 50
+  max_realized_volatility: 1.5
+  max_account_risk_per_trade: 0.05
+  proposal_expiry_minutes: 3
+  approval_max_price_age_seconds: 30
+  approval_max_price_move_bps_base: 50
+  approval_max_price_move_bps_hard_cap: 100
+  default_order_type: limit
+  limit_price_source: midpoint_or_last_with_slippage_cap
+  fallback_market_orders: false
+  allow_new_entries: true
+  allow_add_to_winner: false
+  allow_exits: true
+  eodhd_research_enabled: true
   data_source: alpaca
+  runtime_evidence_gate:
+    enabled: true
+    min_natural_cycles: 3
+    max_cycle_age_hours: 72
   schedule:
     enabled: true
     research_interval_minutes: 60

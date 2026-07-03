@@ -14,8 +14,32 @@ CRYPTO_LANES = {
     "crypto_raw",
     "crypto_research_candidate",
     "crypto_observation",
+    "crypto_paper_watch",
     "crypto_paper_tradable",
     "crypto_trade_proposal",
+}
+
+CRYPTO_MODES = {"research_only", "paper_watch", "paper_proposal"}
+
+CRYPTO_BLOCKER_REASONS = {
+    "crypto_research_only",
+    "crypto_paper_disabled",
+    "crypto_proposals_disabled",
+    "crypto_pair_unsupported",
+    "crypto_price_stale",
+    "crypto_spread_too_wide",
+    "crypto_orderbook_missing",
+    "crypto_volatility_extreme",
+    "crypto_liquidity_insufficient",
+    "crypto_risk_reward_too_low",
+    "crypto_stop_distance_invalid",
+    "crypto_quiet_hours_notification_suppressed",
+    "crypto_existing_position_conflict",
+    "crypto_pending_order_conflict",
+    "crypto_pending_proposal_conflict",
+    "crypto_provider_unavailable",
+    "crypto_alpaca_final_price_unavailable",
+    "crypto_runtime_evidence_gate_failed",
 }
 
 
@@ -83,10 +107,17 @@ def crypto_quiet_hours_active(config: dict[str, Any], now: datetime | None = Non
 
 
 def format_crypto_digest(results: list[CryptoResearchResult]) -> str:
+    mode = _crypto_mode_from_results(results)
     if not results:
-        return "Crypto research: no enabled symbols. Research-only. No proposals/orders."
+        return f"Crypto research: no enabled symbols. Mode {mode}. No proposals/orders."
     scores = ", ".join(f"{res.symbol} {res.score:.0f}" for res in results)
-    return f"Crypto research: {scores}. Research-only. No proposals/orders."
+    if mode == "paper_watch":
+        suffix = "Paper-watch. Hypothetical candidates only. No proposals/orders."
+    elif mode == "paper_proposal":
+        suffix = "Paper-proposal gated. Manual approval and final validation required."
+    else:
+        suffix = "Research-only. No proposals/orders."
+    return f"Crypto research: {scores}. {suffix}"
 
 
 class CryptoResearchEngine:
@@ -115,6 +146,7 @@ class CryptoResearchEngine:
     def run_research(self, symbols: list[str] | None = None, now: datetime | None = None) -> list[CryptoResearchResult]:
         now = now or datetime.now(UTC)
         cfg = self.config.get("crypto") or {}
+        mode = _crypto_mode(self.config)
         enabled_symbols = symbols or configured_crypto_symbols(self.config)
         provider = str(cfg.get("data_source") or "alpaca")
         research_run_id = str(uuid.uuid4())
@@ -127,7 +159,7 @@ class CryptoResearchEngine:
                 now.isoformat(),
                 json_dumps(enabled_symbols),
                 provider,
-                json_dumps({"mode": cfg.get("mode"), "paper_trading_enabled": cfg.get("paper_trading_enabled", False), "proposals_enabled": cfg.get("proposals_enabled", False)}),
+                json_dumps({"mode": mode, "paper_trading_enabled": cfg.get("paper_trading_enabled", False), "proposals_enabled": cfg.get("proposals_enabled", False)}),
             ),
         )
         results: list[CryptoResearchResult] = []
@@ -185,7 +217,8 @@ class CryptoResearchEngine:
             spread=spread,
         )
         lane = _lane_for_score(score, self.config)
-        reason = "research_only_no_proposals"
+        mode = _crypto_mode(self.config)
+        reason = "research_only_no_proposals" if mode == "research_only" else f"{mode}_no_actionable_proposal"
         if data_freshness != "fresh":
             reason = "stale_crypto_data_no_proposals"
         return CryptoResearchResult(
@@ -204,7 +237,7 @@ class CryptoResearchEngine:
             spread=spread,
             risk_metrics=risk_metrics,
             provider=provider,
-            status="research_only",
+            status=mode,
             reason=reason,
         )
 
@@ -277,12 +310,19 @@ class CryptoResearchEngine:
                 result.reason, "pending_forward_outcome", now.isoformat(), now.isoformat(),
             ),
         )
+        self._record_stage_candidate(result, research_run_id, setup_id, now)
 
     def _record_performance_lab(self, result: CryptoResearchResult, now: datetime) -> str | None:
         tables = self.storage.fetch_all("SELECT name FROM sqlite_master WHERE type='table' AND name='performance_setups'")
         if not tables:
             return None
         setup_id = str(uuid.uuid4())
+        cfg = self.config.get("crypto") or {}
+        mode = _crypto_mode(self.config)
+        candidate = _build_candidate_metadata(result, self.config, now)
+        blockers = self._crypto_blockers(result, candidate, now)
+        proposed = 1 if mode == "paper_proposal" and not blockers else 0
+        action_decision = "paper_watch" if mode == "paper_watch" else ("paper_proposal" if mode == "paper_proposal" else "research_only")
         self.storage.execute(
             """
             INSERT INTO performance_setups(
@@ -294,19 +334,23 @@ class CryptoResearchEngine:
             """,
             (
                 setup_id, now.isoformat(), self.run_id, result.symbol, "crypto", result.lane, "hold_watch",
-                "research_only", 0, result.reason, result.score, json_dumps(result.score_components),
-                json_dumps({"action": "RESEARCH", "side": "none", "reason": result.reason}), 0, 0, 0,
+                action_decision, proposed, result.reason, result.score, json_dumps(result.score_components),
+                json_dumps({"action": "RESEARCH", "side": "none", "reason": result.reason, "mode": mode}), 0, 0, 0,
                 result.price, result.price_timestamp, result.data_freshness, json_dumps(result.trend_metrics),
                 json_dumps({"realized_volatility": result.realized_volatility, "atr_like_volatility": result.atr_like_volatility}),
                 json_dumps({"volume": result.volume, "spread": result.spread}),
                 json_dumps({"vs_btc": "btc_baseline" if result.symbol == "BTC/USD" else "pending"}),
-                json_dumps({"crypto_mode": (self.config.get("crypto") or {}).get("mode"), "paper_trading_enabled": False, "proposals_enabled": False}),
-                (self.config.get("crypto") or {}).get("max_notional_per_trade"), now.isoformat(), now.isoformat(),
+                json_dumps(
+                    {
+                        "crypto_mode": mode,
+                        "paper_trading_enabled": bool(cfg.get("paper_trading_enabled", False)),
+                        "proposals_enabled": bool(cfg.get("proposals_enabled", False)),
+                        "evidence_gate_required": mode == "paper_proposal",
+                    }
+                ),
+                candidate.get("position_size"), now.isoformat(), now.isoformat(),
             ),
         )
-        blockers = [("research_only", "crypto proposals disabled by default")]
-        if result.price is None or result.data_freshness == "missing" or "provider_unavailable" in result.reason or "missing_crypto_bars" in result.reason:
-            blockers.append(("crypto_data_unavailable", result.reason))
         for blocker, reason in blockers:
             self.storage.execute(
                 "INSERT INTO performance_blockers(id,setup_id,run_id,symbol,blocker,reason,severity,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -320,7 +364,7 @@ class CryptoResearchEngine:
             """,
             (
                 str(uuid.uuid4()), setup_id, self.run_id, result.symbol, "shadow", now.isoformat(), result.price,
-                (self.config.get("crypto") or {}).get("max_notional_per_trade"), "pending_forward_returns",
+                candidate.get("position_size"), "pending_forward_returns",
                 now.isoformat(), now.isoformat(),
             ),
         )
@@ -333,7 +377,7 @@ class CryptoResearchEngine:
                 """,
                 (
                     str(uuid.uuid4()), setup_id, self.run_id, result.symbol, horizon,
-                    (now + timedelta(days=horizon)).isoformat(), 0, "pending", "crypto_research_only_waiting_for_elapsed_horizon",
+                    (now + timedelta(days=horizon)).isoformat(), 0, "pending", f"crypto_{mode}_waiting_for_elapsed_horizon",
                 ),
             )
         self.storage.execute(
@@ -344,12 +388,223 @@ class CryptoResearchEngine:
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                str(uuid.uuid4()), setup_id, self.run_id, result.symbol, "crypto_research_only",
-                result.price, (self.config.get("crypto") or {}).get("max_notional_per_trade"), result.reason,
+                str(uuid.uuid4()), setup_id, self.run_id, result.symbol, f"crypto_{mode}",
+                result.price, candidate.get("position_size"), result.reason,
                 "pending_forward_outcome", now.isoformat(), now.isoformat(),
             ),
         )
         return setup_id
+
+    def _record_stage_candidate(self, result: CryptoResearchResult, research_run_id: str, setup_id: str | None, now: datetime) -> str | None:
+        mode = _crypto_mode(self.config)
+        if mode == "research_only":
+            return None
+        tables = self.storage.fetch_all("SELECT name FROM sqlite_master WHERE type='table' AND name='crypto_paper_watch_candidates'")
+        if not tables:
+            return None
+        candidate = _build_candidate_metadata(result, self.config, now)
+        blockers = self._crypto_blockers(result, candidate, now)
+        status = "hypothetical"
+        proposal_id = None
+        if mode == "paper_proposal":
+            actionable_blockers = [item for item in blockers if item[0] != "crypto_quiet_hours_notification_suppressed"]
+            if actionable_blockers:
+                status = "blocked"
+            else:
+                gate_passed, gate_reasons = self._runtime_evidence_gate_passed(now)
+                if not gate_passed:
+                    blockers.extend(("crypto_runtime_evidence_gate_failed", reason) for reason in gate_reasons)
+                    status = "blocked"
+                else:
+                    proposal_id = self._create_crypto_trade_proposal(result, candidate, now)
+                    status = "proposal_created" if proposal_id else "blocked"
+                    if not proposal_id:
+                        blockers.append(("crypto_proposals_disabled", "trade proposal creation did not return a proposal id"))
+        row_id = str(uuid.uuid4())
+        blocker_labels = [item[0] for item in blockers]
+        self.storage.execute(
+            """
+            INSERT INTO crypto_paper_watch_candidates(
+                id,run_id,research_run_id,setup_id,proposal_id,symbol,mode,status,score,entry_price,stop_price,
+                take_profit_price,risk_reward_ratio,spread_bps,volatility_regime,position_notional,max_loss_estimate,
+                blockers,candidate_metadata,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                row_id, self.run_id, research_run_id, setup_id, proposal_id, result.symbol, mode, status, result.score,
+                candidate.get("entry_price"), candidate.get("stop_price"), candidate.get("take_profit_target"),
+                candidate.get("risk_reward_ratio"), candidate.get("spread_bps"), candidate.get("volatility_regime"),
+                candidate.get("position_size"), candidate.get("max_loss_estimate"), json_dumps(blocker_labels),
+                json_dumps({"candidate": candidate, "blockers": blockers, "result_reason": result.reason}),
+                now.isoformat(), now.isoformat(),
+            ),
+        )
+        return row_id
+
+    def _create_crypto_trade_proposal(self, result: CryptoResearchResult, candidate: dict[str, Any], now: datetime) -> str | None:
+        cfg = self.config.get("crypto") or {}
+        if not (cfg.get("paper_trading_enabled", False) and cfg.get("proposals_enabled", False)):
+            return None
+        if str(cfg.get("default_order_type") or "limit") != "limit" or cfg.get("fallback_market_orders", False):
+            return None
+        proposal_id = str(uuid.uuid4())
+        expiry_minutes = int(cfg.get("proposal_expiry_minutes", 3) or 3)
+        payload = {
+            "asset_class": "crypto",
+            "mode": "paper_proposal",
+            "action": "entry",
+            "order_type": "limit",
+            "limit_price_source": cfg.get("limit_price_source", "midpoint_or_last_with_slippage_cap"),
+            "candidate": candidate,
+            "approval_max_price_age_seconds": cfg.get("approval_max_price_age_seconds", 30),
+            "approval_max_price_move_bps_base": cfg.get("approval_max_price_move_bps_base", 50),
+            "approval_max_price_move_bps_hard_cap": cfg.get("approval_max_price_move_bps_hard_cap", 100),
+            "requires_manual_telegram_approval": True,
+            "requires_alpaca_final_validation": True,
+            "eodhd_final_trading_price_allowed": False,
+        }
+        self.storage.execute(
+            """
+            INSERT INTO trade_proposals(
+                id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,current_price
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                proposal_id, self.run_id, None, result.symbol, "buy", candidate.get("position_size"), "pending",
+                now.isoformat(), (now + timedelta(minutes=expiry_minutes)).isoformat(), "crypto_paper_v1",
+                json_dumps(payload), candidate.get("entry_price"),
+            ),
+        )
+        if self.telegram is not None and not crypto_quiet_hours_active(self.config, now):
+            try:
+                message = (
+                    f"Crypto paper proposal: {result.symbol} buy ${candidate.get('position_size'):.2f} "
+                    f"limit near {candidate.get('entry_price'):.2f}; stop {candidate.get('stop_price'):.2f}; "
+                    f"target {candidate.get('take_profit_target'):.2f}; R/R {candidate.get('risk_reward_ratio'):.2f}. "
+                    "Manual approval required."
+                )
+                response = self.telegram.send_message(message)
+                message_id = response.get("message_id") if isinstance(response, dict) else None
+                if message_id:
+                    self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(message_id), proposal_id))
+            except Exception as exc:
+                self.storage.audit(self.run_id, "crypto_proposal_telegram_send_failed", {"error": type(exc).__name__, "symbol": result.symbol})
+        return proposal_id
+
+    def _runtime_evidence_gate_passed(self, now: datetime) -> tuple[bool, list[str]]:
+        cfg = self.config.get("crypto") or {}
+        gate_cfg = cfg.get("runtime_evidence_gate") or {}
+        if not gate_cfg.get("enabled", True):
+            return True, []
+        min_cycles = int(gate_cfg.get("min_natural_cycles", 3) or 3)
+        max_age_hours = float(gate_cfg.get("max_cycle_age_hours", 72) or 72)
+        symbols = configured_crypto_symbols(self.config)
+        cutoff = (now - timedelta(hours=max_age_hours)).isoformat()
+        reasons: list[str] = []
+        for symbol in symbols:
+            rows = self.storage.fetch_all(
+                """
+                SELECT COUNT(DISTINCT research_run_id) AS cycles,
+                       SUM(CASE WHEN data_freshness='fresh' THEN 1 ELSE 0 END) AS fresh_rows,
+                       SUM(CASE WHEN spread IS NOT NULL THEN 1 ELSE 0 END) AS spread_rows
+                FROM crypto_research_snapshots
+                WHERE symbol=? AND created_at>=?
+                """,
+                (symbol, cutoff),
+            )
+            row = rows[0] if rows else {}
+            cycles = int(row["cycles"] or 0)
+            fresh_rows = int(row["fresh_rows"] or 0)
+            spread_rows = int(row["spread_rows"] or 0)
+            if cycles < min_cycles:
+                reasons.append(f"{symbol}:requires_{min_cycles}_fresh_cycles")
+            if fresh_rows < min_cycles:
+                reasons.append(f"{symbol}:fresh_alpaca_data_missing")
+            if spread_rows < min_cycles:
+                reasons.append(f"{symbol}:spread_missing")
+        provider_errors = self.storage.fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM crypto_research_snapshots
+            WHERE created_at>=? AND (
+                payload LIKE '%provider_unavailable%' OR
+                payload LIKE '%missing_crypto_bars%' OR
+                payload LIKE '%crypto_provider_unavailable%'
+            )
+            """,
+            (cutoff,),
+        )
+        if provider_errors and int(provider_errors[0]["cnt"] or 0) > 0:
+            reasons.append("unresolved_crypto_provider_errors")
+        proposals = self.storage.fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM trade_proposals
+            WHERE created_at>=? AND run_id<>? AND (symbol LIKE '%/USD' OR json_extract(payload, '$.asset_class')='crypto')
+            """,
+            (cutoff, self.run_id),
+        )
+        if proposals and int(proposals[0]["cnt"] or 0) > 0:
+            reasons.append("unexpected_existing_crypto_proposals")
+        return not reasons, reasons
+
+    def _crypto_blockers(self, result: CryptoResearchResult, candidate: dict[str, Any], now: datetime) -> list[tuple[str, str]]:
+        cfg = self.config.get("crypto") or {}
+        mode = _crypto_mode(self.config)
+        blockers: list[tuple[str, str]] = []
+        if result.symbol not in configured_crypto_symbols(self.config):
+            blockers.append(("crypto_pair_unsupported", f"{result.symbol} is not in configured crypto symbols"))
+        if mode == "research_only":
+            blockers.append(("crypto_research_only", "crypto.mode=research_only"))
+        if not cfg.get("paper_trading_enabled", False):
+            blockers.append(("crypto_paper_disabled", "crypto.paper_trading_enabled=false"))
+        if not cfg.get("proposals_enabled", False):
+            blockers.append(("crypto_proposals_disabled", "crypto.proposals_enabled=false"))
+        if result.price is None:
+            blockers.append(("crypto_alpaca_final_price_unavailable", result.reason))
+        if result.data_freshness != "fresh":
+            blockers.append(("crypto_price_stale", f"data_freshness={result.data_freshness}"))
+        if result.data_freshness == "missing" or "provider_unavailable" in result.reason or "missing_crypto_bars" in result.reason:
+            blockers.append(("crypto_provider_unavailable", result.reason))
+        max_spread_bps = float(cfg.get("max_spread_bps", 50.0) or 50.0)
+        spread_bps = candidate.get("spread_bps")
+        if spread_bps is None:
+            blockers.append(("crypto_orderbook_missing", "Alpaca crypto quote/spread unavailable"))
+        elif float(spread_bps) > max_spread_bps:
+            blockers.append(("crypto_spread_too_wide", f"spread_bps={float(spread_bps):.2f} max={max_spread_bps:.2f}"))
+        max_vol = float(cfg.get("max_realized_volatility", 1.5) or 1.5)
+        if result.realized_volatility is not None and result.realized_volatility > max_vol:
+            blockers.append(("crypto_volatility_extreme", f"realized_volatility={result.realized_volatility:.4f}"))
+        if not result.volume or result.volume <= 0:
+            blockers.append(("crypto_liquidity_insufficient", "latest crypto volume missing or zero"))
+        min_rr = float(cfg.get("min_risk_reward_ratio", 1.5) or 1.5)
+        rr = candidate.get("risk_reward_ratio")
+        if rr is None or rr < min_rr:
+            blockers.append(("crypto_risk_reward_too_low", f"risk_reward_ratio={rr} min={min_rr}"))
+        stop_distance_pct = candidate.get("stop_distance_pct")
+        if stop_distance_pct is None or stop_distance_pct <= 0:
+            blockers.append(("crypto_stop_distance_invalid", "stop distance must be positive"))
+        if crypto_quiet_hours_active(self.config, now):
+            blockers.append(("crypto_quiet_hours_notification_suppressed", "non-urgent Telegram crypto status suppressed"))
+        local_pending = self.storage.fetch_all(
+            "SELECT COUNT(*) AS cnt FROM trade_proposals WHERE symbol=? AND status IN ('pending','approved','submitted')",
+            (result.symbol,),
+        )
+        if local_pending and int(local_pending[0]["cnt"] or 0) > 0:
+            blockers.append(("crypto_pending_proposal_conflict", "local pending crypto proposal exists"))
+        local_orders = self.storage.fetch_all(
+            "SELECT COUNT(*) AS cnt FROM orders WHERE symbol=? AND status NOT IN ('filled','canceled','cancelled','rejected','expired')",
+            (result.symbol,),
+        )
+        if local_orders and int(local_orders[0]["cnt"] or 0) > 0:
+            blockers.append(("crypto_pending_order_conflict", "local pending crypto order exists"))
+        local_positions = self.storage.fetch_all(
+            "SELECT COUNT(*) AS cnt FROM positions WHERE symbol=? AND qty>0",
+            (result.symbol,),
+        )
+        if local_positions and int(local_positions[0]["cnt"] or 0) > 0:
+            blockers.append(("crypto_existing_position_conflict", "local crypto position exists"))
+        return _dedupe_blockers(blockers)
 
     def _missing_result(self, symbol: str, provider: str, reason: str) -> CryptoResearchResult:
         return CryptoResearchResult(
@@ -368,7 +623,7 @@ class CryptoResearchEngine:
             spread=None,
             risk_metrics={"provider_guard": reason},
             provider=provider,
-            status="research_only",
+            status=_crypto_mode(self.config),
             reason=reason,
         )
 
@@ -397,6 +652,102 @@ class CryptoResearchEngine:
 
     def _set_state(self, key: str, value: str) -> None:
         self.storage.set_control_state(key, value, "system", "crypto_research", "", None, None, None)
+
+
+def _crypto_mode(config: dict[str, Any]) -> str:
+    mode = str((config.get("crypto") or {}).get("mode") or "research_only")
+    return mode if mode in CRYPTO_MODES else "research_only"
+
+
+def _crypto_mode_from_results(results: list[CryptoResearchResult]) -> str:
+    if not results:
+        return "research_only"
+    status = str(results[0].status or "research_only")
+    return status if status in CRYPTO_MODES else "research_only"
+
+
+def _build_candidate_metadata(result: CryptoResearchResult, config: dict[str, Any], now: datetime) -> dict[str, Any]:
+    cfg = config.get("crypto") or {}
+    entry_price = float(result.price) if result.price and result.price > 0 else None
+    atr_stop_pct = float(result.atr_like_volatility or 0.0) * 2.0
+    stop_distance_pct = max(float(cfg.get("min_stop_distance_pct", 0.01) or 0.01), atr_stop_pct)
+    stop_distance_pct = min(stop_distance_pct, float(cfg.get("max_stop_distance_pct", 0.08) or 0.08))
+    stop_price = entry_price * (1.0 - stop_distance_pct) if entry_price else None
+    min_rr = float(cfg.get("min_risk_reward_ratio", 1.5) or 1.5)
+    take_profit_target = entry_price * (1.0 + stop_distance_pct * min_rr) if entry_price else None
+    risk_reward_ratio = None
+    if entry_price and stop_price and take_profit_target and entry_price > stop_price:
+        risk_reward_ratio = (take_profit_target - entry_price) / (entry_price - stop_price)
+    max_notional = float(cfg.get("max_notional_per_trade", 5.0) or 5.0)
+    account_risk_notional = float(cfg.get("max_account_risk_per_trade", max_notional * stop_distance_pct) or (max_notional * stop_distance_pct))
+    risk_based_notional = account_risk_notional / stop_distance_pct if stop_distance_pct > 0 else 0.0
+    position_size = max(0.0, min(max_notional, risk_based_notional))
+    max_loss_estimate = position_size * stop_distance_pct if stop_distance_pct > 0 else None
+    spread_bps = float(result.spread) * 10000.0 if result.spread is not None else None
+    provider_coverage = {
+        "alpaca": {
+            "bars": result.data_freshness != "missing",
+            "final_price": result.price is not None,
+            "quote_spread": result.spread is not None,
+            "final_price_timestamp": result.price_timestamp,
+            "authority": "final_price_tradability_positions_orders_execution",
+        },
+        "eodhd": {
+            "available": bool(cfg.get("eodhd_research_enabled", True)),
+            "authority": "research_context_only",
+            "final_trading_price_allowed": False,
+        },
+    }
+    return {
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "stop_distance_pct": stop_distance_pct,
+        "take_profit_target": take_profit_target,
+        "risk_reward_ratio": risk_reward_ratio,
+        "spread_bps": spread_bps,
+        "volatility_regime": _volatility_regime(result.realized_volatility),
+        "position_size": position_size,
+        "max_loss_estimate": max_loss_estimate,
+        "provider_coverage": provider_coverage,
+        "alpaca_final_price_timestamp": result.price_timestamp,
+        "long_only_spot": True,
+        "allow_margin": False,
+        "allow_shorting": False,
+        "allow_add_to_winner": bool(cfg.get("allow_add_to_winner", False)),
+        "allow_new_entries": bool(cfg.get("allow_new_entries", True)),
+        "allow_exits": bool(cfg.get("allow_exits", True)),
+        "default_order_type": cfg.get("default_order_type", "limit"),
+        "limit_price_source": cfg.get("limit_price_source", "midpoint_or_last_with_slippage_cap"),
+        "fallback_market_orders": bool(cfg.get("fallback_market_orders", False)),
+        "computed_at": now.isoformat(),
+    }
+
+
+def _volatility_regime(realized_volatility: float | None) -> str:
+    if realized_volatility is None:
+        return "unknown"
+    if realized_volatility > 1.5:
+        return "extreme"
+    if realized_volatility > 1.0:
+        return "high"
+    if realized_volatility > 0.6:
+        return "elevated"
+    if realized_volatility < 0.2:
+        return "quiet"
+    return "normal"
+
+
+def _dedupe_blockers(blockers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    deduped: list[tuple[str, str]] = []
+    for blocker, reason in blockers:
+        if blocker not in CRYPTO_BLOCKER_REASONS:
+            blocker = "crypto_provider_unavailable" if "provider" in blocker else blocker
+        if blocker in seen:
+            continue
+        seen.add(blocker)
+        deduped.append((blocker, reason))
+    return deduped
 
 
 def _parse_hhmm(value: str) -> time:
@@ -594,8 +945,11 @@ def _score_crypto(
 
 def _lane_for_score(score: float, config: dict[str, Any]) -> str:
     cfg = config.get("crypto") or {}
-    if cfg.get("paper_trading_enabled") and cfg.get("proposals_enabled") and score >= 80:
+    mode = _crypto_mode(config)
+    if mode == "paper_proposal" and cfg.get("paper_trading_enabled") and cfg.get("proposals_enabled") and score >= float(cfg.get("min_score_for_proposal", 80) or 80):
         return "crypto_paper_tradable"
+    if mode == "paper_watch" and score >= float(cfg.get("min_score_for_paper_watch", 70) or 70):
+        return "crypto_paper_watch"
     if score >= 65:
         return "crypto_observation"
     if score >= 50:

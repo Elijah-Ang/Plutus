@@ -100,7 +100,27 @@ def _config(**overrides):
             "max_crypto_exposure_pct": 1.0,
             "require_fresh_price": True,
             "max_price_age_seconds": 300,
+            "min_score_for_paper_watch": 70,
+            "min_score_for_proposal": 80,
+            "min_risk_reward_ratio": 1.5,
+            "min_stop_distance_pct": 0.01,
+            "max_stop_distance_pct": 0.08,
+            "max_spread_bps": 50,
+            "max_realized_volatility": 1.5,
+            "max_account_risk_per_trade": 0.05,
+            "proposal_expiry_minutes": 3,
+            "approval_max_price_age_seconds": 30,
+            "approval_max_price_move_bps_base": 50,
+            "approval_max_price_move_bps_hard_cap": 100,
+            "default_order_type": "limit",
+            "limit_price_source": "midpoint_or_last_with_slippage_cap",
+            "fallback_market_orders": False,
+            "allow_new_entries": True,
+            "allow_add_to_winner": False,
+            "allow_exits": True,
+            "eodhd_research_enabled": True,
             "data_source": "alpaca",
+            "runtime_evidence_gate": {"enabled": True, "min_natural_cycles": 3, "max_cycle_age_hours": 72},
             "schedule": {
                 "enabled": True,
                 "research_interval_minutes": 60,
@@ -225,9 +245,90 @@ def test_crypto_provider_failure_records_data_unavailable_blocker_and_no_orders(
     assert {result.data_freshness for result in results} == {"missing"}
     assert all(result.reason.startswith("provider_unavailable") for result in results)
     assert len(storage.fetch_all("SELECT * FROM crypto_research_snapshots WHERE data_freshness='missing'")) == 2
-    blockers = storage.fetch_all("SELECT symbol,blocker,reason FROM performance_blockers WHERE blocker='crypto_data_unavailable'")
+    blockers = storage.fetch_all("SELECT symbol,blocker,reason FROM performance_blockers WHERE blocker='crypto_provider_unavailable'")
     assert {row["symbol"] for row in blockers} == {"BTC/USD", "ETH/USD"}
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+    assert broker.submitted_orders == []
+
+
+def test_crypto_stage_1_creates_only_research_rows(tmp_path):
+    storage = _storage(tmp_path)
+
+    CryptoResearchEngine(_config(), storage, CryptoBroker(), TelegramSink(), "run-stage-1").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    assert len(storage.fetch_all("SELECT * FROM crypto_research_snapshots")) == 2
+    assert storage.fetch_all("SELECT * FROM crypto_paper_watch_candidates") == []
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    blockers = storage.fetch_all("SELECT DISTINCT blocker FROM performance_blockers WHERE blocker='crypto_research_only'")
+    assert blockers
+
+
+def test_crypto_stage_2_creates_hypothetical_candidates_only(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    config["crypto"]["mode"] = "paper_watch"
+
+    CryptoResearchEngine(config, storage, CryptoBroker(), TelegramSink(), "run-stage-2").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    candidates = storage.fetch_all("SELECT * FROM crypto_paper_watch_candidates ORDER BY symbol")
+    assert {row["symbol"] for row in candidates} == {"BTC/USD", "ETH/USD"}
+    assert {row["mode"] for row in candidates} == {"paper_watch"}
+    assert {row["status"] for row in candidates} == {"hypothetical"}
+    assert all(row["entry_price"] and row["stop_price"] and row["take_profit_price"] for row in candidates)
+    assert all(row["risk_reward_ratio"] >= 1.5 for row in candidates)
+    assert all(row["spread_bps"] is not None for row in candidates)
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_crypto_stage_3_blocks_without_runtime_evidence_gate(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    config["crypto"]["mode"] = "paper_proposal"
+    config["crypto"]["paper_trading_enabled"] = True
+    config["crypto"]["proposals_enabled"] = True
+
+    CryptoResearchEngine(config, storage, CryptoBroker(), TelegramSink(), "run-stage-3-blocked").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    candidates = storage.fetch_all("SELECT * FROM crypto_paper_watch_candidates")
+    assert candidates
+    assert {row["status"] for row in candidates} == {"blocked"}
+    assert any("crypto_runtime_evidence_gate_failed" in (row["blockers"] or "") for row in candidates)
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_crypto_stage_3_creates_manual_limit_proposals_after_evidence_gate(tmp_path):
+    storage = _storage(tmp_path)
+    broker = CryptoBroker()
+    config = _config()
+    historical = _config()
+    for idx in range(3):
+        CryptoResearchEngine(historical, storage, broker, TelegramSink(), f"run-history-{idx}").run_research(
+            now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+        )
+    config["crypto"]["mode"] = "paper_proposal"
+    config["crypto"]["paper_trading_enabled"] = True
+    config["crypto"]["proposals_enabled"] = True
+
+    CryptoResearchEngine(config, storage, broker, TelegramSink(), "run-stage-3").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    proposals = storage.fetch_all("SELECT symbol,side,notional,status,strategy_version,payload FROM trade_proposals ORDER BY symbol")
+    assert {row["symbol"] for row in proposals} == {"BTC/USD", "ETH/USD"}
+    assert {row["status"] for row in proposals} == {"pending"}
+    assert {row["strategy_version"] for row in proposals} == {"crypto_paper_v1"}
+    assert all('"order_type":"limit"' in row["payload"] for row in proposals)
+    assert all('"requires_manual_telegram_approval":true' in row["payload"] for row in proposals)
+    assert all('"eodhd_final_trading_price_allowed":false' in row["payload"] for row in proposals)
     assert storage.fetch_all("SELECT * FROM orders") == []
     assert broker.submitted_orders == []
 

@@ -82,6 +82,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "crypto_research_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, symbol TEXT, lane TEXT, price REAL, price_timestamp TEXT, data_freshness TEXT, return_1h REAL, return_4h REAL, return_1d REAL, return_7d REAL, return_20d REAL, realized_volatility REAL, atr_like_volatility REAL, trend_metrics TEXT, volume REAL, spread REAL, score REAL, score_components TEXT, risk_metrics TEXT, provider TEXT, created_at TEXT, payload TEXT",
     "crypto_observation_state": "symbol TEXT PRIMARY KEY, lane TEXT, score REAL, status TEXT, last_price REAL, last_price_timestamp TEXT, data_freshness TEXT, last_research_at TEXT, observation_since TEXT, updated_at TEXT, payload TEXT",
     "crypto_counterfactual_outcomes": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, setup_id TEXT, symbol TEXT, score REAL, would_propose INTEGER DEFAULT 0, reason TEXT, forward_return_1d REAL, forward_return_7d REAL, status TEXT, created_at TEXT, updated_at TEXT",
+    "crypto_paper_watch_candidates": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, setup_id TEXT, proposal_id TEXT, symbol TEXT, mode TEXT, status TEXT, score REAL, entry_price REAL, stop_price REAL, take_profit_price REAL, risk_reward_ratio REAL, spread_bps REAL, volatility_regime TEXT, position_notional REAL, max_loss_estimate REAL, blockers TEXT, candidate_metadata TEXT, created_at TEXT, updated_at TEXT",
     "dynamic_universe_schedule_state": "id TEXT PRIMARY KEY, schedule_name TEXT UNIQUE, schedule_type TEXT, due_at TEXT, last_started_at TEXT, last_completed_at TEXT, last_success_at TEXT, last_skipped_at TEXT, last_skip_reason TEXT, missed_count INTEGER DEFAULT 0, catchup_required INTEGER DEFAULT 0, catchup_attempted_at TEXT, catchup_completed_at TEXT, catchup_status TEXT, data_freshness_status TEXT, provider_health_status TEXT, internet_status TEXT, power_status TEXT, battery_pct REAL, stale_after_minutes INTEGER, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, notes TEXT, created_at TEXT, updated_at TEXT",
 }
 
@@ -125,6 +126,7 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_snapshots_symbol_created ON crypto_research_snapshots(symbol, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_snapshots_run ON crypto_research_snapshots(research_run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_counterfactuals_symbol ON crypto_counterfactual_outcomes(symbol, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_watch_candidates_symbol ON crypto_paper_watch_candidates(symbol, created_at)")
             stage_rows = [
                 (
                     "raw_universe",
