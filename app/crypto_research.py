@@ -40,6 +40,7 @@ CRYPTO_BLOCKER_REASONS = {
     "crypto_provider_unavailable",
     "crypto_alpaca_final_price_unavailable",
     "crypto_runtime_evidence_gate_failed",
+    "crypto_stage3_enablement_requires_separate_approval",
 }
 
 
@@ -114,7 +115,7 @@ def format_crypto_digest(results: list[CryptoResearchResult]) -> str:
     if mode == "paper_watch":
         suffix = "Paper-watch. Hypothetical candidates only. No proposals/orders."
     elif mode == "paper_proposal":
-        suffix = "Paper-proposal gated. Manual approval and final validation required."
+        suffix = "Stage 3 readiness-report only. No proposals/orders until a separate approved config-change commit."
     else:
         suffix = "Research-only. No proposals/orders."
     return f"Crypto research: {scores}. {suffix}"
@@ -321,7 +322,7 @@ class CryptoResearchEngine:
         mode = _crypto_mode(self.config)
         candidate = _build_candidate_metadata(result, self.config, now)
         blockers = self._crypto_blockers(result, candidate, now)
-        proposed = 1 if mode == "paper_proposal" and not blockers else 0
+        proposed = 0
         action_decision = "paper_watch" if mode == "paper_watch" else ("paper_proposal" if mode == "paper_proposal" else "research_only")
         self.storage.execute(
             """
@@ -407,19 +408,19 @@ class CryptoResearchEngine:
         status = "hypothetical"
         proposal_id = None
         if mode == "paper_proposal":
-            actionable_blockers = [item for item in blockers if item[0] != "crypto_quiet_hours_notification_suppressed"]
-            if actionable_blockers:
+            gate_passed, gate_reasons = self._runtime_evidence_gate_passed(now)
+            if gate_reasons:
+                blockers.extend(("crypto_runtime_evidence_gate_failed", reason) for reason in gate_reasons)
+            if blockers or not gate_passed:
                 status = "blocked"
             else:
-                gate_passed, gate_reasons = self._runtime_evidence_gate_passed(now)
-                if not gate_passed:
-                    blockers.extend(("crypto_runtime_evidence_gate_failed", reason) for reason in gate_reasons)
-                    status = "blocked"
-                else:
-                    proposal_id = self._create_crypto_trade_proposal(result, candidate, now)
-                    status = "proposal_created" if proposal_id else "blocked"
-                    if not proposal_id:
-                        blockers.append(("crypto_proposals_disabled", "trade proposal creation did not return a proposal id"))
+                blockers.append(
+                    (
+                        "crypto_stage3_enablement_requires_separate_approval",
+                        "Stage 3 readiness only; enabling paper proposals requires a separate explicit user-approved config-change task and commit",
+                    )
+                )
+                status = "stage3_ready_report"
         row_id = str(uuid.uuid4())
         blocker_labels = [item[0] for item in blockers]
         self.storage.execute(
@@ -440,56 +441,6 @@ class CryptoResearchEngine:
             ),
         )
         return row_id
-
-    def _create_crypto_trade_proposal(self, result: CryptoResearchResult, candidate: dict[str, Any], now: datetime) -> str | None:
-        cfg = self.config.get("crypto") or {}
-        if not (cfg.get("paper_trading_enabled", False) and cfg.get("proposals_enabled", False)):
-            return None
-        if str(cfg.get("default_order_type") or "limit") != "limit" or cfg.get("fallback_market_orders", False):
-            return None
-        proposal_id = str(uuid.uuid4())
-        expiry_minutes = int(cfg.get("proposal_expiry_minutes", 3) or 3)
-        payload = {
-            "asset_class": "crypto",
-            "mode": "paper_proposal",
-            "action": "entry",
-            "order_type": "limit",
-            "limit_price_source": cfg.get("limit_price_source", "midpoint_or_last_with_slippage_cap"),
-            "candidate": candidate,
-            "approval_max_price_age_seconds": cfg.get("approval_max_price_age_seconds", 30),
-            "approval_max_price_move_bps_base": cfg.get("approval_max_price_move_bps_base", 50),
-            "approval_max_price_move_bps_hard_cap": cfg.get("approval_max_price_move_bps_hard_cap", 100),
-            "requires_manual_telegram_approval": True,
-            "requires_alpaca_final_validation": True,
-            "eodhd_final_trading_price_allowed": False,
-        }
-        self.storage.execute(
-            """
-            INSERT INTO trade_proposals(
-                id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,current_price
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                proposal_id, self.run_id, None, result.symbol, "buy", candidate.get("position_size"), "pending",
-                now.isoformat(), (now + timedelta(minutes=expiry_minutes)).isoformat(), "crypto_paper_v1",
-                json_dumps(payload), candidate.get("entry_price"),
-            ),
-        )
-        if self.telegram is not None and not crypto_quiet_hours_active(self.config, now):
-            try:
-                message = (
-                    f"Crypto paper proposal: {result.symbol} buy ${candidate.get('position_size'):.2f} "
-                    f"limit near {candidate.get('entry_price'):.2f}; stop {candidate.get('stop_price'):.2f}; "
-                    f"target {candidate.get('take_profit_target'):.2f}; R/R {candidate.get('risk_reward_ratio'):.2f}. "
-                    "Manual approval required."
-                )
-                response = self.telegram.send_message(message)
-                message_id = response.get("message_id") if isinstance(response, dict) else None
-                if message_id:
-                    self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(message_id), proposal_id))
-            except Exception as exc:
-                self.storage.audit(self.run_id, "crypto_proposal_telegram_send_failed", {"error": type(exc).__name__, "symbol": result.symbol})
-        return proposal_id
 
     def _runtime_evidence_gate_passed(self, now: datetime) -> tuple[bool, list[str]]:
         cfg = self.config.get("crypto") or {}

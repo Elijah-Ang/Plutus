@@ -12,6 +12,7 @@ from app.crypto_research import (
     normalize_crypto_symbol,
 )
 from app.reports import SHEETS
+from app.risk_engine import RiskEngine
 from app.service import TradingService
 from app.storage import Storage
 
@@ -67,6 +68,11 @@ class CryptoBroker:
 class FailingCryptoBroker(CryptoBroker):
     def get_crypto_historical_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 500):
         raise RuntimeError("provider unavailable")
+
+
+class MissingSpreadCryptoBroker(CryptoBroker):
+    def get_crypto_latest_quote(self, symbol: str):
+        return None
 
 
 class TelegramSink:
@@ -283,7 +289,10 @@ def test_crypto_stage_2_creates_hypothetical_candidates_only(tmp_path):
     assert all(row["risk_reward_ratio"] >= 1.5 for row in candidates)
     assert all(row["spread_bps"] is not None for row in candidates)
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM proposal_batches") == []
+    assert storage.fetch_all("SELECT * FROM approvals") == []
     assert storage.fetch_all("SELECT * FROM orders") == []
+    assert storage.fetch_all("SELECT * FROM fills") == []
 
 
 def test_crypto_stage_3_blocks_without_runtime_evidence_gate(tmp_path):
@@ -305,7 +314,7 @@ def test_crypto_stage_3_blocks_without_runtime_evidence_gate(tmp_path):
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 
-def test_crypto_stage_3_creates_manual_limit_proposals_after_evidence_gate(tmp_path):
+def test_crypto_stage_3_records_readiness_report_only_after_evidence_gate(tmp_path):
     storage = _storage(tmp_path)
     broker = CryptoBroker()
     config = _config()
@@ -322,15 +331,117 @@ def test_crypto_stage_3_creates_manual_limit_proposals_after_evidence_gate(tmp_p
         now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
     )
 
-    proposals = storage.fetch_all("SELECT symbol,side,notional,status,strategy_version,payload FROM trade_proposals ORDER BY symbol")
-    assert {row["symbol"] for row in proposals} == {"BTC/USD", "ETH/USD"}
-    assert {row["status"] for row in proposals} == {"pending"}
-    assert {row["strategy_version"] for row in proposals} == {"crypto_paper_v1"}
-    assert all('"order_type":"limit"' in row["payload"] for row in proposals)
-    assert all('"requires_manual_telegram_approval":true' in row["payload"] for row in proposals)
-    assert all('"eodhd_final_trading_price_allowed":false' in row["payload"] for row in proposals)
+    candidates = storage.fetch_all("SELECT symbol,status,proposal_id,blockers FROM crypto_paper_watch_candidates WHERE mode='paper_proposal' ORDER BY symbol")
+    assert {row["symbol"] for row in candidates} == {"BTC/USD", "ETH/USD"}
+    assert {row["status"] for row in candidates} == {"stage3_ready_report"}
+    assert {row["proposal_id"] for row in candidates} == {None}
+    assert all("crypto_stage3_enablement_requires_separate_approval" in row["blockers"] for row in candidates)
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM proposal_batches") == []
+    assert storage.fetch_all("SELECT * FROM approvals") == []
     assert storage.fetch_all("SELECT * FROM orders") == []
+    assert storage.fetch_all("SELECT * FROM fills") == []
     assert broker.submitted_orders == []
+
+
+def test_crypto_stage_3_does_not_send_proposals_during_quiet_hours(tmp_path):
+    storage = _storage(tmp_path)
+    broker = CryptoBroker()
+    telegram = TelegramSink()
+    config = _config()
+    historical = _config()
+    for idx in range(3):
+        CryptoResearchEngine(historical, storage, broker, TelegramSink(), f"run-history-quiet-{idx}").run_research(
+            now=datetime(2026, 7, 2, 18, 30, tzinfo=UTC)
+        )
+    config["crypto"]["mode"] = "paper_proposal"
+    config["crypto"]["paper_trading_enabled"] = True
+    config["crypto"]["proposals_enabled"] = True
+
+    CryptoResearchEngine(config, storage, broker, telegram, "run-stage-3-quiet").run_research(
+        now=datetime(2026, 7, 2, 18, 30, tzinfo=UTC)  # 02:30 SGT
+    )
+
+    candidates = storage.fetch_all("SELECT status,blockers FROM crypto_paper_watch_candidates WHERE mode='paper_proposal'")
+    assert candidates
+    assert {row["status"] for row in candidates} == {"blocked"}
+    assert all("crypto_quiet_hours_notification_suppressed" in row["blockers"] for row in candidates)
+    assert telegram.messages == []
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_crypto_stage_3_hard_blocks_missing_spread(tmp_path):
+    storage = _storage(tmp_path)
+    broker = MissingSpreadCryptoBroker()
+    config = _config()
+    historical = _config()
+    for idx in range(3):
+        CryptoResearchEngine(historical, storage, broker, TelegramSink(), f"run-history-spread-{idx}").run_research(
+            now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+        )
+    config["crypto"]["mode"] = "paper_proposal"
+    config["crypto"]["paper_trading_enabled"] = True
+    config["crypto"]["proposals_enabled"] = True
+
+    CryptoResearchEngine(config, storage, broker, TelegramSink(), "run-stage-3-no-spread").run_research(
+        now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+    )
+
+    candidates = storage.fetch_all("SELECT status,blockers FROM crypto_paper_watch_candidates WHERE mode='paper_proposal'")
+    assert candidates
+    assert {row["status"] for row in candidates} == {"blocked"}
+    assert all("crypto_orderbook_missing" in row["blockers"] for row in candidates)
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_risk_engine_keeps_crypto_execution_blocked_in_stage_1_and_stage_2():
+    base_config = _config()
+    base_config["risk"] = {"max_price_age_seconds": 120, "allowed_order_types": ["market", "limit"]}
+    proposal = {
+        "symbol": "BTC/USD",
+        "side": "buy",
+        "notional": 5,
+        "asset_class": "crypto",
+        "created_at": datetime(2026, 7, 3, 10, 0, tzinfo=UTC).isoformat(),
+        "expires_at": datetime(2026, 7, 3, 10, 3, tzinfo=UTC).isoformat(),
+        "latest_price": 100.0,
+        "price_at": datetime(2026, 7, 3, 10, 0, tzinfo=UTC).isoformat(),
+        "historical_bars": 100,
+        "volume": 1000,
+        "strategy_version": "rule_based_v1",
+        "reason": "fixture",
+        "order_type": "limit",
+    }
+    context = {
+        "now": datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        "power_connected": True,
+        "internet_available": True,
+        "database_writable": True,
+        "broker_available": True,
+        "telegram_available": True,
+        "market_open": True,
+        "open_positions": 0,
+        "buy_trades_today": 0,
+        "duplicate_order": False,
+        "same_symbol_position": False,
+        "uses_margin": False,
+        "daily_loss": 0,
+        "weekly_loss": 0,
+        "buying_power": 1000,
+    }
+
+    stage_1 = RiskEngine(base_config).evaluate(proposal, context)
+    stage_2_config = _config()
+    stage_2_config["crypto"]["mode"] = "paper_watch"
+    stage_2_config["risk"] = base_config["risk"]
+    stage_2 = RiskEngine(stage_2_config).evaluate(proposal, context)
+
+    assert not stage_1.passed
+    assert not stage_2.passed
+    assert any("crypto is blocked" in reason for reason in stage_1.reasons)
+    assert any("crypto is blocked" in reason for reason in stage_2.reasons)
 
 
 def test_crypto_report_sheets_are_registered():

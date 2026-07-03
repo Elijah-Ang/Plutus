@@ -62,6 +62,11 @@ crypto:
   allow_exits: true
   eodhd_research_enabled: true
   data_source: alpaca
+  stage_transition_governance:
+    stage3_auto_enable: false
+    stage3_readiness_report_only: true
+    stage3_requires_separate_user_approved_config_task: true
+    stage3_requires_separate_commit: true
   runtime_evidence_gate:
     enabled: true
     min_natural_cycles: 3
