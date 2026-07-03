@@ -78,6 +78,10 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "performance_outcomes": "id TEXT PRIMARY KEY, setup_id TEXT UNIQUE, run_id TEXT, symbol TEXT, proposal_id TEXT, batch_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, actual_or_shadow TEXT, entry_time TEXT, entry_price REAL, entry_notional REAL, entry_qty REAL, status TEXT, actual_proposal_execution_helped INTEGER, add_to_winner_improved_position INTEGER, exit_signal_avoided_loss INTEGER, created_at TEXT, updated_at TEXT",
     "performance_forward_returns": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, horizon_days INTEGER, due_at TEXT, eligible_to_update INTEGER DEFAULT 0, updated_at TEXT, forward_return REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, hypothetical_stop_hit INTEGER, hypothetical_target_hit INTEGER, status TEXT, reason TEXT",
     "performance_counterfactuals": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, counterfactual_type TEXT, would_enter INTEGER DEFAULT 0, would_add INTEGER DEFAULT 0, would_exit INTEGER DEFAULT 0, hypothetical_entry_price REAL, hypothetical_notional REAL, reason TEXT, comparison_status TEXT, created_at TEXT, updated_at TEXT",
+    "crypto_research_runs": "id TEXT PRIMARY KEY, run_id TEXT, status TEXT, started_at TEXT, ended_at TEXT, symbols TEXT, provider TEXT, error TEXT, payload TEXT",
+    "crypto_research_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, symbol TEXT, lane TEXT, price REAL, price_timestamp TEXT, data_freshness TEXT, return_1h REAL, return_4h REAL, return_1d REAL, return_7d REAL, return_20d REAL, realized_volatility REAL, atr_like_volatility REAL, trend_metrics TEXT, volume REAL, spread REAL, score REAL, score_components TEXT, risk_metrics TEXT, provider TEXT, created_at TEXT, payload TEXT",
+    "crypto_observation_state": "symbol TEXT PRIMARY KEY, lane TEXT, score REAL, status TEXT, last_price REAL, last_price_timestamp TEXT, data_freshness TEXT, last_research_at TEXT, observation_since TEXT, updated_at TEXT, payload TEXT",
+    "crypto_counterfactual_outcomes": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, setup_id TEXT, symbol TEXT, score REAL, would_propose INTEGER DEFAULT 0, reason TEXT, forward_return_1d REAL, forward_return_7d REAL, status TEXT, created_at TEXT, updated_at TEXT",
     "dynamic_universe_schedule_state": "id TEXT PRIMARY KEY, schedule_name TEXT UNIQUE, schedule_type TEXT, due_at TEXT, last_started_at TEXT, last_completed_at TEXT, last_success_at TEXT, last_skipped_at TEXT, last_skip_reason TEXT, missed_count INTEGER DEFAULT 0, catchup_required INTEGER DEFAULT 0, catchup_attempted_at TEXT, catchup_completed_at TEXT, catchup_status TEXT, data_freshness_status TEXT, provider_health_status TEXT, internet_status TEXT, power_status TEXT, battery_pct REAL, stale_after_minutes INTEGER, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, notes TEXT, created_at TEXT, updated_at TEXT",
 }
 
@@ -118,6 +122,9 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_setups_proposal ON performance_setups(proposal_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_blockers_setup ON performance_blockers(setup_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_performance_forward_due ON performance_forward_returns(status, due_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_snapshots_symbol_created ON crypto_research_snapshots(symbol, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_snapshots_run ON crypto_research_snapshots(research_run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_counterfactuals_symbol ON crypto_counterfactual_outcomes(symbol, created_at)")
             stage_rows = [
                 (
                     "raw_universe",

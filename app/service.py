@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from .ai_review import AIReviewer, deterministic_review
 from .capabilities import AUTO_EXECUTION_SUPPORTED
+from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active
 
 logger = logging.getLogger("trading_agent")
 
@@ -2742,6 +2743,8 @@ class TradingService:
             self.telegram.send_message("Blocked for safety: live trading is disabled.")
             return
 
+        self._run_crypto_research_due()
+
         sleep_mode_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
         sleep_mode_started_at = self.storage.get_control_state("sleep_mode_started_at")
         sleep_mode_ended_at = self.storage.get_control_state("sleep_mode_ended_at")
@@ -4788,6 +4791,18 @@ class TradingService:
                 exit_watch = f"Exit watch: {watch_rows[0]['symbol']} {reason}; no proposal yet."
 
         proposal_capacity = self._proposal_capacity_digest_line(window_start_iso, now.isoformat(), performance_lab)
+        crypto_research_line = None
+        if self.config.get("crypto", {}).get("enabled", False) and not crypto_quiet_hours_active(self.config, now):
+            crypto_rows = self.storage.fetch_all(
+                """
+                SELECT symbol, score
+                FROM crypto_observation_state
+                ORDER BY symbol
+                """
+            )
+            if crypto_rows:
+                crypto_scores = ", ".join(f"{row['symbol']} {float(row['score'] or 0):.0f}" for row in crypto_rows[:2])
+                crypto_research_line = f"Crypto research: {crypto_scores}. Research-only. No proposals/orders."
 
         digest_data = {
             "market_open_status": "Open" if market_open else "Closed",
@@ -4821,6 +4836,7 @@ class TradingService:
             "performance_lab": performance_lab,
             "exit_watch": exit_watch,
             "proposal_capacity": proposal_capacity,
+            "crypto_research": crypto_research_line,
         }
 
         from .utils import format_digest_message
@@ -7155,6 +7171,16 @@ class TradingService:
             "INSERT INTO performance_lab_summaries(id, run_id, timestamp, total_qualified_setups, total_shadow_trades, total_actual_trades) VALUES(?,?,?,?,?,?)",
             (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt),
         )
+
+    def _run_crypto_research_due(self) -> None:
+        crypto_cfg = self.config.get("crypto") or {}
+        if not crypto_cfg.get("enabled", False):
+            return
+        try:
+            CryptoResearchEngine(self.config, self.storage, self.broker, self.telegram, self.run_id).run_due(datetime.now(UTC))
+        except Exception as exc:
+            logger.warning("crypto_research_due_failed: %s", exc)
+            self.storage.audit(self.run_id, "crypto_research_due_failed", {"error": type(exc).__name__})
 
     def _performance_lab_blockers(self, res: dict[str, Any], signal: Any, reason: str | None, active_set: set[str], data_freshness: str) -> list[tuple[str, str]]:
         blockers: list[tuple[str, str]] = []

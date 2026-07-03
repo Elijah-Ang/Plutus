@@ -22,6 +22,36 @@ preflight:
 watchlist: [SPY, QQQ, DIA, IWM]
 approved_strategy_versions: [rule_based_v1]
 
+# Crypto research lane: research-only by default. This is intentionally
+# isolated from equity proposal frequency, sizing, scanner, and execution.
+crypto:
+  enabled: true
+  mode: research_only
+  paper_trading_enabled: false
+  proposals_enabled: false
+  live_enabled: false
+  symbols:
+    - BTC/USD
+    - ETH/USD
+  optional_symbols:
+    - SOL/USD
+  max_symbols: 2
+  allow_margin: false
+  allow_shorting: false
+  max_notional_per_trade: 5.00
+  max_crypto_exposure_pct: 1.0
+  require_fresh_price: true
+  max_price_age_seconds: 300
+  data_source: alpaca
+  schedule:
+    enabled: true
+    research_interval_minutes: 60
+    digest_interval_minutes: 240
+    quiet_hours_sgt:
+      enabled: true
+      start: "01:00"
+      end: "08:00"
+
 # Market Profiles
 market_profiles:
   us_equities:

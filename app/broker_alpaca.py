@@ -40,6 +40,7 @@ class AlpacaBroker(BrokerInterface):
             raise RuntimeError("Install alpaca-py before using AlpacaBroker") from exc
         self.trading = TradingClient(key, secret, paper=self.mode == "paper")
         self.data = StockHistoricalDataClient(key, secret)
+        self._crypto_data = None
 
     def _timeout_seconds(self, kind: str) -> float:
         defaults = {
@@ -103,6 +104,43 @@ class AlpacaBroker(BrokerInterface):
         tf = TimeFrame.Day if timeframe.lower() in {"1day", "day", "1d"} else TimeFrame.Hour
         request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=datetime.now().astimezone() - timedelta(days=max(limit * 2, 365)), limit=limit)
         return self._call("get_historical_bars", "market_data", lambda: self.data.get_stock_bars(request).df)
+
+    def _get_crypto_data_client(self) -> Any:
+        if self._crypto_data is None:
+            try:
+                from alpaca.data.historical import CryptoHistoricalDataClient
+            except ImportError as exc:
+                raise RuntimeError("alpaca-py crypto data client is unavailable") from exc
+            self._crypto_data = CryptoHistoricalDataClient()
+        return self._crypto_data
+
+    def get_crypto_historical_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 500) -> Any:
+        from alpaca.data.requests import CryptoBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        tf = TimeFrame.Day if timeframe.lower() in {"1day", "day", "1d"} else TimeFrame.Hour
+        lookback_days = max(30, int(limit / 24) + 5) if tf != TimeFrame.Day else max(limit + 5, 30)
+        request = CryptoBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=datetime.now().astimezone() - timedelta(days=lookback_days),
+            limit=limit,
+        )
+        return self._call(
+            "get_crypto_historical_bars",
+            "market_data",
+            lambda: self._get_crypto_data_client().get_crypto_bars(request).df,
+        )
+
+    def get_crypto_latest_quote(self, symbol: str) -> Any:
+        from alpaca.data.requests import CryptoLatestQuoteRequest
+
+        request = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        return self._call(
+            "get_crypto_latest_quote",
+            "market_data",
+            lambda: self._get_crypto_data_client().get_crypto_latest_quote(request)[symbol],
+        )
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":

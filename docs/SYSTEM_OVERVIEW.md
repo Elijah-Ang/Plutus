@@ -64,8 +64,9 @@ The project follows a modular design with clear separation between:
 - [risk_engine.py](../app/risk_engine.py): Multi-layer safety gate validating system health and trade size limits.
 - [position_management.py](../app/position_management.py): Deterministic position classifier for profit-taking, profit protection, trailing stops, and healthy-pullback add candidates. It returns decisions only and does not place orders.
 - [dynamic_universe.py](../app/dynamic_universe.py): Deterministic research engine that discovers, scores, promotes, demotes, and audits symbols across raw, research, observation, paper-tradable, and demoted tiers. It does not place orders or bypass proposal approval.
+- [crypto_research.py](../app/crypto_research.py): Deterministic crypto research-only lane for BTC/USD and ETH/USD by default. It records price, return, volatility, trend, liquidity/spread, score, risk, Performance Lab shadow events, and counterfactual placeholders without admitting crypto to the equity scanner or creating proposals/orders.
 - [data_providers/](../app/data_providers): Research-provider abstraction and EODHD implementation. EODHD is used only for discovery/research data; Alpaca remains the paper broker/execution/reconciliation authority.
-- [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, and rejects all live clients in this build.
+- [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, optional read-only Alpaca crypto market-data methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
 - [reconciliation.py](../app/reconciliation.py): Read-only broker reconciliation that updates local order/fill/account/position records without submitting or retrying orders.
 - [capabilities.py](../app/capabilities.py): Non-configurable hard gates keeping live trading and auto-execution unsupported.
@@ -140,6 +141,12 @@ The Dynamic Universe Engine follows `research many -> watch some -> trade few ->
 - Alpaca is the trading source of truth for active/tradable asset status, proposal prices, scanner bars/history, proposal freshness, positions, open orders, buying power/account state, final validation, and order placement. Missing or stale Alpaca trading data blocks proposal evaluation. Stale/missing EODHD data, EODHD cooldown, or EODHD unavailability alone must not block an already-promoted dynamic paper-tradable symbol when Alpaca trading data is fresh.
 - The execution path is staged: `research_candidate` -> `observation` -> `paper_tradable` -> current ENTRY/ADD/EXIT setup -> RiskEngine proposal validation -> Telegram approval -> final broker/order validation. High research score alone does not create a proposal or order. Promotion between Dynamic Universe tiers changes eligibility only; it does not create a trade proposal or order.
 - Forex, crypto, options, bonds, and unsupported asset classes are research-only by default.
+- Crypto has a separate research lane outside the equity scanner. Default symbols are BTC/USD and ETH/USD; SOL/USD is optional but not enabled unless configured. Crypto lanes are `crypto_raw`, `crypto_research_candidate`, `crypto_observation`, `crypto_paper_tradable`, and `crypto_trade_proposal`; the last two remain disabled by default because `crypto.mode=research_only`, `crypto.paper_trading_enabled=false`, and `crypto.proposals_enabled=false`.
+- Crypto research can run 24/7 and does not require the US equity market to be open. Its schedule is separate from equity scans, with independent research and digest intervals plus SGT quiet hours. During quiet hours, research data can still be recorded, but non-urgent Telegram crypto status is suppressed.
+- Crypto data prefers read-only Alpaca crypto market data when available. If the SDK/provider path is unavailable, crypto records missing/provider-unavailable evidence and creates no proposals. EODHD is not used as a final trading price source.
+- Crypto scoring is separate from equity thresholds and considers freshness, trend, momentum, realized volatility, ATR-like volatility, drawdown risk, liquidity, and spread. These scores are measurement-only and cannot create orders.
+- Crypto risk controls are explicit: no live trading, no crypto paper proposals by default, no margin, no shorting, $5 maximum hypothetical notional, 1% maximum crypto exposure setting, and fresh-price requirement for any future proposal path.
+- Crypto must not enter the equity scanner, equity proposal-frequency limits, equity sizing, equity exposure calculations, or equity margin/buying-power assumptions. Options are intentionally not added.
 - Unknown-cluster symbols cannot become executable until sufficient risk classification exists.
 - GPT is not used to promote, demote, approve, reject, size, or execute symbols. Optional Dynamic Universe LLM explanations are disabled by default and may only explain deterministic candidate JSON if safely enabled; deterministic scores and rules remain authoritative.
 - The engine runs through existing scanner due checks; no separate launchd job is required. Supported internal run types are daily scan, intraday light refresh, event-triggered refresh, post-market review, and weekly cleanup. Historical database values may still use `daily_deep_research` as an internal schedule key, but operator-facing wording should say "pre-market universe scan" unless candidate-level briefs or deeper research artifacts were actually generated.
@@ -325,6 +332,10 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `performance_outcomes`: Measurement-only outcome placeholders linked one-to-one with Performance Lab setup rows. These hold actual/shadow status and later proposal/order/fill linkage without creating proposals or orders.
 - `performance_forward_returns`: 1D/5D/20D forward return, MFE, MAE, stop-hit, and target-hit placeholders. Updates are eligible only after the horizon has elapsed; future data is never available to live decisions.
 - `performance_counterfactuals`: Counterfactual entry/add/exit records for suppressed setups, including reason, hypothetical price/notional, and pending comparison status.
+- `crypto_research_runs`: Per-run crypto research metadata, provider status, enabled symbols, and research-only safety context.
+- `crypto_research_snapshots`: Per-symbol crypto observations with lane, price timestamp, freshness, 1h/4h/1d/7d/20d returns, volatility, trend, liquidity/spread, score components, risk metrics, provider, and payload summary.
+- `crypto_observation_state`: Latest per-symbol crypto research/observation state for digest and report summaries.
+- `crypto_counterfactual_outcomes`: Measurement-only crypto counterfactual placeholders linked to Performance Lab setup IDs when available.
 - `trade_setups`: Legacy Performance Lab records for meaningful setups, including active/observation status, score, proposal eligibility, and no-proposal reason.
 - `shadow_trades`: Measurement-only trades for setups that were not actually executed. These never create broker orders or Telegram actionable proposals.
 - `trade_outcomes`: Forward-return, MAE/MFE, stop/target, and actual-vs-shadow outcome labels. Filled ranked-batch paper trades create an `actual` outcome row linked to batch, candidate, proposal, order, broker order, fill, risk-budget decision, sizing decision, approval, and matched shadow row when available.
@@ -373,6 +384,12 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Config Snapshot**: Directly database-backed (`config_snapshots`).
 - **Market Memory**: Telemetry comparison logs (`market_memory`).
 - **Performance Lab Summary**: Per-run setup/shadow/actual counts.
+- **Crypto Research Summary**: Research-only crypto lane, score, freshness, return, provider, and no-proposal/no-order safety status.
+- **Crypto Candidate Briefs**: Per-symbol crypto score components, trend/risk summaries, and blocked actions.
+- **Crypto Observation State**: Latest BTC/USD and ETH/USD research state.
+- **Crypto Counterfactual Outcomes**: Measurement-only crypto outcome placeholders.
+- **Crypto Data Coverage**: Availability flags for price, returns, volatility, volume, spread, and freshness.
+- **Crypto Risk Metrics**: Crypto volatility/spread/risk fields plus explicit margin/shorting/equity-isolation labels.
 - **Setup Events / Suppressed Setups / Counterfactual Trades**: Measurement-only setup, blocker, and counterfactual rows. These sheets do not imply proposal eligibility and do not create broker actions.
 - **Forward Returns 1D / 5D / 20D**: Horizon-specific forward outcome placeholders and completed values after enough time has elapsed.
 - **MFE MAE Summary**: Max favorable/adverse excursion and hypothetical stop/target labels by horizon.
