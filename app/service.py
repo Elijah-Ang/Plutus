@@ -63,6 +63,7 @@ def _format_small_percent(value: float | int | None) -> str:
 
 MARKET_PHASE_PRE = "pre_market"
 MARKET_PHASE_REGULAR = "regular_market"
+MARKET_PHASE_REGULAR_CATCH_UP = "regular_market_catch_up"
 MARKET_PHASE_POST = "post_market"
 MARKET_PHASE_WEEKEND = "market_closed_weekend"
 MARKET_PHASE_HOLIDAY = "market_closed_holiday"
@@ -5387,13 +5388,14 @@ class TradingService:
                 return 0
 
     def _dynamic_universe_market_phase(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
-        if any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in results):
-            return MARKET_PHASE_CATCH_UP
+        catchup_completed = any(bool(r.get("catchup")) or str(r.get("run_type") or "").endswith("_catchup") for r in results)
         try:
             if self.broker and self.broker.is_market_open():
-                return MARKET_PHASE_REGULAR
+                return MARKET_PHASE_REGULAR_CATCH_UP if catchup_completed else MARKET_PHASE_REGULAR
         except Exception:
             pass
+        if catchup_completed:
+            return MARKET_PHASE_CATCH_UP
         now_utc = now or datetime.now(UTC)
         if now_utc.tzinfo is None:
             now_utc = now_utc.replace(tzinfo=UTC)
@@ -5455,6 +5457,7 @@ class TradingService:
         return {
             MARKET_PHASE_PRE: "pre-market universe scan",
             MARKET_PHASE_REGULAR: "intraday refresh",
+            MARKET_PHASE_REGULAR_CATCH_UP: "intraday catch-up refresh",
             MARKET_PHASE_POST: "post-market research",
             MARKET_PHASE_WEEKEND: "market-closed research",
             MARKET_PHASE_HOLIDAY: "market-closed research",
@@ -5470,6 +5473,8 @@ class TradingService:
             return f"Dynamic Universe {label} {verb}. Trading remains blocked until market open."
         if phase == MARKET_PHASE_REGULAR:
             return f"Dynamic Universe {label} {verb}. Trading remains paper-only and guarded by normal proposal rules."
+        if phase == MARKET_PHASE_REGULAR_CATCH_UP:
+            return f"Dynamic Universe {label} {verb}. Market is open; trading remains paper-only and guarded by normal proposal rules."
         if phase == MARKET_PHASE_POST:
             return f"Dynamic Universe {label} {verb}. Trading is blocked until the next market open."
         if phase == MARKET_PHASE_WEEKEND:
@@ -5485,7 +5490,7 @@ class TradingService:
     def _dynamic_universe_next_line(self, phase: str) -> str:
         if phase == MARKET_PHASE_PRE:
             return "Next: market-open refresh/promotion checks."
-        if phase == MARKET_PHASE_REGULAR:
+        if phase in {MARKET_PHASE_REGULAR, MARKET_PHASE_REGULAR_CATCH_UP}:
             return "Next: next intraday refresh or post-market review."
         if phase == MARKET_PHASE_POST:
             return "Next: next scheduled research/promotion review."

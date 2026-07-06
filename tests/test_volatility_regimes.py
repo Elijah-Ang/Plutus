@@ -39,6 +39,11 @@ def test_volatility_score_grading(temp_storage):
 
         app.service.evaluate_symbol = mock_evaluate
         try:
+            temp_storage.execute("DELETE FROM orders")
+            temp_storage.execute("DELETE FROM fills")
+            temp_storage.execute("DELETE FROM approvals")
+            temp_storage.execute("DELETE FROM proposal_batches")
+            temp_storage.execute("DELETE FROM proposal_batch_candidates")
             temp_storage.execute("DELETE FROM trade_proposals")
             temp_storage.execute("DELETE FROM market_memory")
             service.scan()
@@ -113,6 +118,11 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
 
         app.service.evaluate_symbol = mock_evaluate
         try:
+            temp_storage.execute("DELETE FROM orders")
+            temp_storage.execute("DELETE FROM fills")
+            temp_storage.execute("DELETE FROM approvals")
+            temp_storage.execute("DELETE FROM proposal_batches")
+            temp_storage.execute("DELETE FROM proposal_batch_candidates")
             temp_storage.execute("DELETE FROM trade_proposals")
             temp_storage.execute("DELETE FROM market_memory")
             service.scan()

@@ -574,10 +574,29 @@ def test_post_market_after_friday_close_stays_post_market(temp_storage):
     assert "Trading is blocked until the next market open" in msg
 
 
-def test_dynamic_universe_catchup_wording_overrides_market_phase(temp_storage):
+def test_dynamic_universe_catchup_during_open_market_uses_intraday_wording(temp_storage):
     cfg = dynamic_config()
     cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
     service = TradingService(cfg, temp_storage, MockBroker(), "run-test")
+    service.telegram = MockTelegramBot()
+    result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-catchup", "candidate_briefs": 0, "catchup": True}
+
+    service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 26, 12, 0, tzinfo=UTC))
+
+    msg = service.telegram.messages[-1]
+    assert "intraday catch-up refresh completed" in msg
+    assert "Market is open; trading remains paper-only and guarded by normal proposal rules" in msg
+    assert "Next: next intraday refresh or post-market review." in msg
+    assert "pre-market universe scan" not in msg
+    assert "Trading remains blocked until market open" not in msg
+
+
+def test_dynamic_universe_catchup_while_closed_keeps_closed_safety_wording(temp_storage):
+    cfg = dynamic_config()
+    cfg["telegram"]["dynamic_universe_premarket_updates_enabled"] = True
+    broker = MockBroker()
+    broker.open = False
+    service = TradingService(cfg, temp_storage, broker, "run-test")
     service.telegram = MockTelegramBot()
     result = {"status": "completed", "run_type": "intraday_light_refresh", "run_id": "run-catchup", "candidate_briefs": 0, "catchup": True}
 
