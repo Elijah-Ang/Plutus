@@ -37,6 +37,11 @@ class EODHDProvider:
         self.ttls = self.provider_cfg.get("cache_ttl_minutes", {})
         self.plan_limited_cooldown_minutes = int(self.provider_cfg.get("plan_limited_cooldown_minutes", 1440))
         self.plan_limited_reprobe_minutes = int(self.provider_cfg.get("plan_limited_reprobe_minutes", 60))
+        self.run_deadline_monotonic: float | None = None
+
+    def set_run_deadline(self, deadline_monotonic: float | None) -> None:
+        """Bound every request by the enclosing scanner research budget."""
+        self.run_deadline_monotonic = deadline_monotonic
 
     def _ttl(self, name: str, default: int) -> int:
         return int(self.ttls.get(name, default))
@@ -128,6 +133,8 @@ class EODHDProvider:
         url = f"{self.base_url}/{endpoint.lstrip('/')}?{urllib.parse.urlencode(request_params, doseq=True)}"
         last_error = None
         deadline = time.monotonic() + self.total_timeout
+        if self.run_deadline_monotonic is not None:
+            deadline = min(deadline, self.run_deadline_monotonic)
         for attempt in range(max(1, self.max_retries + 1)):
             remaining = deadline - time.monotonic()
             if remaining <= 0:

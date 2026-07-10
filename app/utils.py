@@ -66,6 +66,7 @@ def record_process_identity(role: str, run_id: str) -> dict[str, Any]:
     try:
         with json_path.open("w", encoding="utf-8") as handle:
             json.dump(identity, handle, indent=2)
+        os.chmod(json_path, 0o600)
     except Exception:
         pass
     return identity

@@ -499,10 +499,17 @@ class TradingService:
     def _runtime_orchestration_cfg(self) -> dict[str, Any]:
         return self.config.get("runtime_orchestration") or self.config.get("dynamic_universe", {}).get("runtime_orchestration", {})
 
-    def _run_dynamic_universe_due(self, run_types: list[str] | None = None, skip_run_types: list[str] | None = None) -> list[dict[str, Any]]:
+    def _run_dynamic_universe_due(
+        self,
+        run_types: list[str] | None = None,
+        skip_run_types: list[str] | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> list[dict[str, Any]]:
         engine = self._dynamic_universe_engine()
         if not engine:
             return []
+        if getattr(engine, "provider", None) is not None:
+            engine.provider.set_run_deadline(deadline_monotonic)
         run_types = run_types or ["daily_deep_research", "intraday_light_refresh", "post_market_review", "weekly_cleanup"]
         if self._dynamic_universe_event_refresh_due():
             run_types.append("event_triggered_refresh")
@@ -568,8 +575,13 @@ class TradingService:
         detail = {"timeout_seconds": timeout, "run_types": run_types, "skip_run_types": skip_run_types}
         self.storage.audit(self.run_id, "research_started", detail)
         try:
+            deadline = time.monotonic() + timeout
             with wall_clock_timeout(timeout, label):
-                results = self._run_dynamic_universe_due(run_types=run_types, skip_run_types=skip_run_types)
+                results = self._run_dynamic_universe_due(
+                    run_types=run_types,
+                    skip_run_types=skip_run_types,
+                    deadline_monotonic=deadline,
+                )
         except WallClockTimeout:
             timed_out = self.cleanup_stale_research_runs(timeout_seconds=0, reason="research_wall_clock_timeout", run_id=self.run_id)
             self.storage.audit(

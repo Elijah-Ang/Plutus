@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import socket
 import ssl
+import time
 from urllib.error import HTTPError, URLError
 from typing import Any
 from unittest.mock import patch
@@ -1778,4 +1779,17 @@ def test_eodhd_provider_records_dns_tls_and_timeout_events(temp_storage, monkeyp
 
     timeout = _run_with_error(TimeoutError("timed out"))
     assert timeout.error == "timeout"
+    assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type='provider_timeout'")
+
+
+def test_eodhd_provider_respects_enclosing_research_deadline(temp_storage, monkeypatch):
+    cfg = load_config()
+    provider = EODHDProvider(cfg, temp_storage, run_id="run-deadline", api_key="test-token")
+    provider.set_run_deadline(time.monotonic() - 0.01)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: pytest.fail("expired research budget made a network request"))
+
+    result = provider.get_historical_bars("SPY.US")
+
+    assert result.status == "provider_unavailable"
+    assert result.error == "total_timeout"
     assert temp_storage.fetch_all("SELECT 1 FROM audit_events WHERE event_type='provider_timeout'")
