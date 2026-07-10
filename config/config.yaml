@@ -490,16 +490,16 @@ risk:
   max_price_age_seconds: 120
   min_historical_bars: 50
   max_price_gap_pct: 15
-  max_new_buy_proposals_per_cycle: 1
-  max_pending_buy_proposals: 1
+  max_new_buy_proposals_per_cycle: null
+  max_pending_buy_proposals: null
   allow_multiple_exit_proposals: true
   require_gpt_review_for_buy_proposals: true
 
 portfolio_behavior:
   max_open_positions: 3
   max_new_buy_orders_per_day: 3
-  max_new_buy_proposals_per_cycle: 1
-  max_pending_buy_proposals: 1
+  max_new_buy_proposals_per_cycle: null
+  max_pending_buy_proposals: null
   allow_add_to_existing_position: true
   block_averaging_down: true
   max_adds_per_symbol_per_day: 1

@@ -149,6 +149,7 @@ class TradingService:
         self.telegram = telegram
         self.ai = AIReviewer(config.get("ai", {}))
         self._context_cache: tuple[float, dict[str, Any]] | None = None
+        self._phase1_bar_cache: dict[str, Any] = {}
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
@@ -3109,6 +3110,7 @@ class TradingService:
             self.telegram.send_message("Blocked for safety: live trading is disabled.")
             return
 
+        self._phase1_bar_cache = {}
         self._run_crypto_research_due()
 
         sleep_mode_active = int(self.storage.get_control_state("sleep_mode_active", "0")) == 1
@@ -3707,6 +3709,7 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO signals(id,run_id,symbol,side,action,strategy_version,reason,confidence,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (signal_id, self.run_id, symbol, signal.side, signal.action, signal.strategy_version, signal.reason, signal.confidence, now.isoformat(), expiry.isoformat(), json_dumps(signal.indicators)))
                 self.storage.execute("INSERT INTO indicators(run_id,symbol,values_json,created_at) VALUES(?,?,?,?)", (self.run_id, symbol, json_dumps(signal.indicators), now.isoformat()))
+                self._phase1_bar_cache[symbol] = bars
 
                 profile_results.append({
                     "symbol": symbol,
@@ -4001,20 +4004,11 @@ class TradingService:
                 )
                 suppressed_buy_symbols = {c["symbol"] for c in buy_candidates if c["symbol"] not in allowed_buy_symbols}
             else:
-                risk_cfg = self.config.get("risk", {})
-                portfolio_behavior_cfg = self.config.get("portfolio_behavior", {})
-                max_new_buy_per_cycle = portfolio_behavior_cfg.get(
-                    "max_new_buy_proposals_per_cycle",
-                    risk_cfg.get("max_new_buy_proposals_per_cycle", 1),
-                )
-                max_pending_buy = portfolio_behavior_cfg.get(
-                    "max_pending_buy_proposals",
-                    risk_cfg.get("max_pending_buy_proposals", 1),
-                )
-                pending_in_db = self.storage.fetch_all("SELECT COUNT(*) as cnt FROM trade_proposals WHERE side='buy' AND status='pending'")[0]["cnt"]
-                allowed_new_buys = max(0, min(max_new_buy_per_cycle, max_pending_buy - pending_in_db))
-                allowed_buy_symbols = {c["symbol"] for c in buy_candidates[:allowed_new_buys]}
-                suppressed_buy_symbols = {c["symbol"] for c in buy_candidates[allowed_new_buys:]}
+                # Proposal creation has no count cap. Every candidate that has
+                # already passed signal, data, dedupe, and RiskEngine checks may
+                # be proposed; execution risk controls remain authoritative.
+                allowed_buy_symbols = {c["symbol"] for c in buy_candidates}
+                suppressed_buy_symbols: set[str] = set()
 
             # Record rankings in candidate_rankings table
             for c in buy_candidates:
@@ -4742,25 +4736,6 @@ class TradingService:
                 self._run_performance_lab(profile_results, active_watchlist, positions, now, snapshot)
 
     def _proposal_capacity_digest_line(self, window_start_iso: str, window_end_iso: str, performance_lab: dict[str, Any]) -> str:
-        portfolio_cfg = self.config.get("portfolio_behavior", {})
-        risk_cfg = self.config.get("risk", {})
-        max_session = (
-            portfolio_cfg.get("max_new_buy_proposals_per_session")
-            or portfolio_cfg.get("max_new_buy_orders_per_day")
-            or risk_cfg.get("max_trades_per_day")
-            or 0
-        )
-        try:
-            max_session_int = int(max_session)
-        except (TypeError, ValueError):
-            max_session_int = 0
-
-        used_rows = self.storage.fetch_all(
-            "SELECT COUNT(*) AS cnt FROM trade_proposals WHERE side='buy' AND date(created_at)=date('now')"
-        )
-        used = int(used_rows[0].get("cnt") or 0) if used_rows else 0
-        remaining = max(0, max_session_int - used) if max_session_int > 0 else 0
-
         top_blocker_rows = self.storage.fetch_all(
             """
             SELECT blocker, COUNT(*) AS cnt
@@ -4775,9 +4750,7 @@ class TradingService:
         )
         top_blocker = top_blocker_rows[0]["blocker"] if top_blocker_rows else "none"
         suppressed = int(performance_lab.get("suppressed") or 0)
-        if max_session_int <= 0:
-            return f"Proposal capacity: daily cap not configured. Suppressed setups tracked: {suppressed}. Top blocker: {top_blocker}."
-        return f"Proposal capacity: {used}/{max_session_int} used today, {remaining} remaining. Suppressed setups tracked: {suppressed}. Top blocker: {top_blocker}."
+        return f"Setup tracking: {suppressed} suppressed or observation-only. Top blocker: {top_blocker}. Proposal count is uncapped."
 
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
@@ -7627,8 +7600,6 @@ class TradingService:
             blockers.append(("missing_data", reason_text))
         if "cooldown" in lower_reason or res.get("cooldown_applied"):
             blockers.append(("cooldown", reason_text or str(res.get("cooldown_reason") or "cooldown applied")))
-        if "pending" in lower_reason:
-            blockers.append(("pending_proposal_limit", reason_text))
         if "max daily" in lower_reason or "trades_today" in lower_reason:
             blockers.append(("max_daily_trades", reason_text))
         if "market closed" in lower_reason:
@@ -7702,6 +7673,8 @@ class TradingService:
             self.broker,
             now=now,
             max_updates=int(cfg.get("max_forward_outcome_updates_per_cycle", 25)),
+            run_id=self.run_id,
+            bar_cache=self._phase1_bar_cache,
         )
         self.storage.audit(self.run_id, "canonical_forward_outcomes_updated", result)
         return
@@ -7716,6 +7689,8 @@ class TradingService:
             self.broker,
             now=now,
             max_updates=int(cfg.get("max_forward_outcome_updates_per_cycle", 25)),
+            run_id=self.run_id,
+            bar_cache=self._phase1_bar_cache or None,
         )
         return
 

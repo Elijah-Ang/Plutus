@@ -17,6 +17,7 @@ from app.research_validation import (
     import_legacy_opportunities,
     render_evidence_report,
     score_calibration,
+    update_service_outcomes,
     walk_forward_folds,
 )
 from app.storage import Storage
@@ -215,3 +216,43 @@ def test_full_day_future_revisions_do_not_change_one_session_label():
     one = calculator().calculate(opportunity(), first, spy, as_of=datetime(2026, 2, 1, tzinfo=UTC), horizons=(1,))[0]
     two = calculator().calculate(opportunity(), revised_future, spy, as_of=datetime(2026, 2, 1, tzinfo=UTC), horizons=(1,))[0]
     assert one.gross_return == two.gross_return
+
+
+def test_runtime_outcomes_use_current_run_and_cached_bars_without_provider_calls(tmp_path):
+    storage = Storage(tmp_path / "runtime-clone.db")
+    storage.initialize()
+    observed = datetime(2026, 1, 2, 15, tzinfo=UTC).isoformat()
+    for setup_id, run_id in (("current", "run-current"), ("historical", "run-old")):
+        storage.execute(
+            """INSERT INTO performance_setups(
+               id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,
+               proposed,score,current_price,signal_state,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                setup_id, observed, run_id, "QQQ", "equity", "paper_tradable", "entry",
+                "shadow_only", 0, 80.0, 100.0,
+                '{"side":"buy","strategy_version":"rule_based_v1","stop_price":95}',
+                observed, observed,
+            ),
+        )
+
+    class ForbiddenBroker:
+        def get_historical_bars(self, *args, **kwargs):
+            raise AssertionError("runtime Phase 1 must reuse scanner bars")
+
+    qqq = bars("2026-01-05", [101 + i for i in range(25)])
+    spy = bars("2026-01-05", [501 + i for i in range(25)])
+    result = update_service_outcomes(
+        storage,
+        ForbiddenBroker(),
+        now=datetime(2026, 2, 20, tzinfo=UTC),
+        max_updates=25,
+        run_id="run-current",
+        bar_cache={"QQQ": qqq, "SPY": spy},
+    )
+
+    assert result["provider_calls"] == 0
+    assert storage.fetch_all("SELECT source_id FROM research_opportunities") == [{"source_id": "current"}]
+    outcomes = storage.fetch_all("SELECT status FROM research_outcomes")
+    assert len(outcomes) == 3
+    assert {row["status"] for row in outcomes} == {"completed"}

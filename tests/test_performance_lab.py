@@ -198,24 +198,25 @@ def test_performance_lab_digest_line_is_compact():
             "summary": "No proposals.",
             "performance_lab": {"tracked": 42, "proposed": 1, "suppressed": 41, "outcome_status": "outcomes pending"},
             "exit_watch": "Exit watch: no exit triggers.",
-            "proposal_capacity": "Proposal capacity: 1/3 used today, 2 remaining. Suppressed setups tracked: 18. Top blocker: no_entry_signal.",
+            "proposal_capacity": "Setup tracking: 18 suppressed or observation-only. Top blocker: no_entry_signal. Proposal count is uncapped.",
         },
         {"mode": "paper"},
     )
 
     assert "Performance Lab: tracked 42 setups, proposed 1, suppressed 41, outcomes pending." in msg
     assert "Exit watch: no exit triggers." in msg
-    assert "Proposal capacity: 1/3 used today, 2 remaining. Suppressed setups tracked: 18. Top blocker: no_entry_signal." in msg
+    assert "Setup tracking: 18 suppressed or observation-only. Top blocker: no_entry_signal. Proposal count is uncapped." in msg
+    assert "Proposal capacity" not in msg
     assert "approve" not in msg.lower()
 
 
 def test_proposal_frequency_report_sheets_exist():
     sheet_names = {name for name, _query in SHEETS}
 
-    assert "Proposal Capacity Status" in sheet_names
+    assert "Proposal Activity Status" in sheet_names
     assert "Proposal Bottleneck Summary" in sheet_names
     assert "Suppressed Setup Blockers" in sheet_names
-    assert "Capacity-Limited Candidates" in sheet_names
+    assert "Risk or Workflow Blockers" in sheet_names
     assert "Proposal Frequency Audit" in sheet_names
 
 
@@ -233,8 +234,19 @@ def test_performance_lab_capacity_blockers_are_classified(tmp_path):
     )
     blocker_names = {name for name, _reason in blockers}
 
-    assert "pending_proposal_limit" in blocker_names
+    assert "pending_proposal_limit" not in blocker_names
     assert "cooldown" in blocker_names
+
+
+def test_digest_setup_tracking_never_invents_proposal_capacity(tmp_path):
+    service, _storage, _broker = _service(tmp_path)
+    line = service._proposal_capacity_digest_line(
+        "2026-01-02T15:00:00+00:00",
+        "2026-01-02T15:30:00+00:00",
+        {"suppressed": 18},
+    )
+    assert line == "Setup tracking: 18 suppressed or observation-only. Top blocker: none. Proposal count is uncapped."
+    assert "capacity" not in line.lower()
 
 
 def test_performance_lab_safety_config_invariants():

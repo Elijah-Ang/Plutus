@@ -253,7 +253,7 @@ def test_telegram_process_reply_to_and_acknowledgements(temp_storage, mock_confi
     assert app_rows[0]["proposal_targeting_method"] == "reply_to"
     assert app_rows[0]["acknowledgement_status"] == "submitted"
 
-def test_simultaneous_buy_limits_and_tie_breaker(temp_storage, mock_config):
+def test_simultaneous_buy_candidates_are_all_proposed_without_count_cap(temp_storage, mock_config):
     bot = MockTelegramBot()
     broker = MockBroker()
     service = TradingService(mock_config, temp_storage, broker, "run_id")
@@ -280,22 +280,18 @@ def test_simultaneous_buy_limits_and_tie_breaker(temp_storage, mock_config):
     try:
         service.scan()
         
-        # Verify only 1 BUY proposal is generated in trade_proposals
+        # Proposal count is uncapped; all otherwise eligible candidates survive.
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE status='pending'")
-        assert len(props) == 1
-        best_symbol = props[0]["symbol"]
-        
-        # Verify the other two are suppressed and logged in market_memory
+        assert {row["symbol"] for row in props} == {"SPY", "DIA", "IWM"}
+
+        # No candidate is suppressed merely because others were proposed.
         suppressed = temp_storage.fetch_all("SELECT * FROM market_memory WHERE candidate_suppression_reason='suppressed_by_candidate_limit'")
-        assert len(suppressed) == 2
-        for r in suppressed:
-            assert r["symbol"] != best_symbol
-            assert r["no_action_reason"] == "suppressed due to simultaneous candidate limits"
+        assert suppressed == []
             
     finally:
         app.service.evaluate_symbol = original_evaluate
 
-def test_pending_buy_blocks_new_buys(temp_storage, mock_config):
+def test_pending_buy_blocks_only_duplicate_symbol_not_other_proposals(temp_storage, mock_config):
     bot = MockTelegramBot()
     broker = MockBroker()
     service = TradingService(mock_config, temp_storage, broker, "run_id")
@@ -318,12 +314,13 @@ def test_pending_buy_blocks_new_buys(temp_storage, mock_config):
 
     try:
         service.scan()
-        # Verify no new proposals generated since pending limit is 1
+        # Existing SPY remains deduplicated, while unrelated candidates are not
+        # suppressed by a global pending-proposal count.
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE status='pending'")
-        assert len(props) == 1  # only the existing one
+        assert {row["symbol"] for row in props} == {"SPY", "DIA", "IWM"}
         
         suppressed = temp_storage.fetch_all("SELECT * FROM market_memory WHERE candidate_suppression_reason='suppressed_by_candidate_limit'")
-        assert len(suppressed) == 2  # SPY is suppressed by pending dedupe, DIA & IWM suppressed by candidate limit
+        assert suppressed == []
     finally:
         app.service.evaluate_symbol = original_evaluate
 

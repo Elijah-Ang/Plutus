@@ -642,7 +642,12 @@ def _safe_json(value: Any) -> dict[str, Any]:
         return {}
 
 
-def import_legacy_opportunities(storage: Any, repository: ResearchRepository) -> list[Opportunity]:
+def import_legacy_opportunities(
+    storage: Any,
+    repository: ResearchRepository,
+    *,
+    run_id: str | None = None,
+) -> list[Opportunity]:
     """Idempotently normalize every historical Performance Lab/trade row.
 
     Classification is intentionally descriptive, not ordinal: actual fills,
@@ -657,7 +662,9 @@ def import_legacy_opportunities(storage: Any, repository: ResearchRepository) ->
            FROM performance_setups ps
            LEFT JOIN performance_outcomes po ON po.setup_id=ps.id
            LEFT JOIN performance_blockers pb ON pb.setup_id=ps.id
+           WHERE (? IS NULL OR ps.run_id=?)
            GROUP BY ps.id"""
+        , (run_id, run_id)
     )
     for row in setups:
         observed_at = row.get("timestamp") or row.get("created_at")
@@ -715,7 +722,10 @@ def import_legacy_opportunities(storage: Any, repository: ResearchRepository) ->
             if row.get(key):
                 linked_execution_keys.add((key, str(row[key])))
 
-    trades = storage.fetch_all("SELECT * FROM trade_outcomes")
+    # Full clone backfills normalize the legacy trade-outcome ledger. Runtime
+    # cycles import only their newly captured Performance Lab rows; actual fill
+    # linkage is synchronized there without rescanning all historical trades.
+    trades = storage.fetch_all("SELECT * FROM trade_outcomes") if run_id is None else []
     existing_sources = {(o.source_table, o.source_id) for o in opportunities}
     for row in trades:
         source_id = str(row["id"])
@@ -891,27 +901,35 @@ def project_canonical_to_legacy(storage: Any) -> None:
         )
 
 
-def update_service_outcomes(storage: Any, broker: Any, *, now: datetime, max_updates: int = 25) -> dict[str, Any]:
-    """Single runtime entrypoint for legacy and Phase 2 shadow outcomes."""
+def update_service_outcomes(
+    storage: Any,
+    broker: Any,
+    *,
+    now: datetime,
+    max_updates: int = 25,
+    run_id: str | None = None,
+    bar_cache: Mapping[str, pd.DataFrame] | None = None,
+) -> dict[str, Any]:
+    """Single bounded runtime entrypoint for legacy and Phase 2 shadow outcomes."""
     repository = ResearchRepository(storage.path)
     repository.migrate()
-    opportunities = import_legacy_opportunities(storage, repository)
+    import_legacy_opportunities(storage, repository, run_id=run_id)
     with repository.connect() as conn:
-        for row in conn.execute("SELECT * FROM research_opportunities WHERE source_table='shadow_insights'"):
-            item = dict(row)
-            opportunities.append(
-                Opportunity(
-                    id=item["id"], symbol=item["symbol"], observed_at=_utc(item["observed_at"]),
-                    entry_price=item["entry_price"], direction=item["direction"],
-                    execution_type=item["execution_type"], strategy_version=item["strategy_version"],
-                    score=item["score"], blocker=item["blocker"], ai_gate=item["ai_gate"],
-                    stop_price=item["stop_price"], target_price=item["target_price"],
-                    benchmark_entry_price=item["benchmark_entry_price"],
-                    feature_version=item["feature_version"], universe_version=item["universe_version"],
-                    regime_version=item["regime_version"], eligibility_version=item["eligibility_version"],
-                    source_id=item["source_id"], source_table=item["source_table"],
-                )
+        opportunities = [
+            Opportunity(
+                id=row["id"], source_table=row["source_table"], source_id=row["source_id"],
+                symbol=row["symbol"], observed_at=_utc(row["observed_at"]),
+                entry_price=row["entry_price"], direction=row["direction"],
+                execution_type=row["execution_type"], strategy_version=row["strategy_version"],
+                score=row["score"], blocker=row["blocker"], ai_gate=row["ai_gate"],
+                stop_price=row["stop_price"], target_price=row["target_price"],
+                benchmark_entry_price=row["benchmark_entry_price"], actual_exit_price=row["actual_exit_price"],
+                feature_version=row["feature_version"], universe_version=row["universe_version"],
+                regime_version=row["regime_version"], eligibility_version=row["eligibility_version"],
             )
+            for row in conn.execute("SELECT * FROM research_opportunities ORDER BY observed_at,id")
+        ]
+    with repository.connect() as conn:
         states: dict[str, list[tuple[str, str]]] = {}
         for row in conn.execute("SELECT opportunity_id,status,maturity_session FROM research_outcomes"):
             states.setdefault(row["opportunity_id"], []).append((row["status"], row["maturity_session"]))
@@ -921,8 +939,13 @@ def update_service_outcomes(storage: Any, broker: Any, *, now: datetime, max_upd
         if opportunity.id not in states
         or any(status == "maturing" and maturity <= now.date().isoformat() for status, maturity in states[opportunity.id])
     ]
+    if bar_cache is not None:
+        available = {str(symbol).upper() for symbol, frame in bar_cache.items() if frame is not None and not frame.empty}
+        selected = [opportunity for opportunity in selected if opportunity.symbol.upper() in available]
     selected.sort(key=lambda opportunity: (opportunity.observed_at, opportunity.id))
     def load(symbol: str) -> pd.DataFrame:
+        if bar_cache is not None:
+            return bar_cache.get(symbol, pd.DataFrame())
         if broker is None:
             return pd.DataFrame()
         from .market_data import normalize_bars
@@ -930,6 +953,12 @@ def update_service_outcomes(storage: Any, broker: Any, *, now: datetime, max_upd
         return normalize_bars(broker.get_historical_bars(symbol, "1Day", 250), symbol)
 
     model = CostModel("paper_cost_assumption_v1", 4.0, 2.0, 2.0, source="documented conservative paper assumption; replace with observed quote/fill calibration")
+    if bar_cache is not None and ("SPY" not in bar_cache or bar_cache["SPY"] is None or bar_cache["SPY"].empty):
+        project_canonical_to_legacy(storage)
+        return {"status": "deferred", "reason": "cached_spy_bars_unavailable", "selected": len(selected), "provider_calls": 0}
+    if not selected:
+        project_canonical_to_legacy(storage)
+        return {"status": "completed", "processed": 0, "provider_calls": 0}
     runner = BoundedBackfill(repository, CanonicalOutcomeCalculator(ExchangeSessions(), model), load, as_of=now)
     result = runner.run(
         selected,
@@ -937,6 +966,7 @@ def update_service_outcomes(storage: Any, broker: Any, *, now: datetime, max_upd
         job_key=f"runtime:{now.date().isoformat()}:{fingerprint([o.id for o in selected[:max_updates or None]])}",
     )
     project_canonical_to_legacy(storage)
+    result["provider_calls"] = 0 if bar_cache is not None else None
     return result
 
 
