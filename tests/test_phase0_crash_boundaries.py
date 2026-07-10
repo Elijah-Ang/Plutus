@@ -139,14 +139,16 @@ def test_crash_02_after_intent_commit_before_broker_call(tmp_path):
 
 def test_crash_03_immediately_before_broker_invocation(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker()
+    workflow = _workflow(storage)
     with pytest.raises(SimulatedProcessCrash):
-        Executor(broker, PassingRisk(), storage, "run", _crash_at("immediately_before_broker_invocation")).execute(
-            _proposal(), {"approval_valid": True}
+        Executor(broker, PassingRisk(), storage, "run", _crash_at("immediately_before_broker_submit")).execute(
+            _proposal(), {"approval_valid": True}, approval_id="approval-1"
         )
     assert broker.submit_calls == 0
-    assert storage.fetch_all("SELECT state FROM order_intents")[0]["state"] == "reserved"
-    assert Executor(broker, PassingRisk(), Storage(storage.path), "restart").execute(
-        _proposal(), {"approval_valid": True}
+    assert storage.fetch_all("SELECT state FROM order_intents")[0]["state"] == "submitting"
+    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "submission_started"
+    assert Executor(broker, PassingRisk(), Storage(storage.path), "restart", recovery_proven_no_submit=True).execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
     ).submitted
     assert broker.submit_calls == 1
 
