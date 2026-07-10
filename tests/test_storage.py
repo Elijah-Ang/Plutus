@@ -3,6 +3,45 @@ from datetime import UTC, datetime, timedelta
 from app.storage import Storage, TABLE_DEFINITIONS
 
 
+def test_initialize_upgrades_legacy_telegram_inbox_schema(tmp_path):
+    db_path = tmp_path / "legacy-telegram.db"
+    legacy_columns = """
+        update_id INTEGER PRIMARY KEY,
+        message_id INTEGER,
+        received_at TEXT NOT NULL,
+        processing_state TEXT NOT NULL,
+        processed_at TEXT,
+        approval_id TEXT,
+        safe_message_type TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        last_error_category TEXT
+    """
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE telegram_updates (" + legacy_columns + ")")
+
+    storage = Storage(db_path)
+    storage.initialize()
+
+    columns = {row["name"] for row in storage.fetch_all("PRAGMA table_info(telegram_updates)")}
+    assert {
+        "message_timestamp",
+        "normalized_action",
+        "target_hint",
+        "sender_authorized",
+    } <= columns
+    assert storage.ingest_telegram_update(
+        1,
+        message_id=10,
+        message_timestamp=20,
+        safe_message_type="approval",
+        normalized_action="yes",
+        target_hint="AMX",
+        sender_authorized=True,
+    ) == "received"
+
+
 def test_schema_and_duplicate_approval(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()

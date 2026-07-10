@@ -459,6 +459,20 @@ class Storage:
                     if column not in existing:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+            # The durable Telegram inbox was introduced after some production
+            # databases had already created this table. Keep the upgrade
+            # additive and idempotent so the listener can ingest updates before
+            # advancing the Telegram cursor on those databases.
+            add_missing_columns(
+                "telegram_updates",
+                {
+                    "message_timestamp": "INTEGER",
+                    "normalized_action": "TEXT",
+                    "target_hint": "TEXT",
+                    "sender_authorized": "INTEGER",
+                },
+            )
+
             add_missing_columns(
                 "fills",
                 {
