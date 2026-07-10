@@ -1,7 +1,7 @@
 # Trading System Transformation Roadmap
 
-Last updated: 2026-07-10  
-Authoritative implementation branch: `codex/phase0-execution-integrity`  
+Last updated: 2026-07-11
+Authoritative implementation branch: `codex/phase1-evidence-validation`
 Safety posture: paper-only; live and ordinary automatic execution remain compile-time/runtime blocked.
 
 Implementation commits:
@@ -10,6 +10,8 @@ Implementation commits:
 - `8d7d1f5` — Phase 0 execution-integrity foundation, offline tests, and additive schema.
 - `4b6a444` — Phase 0 completion-gate implementation and audit repairs.
 - `971c3d3` — immutable release/runtime-state cutover and explicit migration gate.
+- `581ddff` — verified Phase 0 development tip used as the Phase 1 branch base.
+- Phase 1 implementation/evidence commits are recorded in branch history; the gate remains partial until sufficient OOS data exists.
 
 Ledger commit resolution: every Phase 0 cell below that says `pending final commit` resolves to implementation commit `4b6a444`; the final evidence/roadmap commit is recorded separately in the repository history.
 
@@ -131,6 +133,24 @@ Common metadata for all `P1-*` entries: rationale = establish point-in-time out-
 | P1-PERF-001..006 | Profitable-month percentage; worst month; drawdown/recovery; exposure-adjusted return; performance by strategy/regime/score/execution; completed forward sample report |
 | P1-RL-001 | Explicitly exclude deep reinforcement learning until the evidence environment is valid |
 
+### Phase 1 implementation checkpoint (2026-07-11)
+
+| IDs | Status | Evidence and remaining gate |
+|---|---|---|
+| P1-OUT-001..005 | tested | Canonical session-based 1/5/20 outcomes, SPY-relative returns, MFE/MAE, barrier ordering, actual/hypothetical R and explicit unknowns; point-in-time bar coverage is still unavailable for completed historical evidence. |
+| P1-EXEC-001..004 | implemented/tested | Versioned spread, slippage, commission/regulatory, delayed-entry parameters and provenance; current 8 bps report value is an assumption, not observed fill calibration. |
+| P1-HOLD-001 | implemented | Horizon results and barrier exit sessions support holding-period analysis; no completed OOS sample exists. |
+| P1-CAL-001..004 | implemented/inconclusive | Score bands, Brier reliability, blocker and AI-gate grouping exist; no completed OOS labels support calibration or incremental AI value. Existing trading behavior is unchanged. |
+| P1-DATA-001..006 | partial | Deterministic regime/version fields, point-in-time feature prefixes, universe version contracts, session cadence design, and explicit revised/delisting limitations exist. A historical point-in-time universe/corporate-action bundle is not yet available. |
+| P1-SIM-001..003 | tested | Historical simulation reuses `evaluate_symbol`; costs and conservative same-bar stop/target ordering are tested. Partial-fill simulation remains unavailable from daily bars. |
+| P1-VAL-001..008 | partial | Walk-forward, purge/embargo, sensitivity, ablation grouping, bootstrap uncertainty, score calibration, and probabilistic Sharpe exist. Deflated Sharpe/PBO/data-snooping conclusions remain unavailable without multiple independent configurations and completed OOS samples. |
+| P1-PERF-001..006 | partial | Reproducible grouped reporting with sample sizes and explicit coverage exists; drawdown/month/recovery statistics remain unavailable with zero completed OOS rows. |
+| P1-RL-001 | tested | No reinforcement-learning code or Phase 2 strategy was added. |
+
+Pending-outcome root cause: two independent calendar-day/rolling-window calculators silently retried invalid timestamps, absent bars, and provider errors while inventing an 8% stop when the intended stop was unknown. The Phase 1 path uses one exchange-session calculator, explicit `completed`/`maturing`/`unavailable`/`failed` states, immutable fingerprints, and compatibility projections only. The duplicate legacy calculation bodies were removed.
+
+The clone-only evidence cut imported 3,114 duplicate-free opportunities and classified all 9,342 horizon rows: 5,804 were still maturing and 3,538 were unavailable (3,526 missing immutable asset-session bars; 12 missing/invalid entry prices). Completed OOS n=0. Therefore `P1-GATE-001` is **not met** and Phase 1 status is **partial**. See `docs/PHASE1_EVIDENCE_REPORT.md` and `docs/PHASE1_RESEARCH_OPERATIONS.md`.
+
 Phase 1 gate `P1-GATE-001`: no score-based risk increase or broader profile until completed outcomes show positive out-of-sample expectancy after realistic costs.
 
 ## Phase 2 — shadow strategy and market-context expansion
@@ -214,6 +234,6 @@ Common acceptance: reachability, tests, docs, scripts, and runtime references ve
 
 ## Current phase verdict
 
-Phase 0 code and release isolation are **complete**: the installed scanner runs only through an immutable release with external state, ordinary startup cannot migrate the production database, and the listener is deliberately stopped so pending updates cannot be consumed during validation. The remaining acceptance item is one controlled regular-market scanner observation on this exact release. Phase 1–5 remain pending and all moderate-risk values remain inactive.
+Phase 0 code and release isolation remain **complete** on the verified development base. Phase 1 implementation is **partial**: the evidence machinery and explicit coverage classification are present, but the point-in-time historical data needed for completed OOS expectancy is unavailable. The Phase 1 gate is not met; Phase 2–5 remain pending and all moderate-risk values remain inactive.
 
 Next dependency-ordered task: isolate the active checkout from installed scheduling, prove the exact case-3 pre-adapter crash boundary, execute old application code against the migrated clone, and repeat the production-clone rehearsal from a pre-change backup before any Phase 1 implementation.
