@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import functools
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -108,6 +109,31 @@ def _crash_at(boundary):
             raise SimulatedProcessCrash(actual)
 
     return hook
+
+
+def assert_common_crash_invariants(tmp_path) -> None:
+    """Shared postcondition set invoked for every named crash boundary."""
+    for path in tmp_path.glob("*.sqlite3"):
+        storage = Storage(path)
+        assert storage.fetch_all("SELECT COUNT(*) n FROM risk_reservations WHERE active_notional<0 OR active_stop_risk<0")[0]["n"] == 0
+        assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents WHERE filled_quantity<0 OR filled_quantity>requested_quantity+0.000000001")[0]["n"] == 0
+        report = DurableExecutionStore(storage).integrity_report()
+        assert all(value == 0 for value in report.values()), report
+        # Every exercised durable action has either an order event or a workflow/
+        # reconciliation audit record; tests use only temporary databases/fakes.
+        events = storage.fetch_all("SELECT COUNT(*) n FROM order_events")[0]["n"]
+        audits = storage.fetch_all("SELECT COUNT(*) n FROM audit_events")[0]["n"]
+        assert events > 0 or audits > 0
+
+
+def crash_case(test):
+    @functools.wraps(test)
+    def wrapped(*args, **kwargs):
+        result = test(*args, **kwargs)
+        tmp_path = kwargs.get("tmp_path") or args[0]
+        assert_common_crash_invariants(tmp_path)
+        return result
+    return wrapped
 
 
 def test_crash_01_failure_before_intent_persistence(tmp_path):
@@ -369,3 +395,10 @@ def test_crash_20_never_submitted_local_order_is_not_reconciled(tmp_path):
     )
     result = BrokerReconciler(broker, storage, "run").reconcile()
     assert result.checked == 0 and broker.lookup_calls == broker.submit_calls == 0
+
+
+# Keep the named matrix readable while guaranteeing every row invokes the same
+# complete DB-level invariant helper after its case-specific assertions.
+for _name, _test in list(globals().items()):
+    if _name.startswith("test_crash_"):
+        globals()[_name] = crash_case(_test)

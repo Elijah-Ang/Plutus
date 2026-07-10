@@ -45,6 +45,10 @@ class PositionLifecycleManager:
                         (now, now, archive, lifecycle["id"]),
                     )
                     conn.execute("DELETE FROM position_management_state WHERE symbol=?", (symbol,))
+                    conn.execute(
+                        "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(NULL,?,?,?,?)",
+                        ("position_lifecycle_closed", "position_lifecycle", json_dumps({"symbol": symbol, "lifecycle_id": lifecycle["id"]}), now),
+                    )
             # Refresh after closing flips so one-active-symbol uniqueness remains valid.
             active_symbols = {
                 row["symbol"]: row for row in conn.execute("SELECT * FROM position_lifecycles WHERE state='active'").fetchall()
@@ -56,6 +60,10 @@ class PositionLifecycleManager:
                         """UPDATE position_lifecycles SET broker_position_id=COALESCE(?,broker_position_id),
                            current_quantity=?,average_entry_price=COALESCE(?,average_entry_price),updated_at=? WHERE id=?""",
                         (observed["broker_position_id"], observed["quantity"], observed["average_entry_price"], now, lifecycle["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(NULL,?,?,?,?)",
+                        ("position_lifecycle_opened", "position_lifecycle", json_dumps({"symbol": symbol, "lifecycle_id": lifecycle_id}), now),
                     )
                 else:
                     lifecycle_id = str(uuid.uuid4())

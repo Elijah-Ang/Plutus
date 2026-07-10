@@ -31,8 +31,7 @@ Path('release-manifest.json').write_text(json.dumps({
 }, indent=2, sort_keys=True) + '\n')
 PY
 rm -rf "$DEST/.git" "$DEST/data" "$DEST/logs" "$DEST/scratch"
+chmod 755 "$DEST/scripts/run_once.sh" "$DEST/scripts/run_telegram_listener.sh"
 find "$DEST" -type d -exec chmod a-w {} +
 find "$DEST" -type f -exec chmod a-w {} +
-chmod u+w "$DEST" "$DEST/release-manifest.json" "$DEST/scripts/run_once.sh" "$DEST/scripts/run_telegram_listener.sh"
-chmod 755 "$DEST/scripts/run_once.sh" "$DEST/scripts/run_telegram_listener.sh"
 print -- "$DEST"
