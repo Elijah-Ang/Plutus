@@ -9,8 +9,10 @@ RUNTIME="$HOME/TradingAgentRuntime"
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "scanner must be stopped"; exit 2; }
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent.telegram 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "listener must be stopped"; exit 2; }
 [[ "$RELEASE" == "$HOME/TradingAgentReleases/"* ]] || { print -u2 -- "release must be immutable release path"; exit 2; }
-ln -sfn "$RELEASE" "$RUNTIME.next"
-mv -f "$RUNTIME.next" "$RUNTIME"
+# BSD ln replaces the symlink entry itself; this does not traverse the old
+# runtime target and keeps the pointer switch as one filesystem operation.
+ln -sfn "$RELEASE" "$RUNTIME"
+[[ "$(readlink "$RUNTIME")" == "$RELEASE" ]] || { print -u2 -- "runtime pointer switch failed"; exit 2; }
 cp "$RELEASE/launchd/com.elijah.tradingagent.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
 cp "$RELEASE/launchd/com.elijah.tradingagent.telegram.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"

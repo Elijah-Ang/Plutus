@@ -60,7 +60,7 @@ def record_process_identity(role: str, run_id: str) -> dict[str, Any]:
         "commit": BOOT_COMMIT,
         "git_clean": is_git_clean(),
     }
-    runtime_dir = PROJECT_ROOT / "logs" / "runtime"
+    runtime_dir = Path(os.environ["TRADING_AGENT_STATE_ROOT"]) / "runtime" if os.getenv("TRADING_AGENT_STATE_ROOT") else PROJECT_ROOT / "logs" / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     json_path = runtime_dir / f"{role}_identity.json"
     try:
