@@ -484,7 +484,7 @@ def test_revalidate_and_execute_emergency_exit(temp_storage, base_config):
 
     # 1. Revalidation passes -> executes successfully
     success, desc = service.revalidate_and_execute_emergency_exit(proposal)
-    assert success is True
+    assert success is True, desc
     assert desc == "submitted"
     orders = temp_storage.fetch_all("SELECT * FROM orders WHERE proposal_id='prop_emerg_123'")
     assert len(orders) == 1

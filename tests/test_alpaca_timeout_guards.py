@@ -4,7 +4,7 @@ import time
 import uuid
 import socket
 import ssl
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -112,6 +112,7 @@ def test_listener_approval_validation_stall_is_bounded_and_blocks_without_order(
     storage.initialize()
     broker = _broker()
     broker.data.get_stock_latest_trade = _sleeping_call
+    broker.trading.get_clock = lambda: SimpleNamespace(is_open=True)
     service = TradingService(
         {
             "mode": "paper",
@@ -136,7 +137,7 @@ def test_listener_approval_validation_stall_is_bounded_and_blocks_without_order(
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 
-def test_order_submission_timeout_is_unknown_and_not_retried():
+def test_order_submission_timeout_is_unknown_and_not_retried(tmp_path):
     broker = _broker()
     calls = {"submit": 0}
 
@@ -150,8 +151,16 @@ def test_order_submission_timeout_is_unknown_and_not_retried():
         def evaluate(self, proposal, context, final=False):
             return SimpleNamespace(passed=True, reasons=[])
 
-    proposal = {"id": "p1", "status": "approved", "symbol": "SPY", "side": "buy", "notional": 5.0}
-    result = Executor(broker, PassingRisk()).execute(proposal, {"approval_valid": True})
+    from app.storage import Storage
+    storage = Storage(tmp_path / "timeout.db")
+    storage.initialize()
+    now = datetime.now(UTC)
+    proposal = {
+        "id": "p1", "status": "approved", "symbol": "SPY", "side": "buy", "action": "entry",
+        "notional": 5.0, "latest_price": 100.0, "price_at": now.isoformat(),
+        "created_at": now.isoformat(), "expires_at": (now + timedelta(minutes=5)).isoformat(),
+    }
+    result = Executor(broker, PassingRisk(), storage, "run").execute(proposal, {"approval_valid": True})
 
     assert calls["submit"] == 1
     assert result.submitted is False

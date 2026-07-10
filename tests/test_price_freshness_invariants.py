@@ -138,6 +138,7 @@ def test_proposal_blocked_if_stale_price_at_scan(temp_storage, base_config):
 
 def test_proposal_created_if_fresh_price_at_scan(temp_storage, base_config):
     base_config["ai"] = {"enabled": False, "ai_review_min_score": 65}
+    base_config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(base_config, temp_storage, broker, "test-run")
     service.telegram = MockTelegramBot()

@@ -131,8 +131,9 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config = load_yaml(path or PROJECT_ROOT / "config" / "config.yaml")
-    if config.get("mode") not in {"paper", "live"}:
-        raise ValueError("mode must be paper or live")
+    from .configuration import validate_config
+
+    validate_config(config)
     return config
 
 
@@ -406,7 +407,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         movement_section = (
             f"Current movement:\n"
             f"Since last check: {price_change_pct:+.2f}%\n"
-            f"Since market open: {session_change_pct:+.2f}%\n"
+            f"Since first stored observation today (UTC): {session_change_pct:+.2f}%\n"
             f"{vol_regime_str}\n"
         )
 
@@ -798,7 +799,7 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             session_change_str = f"{session_change:+.2f}%" if isinstance(session_change, (int, float)) else "0.00%"
             msg_parts.append(
                 f"{rank}. {sym_data['symbol']} — Trade score {score_str}, {class_str}\n"
-                f"   30-min: {change_30m_str} | Session: {session_change_str}\n"
+                f"   30-min: {change_30m_str} | Since first UTC-day observation: {session_change_str}\n"
                 f"   Status: {sym_data['status']}"
             )
 

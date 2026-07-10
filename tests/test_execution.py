@@ -1,5 +1,6 @@
 from app.execution import Executor
 from app.risk_engine import RiskDecision
+from app.storage import Storage
 
 
 class Broker:
@@ -16,12 +17,14 @@ class SpyRisk:
         return RiskDecision(self.called_final, ())
 
 
-def test_execution_requires_final_revalidation(safe_config, proposal, context):
+def test_execution_requires_final_revalidation(safe_config, proposal, context, tmp_path):
     broker = Broker()
     risk = SpyRisk()
     proposal["status"] = "approved"
     context["approval_valid"] = True
-    result = Executor(broker, risk).execute(proposal, context)
+    storage = Storage(tmp_path / "execution.db")
+    storage.initialize()
+    result = Executor(broker, risk, storage, "run").execute(proposal, context)
     assert result.submitted
     assert risk.called_final
     assert broker.called

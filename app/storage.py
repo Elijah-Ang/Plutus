@@ -9,6 +9,7 @@ from typing import Any, Iterator
 from .utils import PROJECT_ROOT, iso_now, json_dumps
 
 TABLE_DEFINITIONS: dict[str, str] = {
+    "schema_migrations": "version TEXT PRIMARY KEY, applied_at TEXT NOT NULL, detail TEXT",
     "runs": "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL, mode TEXT NOT NULL, detail TEXT",
     "preflight_checks": "id INTEGER PRIMARY KEY, run_id TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT",
     "market_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, price REAL, price_at TEXT, volume REAL, payload TEXT, created_at TEXT",
@@ -21,6 +22,19 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
     "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, created_at TEXT, updated_at TEXT",
     "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT, fill_notified_at TEXT, fill_notification_status TEXT, fill_notification_error TEXT",
+    # Phase 0 execution integrity invariants:
+    # - the intent and reservation are committed before any broker submission;
+    # - logical_action_key and client_order_id are stable across restarts;
+    # - UNKNOWN is non-terminal and retains its reservation until reconciliation proves the outcome.
+    "order_intents": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, approval_id TEXT, source_id TEXT NOT NULL, source_type TEXT NOT NULL, logical_action_key TEXT NOT NULL UNIQUE, candidate_id TEXT, position_lifecycle_id TEXT, symbol TEXT NOT NULL, side TEXT NOT NULL, intended_action TEXT NOT NULL, request_basis TEXT NOT NULL CHECK(request_basis IN ('quantity','notional')), approved_quantity_ceiling REAL, approved_notional_ceiling REAL, requested_quantity REAL NOT NULL, requested_notional REAL, filled_quantity REAL NOT NULL DEFAULT 0 CHECK(filled_quantity>=0), average_fill_price REAL, reference_price REAL NOT NULL CHECK(reference_price>0), intended_stop_price REAL, reserved_notional REAL NOT NULL DEFAULT 0 CHECK(reserved_notional>=0), reserved_stop_risk REAL NOT NULL DEFAULT 0 CHECK(reserved_stop_risk>=0), client_order_id TEXT NOT NULL UNIQUE, trading_mode TEXT NOT NULL CHECK(trading_mode='paper'), state TEXT NOT NULL, submission_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(submission_attempt_count>=0), broker_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, first_submission_at TEXT, last_reconciliation_at TEXT, terminal_at TEXT, last_error_category TEXT, safe_error_summary TEXT, transition_counter INTEGER NOT NULL DEFAULT 0 CHECK(transition_counter>=0), not_found_count INTEGER NOT NULL DEFAULT 0 CHECK(not_found_count>=0), replacement_enabled INTEGER NOT NULL DEFAULT 0 CHECK(replacement_enabled IN (0,1)), parent_intent_id TEXT, relationship_group_id TEXT, relationship_type TEXT, order_role TEXT NOT NULL DEFAULT 'primary', protection_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(protection_confirmed IN (0,1)), CHECK(filled_quantity<=requested_quantity+0.000000001)",
+    "order_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, event_key TEXT NOT NULL UNIQUE, from_state TEXT, to_state TEXT NOT NULL, event_type TEXT NOT NULL, broker_event_id TEXT, filled_quantity REAL, fill_price REAL, safe_detail TEXT, created_at TEXT NOT NULL, transition_counter INTEGER NOT NULL",
+    "risk_reservations": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL, cluster_name TEXT, initial_notional REAL NOT NULL CHECK(initial_notional>=0), active_notional REAL NOT NULL CHECK(active_notional>=0), initial_stop_risk REAL NOT NULL CHECK(initial_stop_risk>=0), active_stop_risk REAL NOT NULL CHECK(active_stop_risk>=0), state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, released_at TEXT, release_reason TEXT, version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0)",
+    "broker_fill_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, broker_event_key TEXT NOT NULL UNIQUE, broker_order_id TEXT, cumulative_filled_quantity REAL NOT NULL CHECK(cumulative_filled_quantity>=0), delta_quantity REAL NOT NULL CHECK(delta_quantity>=0), fill_price REAL NOT NULL CHECK(fill_price>=0), occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, payload TEXT",
+    "reconciliation_attempts": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, lookup_type TEXT NOT NULL, lookup_value_redacted TEXT NOT NULL, outcome TEXT NOT NULL, broker_status TEXT, safe_detail TEXT, created_at TEXT NOT NULL, UNIQUE(intent_id, lookup_type, outcome, broker_status, created_at)",
+    "telegram_updates": "update_id INTEGER PRIMARY KEY, message_id INTEGER, message_timestamp INTEGER, received_at TEXT NOT NULL, processing_state TEXT NOT NULL, processed_at TEXT, approval_id TEXT, safe_message_type TEXT, normalized_action TEXT, target_hint TEXT, sender_authorized INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT",
+    "approval_workflows": "id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, proposal_id TEXT NOT NULL, telegram_update_id INTEGER UNIQUE, state TEXT NOT NULL, intent_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, manual_review_reason TEXT, version INTEGER NOT NULL DEFAULT 0",
+    "position_lifecycles": "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, broker_position_id TEXT, side TEXT NOT NULL, state TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, opening_quantity REAL NOT NULL, current_quantity REAL NOT NULL, average_entry_price REAL, source TEXT NOT NULL, management_state_archive TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL",
+    "health_heartbeats": "component TEXT PRIMARY KEY, state TEXT NOT NULL, attempted_at TEXT, completed_at TEXT, successful_at TEXT, blocked_reason TEXT, detail TEXT, commit_sha TEXT, updated_at TEXT NOT NULL",
     "positions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, qty REAL, market_value REAL, unrealized_pl REAL, payload TEXT, created_at TEXT",
     "cash_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, equity REAL, cash REAL, settled_cash REAL, realized_pl REAL, unrealized_pl REAL, created_at TEXT",
     "cashout_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, payload TEXT, created_at TEXT",
@@ -31,7 +45,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
     "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
-    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, session_start_price REAL, session_change REAL, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL, candidate_suppression_reason TEXT, deferred_ai_review_reason TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
+    "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, previous_observation_change_pct REAL, session_start_price REAL, session_change REAL, utc_day_first_observation_change REAL, movement_semantics_version TEXT, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL, candidate_suppression_reason TEXT, deferred_ai_review_reason TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
     "telegram_digests": "id INTEGER PRIMARY KEY, run_id TEXT, window_start TEXT, window_end TEXT, sent_at TEXT, symbols TEXT, summary_text TEXT, status TEXT",
     "control_state": "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT, source TEXT, raw_command_redacted TEXT, telegram_update_id INTEGER, telegram_message_id INTEGER, telegram_message_timestamp INTEGER, processed_at TEXT",
     "trade_setups": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, side TEXT, action TEXT, setup_key TEXT, is_active INTEGER, price REAL, score REAL, asset_score REAL, volatility_regime TEXT, trend_state TEXT, gpt_status TEXT, proposal_eligible INTEGER, proposal_sent INTEGER, block_reason TEXT",
@@ -48,9 +62,10 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "candidate_batch_allocations": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, symbol TEXT, rank INTEGER, raw_suggested_notional REAL, adjusted_suggested_notional REAL, risk_budget_adjusted_notional REAL, final_suggested_notional REAL, final_suggested_shares REAL, cap_reason TEXT, reduction_reason TEXT, created_at TEXT",
     "approval_batch_actions": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, action TEXT, status TEXT, created_at TEXT, detail TEXT",
     "risk_budget_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, open_risk_pct REAL, daily_realized_loss_pct REAL, max_open_risk_pct REAL, buying_power REAL, payload TEXT",
+    "risk_snapshots_v2": "id TEXT PRIMARY KEY, run_id TEXT, calculated_at TEXT NOT NULL, source_at TEXT, source_status TEXT NOT NULL, portfolio_equity REAL, filled_gross_exposure REAL, filled_net_exposure REAL, active_reserved_exposure REAL, projected_gross_exposure REAL, held_open_stop_risk REAL, active_reserved_stop_risk REAL, projected_total_open_risk REAL, daily_realized_pl REAL, daily_realized_loss_pct REAL, weekly_realized_pl REAL, weekly_realized_loss_pct REAL, unresolved_unknown_exposure REAL, buying_power REAL, cash REAL, symbol_exposure_json TEXT, cluster_exposure_json TEXT, raw_inputs TEXT",
     "ranked_opportunity_sets": "id TEXT PRIMARY KEY, run_id TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, timestamp TEXT, symbol TEXT, rank INTEGER, actionable INTEGER, reason TEXT, score REAL, suggested_notional REAL, suggested_shares REAL, payload TEXT",
-    "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_model TEXT, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
-    "position_management_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, decision_type TEXT, priority INTEGER, action TEXT, reason TEXT, current_price REAL, avg_entry_price REAL, quantity REAL, unrealized_profit_pct REAL, highest_price_since_entry REAL, max_unrealized_profit_pct REAL, pullback_from_peak_pct REAL, drawdown_from_entry_pct REAL, drawdown_from_peak_pct REAL, profit_giveback_ratio REAL, current_r_multiple REAL, trailing_stop_price REAL, suggested_sell_fraction REAL, suggested_add_notional REAL, blocking_reasons TEXT, is_actionable INTEGER, dip_trap_classification TEXT, position_age_days REAL, position_age_cycles INTEGER, exit_review_needed INTEGER DEFAULT 0, created_at TEXT, payload TEXT",
+    "position_management_state": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, position_lifecycle_id TEXT, broker_position_id TEXT, avg_entry_price REAL, quantity REAL, highest_price_since_entry REAL, highest_price_seen_at TEXT, max_unrealized_profit_pct REAL, max_unrealized_profit_seen_at TEXT, profit_protection_active INTEGER DEFAULT 0, profit_protection_activated_at TEXT, take_profit_level_1_hit INTEGER DEFAULT 0, take_profit_level_2_hit INTEGER DEFAULT 0, take_profit_level_3_hit INTEGER DEFAULT 0, trailing_stop_price REAL, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_model TEXT, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, last_decision_type TEXT, last_reason TEXT, updated_at TEXT, created_at TEXT",
+    "position_management_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, position_lifecycle_id TEXT, decision_type TEXT, priority INTEGER, action TEXT, reason TEXT, current_price REAL, avg_entry_price REAL, quantity REAL, unrealized_profit_pct REAL, highest_price_since_entry REAL, max_unrealized_profit_pct REAL, pullback_from_peak_pct REAL, drawdown_from_entry_pct REAL, drawdown_from_peak_pct REAL, profit_giveback_ratio REAL, current_r_multiple REAL, trailing_stop_price REAL, suggested_sell_fraction REAL, suggested_add_notional REAL, blocking_reasons TEXT, is_actionable INTEGER, dip_trap_classification TEXT, position_age_days REAL, position_age_cycles INTEGER, exit_review_needed INTEGER DEFAULT 0, created_at TEXT, payload TEXT",
     "exit_review_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, review_type TEXT, status TEXT, reason TEXT, drawdown_from_entry_pct REAL, drawdown_from_peak_pct REAL, unrealized_pl_pct REAL, peak_price_since_entry REAL, peak_unrealized_pct REAL, trailing_stop_price REAL, time_stop_status TEXT, position_age_days REAL, position_age_cycles INTEGER, proposal_id TEXT, created_at TEXT, payload TEXT",
     "profit_exit_events": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, event_type TEXT, proposal_id TEXT, proposal_batch_id TEXT, sell_fraction REAL, estimated_shares REAL, estimated_notional REAL, current_gain_pct REAL, peak_gain_pct REAL, giveback_ratio REAL, r_multiple REAL, trailing_stop_price REAL, status TEXT, created_at TEXT, resolved_at TEXT",
     "universe_symbols": "id TEXT PRIMARY KEY, symbol TEXT UNIQUE, provider_symbol TEXT, exchange TEXT, asset_class TEXT, country TEXT, region TEXT, currency TEXT, sector TEXT, cluster TEXT, tier TEXT, state TEXT, universe_lane TEXT, alpaca_compatible INTEGER DEFAULT 0, exclusion_reason TEXT, executable INTEGER DEFAULT 0, observation_only INTEGER DEFAULT 1, score REAL, reason TEXT, source TEXT, provider TEXT, data_quality TEXT, data_confidence TEXT, data_confidence_reason TEXT, data_freshness_status TEXT, last_successful_research_at TEXT, provider_health_status TEXT, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, stale_after_minutes INTEGER, promotion_freshness_path TEXT, promotion_confidence_adjustment TEXT, promotion_data_limitations TEXT, proposal_block_reason_after_promotion TEXT, fallback_used TEXT, next_review_time TEXT, alpaca_quote_freshness TEXT, alpaca_tradability_result TEXT, intraday_freshness TEXT, eod_freshness TEXT, last_seen_at TEXT, last_promoted_at TEXT, last_demoted_at TEXT, created_at TEXT, updated_at TEXT",
@@ -114,6 +129,13 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON trade_proposals(status, expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_proposal ON risk_checks(proposal_id)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_order_intents_reconcile ON order_intents(state, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_order_intents_symbol_active ON order_intents(symbol, side, state)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_order_events_intent ON order_events(intent_id, transition_counter)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_reservations_active ON risk_reservations(state, symbol)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_reconciliation_intent ON reconciliation_attempts(intent_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_approval_workflows_state ON approval_workflows(state, updated_at)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_position_lifecycle_one_active ON position_lifecycles(symbol) WHERE state='active'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_symbols(tier, executable, observation_only)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_symbol ON symbol_research_scores(symbol, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_candidate_briefs_symbol ON research_candidate_briefs(symbol, created_at)")
@@ -388,6 +410,32 @@ class Storage:
                     "fill_notification_error": "TEXT",
                 },
             )
+            add_missing_columns("position_management_state", {"position_lifecycle_id": "TEXT"})
+            add_missing_columns("position_management_decisions", {"position_lifecycle_id": "TEXT"})
+            add_missing_columns(
+                "market_memory",
+                {
+                    "previous_observation_change_pct": "REAL",
+                    "utc_day_first_observation_change": "REAL",
+                    "movement_semantics_version": "TEXT",
+                },
+            )
+            conn.execute(
+                """CREATE TRIGGER IF NOT EXISTS trg_market_memory_semantics_v2
+                   AFTER INSERT ON market_memory
+                   WHEN NEW.movement_semantics_version IS NULL
+                   BEGIN
+                     UPDATE market_memory SET
+                       previous_observation_change_pct=NEW.price_change_pct,
+                       utc_day_first_observation_change=NEW.session_change,
+                       movement_semantics_version='v2_previous_observation_and_utc_day_first'
+                     WHERE id=NEW.id;
+                   END"""
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+                ("phase0_execution_integrity_v1", iso_now(), "additive durable intent, reservation, lifecycle, health and semantics schema"),
+            )
 
             add_missing_columns(
                 "candidate_risk_budget_decisions",
@@ -632,10 +680,29 @@ class Storage:
     def start_run(self, mode: str) -> str:
         run_id = str(uuid.uuid4())
         self.execute("INSERT INTO runs VALUES (?, ?, NULL, ?, ?, NULL)", (run_id, iso_now(), "running", mode))
+        if mode == "paper":
+            now = iso_now()
+            self.execute(
+                """INSERT INTO health_heartbeats(component,state,attempted_at,detail,updated_at)
+                   VALUES('scanner','unknown',?,?,?) ON CONFLICT(component) DO UPDATE SET
+                   state='unknown',attempted_at=excluded.attempted_at,detail=excluded.detail,updated_at=excluded.updated_at""",
+                (now, json_dumps({"run_id": run_id}), now),
+            )
         return run_id
 
     def finish_run(self, run_id: str, status: str, detail: str = "") -> None:
         self.execute("UPDATE runs SET ended_at=?, status=?, detail=? WHERE id=?", (iso_now(), status, detail, run_id))
+        rows = self.fetch_all("SELECT mode FROM runs WHERE id=?", (run_id,))
+        if rows and rows[0]["mode"] == "paper":
+            now = iso_now()
+            state = "healthy" if status in {"completed", "research_completed_trading_blocked_market_closed"} else ("blocked" if status == "blocked" else "failed")
+            self.execute(
+                """INSERT INTO health_heartbeats(component,state,completed_at,successful_at,blocked_reason,detail,updated_at)
+                   VALUES('scanner',?,?,?,?,?,?) ON CONFLICT(component) DO UPDATE SET
+                   state=excluded.state,completed_at=excluded.completed_at,successful_at=excluded.successful_at,
+                   blocked_reason=excluded.blocked_reason,detail=excluded.detail,updated_at=excluded.updated_at""",
+                (state, now, now if state == "healthy" else None, detail if state == "blocked" else None, json_dumps({"run_id": run_id, "status": status}), now),
+            )
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         with self.connect() as conn:
@@ -684,6 +751,50 @@ class Storage:
             if updated:
                 conn.execute("UPDATE approvals SET consumed_at=?, status='consumed' WHERE id=? AND consumed_at IS NULL", (now, approval_id))
             return bool(updated)
+
+    def ingest_telegram_update(
+        self,
+        update_id: int,
+        *,
+        message_id: int | None,
+        message_timestamp: int | None,
+        safe_message_type: str,
+        normalized_action: str | None,
+        target_hint: str | None,
+        sender_authorized: bool,
+    ) -> str:
+        """Persist a non-secret business envelope before advancing any cursor."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT processing_state FROM telegram_updates WHERE update_id=?", (update_id,)).fetchone()
+            if existing:
+                return str(existing["processing_state"])
+            conn.execute(
+                """INSERT INTO telegram_updates(
+                       update_id,message_id,message_timestamp,received_at,processing_state,safe_message_type,
+                       normalized_action,target_hint,sender_authorized)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (update_id, message_id, message_timestamp, iso_now(), "received", safe_message_type, normalized_action, target_hint, int(sender_authorized)),
+            )
+        return "received"
+
+    def complete_telegram_updates(self, update_ids: set[int]) -> None:
+        if not update_ids:
+            return
+        now = iso_now()
+        placeholders = ",".join("?" for _ in update_ids)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"UPDATE telegram_updates SET processing_state='processed',processed_at=?,last_error_category=NULL WHERE update_id IN ({placeholders})",
+                (now, *sorted(update_ids)),
+            )
+
+    def mark_telegram_update_failed(self, update_id: int, error_category: str) -> None:
+        self.execute(
+            "UPDATE telegram_updates SET processing_state='received',retry_count=retry_count+1,last_error_category=? WHERE update_id=?",
+            (error_category, update_id),
+        )
 
     def get_control_state(self, key: str, default: Any = None) -> Any:
         row = self.fetch_all("SELECT value FROM control_state WHERE key=?", (key,))

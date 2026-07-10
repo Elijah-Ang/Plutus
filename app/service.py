@@ -25,11 +25,15 @@ from .approval_parser import parse_approval
 from .data_providers.eodhd import EODHDProvider
 from .dynamic_universe import DynamicUniverseEngine, OBSERVATION, PAPER_TRADABLE, RESEARCH_CANDIDATE
 from .execution import Executor, ExecutionResult
+from .execution import DurableExecutionStore
+from .health import HealthMonitor, record_heartbeat
 from .internet import internet_available
 from .market_data import normalize_bars
 from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
+from .position_lifecycle import PositionLifecycleManager
 from .risk_engine import RiskCheck, RiskEngine, _dt
+from .risk_snapshot import RiskSnapshotBuilder
 from .reconciliation import BrokerReconciler
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
@@ -141,6 +145,48 @@ class TradingService:
         self._context_cache: tuple[float, dict[str, Any]] | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
+        if self.storage is not None:
+            self._recover_local_workflows()
+
+    def _recover_local_workflows(self) -> dict[str, int]:
+        """Idempotently surface unfinished local work without submitting orders."""
+        recovery = DurableExecutionStore(self.storage).recovery_sweep()
+        consumed_without_intent = self.storage.fetch_all(
+            """SELECT a.id,a.proposal_id FROM approvals a LEFT JOIN order_intents i ON i.approval_id=a.id
+               WHERE a.consumed_at IS NOT NULL AND i.id IS NULL"""
+        )
+        now = iso_now()
+        for row in consumed_without_intent:
+            self.storage.execute(
+                """INSERT INTO approval_workflows(
+                       id,approval_id,proposal_id,state,created_at,updated_at,manual_review_reason)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(approval_id) DO UPDATE SET
+                   state=CASE WHEN approval_workflows.intent_id IS NULL THEN 'manual_review' ELSE approval_workflows.state END,
+                   updated_at=excluded.updated_at,
+                   manual_review_reason=CASE WHEN approval_workflows.intent_id IS NULL THEN excluded.manual_review_reason ELSE approval_workflows.manual_review_reason END,
+                   version=approval_workflows.version+1""",
+                (str(uuid.uuid4()), row["id"], row["proposal_id"], "manual_review", now, now, "consumed approval has no durable order intent"),
+            )
+        received_updates = int(self.storage.fetch_all("SELECT COUNT(*) n FROM telegram_updates WHERE processing_state='received'")[0]["n"])
+        detail = {
+            "received_unprocessed_updates": received_updates,
+            "approvals_without_intents": recovery.approvals_without_intents,
+            "intents_awaiting_submission": recovery.intents_awaiting_submission,
+            "intents_awaiting_reconciliation": recovery.intents_awaiting_reconciliation,
+            "stale_submitted": recovery.stale_submitted,
+            "terminal_with_reservations": recovery.terminal_with_reservations,
+        }
+        state = "degraded" if any(detail.values()) else "healthy"
+        self.storage.execute(
+            """INSERT INTO health_heartbeats(component,state,attempted_at,completed_at,successful_at,detail,updated_at)
+               VALUES('recovery',?,?,?,?,?,?) ON CONFLICT(component) DO UPDATE SET
+               state=excluded.state,attempted_at=excluded.attempted_at,completed_at=excluded.completed_at,
+               successful_at=excluded.successful_at,detail=excluded.detail,updated_at=excluded.updated_at""",
+            (state, now, now, now if state == "healthy" else None, json_dumps(detail), now),
+        )
+        if any(detail.values()):
+            self.storage.audit(self.run_id, "execution_recovery_work_detected", detail)
+        return detail
 
     def _risk_engine(self, proposal_id: str, stage: str) -> RiskEngine:
         return RiskEngine(self.config, lambda c: self.storage.record_check(self.run_id, c.name, c.passed, c.reason, proposal_id, stage))
@@ -454,7 +500,14 @@ class TradingService:
         return self._sleep_mode_active() and buy_or_add and not risk_reducing
 
     def _position_management_state(self, symbol: str) -> dict[str, Any] | None:
-        rows = self.storage.fetch_all("SELECT * FROM position_management_state WHERE symbol=?", (symbol.upper(),))
+        lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+        if lifecycle_id:
+            rows = self.storage.fetch_all(
+                "SELECT * FROM position_management_state WHERE symbol=? AND position_lifecycle_id=?",
+                (symbol.upper(), lifecycle_id),
+            )
+        else:
+            rows = self.storage.fetch_all("SELECT * FROM position_management_state WHERE symbol=?", (symbol.upper(),))
         return rows[0] if rows else None
 
     def _initial_risk_seed_for_position(self, symbol: str) -> dict[str, Any]:
@@ -551,6 +604,7 @@ class TradingService:
 
     def _record_position_management(self, decision: PositionManagementDecision, now: datetime, proposal_id: str | None = None) -> None:
         symbol = decision.symbol.upper()
+        lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
         previous = self._position_management_state(symbol)
         risk_seed = self._initial_risk_seed_for_position(symbol)
         created_at = previous.get("created_at") if previous else now.isoformat()
@@ -581,13 +635,14 @@ class TradingService:
         self.storage.execute(
             """
             INSERT INTO position_management_state(
-                id,symbol,broker_position_id,avg_entry_price,quantity,highest_price_since_entry,highest_price_seen_at,
+                id,symbol,position_lifecycle_id,broker_position_id,avg_entry_price,quantity,highest_price_since_entry,highest_price_seen_at,
                 max_unrealized_profit_pct,max_unrealized_profit_seen_at,profit_protection_active,profit_protection_activated_at,
                 take_profit_level_1_hit,take_profit_level_2_hit,take_profit_level_3_hit,trailing_stop_price,
                 initial_stop_price,initial_risk_per_share,initial_risk_pct,initial_risk_dollars,stop_model,stop_source,
                 entry_price_for_r,risk_model_version,r_multiple_unavailable_reason,last_decision_type,last_reason,updated_at,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
+                position_lifecycle_id=excluded.position_lifecycle_id,
                 avg_entry_price=excluded.avg_entry_price,
                 quantity=excluded.quantity,
                 highest_price_since_entry=excluded.highest_price_since_entry,
@@ -614,7 +669,7 @@ class TradingService:
                 updated_at=excluded.updated_at
             """,
             (
-                str(uuid.uuid4()), symbol, symbol, decision.avg_entry_price, decision.quantity,
+                str(uuid.uuid4()), symbol, lifecycle_id, symbol, decision.avg_entry_price, decision.quantity,
                 decision.highest_price_since_entry, highest_seen_at, decision.max_unrealized_profit_pct,
                 max_seen_at, profit_active, profit_activated_at, level_hits[1], level_hits[2], level_hits[3],
                 decision.trailing_stop_price,
@@ -633,15 +688,15 @@ class TradingService:
         self.storage.execute(
             """
             INSERT INTO position_management_decisions(
-                id,run_id,symbol,decision_type,priority,action,reason,current_price,avg_entry_price,quantity,
+                id,run_id,symbol,position_lifecycle_id,decision_type,priority,action,reason,current_price,avg_entry_price,quantity,
                 unrealized_profit_pct,highest_price_since_entry,max_unrealized_profit_pct,pullback_from_peak_pct,
                 drawdown_from_entry_pct,drawdown_from_peak_pct,profit_giveback_ratio,current_r_multiple,
                 trailing_stop_price,suggested_sell_fraction,suggested_add_notional,blocking_reasons,is_actionable,
                 dip_trap_classification,position_age_days,position_age_cycles,exit_review_needed,created_at,payload
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                str(uuid.uuid4()), self.run_id, symbol, decision.decision_type, decision.priority, decision.action,
+                str(uuid.uuid4()), self.run_id, symbol, lifecycle_id, decision.decision_type, decision.priority, decision.action,
                 decision.reason, decision.current_price, decision.avg_entry_price, decision.quantity,
                 decision.unrealized_profit_pct, decision.highest_price_since_entry, decision.max_unrealized_profit_pct,
                 decision.pullback_from_peak_pct, decision.drawdown_from_entry_pct, decision.drawdown_from_peak_pct,
@@ -1008,16 +1063,21 @@ class TradingService:
         # Calculate exposure snapshot from current positions
         snapshot = self._get_exposure_snapshot(positions, account)
         equity = snapshot["portfolio_equity"]
+        reservation_snapshot = DurableExecutionStore(self.storage).active_reservations()
+        active_reserved_notional = float(reservation_snapshot["active_reserved_notional"])
+        active_reserved_stop_risk = float(reservation_snapshot["active_reserved_stop_risk"])
+        reserved_pct = (active_reserved_notional / equity) * 100 if equity > 0 else float("inf")
 
         # Proposal notional
         proposal_notional = float(proposal.get("notional") or 0.0)
         proposal_notional_pct = (proposal_notional / equity) * 100 if equity > 0 else 0.0
 
         # Proposed total exposure %
-        proposed_total_exposure_pct = snapshot["total_exposure_pct"] + proposal_notional_pct
+        proposed_total_exposure_pct = snapshot["total_exposure_pct"] + reserved_pct + proposal_notional_pct
 
         # Proposed symbol exposure %
-        current_symbol_exposure = snapshot["single_exposures"].get(symbol.upper(), 0.0)
+        symbol_reserved = float(reservation_snapshot["symbol_reserved_notional"].get(symbol.upper(), 0.0))
+        current_symbol_exposure = snapshot["single_exposures"].get(symbol.upper(), 0.0) + ((symbol_reserved / equity) * 100 if equity > 0 else float("inf"))
         proposed_symbol_exposure_pct = current_symbol_exposure + proposal_notional_pct
 
         # Cluster parameters
@@ -1026,7 +1086,8 @@ class TradingService:
         proposed_cluster_exposure_pct = 0.0
         if c_name:
             current_cluster_count = snapshot["cluster_counts"].get(c_name, 0)
-            current_cluster_exposure = snapshot["cluster_exposures"].get(c_name, 0.0)
+            cluster_reserved = float(reservation_snapshot["cluster_reserved_notional"].get(c_name, 0.0))
+            current_cluster_exposure = snapshot["cluster_exposures"].get(c_name, 0.0) + ((cluster_reserved / equity) * 100 if equity > 0 else float("inf"))
             has_symbol_pos = any(str(_value(p, "symbol", "")).upper() == symbol.upper() for p in positions)
             proposed_cluster_positions_count = current_cluster_count + (0 if has_symbol_pos else 1)
             proposed_cluster_exposure_pct = current_cluster_exposure + proposal_notional_pct
@@ -1079,7 +1140,7 @@ class TradingService:
             "uses_margin": state["uses_margin"],
             "daily_loss": state["daily_loss"],
             "weekly_loss": state["weekly_loss"],
-            "buying_power": float(_value(account, "buying_power", 0) or 0) if account is not None else 0.0,
+            "buying_power": max(0.0, float(_value(account, "buying_power", 0) or 0) - active_reserved_notional) if account is not None else None,
             "approval_valid": approval_valid,
 
             # Exposure context fields
@@ -1096,7 +1157,16 @@ class TradingService:
             "universe_symbol_info": universe_symbol_info,
             "active_dynamic_paper_tradable_symbols": active_dynamic,
             "portfolio_equity": equity,
-            "cash": snapshot["cash"]
+            "cash": snapshot["cash"],
+            "active_reserved_exposure": active_reserved_notional,
+            "active_reserved_stop_risk": active_reserved_stop_risk,
+            "unresolved_unknown_order_exposure": sum(
+                float(row.get("active_notional") or 0)
+                for row in self.storage.fetch_all(
+                    """SELECT r.active_notional FROM risk_reservations r
+                       JOIN order_intents i ON i.id=r.intent_id WHERE r.state='active' AND i.state='unknown'"""
+                )
+            ),
         }
 
     def _process_sleep_mode_emergency_timeouts(self) -> None:
@@ -1157,6 +1227,7 @@ class TradingService:
             self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {"symbol": row["symbol"], "proposal_id": row["id"], "reason": "non_sleep_mode"})
 
     def process_telegram(self) -> None:
+        self._recover_local_workflows()
         self.storage.expire_proposals()
         self._expire_pending_batches(notify=False)
         self._process_sleep_mode_emergency_timeouts()
@@ -1164,6 +1235,15 @@ class TradingService:
         if not updates:
             self.notify_expired_proposals()
             self._expire_pending_batches(notify=True)
+            record_heartbeat(
+                self.storage,
+                "listener_poll",
+                "healthy",
+                attempted_at=iso_now(),
+                completed_at=iso_now(),
+                successful_at=iso_now(),
+                detail={"updates_processed": 0},
+            )
             return
 
         processed_update_ids = set()
@@ -1177,17 +1257,27 @@ class TradingService:
 
             max_id = max(max_id, update.get("update_id", 0) if update_id is not None else 0)
             message = update.get("message") or {}
-
-            # 0. Duplicate Update Prevention (Only in production, not with MockTelegramBot)
-            is_mock_bot = getattr(self.telegram, "is_mock", False) or "Mock" in type(self.telegram).__name__
-            if not is_mock_bot and update_id is not None:
-                last_processed_id = int(self.storage.get_control_state("telegram_last_processed_update_id", "0"))
-                if update_id <= last_processed_id:
-                    continue
-                self.storage.set_control_state("telegram_last_processed_update_id", str(update_id), "system", "telegram", f"processed_{update_id}", update_id, None, None)
-
             text = str(message.get("text", "")).strip()
             sender = str((message.get("from") or {}).get("id", ""))
+
+            # 0. Durable inbox. The received cursor is represented by this committed
+            # row; business processing remains independently recoverable.
+            is_mock_bot = getattr(self.telegram, "is_mock", False) or "Mock" in type(self.telegram).__name__
+            if not is_mock_bot and update_id is not None:
+                intent, target_symbol, target_proposal_id, _ = self._approval_intent_from_text(text)
+                safe_type = "command" if text.startswith("/") else ("approval" if intent != "unknown" else "other")
+                state = self.storage.ingest_telegram_update(
+                    int(update_id),
+                    message_id=message.get("message_id"),
+                    message_timestamp=message.get("date"),
+                    safe_message_type=safe_type,
+                    normalized_action=intent,
+                    target_hint=target_proposal_id or target_symbol,
+                    sender_authorized=bool(self.telegram.is_authorized(sender)),
+                )
+                if state == "processed":
+                    continue
+
             if not text:
                 continue
 
@@ -1280,24 +1370,7 @@ class TradingService:
                 cmd_parts = text.strip().split()
                 cmd = cmd_parts[0].lower() if cmd_parts else ""
                 if cmd == "/status":
-                    from .utils import check_listener_freshness
-                    freshness = check_listener_freshness()
-                    status_text = (
-                        f"Status: Active\n"
-                        f"Mode: {self.config.get('mode')}\n"
-                        f"Live Enabled: {self.config.get('live_enabled')}\n"
-                        f"Auto Execution: {self.config.get('auto_execution_enabled')}\n"
-                        f"HEAD Commit: {freshness['current_head'][:7] if freshness['current_head'] else 'unknown'}\n"
-                    )
-                    if freshness["running"]:
-                        status_text += f"Listener PID: {freshness['pid']}\n"
-                        status_text += f"Listener Startup Commit: {freshness['startup_commit'][:7] if freshness['startup_commit'] else 'unknown'}\n"
-                        if freshness["fresh"]:
-                            status_text += "Listener Freshness: Fresh ✅\n"
-                        else:
-                            status_text += "Listener Freshness: Stale ❌ (Please restart listener)\n"
-                    else:
-                        status_text += "Listener Freshness: Not running ❌\n"
+                    status_text = HealthMonitor(self.storage, self.config).format_status()
                     
                     self.storage.audit(self.run_id, "telegram_command", {"command": "/status", "authorized": self.telegram.is_authorized(sender)})
                     self.telegram.send_message(status_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
@@ -1696,7 +1769,7 @@ class TradingService:
             final_revalidation_completed_at = iso_now()
 
             # Record order decision
-            final_order_decision = "submitted" if result.submitted else "blocked"
+            final_order_decision = "submitted" if result.submitted else ("unknown" if result.status == "unknown" else "blocked")
             final_block_reason = result.reason if not result.submitted else None
 
             self.storage.execute(
@@ -1714,10 +1787,9 @@ class TradingService:
                 )
             )
 
-            self.storage.execute(
-                "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.run_id, parsed.proposal_id, str(_value(result.broker_response, "id", "")) or None, result.client_order_id, proposal.get("symbol", prop_symbol), proposal.get("side", prop_side), proposal.get("notional"), proposal.get("qty"), result.status, json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()),
-            )
+            if result.intent_id:
+                self.storage.link_executed_order_records(result.intent_id)
+                self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
 
             if result.submitted:
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
@@ -1748,8 +1820,9 @@ class TradingService:
                         self.telegram.send_message("Other pending BUY proposals were cancelled because one paper position/trade is already active.")
                 continue
             else:
-                self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
-                self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (parsed.proposal_id,))
+                decision_status = "unknown" if result.status == "unknown" else "blocked"
+                self.storage.execute("UPDATE approvals SET acknowledgement_status=? WHERE id=?", (decision_status, approval_id))
+                self.storage.execute("UPDATE trade_proposals SET status=? WHERE id=?", (decision_status, parsed.proposal_id))
                 
                 # Format failure message
                 if "could not get a fresh Alpaca price" in result.reason:
@@ -1763,10 +1836,23 @@ class TradingService:
                 continue
         self.notify_expired_proposals()
         self._expire_pending_batches(notify=True)
+        durable_ids = {int(value) for value in processed_update_ids if value is not None}
+        self.storage.complete_telegram_updates(durable_ids)
+        if max_id > 0:
+            self.storage.set_control_state("telegram_last_processed_update_id", str(max_id), "system", "telegram", f"processed_{max_id}", max_id, None, None)
         if max_id > 0:
             self.telegram.get_updates(offset=max_id + 1, timeout=0)
 
         self._process_sleep_mode_emergency_timeouts()
+        record_heartbeat(
+            self.storage,
+            "listener_poll",
+            "healthy",
+            attempted_at=iso_now(),
+            completed_at=iso_now(),
+            successful_at=iso_now(),
+            detail={"updates_processed": len(processed_update_ids)},
+        )
 
     def _update_batch_status(self, batch_id: str) -> None:
         rows = self.storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE batch_id=?", (batch_id,))
@@ -2019,7 +2105,7 @@ class TradingService:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
 
         if block_reason:
-            result = ExecutionResult(False, "blocked", f"ta-{uuid.uuid4().hex[:24]}", reason=block_reason)
+            result = ExecutionResult(False, "blocked", None, reason=block_reason)
             return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
         # Get authoritative runtime state to evaluate fresh exposure snapshot
@@ -2037,6 +2123,8 @@ class TradingService:
 
         approved_notional = float(row.get("notional") or 0.0)
         proposal["approved_notional"] = approved_notional
+        proposal["approved_notional_ceiling"] = approved_notional
+        proposal["cluster_name"] = self._get_symbol_cluster(prop_symbol)
 
         # Recalculate dynamic size if sizing enabled and buy
         if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
@@ -2069,7 +2157,17 @@ class TradingService:
         # Execute
         proposal["status"] = "approved"
         context = self._portfolio_context(proposal, approval_valid=True)
-        result = Executor(self.broker, self._risk_engine(row.get("id"), "final")).execute(proposal, context)
+        result = Executor(
+            self.broker,
+            self._risk_engine(row.get("id"), "final"),
+            self.storage,
+            self.run_id,
+        ).execute(
+            proposal,
+            context,
+            source_type="emergency" if row.get("emergency_exit_triggered") == 1 else "proposal",
+            approval_id=approval_id,
+        )
 
         return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
@@ -2132,18 +2230,9 @@ class TradingService:
                 approval_id,
             ),
         )
-        order_id = str(uuid.uuid4())
-        self.storage.execute(
-            "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                order_id, self.run_id, proposal_id, str(_value(result.broker_response, "id", "")) or None,
-                result.client_order_id, proposal.get("symbol", prop_symbol), proposal.get("side", prop_side),
-                proposal.get("notional"), proposal.get("qty"), result.status,
-                json_dumps({"submitted": result.submitted, "reason": result.reason}), iso_now(), iso_now()
-            ),
-        )
-        self.storage.link_executed_order_records(order_id)
-        self.storage.upsert_actual_trade_outcome_for_order(order_id)
+        if result.intent_id:
+            self.storage.link_executed_order_records(result.intent_id)
+            self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
         if result.submitted:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
             self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
@@ -2167,8 +2256,9 @@ class TradingService:
             self.telegram.send_message("✅ " + msg)
             return True, "submitted", None
 
-        self.storage.execute("UPDATE approvals SET acknowledgement_status='blocked' WHERE id=?", (approval_id,))
-        self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (proposal_id,))
+        decision_status = "unknown" if result.status == "unknown" else "blocked"
+        self.storage.execute("UPDATE approvals SET acknowledgement_status=? WHERE id=?", (decision_status, approval_id))
+        self.storage.execute("UPDATE trade_proposals SET status=? WHERE id=?", (decision_status, proposal_id))
         
         # Format failure message
         if "could not get a fresh Alpaca price" in result.reason:
@@ -2405,8 +2495,9 @@ class TradingService:
         symbol = proposal["symbol"]
 
         existing_orders = self.storage.fetch_all(
-            "SELECT id FROM orders WHERE symbol=? AND side='sell' AND status IN ('submitted', 'filled')",
-            (symbol,)
+            """SELECT id FROM order_intents WHERE symbol=? AND side='sell'
+               AND state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required','filled')""",
+            (symbol,),
         )
         if existing_orders:
             return False, "duplicate emergency exit order already submitted"
@@ -2448,19 +2539,31 @@ class TradingService:
             if move_bps > max_move_bps:
                 return False, f"price moved too much since emergency decision ({move_bps:.1f} bps > limit {max_move_bps} bps)"
 
-        client_order_id = f"ta-emergency-{uuid.uuid4().hex[:16]}"
-        try:
-            order_args = {"qty": qty_held}
-            response = self.broker.submit_order(
-                symbol, "sell", order_args, "market", None, client_order_id
-            )
-            self.storage.execute(
-                "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), self.run_id, proposal["id"], str(_value(response, "id", "")) or None, client_order_id, symbol, "sell", None, qty_held, "submitted", json_dumps({"submitted": True}), iso_now(), iso_now()),
-            )
-            return True, "submitted"
-        except Exception as e:
-            return False, f"broker execution failed: {type(e).__name__} ({str(e)})"
+        approval_rows = self.storage.fetch_all(
+            "SELECT id FROM approvals WHERE proposal_id=? AND consumed_at IS NOT NULL ORDER BY consumed_at DESC LIMIT 1",
+            (proposal["id"],),
+        )
+        approval_id = approval_rows[0]["id"] if approval_rows else None
+        executable = {
+            **proposal,
+            "status": "approved",
+            "side": "sell",
+            "action": "exit",
+            "qty": qty_held,
+            "latest_price": refreshed_price,
+            "price_at": refreshed_at.isoformat(),
+            "trading_mode": "paper",
+        }
+        context = self._portfolio_context(executable, approval_valid=True)
+        result = Executor(
+            self.broker,
+            self._risk_engine(proposal["id"], "emergency_final"),
+            self.storage,
+            self.run_id,
+        ).execute(executable, context, source_type="emergency", approval_id=approval_id)
+        if result.submitted:
+            return True, result.status
+        return False, result.reason or result.status
 
     def send_wake_summary(self, start_time: str, end_time: str) -> None:
         suppressed_buys = self.storage.fetch_all(
@@ -4237,7 +4340,7 @@ class TradingService:
                 )
 
                 logger.info(
-                    "Symbol: %s | Profile: %s | Asset Score: %.2f (%s) | Trade Score: %.2f (%s) | Watchlist Order: #%d | True Score Rank: %s | Prev Change: %.2f%% | Session Change: %.2f | Proposal Allowed: %s | GPT Called: %s | Proposal Generated: %s | No-Action Reason: %s",
+                    "Symbol: %s | Profile: %s | Asset Score: %.2f (%s) | Trade Score: %.2f (%s) | Watchlist Order: #%d | True Score Rank: %s | Previous-observation change: %.2f%% | UTC-day first-observation change: %.2f | Proposal Allowed: %s | GPT Called: %s | Proposal Generated: %s | No-Action Reason: %s",
                     symbol, profile_key, asset_score, asset_classification, score, classification, watchlist_order, true_score_rank, price_change_pct, session_change, proposal_allowed, gpt_called, proposal_generated, no_action_reason or "N/A"
                 )
 
@@ -6655,14 +6758,21 @@ class TradingService:
     def _record_risk_budget_snapshot(self, snapshot: dict[str, Any], account: Any, now: datetime) -> dict[str, Any]:
         cfg = self._risk_budget_cfg()
         buying_power = self._buying_power(account)
+        state = self._authoritative_runtime_state()
+        canonical_builder = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster)
+        canonical = canonical_builder.build(state.get("positions", []), account, source_at=now.isoformat())
+        canonical_builder.persist(self.run_id, canonical)
+        equity = canonical.portfolio_equity
         row = {
-            "total_exposure_pct": float(snapshot.get("total_exposure_pct", 0.0) or 0.0),
-            "open_risk_pct": 0.0,
-            "daily_realized_loss_pct": 0.0,
+            "total_exposure_pct": ((canonical.projected_gross_exposure / equity) * 100) if canonical.projected_gross_exposure is not None and equity else None,
+            "open_risk_pct": ((canonical.projected_total_open_risk / equity) * 100) if canonical.projected_total_open_risk is not None and equity else None,
+            "daily_realized_loss_pct": canonical.daily_realized_loss_pct,
             "max_open_risk_pct": cfg["max_open_risk_pct"],
             "buying_power": buying_power,
-            "portfolio_equity": float(snapshot.get("portfolio_equity", 10000.0) or 10000.0),
-            "cash": float(snapshot.get("cash", 0.0) or 0.0),
+            "portfolio_equity": equity,
+            "cash": canonical.cash,
+            "risk_snapshot_status": canonical.source_status,
+            "risk_snapshot_unavailable": list(canonical.unavailable),
         }
         self.storage.execute(
             "INSERT INTO risk_budget_snapshots(id,run_id,timestamp,total_exposure_pct,open_risk_pct,daily_realized_loss_pct,max_open_risk_pct,buying_power,payload) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -6687,11 +6797,22 @@ class TradingService:
         equity = float(snapshot.get("portfolio_equity", 10000.0) or 10000.0)
         if equity <= 0:
             equity = 10000.0
-        buying_power_remaining = self._buying_power(account)
-        total_exposure_after = float(snapshot.get("total_exposure_pct", 0.0) or 0.0)
+        canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(
+            self._authoritative_runtime_state().get("positions", []), account, source_at=now.isoformat()
+        )
+        buying_power_remaining = max(0.0, self._buying_power(account) - canonical.active_reserved_exposure)
+        total_exposure_after = (
+            canonical.projected_gross_exposure / equity * 100
+            if canonical.projected_gross_exposure is not None and equity > 0
+            else float("inf")
+        )
         single_after = dict(snapshot.get("single_exposures", {}) or {})
         cluster_after = dict(snapshot.get("cluster_exposures", {}) or {})
-        open_risk_after = 0.0
+        open_risk_after = (
+            canonical.projected_total_open_risk / equity * 100
+            if canonical.projected_total_open_risk is not None and equity > 0
+            else float("inf")
+        )
         allowed: set[str] = set()
         reasons: dict[str, str] = {}
 

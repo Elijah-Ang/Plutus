@@ -16,6 +16,7 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   set -e
   if [[ "$LOCK_RC" -ne 10 || "$LOCK_STATE" != "stale" ]]; then
     # Active or recently ambiguous locks fail closed and preserve overlap protection.
+    print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z') scanner overlap skipped lock_state=${LOCK_STATE:-unknown}" >> "$RUNTIME/agent.log"
     exit 0
   fi
   RECOVERY_DIR="$RUNTIME/agent.lockdir.stale.$$"
@@ -30,9 +31,11 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
 fi
 print -r -- "$$" > "$LOCKDIR/pid"
 date +%s > "$LOCKDIR/started_at_epoch"
+print -r -- "$ROOT" > "$LOCKDIR/repository_path"
+git rev-parse HEAD > "$LOCKDIR/commit" 2>/dev/null || print -r -- "unknown" > "$LOCKDIR/commit"
 cleanup_lock() {
   if [[ -f "$LOCKDIR/pid" && "$(<"$LOCKDIR/pid")" == "$$" ]]; then
-    rm -f "$LOCKDIR/pid" "$LOCKDIR/started_at_epoch"
+    rm -f "$LOCKDIR/pid" "$LOCKDIR/started_at_epoch" "$LOCKDIR/repository_path" "$LOCKDIR/commit"
     rmdir "$LOCKDIR" 2>/dev/null || true
   fi
 }

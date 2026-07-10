@@ -46,6 +46,12 @@ def test_missing_alpaca_credentials_fail_safely(monkeypatch):
 
 def test_invalid_alpaca_credentials_fail_safely():
     broker = AlpacaBroker({"mode": "paper"}, "invalid_key", "invalid_secret")
+    class FakeAuthFailure:
+        def get_account(self):
+            error = RuntimeError("unauthorized")
+            error.status_code = 401
+            raise error
+    broker.trading = FakeAuthFailure()
     with pytest.raises(AlpacaBrokerError) as exc_info:
         broker.get_account()
     assert exc_info.value.category == "alpaca_auth_error"
@@ -55,6 +61,12 @@ def test_no_broker_secrets_are_logged():
     key = "super_secret_alpaca_key_12345"
     secret = "super_secret_alpaca_secret_67890"
     broker = AlpacaBroker({"mode": "paper"}, key, secret)
+    class FakeAuthFailure:
+        def get_account(self):
+            error = RuntimeError("unauthorized")
+            error.status_code = 401
+            raise error
+    broker.trading = FakeAuthFailure()
     with pytest.raises(AlpacaBrokerError) as exc_info:
         broker.get_account()
     

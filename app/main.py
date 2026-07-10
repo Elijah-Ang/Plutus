@@ -13,7 +13,7 @@ from .storage import Storage
 import sys
 import traceback
 from .service import TradingService
-from .utils import PROJECT_ROOT, load_config, redact, redact_sensitive_url
+from .utils import PROJECT_ROOT, iso_now, load_config, redact, redact_sensitive_url
 
 def redacting_excepthook(type, value, tb):
     tb_lines = traceback.format_exception(type, value, tb)
@@ -209,6 +209,8 @@ def run_listener(config_path: str | Path | None = None) -> int:
                 service.process_telegram()
             except Exception as e:
                 logger.exception("Error processing Telegram updates: %s", e)
+                from .health import record_heartbeat
+                record_heartbeat(storage, "listener_poll", "failed", attempted_at=iso_now(), detail={"error_type": type(e).__name__})
             time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Listener stopped by user")

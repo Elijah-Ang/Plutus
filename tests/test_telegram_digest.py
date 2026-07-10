@@ -148,7 +148,7 @@ def test_digest_wording_and_structure():
     assert "Window: 9:30 PM–10:00 PM SGT" in msg
     assert "Mode: Paper trading only" in msg
     assert "1. QQQ — Trade score 62.5, Weak setup, watch only" in msg
-    assert "30-min: +0.42% | Session: +0.71%" in msg
+    assert "30-min: +0.42% | Since first UTC-day observation: +0.71%" in msg
     assert "Status: Watch, no proposal" in msg
     assert "Weakest: SPY — 17.5, No action suggested" in msg
     assert "Past 30 min actions:" in msg

@@ -161,7 +161,7 @@ def test_telegram_proposal_message_content():
     assert "Watchlist order: #1 of 4" in msg
     assert "Score rank: #1 of 4 active ETFs" in msg
     assert "Since last check: +0.18%" in msg
-    assert "Since market open: +0.72%" in msg
+    assert "Since first stored observation today (UTC): +0.72%" in msg
     assert "Main risk:\nVolatility is still slightly elevated." in msg
     assert "Decision time: 15 minutes" in msg
     assert "yes = approve this QQQ paper buy" in msg

@@ -182,6 +182,7 @@ def test_candidate_ranking(base_config, temp_storage):
 
 def test_pyramiding_eligibility(temp_storage, base_config):
     base_config.setdefault("position_management", {})["enabled"] = False
+    base_config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     # We hold SPY at avg_entry 95.0, current price is 100.0 (profitable!)
     broker.positions = [
@@ -192,6 +193,12 @@ def test_pyramiding_eligibility(temp_storage, base_config):
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,symbol,side,status,created_at,expires_at,payload) VALUES(?,?,?,?,?,?,?,?)",
         ("prop-1", "run-1", "SPY", "buy", "filled", "2026-06-22T12:00:00", "2026-06-22T12:05:00", json.dumps({"score": 80.0, "action": "entry"}))
+    )
+    # Phase 0 projected-open-risk checks fail closed unless the held lifecycle has
+    # an auditable initial stop rather than silently treating its risk as zero.
+    temp_storage.execute(
+        "INSERT INTO position_management_state(id,symbol,avg_entry_price,quantity,initial_stop_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        ("pm-spy", "SPY", 95.0, 1.0, 90.0, "2026-06-22T12:00:00", "2026-06-22T12:00:00"),
     )
 
     service = TradingService(base_config, temp_storage, broker, "run-2")
@@ -280,11 +287,11 @@ def test_final_revalidation(temp_storage, base_config):
 
     service.process_telegram() # triggers execute_approved_proposals path
 
-    # The order should not be submitted; blocked attempts are retained as local audit rows.
+    # A pre-submission validation block is a local approval decision, not a broker
+    # order and not an order intent, so reconciliation must never look it up.
     orders = temp_storage.fetch_all("SELECT * FROM orders")
-    assert len(orders) == 1
-    assert orders[0]["status"] == "blocked"
-    assert json.loads(orders[0]["payload"])["submitted"] is False
+    assert orders == []
+    assert temp_storage.fetch_all("SELECT * FROM order_intents") == []
     assert len(broker.orders) == 0
 
     # The approval status should be updated to blocked
@@ -294,6 +301,7 @@ def test_final_revalidation(temp_storage, base_config):
 
 
 def test_new_buy_persists_initial_risk_fields(temp_storage, base_config):
+    base_config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(base_config, temp_storage, broker, "run-buy")
     service.telegram = MagicMock()

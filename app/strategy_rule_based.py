@@ -36,7 +36,7 @@ def evaluate_symbol(symbol: str, bars: pd.DataFrame, has_position: bool = False,
     if vol_20 is None:
         volatility_ok = False
         vol_reason = "missing volatility data; fail-safe HOLD"
-    elif vol_20 > 0.45:
+    elif vol_20 > maximum_volatility_20d:
         volatility_ok = False
         vol_reason = "extreme volatility; blocked"
     elif vol_20 > 0.35:

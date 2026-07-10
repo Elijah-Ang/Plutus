@@ -44,6 +44,8 @@ class RiskEngine:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         checks: list[RiskCheck] = []
+        is_entry = str(proposal.get("action", "entry")) in {"entry", "add"}
+        is_add = str(proposal.get("action", "entry")) == "add" or bool(proposal.get("is_add", False))
 
         def check(name: str, passed: bool, reason: str) -> None:
             item = RiskCheck(name, bool(passed), reason)
@@ -57,7 +59,7 @@ class RiskEngine:
         check("internet", context.get("internet_available") is True, "internet must be available")
         check("database", context.get("database_writable") is True, "database must be writable")
         check("broker", context.get("broker_available") is True, "broker must be reachable")
-        check("telegram", context.get("telegram_available") is True, "Telegram must be configured")
+        check("telegram", not is_entry or context.get("telegram_available") is True, "Telegram must be configured for entry execution")
         check("market_open", context.get("market_open") is True, "market must be open")
 
         price = proposal.get("latest_price")
@@ -69,13 +71,11 @@ class RiskEngine:
             check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "dynamic symbol failed final Alpaca price freshness check")
         else:
             check("fresh_price", -5 <= age <= self.risk.get("max_price_age_seconds", 120), "price timestamp must be fresh")
-        check("historical_data", int(proposal.get("historical_bars", 0)) >= self.risk.get("min_historical_bars", 50), "sufficient history required")
-        check("volume", proposal.get("volume") is not None and proposal.get("volume", 0) >= 0, "volume must be present")
-        check("price_gap", abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious price gap blocked")
+        check("historical_data", not is_entry or int(proposal.get("historical_bars", 0)) >= self.risk.get("min_historical_bars", 50), "sufficient history required for entries")
+        check("volume", not is_entry or (proposal.get("volume") is not None and proposal.get("volume", 0) >= 0), "volume must be present for entries")
+        check("price_gap", not is_entry or abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious entry price gap blocked")
 
         positions = int(context.get("open_positions", 0))
-        is_entry = str(proposal.get("action", "entry")) in {"entry", "add"}
-        is_add = str(proposal.get("action", "entry")) == "add" or bool(proposal.get("is_add", False))
         risk_budgeted_mode = self.config.get("portfolio_execution_mode") == "risk_budgeted"
 
         max_pos = self.config.get("portfolio_behavior", {}).get("max_open_positions", 3)
@@ -92,16 +92,20 @@ class RiskEngine:
 
         # Portfolio Exposure caps
         max_total_exposure = self.config.get("portfolio_behavior", {}).get("max_total_portfolio_exposure_pct", 6.0)
-        check("portfolio_total_exposure", not is_entry or context.get("proposed_total_exposure_pct", 0.0) <= max_total_exposure, "total portfolio exposure cap")
+        projected_total = context.get("proposed_total_exposure_pct")
+        check("portfolio_total_exposure", not is_entry or (isinstance(projected_total, (int, float)) and projected_total <= max_total_exposure), "total portfolio exposure cap")
 
         max_single_exposure = self.config.get("portfolio_behavior", {}).get("max_single_symbol_exposure_pct", 2.5)
-        check("portfolio_single_symbol_exposure", not is_entry or context.get("proposed_symbol_exposure_pct", 0.0) <= max_single_exposure, "single symbol exposure cap")
+        projected_symbol = context.get("proposed_symbol_exposure_pct")
+        check("portfolio_single_symbol_exposure", not is_entry or (isinstance(projected_symbol, (int, float)) and projected_symbol <= max_single_exposure), "single symbol exposure cap")
 
         max_cluster_pos = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_positions", 2)
-        check("portfolio_cluster_positions_limit", not is_entry or context.get("proposed_cluster_positions_count", 0) <= max_cluster_pos, "same cluster positions limit")
+        projected_cluster_count = context.get("proposed_cluster_positions_count")
+        check("portfolio_cluster_positions_limit", not is_entry or (isinstance(projected_cluster_count, (int, float)) and projected_cluster_count <= max_cluster_pos), "same cluster positions limit")
 
         max_cluster_exposure = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0)
-        check("portfolio_cluster_exposure_limit", not is_entry or context.get("proposed_cluster_exposure_pct", 0.0) <= max_cluster_exposure, "same cluster exposure limit")
+        projected_cluster = context.get("proposed_cluster_exposure_pct")
+        check("portfolio_cluster_exposure_limit", not is_entry or (isinstance(projected_cluster, (int, float)) and projected_cluster <= max_cluster_exposure), "same cluster exposure limit")
 
         # Warning / Exit pending controls
         block_if_exit_pending = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_exit_pending", True)
@@ -131,7 +135,8 @@ class RiskEngine:
                 limit = max(limit, sizing_cfg.get("max_initial_paper_notional", 50.0))
 
         notional = proposal.get("notional")
-        check("notional", isinstance(notional, (int, float)) and 0 < notional <= limit, "notional must be positive and within limit")
+        exit_quantity = proposal.get("qty")
+        check("notional", (not is_entry and isinstance(exit_quantity, (int, float)) and float(exit_quantity) > 0) or (isinstance(notional, (int, float)) and 0 < notional <= limit), "entry notional or exit quantity must be positive and within policy")
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
         check("duplicate_position", not (is_entry and not is_add and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
 
@@ -275,12 +280,13 @@ class RiskEngine:
 
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))
-        check("signal_time", created is not None and created <= now and expires is not None and expires > now, "signal/proposal must be current")
-        check("strategy", proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1"]), "approved strategy version required")
-        check("reason", bool(proposal.get("reason")), "strategy reason required")
+        check("signal_time", not is_entry or (created is not None and created <= now and expires is not None and expires > now), "entry signal/proposal must be current")
+        check("strategy", not is_entry or proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1"]), "approved entry strategy version required")
+        check("reason", not is_entry or bool(proposal.get("reason")), "entry strategy reason required")
         check("side", str(proposal.get("side", "")).lower() in {"buy", "sell"}, "side must be buy or sell")
         check("order_type", proposal.get("order_type", "market") in self.risk.get("allowed_order_types", ["market", "limit"]), "allowed order type required")
-        check("buying_power", (not is_entry) or (notional is not None and float(context.get("buying_power", 0)) >= float(notional)), "sufficient buying power required for entries")
+        buying_power = context.get("buying_power")
+        check("buying_power", (not is_entry) or (notional is not None and isinstance(buying_power, (int, float)) and float(buying_power) >= float(notional)), "sufficient buying power required for entries")
         check("client_order_id", bool(proposal.get("client_order_id")) if final else True, "unique client order ID required at final validation")
         if final:
             check("final_revalidation", context.get("final_revalidation") is True, "final revalidation marker required")
