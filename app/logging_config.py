@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -14,10 +15,16 @@ class RedactingFormatter(logging.Formatter):
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    log_dir = PROJECT_ROOT / "logs" / "runtime"
-    error_dir = PROJECT_ROOT / "logs" / "errors"
+    runtime_root = Path(os.environ["TRADING_AGENT_LOG_ROOT"]) if os.getenv("TRADING_AGENT_LOG_ROOT") else PROJECT_ROOT / "logs"
+    log_dir = runtime_root if os.getenv("TRADING_AGENT_LOG_ROOT") else runtime_root / "runtime"
+    error_dir = runtime_root if os.getenv("TRADING_AGENT_LOG_ROOT") else runtime_root / "errors"
     log_dir.mkdir(parents=True, exist_ok=True)
     error_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(log_dir, 0o700)
+        os.chmod(error_dir, 0o700)
+    except OSError:
+        pass
     logger = logging.getLogger("trading_agent")
     if logger.handlers:
         return logger

@@ -5,7 +5,7 @@ RELEASE="${1:?usage: deploy_release.sh /absolute/release/path}"
 STATE_ROOT="$HOME/Library/Application Support/TradingAgent"
 RUNTIME="$HOME/TradingAgentRuntime"
 [[ -f "$RELEASE/release-manifest.json" ]] || { print -u2 -- "missing release manifest"; exit 2; }
-[[ "$("$RELEASE/.venv/bin/python" -c 'import json; print(json.load(open("release-manifest.json"))["mode"])')" == "paper" ]] || { print -u2 -- "release is not paper-only"; exit 2; }
+[[ "$(cd "$RELEASE" && "$RELEASE/.venv/bin/python" -c 'import json; print(json.load(open("release-manifest.json"))["mode"])')" == "paper" ]] || { print -u2 -- "release is not paper-only"; exit 2; }
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "scanner must be stopped"; exit 2; }
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent.telegram 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "listener must be stopped"; exit 2; }
 [[ "$RELEASE" == "$HOME/TradingAgentReleases/"* ]] || { print -u2 -- "release must be immutable release path"; exit 2; }
