@@ -35,3 +35,22 @@ Ordinary scanner/listener startup verifies a release manifest, paper mode, expli
 The deployment-only migration command requires both `--allow-production-migration` and `TRADINGAGENT_ALLOW_PRODUCTION_DB_MIGRATION=YES_I_AM_DEPLOYING`; it creates and verifies a backup before writing schema or the production-paper sentinel.
 
 No database restore was performed as part of this containment.
+
+## Completed isolated release
+
+The selected runtime release is `971c3d373ce9` at
+`/Users/elijahang/TradingAgentReleases/971c3d373ce9`; its manifest declares
+paper mode and runtime-isolation schema `phase0_execution_integrity_v3_runtime_isolation`.
+`/Users/elijahang/TradingAgentRuntime` points to that release. The previous
+release `43cda459bd1e` is retained as the code rollback target.
+
+The explicit production migration created
+`backups/explicit-pre-migration-20260710T123015Z.sqlite3`, then produced an
+integrity-checked database with 90 tables, schema SHA-256
+`1029677bef2fe79dcf4c02f61bccacdc855000febeba7923a6578dc1571c2237`, all
+three Phase 0 schema versions, and the `production-paper` runtime sentinel.
+
+The scanner launchd job now uses the runtime symlink for both program and
+working directory and writes launchd/log/lock state only below Application
+Support. The listener plist was also converted but is deliberately unloaded:
+it will not consume pending updates during this release validation.

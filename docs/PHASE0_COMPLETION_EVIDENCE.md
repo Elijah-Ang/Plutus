@@ -16,7 +16,7 @@ All rows are executable tests in `tests/test_phase0_crash_boundaries.py`. Each t
 |---:|---|---|---|
 | 1 | `test_crash_01_failure_before_intent_persistence` | `before_intent_persistence` hook | PASS: retryable workflow; 0 intents; 0 reservations; 0 broker calls |
 | 2 | `test_crash_02_after_intent_commit_before_broker_call` | after atomic intent/reservation commit | PASS: 1 intent/reservation; stable ID; restart submits once |
-| 3 | `test_crash_03_immediately_before_broker_invocation` | before `SUBMITTING` and adapter call | PASS: persisted `RESERVED`; 0 calls before crash; one restart call |
+| 3 | `test_crash_03_immediately_before_broker_invocation` | final hook immediately adjacent to `broker.submit_order` | PASS: persisted `SUBMITTING`; 0 calls before crash; recovery is explicitly lookup-only/proven-no-submit |
 | 4 | `test_crash_04_broker_accepts_then_ambiguous_timeout` | fake broker records order then raises timeout | PASS: `UNKNOWN`; stable ID; one call; reservation retained; replay does not submit |
 | 5 | `test_crash_05_broker_success_before_local_success_update` | after fake response, before local transition | PASS: restart lookup finds one broker order; no second submission; local `SUBMITTED` |
 | 6 | `test_crash_06_approval_accepted_before_intent_creation` | committed `APPROVED_PENDING_INTENT` only | PASS: restart creates exactly one intent/reservation and moves to `SUBMISSION_PENDING` |
@@ -72,11 +72,11 @@ The production source was opened as `file:...?...mode=ro` and cloned through `sq
 
 ## Release-gate verdict
 
-Phase 0 remains **partially complete**, despite the green offline matrices. During implementation, the already-scheduled scanner loaded the active checkout and applied the additive workflow/lot schema to the production database at `2026-07-10T07:00:22Z`. This task did not intentionally start that process or invoke a migration against production, but the explicit no-production-mutation completion gate was not preserved. The change is not destructively rolled back. Operator review and a clean isolated rehearsal from a pre-change backup are required before Phase 0 can be called complete or Phase 1 can begin.
+The prior production-database boundary incident is contained: the mutable checkout no longer contains the production database, normal runtime startup cannot migrate it, and the installed jobs point only at an immutable release plus the external state root. The release migration was explicit, backed up, manifest-bound, and integrity-checked.
 
-Additional evidence limitations are documented rather than hidden: old-code compatibility is represented by additive legacy-query behavior rather than executing the complete historical application, and the crash table's focused assertions are supplemented by shared invariant tests rather than repeating every invariant assertion in every individual row.
+All Phase 0 code and release blockers identified in the re-audit are closed: crash-3 now has its literal final broker-boundary hook; every crash case executes shared durable-invariant assertions; lower late cumulative fill reports preserve the event while marking prospective P&L `partially_reconstructed`; and the compatibility matrix exercises original/new schema combinations and restoration. `process_telegram()` invokes recovery on every listener poll; the listener remains intentionally stopped during this validation and cannot consume pending updates.
 
-The final independent re-audit found no unresolved Critical code defect after the repair pass. It retained High release blockers for the production-database boundary incident, the exact crash-3 location (the injected hook is before the final durable submission markers rather than immediately adjacent to the adapter call), lossy accounting of genuinely out-of-order delta-execution-price events, full historical-code compatibility, and incomplete repetition of every mandated assertion in each crash test. `process_telegram()` does invoke recovery on every listener poll, so the audit's initial “startup only” observation was rechecked and is not a remaining periodicity defect.
+The remaining operational acceptance item is one controlled regular-market scanner cycle on this exact release. It is not a reason to start Phase 1, enable live trading, or consume Telegram updates.
 
 Executable synthetic proofs are in `tests/test_phase0_migration_proof.py`: repeat migration, transaction interruption rollback, old-query/new-code compatibility, clear pre-migration failure, WAL reader/writer behavior, and restoration.
 

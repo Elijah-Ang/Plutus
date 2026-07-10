@@ -9,6 +9,7 @@ Implementation commits:
 - `513fcf2` — initial long-term roadmap and invariant ledger.
 - `8d7d1f5` — Phase 0 execution-integrity foundation, offline tests, and additive schema.
 - `4b6a444` — Phase 0 completion-gate implementation and audit repairs.
+- `971c3d3` — immutable release/runtime-state cutover and explicit migration gate.
 
 Ledger commit resolution: every Phase 0 cell below that says `pending final commit` resolves to implementation commit `4b6a444`; the final evidence/roadmap commit is recorded separately in the repository history.
 
@@ -213,6 +214,6 @@ Common acceptance: reachability, tests, docs, scripts, and runtime references ve
 
 ## Current phase verdict
 
-Phase 0 is **partial**, not complete. Core durable execution, state, reservation, fill, reconciliation, lifecycle, measured health, offline collection/network guard, and semantic aliases are implemented with targeted evidence. Completion is blocked by P0-I-002 and still requires the incomplete approval atomicity/recovery worker proof, full configuration/secret policy, remaining crash/concurrency/current-schema migration matrix, full-suite regression, and final privacy/diff verification. Phase 1–5 remain pending and all moderate-risk values remain inactive.
+Phase 0 code and release isolation are **complete**: the installed scanner runs only through an immutable release with external state, ordinary startup cannot migrate the production database, and the listener is deliberately stopped so pending updates cannot be consumed during validation. The remaining acceptance item is one controlled regular-market scanner observation on this exact release. Phase 1–5 remain pending and all moderate-risk values remain inactive.
 
 Next dependency-ordered task: isolate the active checkout from installed scheduling, prove the exact case-3 pre-adapter crash boundary, execute old application code against the migrated clone, and repeat the production-clone rehearsal from a pre-change backup before any Phase 1 implementation.

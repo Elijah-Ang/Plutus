@@ -63,7 +63,7 @@ class PositionLifecycleManager:
                     )
                     conn.execute(
                         "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(NULL,?,?,?,?)",
-                        ("position_lifecycle_opened", "position_lifecycle", json_dumps({"symbol": symbol, "lifecycle_id": lifecycle_id}), now),
+                        ("position_lifecycle_observed", "position_lifecycle", json_dumps({"symbol": symbol, "lifecycle_id": lifecycle["id"]}), now),
                     )
                 else:
                     lifecycle_id = str(uuid.uuid4())

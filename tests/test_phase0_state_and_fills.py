@@ -89,6 +89,7 @@ def test_duplicate_and_out_of_order_cumulative_fills_are_monotonic(tmp_path):
     assert current["average_fill_price"] == 51
     assert storage.fetch_all("SELECT COUNT(*) n FROM broker_fill_events")[0]["n"] == 2
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_events WHERE event_type='out_of_order_fill_ignored'")[0]["n"] == 1
+    assert storage.fetch_all("SELECT confidence FROM pnl_ledger_status WHERE scope='prospective'")[0]["confidence"] == "partially_reconstructed"
 
 
 def test_final_fill_after_partial_reopens_final_notification_eligibility(tmp_path):
