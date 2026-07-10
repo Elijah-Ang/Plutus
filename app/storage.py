@@ -490,6 +490,14 @@ class Storage:
                 "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
                 ("phase0_execution_integrity_v1", iso_now(), "additive durable intent, reservation, lifecycle, health and semantics schema"),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+                (
+                    "phase0_execution_integrity_v2_completion",
+                    iso_now(),
+                    "approval CAS recovery, prospective FIFO PnL, secret redaction, lock identity and completion indexes",
+                ),
+            )
 
             add_missing_columns(
                 "candidate_risk_budget_decisions",

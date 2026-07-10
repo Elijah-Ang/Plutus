@@ -64,6 +64,7 @@ The production source was opened as `file:...?...mode=ro` and cloned through `sq
 - repeated startup: 0.0020 seconds and schema-identical;
 - disk growth: 0 bytes for the already-additive source shape;
 - schema: 89 tables, 27 indexes, 1 trigger, WAL;
+- migration versions: `phase0_execution_integrity_v1` plus `phase0_execution_integrity_v2_completion` on the migrated clone;
 - source and post-migration `PRAGMA integrity_check`: `ok`;
 - all fourteen Phase 0 read-only integrity counters: zero after the legacy-approval manual-review backfill;
 - restoration through SQLite backup: schema hash and all table counts exactly match the pre-migration snapshot;
