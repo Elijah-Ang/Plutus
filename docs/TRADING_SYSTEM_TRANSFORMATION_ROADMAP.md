@@ -129,8 +129,8 @@ Common metadata: rationale = measure independent alpha sleeves without opaque sc
 | IDs | Pending requirements |
 |---|---|
 | P2-STRAT-001..005 | Cross-sectional momentum; time-series trend/breakout; uptrend pullback; ETF sector/broad-asset rotation; distinct breakout continuation |
-| P2-INS-001..009 | Insight symbol; direction; strategy ID; signal time; horizon; calibrated expected return; confidence; uncertainty; stop/invalidation; feature snapshot ID |
-| P2-REG-001..011 | SPY MA100/200 and slopes; breadth; vol percentile; drawdown; dispersion; defensive/credit confirmation; panic-rebound; favorable/narrow/high-vol trend; defensive; panic/rebound; uncertain |
+| P2-INS-001..010 | Insight symbol; direction; strategy ID; signal time; horizon; calibrated expected return; confidence; uncertainty; stop/invalidation; feature snapshot ID |
+| P2-REG-001..013 | SPY MA100/200 and slopes; breadth; vol percentile; drawdown; dispersion; defensive/credit confirmation; panic-rebound; favorable/narrow/high-vol trend; defensive; panic/rebound; uncertain |
 | P2-EVT-001..009 | Earnings; ex-dividend/corporate actions; FOMC/CPI/employment/holiday/early-close; pre-earnings entry ban; reduced adds; overnight gap class; quote/spread/liquidity; session-aware features; point-in-time universe |
 | P2-SAFE-001 | All new strategies shadow-only initially |
 
@@ -145,7 +145,7 @@ Common metadata: rationale = improve execution/protection only after evidence; d
 | P3-EXEC-001..007 | Marketable-limit normal entries; max slippage; bounded expiry; cancel/reassess; no price chase; urgent-exit policy; opening/late-session experiments |
 | P3-HOURS-001 | Extended hours disabled by default/separate limits |
 | P3-PROT-001..010 | Native stop capability; whole-share brackets; fractional+stop; stop replacement; trailing replacement; partial-fill protection; cancel after partial; confirmed protection health; structural/ATR stop; Mac-independent catastrophe protection |
-| P3-MGMT-001..008 | Trailing variants; time stops; partial profits; add only after initial risk reduction; no averaging down; reservation-aware adds; liquidity participation; gap/overnight reserves; stress tests |
+| P3-MGMT-001..009 | Trailing variants; time stops; partial profits; add only after initial risk reduction; no averaging down; reservation-aware adds; liquidity participation; gap/overnight reserves; stress tests |
 | P3-RISK-001..012 | Test inactive profile: 0.20–0.25% trade risk; 0.35% calibrated max; 0.10–0.15% add; 1.00–1.25% total risk; 1.50% favorable; <=0.50% defensive; 25–30% gross; 35–40% favorable; 50% hard paper ceiling; 5–6% symbol; 12–15% cluster; no leverage |
 | P3-LOSS-001..002 | 0.75% daily throttle; 1.5–2.0% weekly throttle |
 | P3-DD-001..004 | Drawdown multipliers: <2 normal; 2–4 -25%; 4–6 -50%; >6 halt/review |
@@ -160,7 +160,7 @@ Common metadata: rationale = separate alpha, risk, execution, uncertainty, and c
 |---|---|
 | P4-CAL-001..005 | Separate alpha/risk/execution assessments; EV in R; calibrated positive probability; confidence intervals/uncertainty; isotonic/logistic calibration |
 | P4-PORT-001..006 | Ledoit-Wolf covariance; sector fallback; component/marginal risk; concentration penalties; stress correlations; Expected Shortfall |
-| P4-SCEN-001..006 | SPY -3%; SPY -5%; sector -7%; vol doubles; 2-ATR gaps; correlations→1; largest position -10–15% |
+| P4-SCEN-001..007 | SPY -3%; SPY -5%; sector -7%; vol doubles; 2-ATR gaps; correlations→1; largest position -10–15% |
 | P4-ADAPT-001..006 | Conservative vol target; bounded fractional Kelly; Bayesian sleeve expectancy; change points; auto throttling; contextual bandit among validated sleeves |
 | P4-SAFE-001..003 | Adaptive shadow-first; hard deterministic limits cannot be overridden; no unconstrained deep-RL agent |
 
