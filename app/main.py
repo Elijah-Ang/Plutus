@@ -27,8 +27,19 @@ sys.excepthook = redacting_excepthook
 def _load_runtime_environment() -> None:
     # Tests establish synthetic credentials before importing application code.
     # Never consult a developer/production .env inside the offline suite.
-    if os.getenv("TRADING_AGENT_TESTING") != "1":
-        load_dotenv(PROJECT_ROOT / ".env")
+    if os.getenv("TRADING_AGENT_TESTING") == "1":
+        return
+    if os.getenv("TRADING_AGENT_RUNTIME") == "production-paper":
+        state_root = Path(os.environ["TRADING_AGENT_STATE_ROOT"]).resolve()
+        env_file = Path(os.environ.get("TRADING_AGENT_ENV_FILE", "")).expanduser().resolve()
+        allowed_root = state_root / "runtime"
+        if not env_file.is_file() or allowed_root not in env_file.parents:
+            raise RuntimeGuardError("production runtime requires an external state-root environment file")
+        if env_file.stat().st_mode & 0o077:
+            raise RuntimeGuardError("production environment file must be owner-only")
+        load_dotenv(env_file)
+        return
+    load_dotenv(PROJECT_ROOT / ".env")
 
 
 def _open_runtime_storage(config: dict) -> Storage:

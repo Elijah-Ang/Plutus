@@ -48,3 +48,25 @@ def test_runtime_scripts_keep_locks_and_logs_outside_release_tree():
         text = (root / "scripts" / name).read_text(encoding="utf-8")
         assert "Library/Application Support/TradingAgent" in text
         assert 'RUNTIME="$ROOT/logs/runtime"' not in text
+        assert 'TRADING_AGENT_ENV_FILE="$STATE_ROOT/runtime/production.env"' in text
+
+
+def test_production_environment_must_be_external_and_owner_only(tmp_path, monkeypatch):
+    from app.main import _load_runtime_environment
+
+    state_root = tmp_path / "state"
+    runtime = state_root / "runtime"
+    runtime.mkdir(parents=True)
+    env_file = runtime / "production.env"
+    env_file.write_text("TRADING_AGENT_RUNTIME_TEST_ENV=loaded\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    monkeypatch.delenv("TRADING_AGENT_TESTING", raising=False)
+    monkeypatch.setenv("TRADING_AGENT_RUNTIME", "production-paper")
+    monkeypatch.setenv("TRADING_AGENT_STATE_ROOT", str(state_root))
+    monkeypatch.setenv("TRADING_AGENT_ENV_FILE", str(env_file))
+    _load_runtime_environment()
+    assert os.environ["TRADING_AGENT_RUNTIME_TEST_ENV"] == "loaded"
+
+    env_file.chmod(0o644)
+    with pytest.raises(RuntimeGuardError, match="owner-only"):
+        _load_runtime_environment()
