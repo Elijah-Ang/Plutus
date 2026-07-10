@@ -6,6 +6,25 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STATE_ROOT = Path.home() / "Library" / "Application Support" / "TradingAgent"
+
+
+def runtime_state_root() -> Path:
+    configured = os.getenv("TRADING_AGENT_STATE_ROOT")
+    return Path(configured).expanduser().resolve() if configured else DEFAULT_STATE_ROOT.resolve()
+
+
+def release_manifest() -> dict:
+    candidates = [PROJECT_ROOT / "release-manifest.json", Path.home() / "TradingAgentRuntime" / "release-manifest.json"]
+    for path in candidates:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("release_commit"):
+                value["_path"] = str(path)
+                return value
+        except Exception:
+            continue
+    return {}
 
 def get_git_commit() -> str:
     try:
@@ -21,7 +40,7 @@ def get_git_commit() -> str:
             return res.stdout.strip()
     except Exception:
         pass
-    return "unknown"
+    return str(release_manifest().get("release_commit") or "unknown")
 
 def check_pid_running(pid: int) -> bool:
     try:
@@ -31,9 +50,11 @@ def check_pid_running(pid: int) -> bool:
         return False
 
 def main():
-    head_commit = get_git_commit()
-    
-    runtime_dir = PROJECT_ROOT / "logs" / "runtime"
+    manifest = release_manifest()
+    expected_commit = str(manifest.get("release_commit") or get_git_commit())
+    expected_root = str(Path(manifest.get("_path", PROJECT_ROOT)).resolve().parent) if manifest else str(PROJECT_ROOT)
+    state_root = runtime_state_root()
+    runtime_dir = state_root / "runtime"
     listener_path = runtime_dir / "telegram_listener_identity.json"
     scanner_path = runtime_dir / "scanner_identity.json"
     
@@ -54,7 +75,9 @@ def main():
             pass
 
     print("=== Runtime Freshness Report ===")
-    print(f"Current Repository HEAD: {head_commit}")
+    print(f"Runtime State Root: {state_root}")
+    print(f"Expected Runtime Commit: {expected_commit}")
+    print(f"Expected Runtime Root: {expected_root}")
     
     if scanner_info:
         scan_commit = scanner_info.get("commit", "unknown")
@@ -63,8 +86,8 @@ def main():
         print(f"Scanner Latest Run Commit: {scan_commit}")
         print(f"Scanner Latest Run Time: {scan_time}")
         print(f"Scanner Project Root: {scan_root}")
-        if scan_root != str(PROJECT_ROOT):
-            print(f"⚠️ Scanner Project Root Mismatch: {scan_root} vs expected {PROJECT_ROOT}")
+        if scan_root != expected_root:
+            print(f"⚠️ Scanner Project Root Mismatch: {scan_root} vs expected {expected_root}")
     else:
         print("Scanner status: No run recorded yet.")
         
@@ -83,13 +106,14 @@ def main():
         print(f"Listener Project Root: {list_root}")
         
         if running:
-            if list_root != str(PROJECT_ROOT):
-                print(f"⚠️ Listener Project Root Mismatch: {list_root} vs expected {PROJECT_ROOT}")
-            if head_commit != "unknown" and list_commit != "unknown" and list_commit != head_commit:
+            if list_root != expected_root:
                 listener_stale = True
-                print("❌ Listener status: STALE (Running code differs from current HEAD)")
-            else:
-                print("✅ Listener status: FRESH (Matches repository HEAD)")
+                print(f"❌ Listener Project Root Mismatch: {list_root} vs expected {expected_root}")
+            if expected_commit != "unknown" and list_commit != expected_commit:
+                listener_stale = True
+                print("❌ Listener status: STALE (Running code differs from active release)")
+            if not listener_stale:
+                print("✅ Listener status: FRESH (Matches active release)")
         else:
             print("❌ Listener status: NOT RUNNING")
     else:

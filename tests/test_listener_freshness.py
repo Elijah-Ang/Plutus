@@ -3,6 +3,7 @@ import uuid
 import pytest
 import os
 from datetime import datetime, UTC, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.storage import Storage
@@ -142,6 +143,8 @@ def test_record_process_identity(tmp_path, monkeypatch):
 def test_check_listener_freshness(tmp_path, monkeypatch):
     from pathlib import Path
     monkeypatch.setattr("app.utils.PROJECT_ROOT", tmp_path)
+    state_root = tmp_path / "external-state"
+    monkeypatch.setenv("TRADING_AGENT_STATE_ROOT", str(state_root))
     
     res = check_listener_freshness()
     assert res["running"] is False
@@ -156,7 +159,7 @@ def test_check_listener_freshness(tmp_path, monkeypatch):
         "git_clean": True
     }
     
-    runtime_dir = tmp_path / "logs" / "runtime"
+    runtime_dir = state_root / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     json_path = runtime_dir / "telegram_listener_identity.json"
     with json_path.open("w") as f:
@@ -174,6 +177,59 @@ def test_check_listener_freshness(tmp_path, monkeypatch):
     assert res["fresh"] is False
     assert res["mismatch"] is True
     assert "stale" in res["message"]
+
+
+def test_release_manifest_is_commit_source_without_git(tmp_path, monkeypatch):
+    import app.utils as utils
+
+    (tmp_path / "release-manifest.json").write_text(
+        json.dumps({"release_id": "release-1", "release_commit": "a" * 40}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(utils.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no git")))
+
+    assert utils.get_git_commit() == "a" * 40
+    assert utils.is_git_clean() is True
+
+
+def test_runtime_freshness_script_reads_external_state(tmp_path, monkeypatch, capsys):
+    import importlib.util
+
+    release = tmp_path / "release"
+    release.mkdir()
+    commit = "b" * 40
+    (release / "release-manifest.json").write_text(
+        json.dumps({"release_id": "release-2", "release_commit": commit}),
+        encoding="utf-8",
+    )
+    state_root = tmp_path / "state"
+    runtime = state_root / "runtime"
+    runtime.mkdir(parents=True)
+    identity = {
+        "pid": os.getpid(),
+        "commit": commit,
+        "start_time": datetime.now(UTC).isoformat(),
+        "project_root": str(release),
+    }
+    (runtime / "telegram_listener_identity.json").write_text(json.dumps(identity), encoding="utf-8")
+    (runtime / "scanner_identity.json").write_text(json.dumps(identity), encoding="utf-8")
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_runtime_freshness.py"
+    spec = importlib.util.spec_from_file_location("runtime_freshness_test_module", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "PROJECT_ROOT", release)
+    monkeypatch.setattr(module, "DEFAULT_STATE_ROOT", state_root)
+    monkeypatch.delenv("TRADING_AGENT_STATE_ROOT", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert f"Runtime State Root: {state_root}" in output
+    assert "Listener status: FRESH" in output
 
 def test_stale_listener_blocks_approvals(temp_storage, base_config, monkeypatch):
     monkeypatch.setattr("app.utils.BOOT_COMMIT", "boot-commit-abc")

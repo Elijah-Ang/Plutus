@@ -26,6 +26,14 @@ def get_git_commit() -> str:
             return res.stdout.strip()
     except Exception:
         pass
+    manifest_path = PROJECT_ROOT / "release-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        commit = str(manifest.get("release_commit") or "").strip()
+        if commit:
+            return commit
+    except Exception:
+        pass
     return "unknown"
 
 
@@ -41,6 +49,15 @@ def is_git_clean() -> bool:
         )
         if res.returncode == 0:
             return len(res.stdout.strip()) == 0
+    except Exception:
+        pass
+    # Immutable releases intentionally contain no .git directory. Their
+    # manifest is created from a clean committed archive before write bits are
+    # removed, so presence of a valid pinned release commit is the clean-state
+    # proof used by production identity reporting.
+    try:
+        manifest = json.loads((PROJECT_ROOT / "release-manifest.json").read_text(encoding="utf-8"))
+        return bool(manifest.get("release_commit") and manifest.get("release_id"))
     except Exception:
         pass
     return False
@@ -74,7 +91,8 @@ def record_process_identity(role: str, run_id: str) -> dict[str, Any]:
 
 def check_listener_freshness() -> dict[str, Any]:
     current_head = get_git_commit()
-    identity_path = PROJECT_ROOT / "logs" / "runtime" / "telegram_listener_identity.json"
+    runtime_dir = Path(os.environ["TRADING_AGENT_STATE_ROOT"]) / "runtime" if os.getenv("TRADING_AGENT_STATE_ROOT") else PROJECT_ROOT / "logs" / "runtime"
+    identity_path = runtime_dir / "telegram_listener_identity.json"
     status = {
         "running": False,
         "pid": None,
