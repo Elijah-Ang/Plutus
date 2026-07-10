@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 from .utils import PROJECT_ROOT, iso_now, json_dumps
+from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
 
 TABLE_DEFINITIONS: dict[str, str] = {
+    "runtime_metadata": "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL",
     "schema_migrations": "version TEXT PRIMARY KEY, applied_at TEXT NOT NULL, detail TEXT",
     "runs": "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL, mode TEXT NOT NULL, detail TEXT",
     "preflight_checks": "id INTEGER PRIMARY KEY, run_id TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT",
@@ -110,7 +113,43 @@ TABLE_DEFINITIONS: dict[str, str] = {
 class Storage:
     def __init__(self, path: str | Path = PROJECT_ROOT / "data" / "trading_agent.db") -> None:
         self.path = Path(path)
+        if os.getenv("TRADING_AGENT_TESTING") == "1" and is_production_path(self.path):
+            raise RuntimeError("tests must never open a production-paper database")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def schema_versions(self) -> set[str]:
+        try:
+            return {row["version"] for row in self.fetch_all("SELECT version FROM schema_migrations")}
+        except sqlite3.Error:
+            return set()
+
+    def require_runtime_schema(self, *, production: bool = False) -> None:
+        versions = self.schema_versions()
+        if REQUIRED_SCHEMA_VERSION not in versions:
+            raise RuntimeError("Database migration required. Trading remains blocked.")
+        if production:
+            rows = self.fetch_all("SELECT value FROM runtime_metadata WHERE key='environment'")
+            if not rows or rows[0]["value"] != "production-paper":
+                raise RuntimeError("production-paper database sentinel is missing")
+
+    def apply_explicit_migrations(self, *, production_paper: bool = False) -> None:
+        """Deployment-only schema mutation. Ordinary runtime must not call this."""
+        self.initialize()
+        with self.connect() as conn:
+            now = iso_now()
+            if production_paper:
+                existing = conn.execute("SELECT value FROM runtime_metadata WHERE key='environment'").fetchone()
+                if existing and existing["value"] != "production-paper":
+                    raise RuntimeError("refusing to overwrite a non-production database sentinel")
+                conn.execute(
+                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('environment','production-paper',?) "
+                    "ON CONFLICT(key) DO UPDATE SET updated_at=excluded.updated_at",
+                    (now,),
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+                (REQUIRED_SCHEMA_VERSION, now, "explicit deployment-only runtime isolation migration"),
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -732,8 +771,8 @@ class Storage:
 
     def writable(self) -> bool:
         try:
-            self.initialize()
             with self.connect() as conn:
+                conn.execute("SELECT 1 FROM schema_migrations LIMIT 1")
                 conn.execute("CREATE TEMP TABLE IF NOT EXISTS writable_probe (value INTEGER)")
             return True
         except sqlite3.Error:

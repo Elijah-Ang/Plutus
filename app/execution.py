@@ -426,6 +426,12 @@ class DurableExecutionStore:
                     (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative_quantity, 0.0, fill_price, occurred_at or now, now, json_dumps({"out_of_order": True, "retained_cumulative": previous})),
                 )
                 conn.execute(
+                    """UPDATE pnl_ledger_status SET confidence='partially_reconstructed',
+                           provenance='late lower cumulative broker event; authoritative history required',
+                           last_event_at=?,updated_at=? WHERE scope='prospective'""",
+                    (occurred_at or now, now),
+                )
+                conn.execute(
                     "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4()), intent_id, f"{intent_id}:out_of_order_fill:{broker_event_key}", intent["state"], intent["state"], "out_of_order_fill_ignored", json_dumps({"reported": cumulative_quantity, "retained": previous}), now, counter),
                 )
@@ -586,12 +592,14 @@ class Executor:
         storage: Any | None = None,
         run_id: str | None = None,
         fault_hook: Any | None = None,
+        recovery_proven_no_submit: bool = False,
     ) -> None:
         self.broker = broker
         self.risk_engine = risk_engine
         self.storage = storage
         self.run_id = run_id
         self.fault_hook = fault_hook
+        self.recovery_proven_no_submit = recovery_proven_no_submit
 
     def _fault(self, boundary: str, **detail: Any) -> None:
         if self.fault_hook is not None:
@@ -692,7 +700,8 @@ class Executor:
         intent_id = str(intent["id"])
         self._fault("after_intent_and_reservation_commit", intent_id=intent_id)
         state = OrderState(intent["state"])
-        if state in BROKER_RELEVANT_STATES or state in TERMINAL_STATES:
+        exact_pre_broker_recovery = state == OrderState.SUBMITTING and self.recovery_proven_no_submit
+        if (state in BROKER_RELEVANT_STATES or state in TERMINAL_STATES) and not exact_pre_broker_recovery:
             # An existing logical action is never automatically submitted again.
             return ExecutionResult(
                 state in {OrderState.SUBMITTED, OrderState.PARTIALLY_FILLED, OrderState.FILLED},
@@ -707,12 +716,13 @@ class Executor:
                 workflow_store.transition(current_workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
         try:
             self._fault("immediately_before_broker_invocation", intent_id=intent_id)
-            intent = store.transition(
-                intent_id,
-                OrderState.SUBMITTING,
-                event_type="broker_submission_started",
-                expected_state=OrderState.RESERVED,
-            )
+            if not exact_pre_broker_recovery:
+                intent = store.transition(
+                    intent_id,
+                    OrderState.SUBMITTING,
+                    event_type="broker_submission_started",
+                    expected_state=OrderState.RESERVED,
+                )
             if workflow_store is not None and workflow is not None:
                 current_workflow = workflow_store.get(workflow["id"])
                 if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_PENDING.value:
@@ -727,6 +737,9 @@ class Executor:
                 order_args = {"notional": float(intent["requested_notional"])}
             else:
                 order_args = {"qty": float(intent["requested_quantity"])}
+            # This is deliberately the final instruction before adapter I/O. The
+            # production hook is a no-op; deterministic tests may fail here.
+            self._fault("immediately_before_broker_submit", intent_id=intent_id)
             response = self.broker.submit_order(
                 intent["symbol"],
                 intent["side"],

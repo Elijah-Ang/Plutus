@@ -14,6 +14,7 @@ import sys
 import traceback
 from .service import TradingService
 from .utils import PROJECT_ROOT, iso_now, load_config, redact, redact_sensitive_url
+from .runtime_guard import RuntimeGuardError, runtime_database_path, validate_production_runtime
 
 def redacting_excepthook(type, value, tb):
     tb_lines = traceback.format_exception(type, value, tb)
@@ -30,12 +31,20 @@ def _load_runtime_environment() -> None:
         load_dotenv(PROJECT_ROOT / ".env")
 
 
+def _open_runtime_storage(config: dict) -> Storage:
+    path = runtime_database_path(config)
+    storage = Storage(path)
+    if os.getenv("TRADING_AGENT_RUNTIME") == "production-paper":
+        validate_production_runtime()
+        storage.require_runtime_schema(production=True)
+    return storage
+
+
 def run_once(config_path: str | Path | None = None) -> int:
     _load_runtime_environment()
     logger = configure_logging()
     config = load_config(config_path)
-    storage = Storage(PROJECT_ROOT / config["storage"]["sqlite_path"])
-    storage.initialize()
+    storage = _open_runtime_storage(config)
     run_id = storage.start_run(config["mode"])
     from .utils import record_process_identity
     identity = record_process_identity("scanner", run_id)
@@ -182,8 +191,7 @@ def run_listener(config_path: str | Path | None = None) -> int:
     _load_runtime_environment()
     logger = configure_logging()
     config = load_config(config_path)
-    storage = Storage(PROJECT_ROOT / config["storage"]["sqlite_path"])
-    storage.initialize()
+    storage = _open_runtime_storage(config)
     
     telegram_cfg = config.get("telegram", {})
     if not telegram_cfg.get("telegram_approval_listener_enabled", True):

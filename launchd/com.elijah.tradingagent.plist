@@ -2,11 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.elijah.tradingagent</string>
-  <key>ProgramArguments</key><array><string>__PROJECT_ROOT__/scripts/run_once.sh</string></array>
-  <key>WorkingDirectory</key><string>__PROJECT_ROOT__</string>
+  <key>ProgramArguments</key><array><string>/Users/elijahang/TradingAgentRuntime/scripts/run_once.sh</string></array>
+  <key>WorkingDirectory</key><string>/Users/elijahang/TradingAgentRuntime</string>
   <key>StartInterval</key><integer>600</integer>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>__PROJECT_ROOT__/logs/runtime/launchd.out</string>
-  <key>StandardErrorPath</key><string>__PROJECT_ROOT__/logs/errors/launchd.err</string>
-  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/elijahang/Library/Application Support/TradingAgent/logs/launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/elijahang/Library/Application Support/TradingAgent/logs/launchd.err</string>
 </dict></plist>

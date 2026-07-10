@@ -2,11 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.elijah.tradingagent.telegram</string>
-  <key>ProgramArguments</key><array><string>__PROJECT_ROOT__/scripts/run_telegram_listener.sh</string></array>
-  <key>WorkingDirectory</key><string>__PROJECT_ROOT__</string>
-  <key>KeepAlive</key><true/>
+  <key>ProgramArguments</key><array><string>/Users/elijahang/TradingAgentRuntime/scripts/run_telegram_listener.sh</string></array>
+  <key>WorkingDirectory</key><string>/Users/elijahang/TradingAgentRuntime</string>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>__PROJECT_ROOT__/logs/runtime/listener.out</string>
-  <key>StandardErrorPath</key><string>__PROJECT_ROOT__/logs/errors/listener.err</string>
-  <key>ProcessType</key><string>Background</string>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/elijahang/Library/Application Support/TradingAgent/logs/listener-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/elijahang/Library/Application Support/TradingAgent/logs/listener-launchd.err</string>
 </dict></plist>
