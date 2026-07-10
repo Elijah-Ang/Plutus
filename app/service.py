@@ -7520,7 +7520,10 @@ class TradingService:
                 ),
             )
             for horizon in (1, 5, 20):
-                due_at = now + timedelta(days=horizon)
+                from .research_validation import ExchangeSessions
+
+                due_session = ExchangeSessions().add_sessions(now.date(), horizon)
+                due_at = datetime.combine(due_session, now.timetz()).astimezone(UTC)
                 self.storage.execute(
                     """
                     INSERT INTO performance_forward_returns(
@@ -7664,201 +7667,34 @@ class TradingService:
             )
 
     def _update_forward_outcomes(self) -> None:
+        # Phase 1 owns outcome calculation. Both legacy tables below are now
+        # compatibility projections from one exchange-session-aware result.
+        from .research_validation import update_service_outcomes
+
         now = datetime.now(UTC)
         self._sync_performance_lab_order_links()
-        self._update_performance_forward_returns(now)
-        pending = self.storage.fetch_all("SELECT * FROM trade_outcomes WHERE outcome_status IN ('pending','pending_forward_returns')")
-        if not pending:
-            return
-
         cfg = self._runtime_orchestration_cfg()
-        max_updates = int(cfg.get("max_forward_outcome_updates_per_cycle", 25))
-        total_pending = len(pending)
-        if max_updates > 0:
-            pending = pending[:max_updates]
-        logger.info("Updating %d of %d pending trade outcomes...", len(pending), total_pending)
-        self.storage.audit(self.run_id, "forward_outcomes_update_started", {"pending": total_pending, "processing": len(pending)})
-        for out in pending:
-            out_id = out["id"]
-            trade_id = out["trade_id"]
-            actual_or_shadow = out["actual_or_shadow"]
-            symbol = out["symbol"]
-            entry_price = float(out["entry_price"])
-            entry_time_str = out["entry_time"]
-
-            try:
-                entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00")).replace(tzinfo=UTC)
-            except Exception:
-                continue
-            if now < entry_dt + timedelta(days=1):
-                continue
-
-            stop_price = None
-            if actual_or_shadow == "shadow":
-                shadow_row = self.storage.fetch_all("SELECT would_have_stop_price FROM shadow_trades WHERE id=?", (trade_id,))
-                if shadow_row and shadow_row[0]["would_have_stop_price"] is not None:
-                    stop_price = float(shadow_row[0]["would_have_stop_price"])
-            else:
-                order_row = self.storage.fetch_all("SELECT proposal_id FROM orders WHERE id=?", (trade_id,))
-                if order_row:
-                    prop_id = order_row[0]["proposal_id"]
-                    prop_row = self.storage.fetch_all("SELECT payload FROM trade_proposals WHERE id=?", (prop_id,))
-                    if prop_row:
-                        try:
-                            payload = json.loads(prop_row[0]["payload"])
-                            stop_price = payload.get("stop_price")
-                        except Exception:
-                            pass
-            if not stop_price or stop_price >= entry_price:
-                stop_price = entry_price * 0.92
-
-            target_price = entry_price + 2.0 * (entry_price - stop_price)
-
-            if self.broker is None:
-                continue
-            try:
-                bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
-            except Exception as e:
-                logger.warning("Failed to fetch historical bars for %s during outcome update: %s", symbol, e)
-                continue
-
-            if bars.empty:
-                continue
-
-            future_bars = []
-            for idx, row in bars.iterrows():
-                bar_dt = idx
-                if hasattr(bar_dt, "to_pydatetime"):
-                    bar_dt = bar_dt.to_pydatetime()
-                if bar_dt.tzinfo is None:
-                    bar_dt = bar_dt.replace(tzinfo=UTC)
-                else:
-                    bar_dt = bar_dt.astimezone(UTC)
-                if bar_dt > entry_dt:
-                    future_bars.append((bar_dt, row))
-
-            if not future_bars:
-                continue
-
-            ret_1d = None
-            ret_5d = None
-            ret_20d = None
-
-            if len(future_bars) >= 1:
-                ret_1d = float(future_bars[0][1]["close"] / entry_price - 1.0) * 100
-            if len(future_bars) >= 5:
-                ret_5d = float(future_bars[4][1]["close"] / entry_price - 1.0) * 100
-            if len(future_bars) >= 20:
-                ret_20d = float(future_bars[19][1]["close"] / entry_price - 1.0) * 100
-
-            max_high = max(float(row["high"]) for _, row in future_bars[:20])
-            min_low = min(float(row["low"]) for _, row in future_bars[:20])
-            mfe = (max_high - entry_price) / entry_price * 100
-            mae = (min_low - entry_price) / entry_price * 100
-
-            stop_hit = 1 if min_low <= stop_price else 0
-            target_reached = 1 if max_high >= target_price else 0
-
-            outcome_status = "complete" if (len(future_bars) >= 20 or stop_hit == 1) else "pending"
-
-            self.storage.execute(
-                """UPDATE trade_outcomes SET
-                    forward_return_1d=?, forward_return_5d=?, forward_return_20d=?,
-                    max_favorable_excursion=?, max_adverse_excursion=?, stop_hit=?,
-                    target_reached=?, outcome_status=?, updated_at=?
-                   WHERE id=?""",
-                (
-                    ret_1d, ret_5d, ret_20d, mfe, mae, stop_hit, target_reached,
-                    outcome_status, now.isoformat(), out_id
-                )
-            )
-
-            if outcome_status == "complete" and actual_or_shadow == "actual" and ret_20d is not None:
-                shadows = self.storage.fetch_all(
-                    "SELECT forward_return_20d FROM trade_outcomes WHERE actual_or_shadow='shadow' AND symbol=? AND outcome_status='complete'",
-                    (symbol,)
-                )
-                if shadows:
-                    max_shadow = max([float(s["forward_return_20d"]) for s in shadows if s["forward_return_20d"] is not None] + [-999.0])
-                    beat = 1 if ret_20d > max_shadow else 0
-                    self.storage.execute("UPDATE trade_outcomes SET beat_shadow_alternatives=? WHERE id=?", (beat, out_id))
-        self.storage.audit(self.run_id, "forward_outcomes_update_completed", {"pending": total_pending, "processed": len(pending)})
+        result = update_service_outcomes(
+            self.storage,
+            self.broker,
+            now=now,
+            max_updates=int(cfg.get("max_forward_outcome_updates_per_cycle", 25)),
+        )
+        self.storage.audit(self.run_id, "canonical_forward_outcomes_updated", result)
+        return
 
     def _update_performance_forward_returns(self, now: datetime | None = None) -> None:
+        from .research_validation import update_service_outcomes
+
         now = now or datetime.now(UTC)
         cfg = self._runtime_orchestration_cfg()
-        max_updates = int(cfg.get("max_forward_outcome_updates_per_cycle", 25))
-        pending = self.storage.fetch_all(
-            """
-            SELECT fr.*, ps.current_price AS setup_price, ps.timestamp AS setup_timestamp
-            FROM performance_forward_returns fr
-            JOIN performance_setups ps ON ps.id=fr.setup_id
-            WHERE fr.status='pending' AND datetime(fr.due_at) <= datetime(?)
-            ORDER BY fr.due_at
-            LIMIT ?
-            """,
-            (now.isoformat(), max_updates if max_updates > 0 else 1000000),
+        update_service_outcomes(
+            self.storage,
+            self.broker,
+            now=now,
+            max_updates=int(cfg.get("max_forward_outcome_updates_per_cycle", 25)),
         )
-        for row in pending:
-            symbol = row["symbol"]
-            entry_price = float(row.get("setup_price") or 0.0)
-            if entry_price <= 0:
-                self.storage.execute(
-                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='blocked',reason=?,updated_at=? WHERE id=?",
-                    ("missing_entry_price", now.isoformat(), row["id"]),
-                )
-                continue
-            try:
-                setup_dt = datetime.fromisoformat(str(row["setup_timestamp"]).replace("Z", "+00:00"))
-                setup_dt = setup_dt.replace(tzinfo=UTC) if setup_dt.tzinfo is None else setup_dt.astimezone(UTC)
-            except Exception:
-                self.storage.execute(
-                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='blocked',reason=?,updated_at=? WHERE id=?",
-                    ("invalid_setup_timestamp", now.isoformat(), row["id"]),
-                )
-                continue
-            horizon = int(row["horizon_days"])
-            try:
-                bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", max(60, horizon + 5)), symbol) if self.broker else pd.DataFrame()
-            except Exception as exc:
-                self.storage.execute(
-                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='pending',reason=?,updated_at=? WHERE id=?",
-                    (f"historical_bars_unavailable:{type(exc).__name__}", now.isoformat(), row["id"]),
-                )
-                continue
-            future_bars = []
-            for idx, bar in bars.iterrows():
-                bar_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-                if not isinstance(bar_dt, datetime):
-                    continue
-                bar_dt = bar_dt.replace(tzinfo=UTC) if bar_dt.tzinfo is None else bar_dt.astimezone(UTC)
-                if bar_dt > setup_dt:
-                    future_bars.append((bar_dt, bar))
-            if len(future_bars) < horizon:
-                self.storage.execute(
-                    "UPDATE performance_forward_returns SET eligible_to_update=1,status='pending',reason=?,updated_at=? WHERE id=?",
-                    ("waiting_for_provider_horizon_bars", now.isoformat(), row["id"]),
-                )
-                continue
-            window = future_bars[:horizon]
-            close_price = float(window[-1][1]["close"])
-            high = max(float(bar["high"]) if "high" in bar else float(bar["close"]) for _, bar in window)
-            low = min(float(bar["low"]) if "low" in bar else float(bar["close"]) for _, bar in window)
-            forward_return = (close_price / entry_price - 1.0) * 100.0
-            mfe = (high / entry_price - 1.0) * 100.0
-            mae = (low / entry_price - 1.0) * 100.0
-            stop_price = entry_price * 0.92
-            target_price = entry_price + 2.0 * (entry_price - stop_price)
-            self.storage.execute(
-                """
-                UPDATE performance_forward_returns
-                SET eligible_to_update=1, updated_at=?, forward_return=?, max_favorable_excursion=?,
-                    max_adverse_excursion=?, hypothetical_stop_hit=?, hypothetical_target_hit=?,
-                    status='complete', reason='updated_after_elapsed_horizon'
-                WHERE id=?
-                """,
-                (now.isoformat(), forward_return, mfe, mae, int(low <= stop_price), int(high >= target_price), row["id"]),
-            )
+        return
 
     def _create_shadow_trade_from_proposal(self, prop_row: dict[str, Any], reason: str) -> None:
         exists = self.storage.fetch_all("SELECT 1 FROM shadow_trades WHERE id=?", (prop_row["id"],))

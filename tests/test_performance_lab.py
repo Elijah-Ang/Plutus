@@ -174,7 +174,7 @@ def test_performance_forward_returns_wait_until_horizon_elapsed(tmp_path):
     service._run_performance_lab([res], ["SPY"], [], now, {"portfolio_equity": 1000, "total_exposure_pct": 0, "single_exposures": {}, "cluster_exposures": {}})
 
     service._update_performance_forward_returns(now + timedelta(hours=12))
-    assert {r["status"] for r in storage.fetch_all("SELECT status FROM performance_forward_returns")} == {"pending"}
+    assert {r["status"] for r in storage.fetch_all("SELECT status FROM performance_forward_returns")} == {"maturing"}
 
     service._update_performance_forward_returns(datetime(2026, 1, 10, tzinfo=UTC))
     rows = storage.fetch_all("SELECT horizon_days, status, forward_return, max_favorable_excursion, max_adverse_excursion FROM performance_forward_returns")

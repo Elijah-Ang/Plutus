@@ -103,7 +103,7 @@ def test_scanner_side_market_data_stall_is_bounded(tmp_path, monkeypatch):
 
     assert time.monotonic() - started < 1.0
     row = storage.fetch_all("SELECT outcome_status FROM trade_outcomes WHERE trade_id='shadow-1'")[0]
-    assert row["outcome_status"] == "pending"
+    assert row["outcome_status"] == "failed"
 
 
 def test_listener_approval_validation_stall_is_bounded_and_blocks_without_order(tmp_path, monkeypatch):

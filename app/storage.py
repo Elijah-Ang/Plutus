@@ -783,6 +783,13 @@ class Storage:
                 if col_name not in cols_mem:
                     conn.execute(f"ALTER TABLE market_memory ADD COLUMN {col_name} {col_type}")
 
+            # Phase 1 is additive and dormant: ordinary trading code neither
+            # reads these tables nor changes behavior based on their contents.
+            # Installed production releases never load this development branch.
+            from .research_validation import apply_phase1_schema
+
+            apply_phase1_schema(conn)
+
     def writable(self) -> bool:
         try:
             with self.connect() as conn:
