@@ -15,6 +15,7 @@ mkdir "$DEST"
 git -C "$SOURCE" archive --format=tar "$COMMIT" | tar -x -C "$DEST" -f -
 cp -a "$SOURCE/.venv" "$DEST/.venv"
 FINGERPRINT=$(shasum -a 256 "$SOURCE/requirements.txt" 2>/dev/null | awk '{print $1}')
+cd "$DEST"
 RELEASE_ID="$RELEASE_ID" COMMIT="$COMMIT" BRANCH="$BRANCH" FINGERPRINT="$FINGERPRINT" "$DEST/.venv/bin/python" - <<'PY'
 import json, os, platform
 from datetime import UTC, datetime
