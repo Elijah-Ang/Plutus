@@ -23,8 +23,15 @@ def redacting_excepthook(type, value, tb):
 sys.excepthook = redacting_excepthook
 
 
+def _load_runtime_environment() -> None:
+    # Tests establish synthetic credentials before importing application code.
+    # Never consult a developer/production .env inside the offline suite.
+    if os.getenv("TRADING_AGENT_TESTING") != "1":
+        load_dotenv(PROJECT_ROOT / ".env")
+
+
 def run_once(config_path: str | Path | None = None) -> int:
-    load_dotenv(PROJECT_ROOT / ".env")
+    _load_runtime_environment()
     logger = configure_logging()
     config = load_config(config_path)
     storage = Storage(PROJECT_ROOT / config["storage"]["sqlite_path"])
@@ -172,7 +179,7 @@ def run_once(config_path: str | Path | None = None) -> int:
 
 
 def run_listener(config_path: str | Path | None = None) -> int:
-    load_dotenv(PROJECT_ROOT / ".env")
+    _load_runtime_environment()
     logger = configure_logging()
     config = load_config(config_path)
     storage = Storage(PROJECT_ROOT / config["storage"]["sqlite_path"])

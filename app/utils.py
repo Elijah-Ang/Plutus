@@ -143,18 +143,10 @@ def secret_present(name: str) -> bool:
 
 
 def get_secret(name: str) -> str | None:
-    """Read environment first, then macOS Keychain without logging the value."""
-    value = os.getenv(name)
-    if value and not value.startswith("replace_with_"):
-        return value
-    try:
-        result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-a", os.getenv("USER", ""), "-s", f"TradingAgent.{name}", "-w"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    """Compatibility boundary for callers that need plaintext client credentials."""
+    from .secrets import default_secret_store
+
+    return default_secret_store().get_plaintext(name)
 
 
 def json_dumps(value: Any) -> str:
@@ -162,7 +154,7 @@ def json_dumps(value: Any) -> str:
 
 
 def redact(value: Any) -> Any:
-    sensitive = ("key", "secret", "token", "password", "account_id")
+    sensitive = ("key", "secret", "token", "password", "account_id", "authorization", "cookie")
     if isinstance(value, dict):
         return {k: "[REDACTED]" if any(s in k.lower() for s in sensitive) else redact(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -843,7 +835,7 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
     return "\n".join(msg_parts)
 
 
-def redact_sensitive_url(text: str) -> str:
+def redact_sensitive_url(text: str, registered_secrets: tuple[str, ...] | list[str] = ()) -> str:
     import re
     if not isinstance(text, str):
         text = str(text)
@@ -851,6 +843,43 @@ def redact_sensitive_url(text: str) -> str:
     text = re.sub(r"bot[0-9]+:[A-Za-z0-9_-]+", "bot<redacted_token>", text)
     # Also handle full api.telegram.org/bot... URLs
     text = re.sub(r"api\.telegram\.org/bot[^/ \'\"]+", "api.telegram.org/bot<redacted_token>", text)
-    # Redact credentials/tokens in query parameters if any
-    text = re.sub(r"token=[A-Za-z0-9_-]+", "token=<redacted>", text)
+    # Redact common URL query credentials, preserving the parameter name.
+    text = re.sub(
+        r"(?i)([?&](?:token|api[_-]?key|access[_-]?token|secret|password)=)[^&#\s'\"]+",
+        r"\1<redacted>",
+        text,
+    )
+    # Redact headers, environment-style assignments and JSON/log key-value pairs.
+    text = re.sub(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+", r"\1<redacted>", text)
+    text = re.sub(
+        r"(?i)(\b(?:ALPACA_(?:API|SECRET)_KEY|TELEGRAM_BOT_TOKEN|OPENAI_API_KEY|EODHD_API_TOKEN)\s*=\s*)[^\s,;]+",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r'(?i)(["\'](?:api[_-]?key|secret(?:[_-]?key)?|token|password|authorization)["\']\s*:\s*["\'])[^"\']+(["\'])',
+        r"\1<redacted>\2",
+        text,
+    )
+    # Credential-bearing database URLs and webhook-style URL userinfo.
+    text = re.sub(
+        r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)",
+        r"\1<redacted>\2",
+        text,
+    )
+    for value in registered_secrets:
+        if value:
+            text = text.replace(str(value), "<redacted>")
     return text
+
+
+def redact_exception(exc: BaseException, registered_secrets: tuple[str, ...] | list[str] = ()) -> str:
+    """Return a bounded, redacted exception chain without request/credential reprs."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 8:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {redact_sensitive_url(str(current), registered_secrets)}")
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)

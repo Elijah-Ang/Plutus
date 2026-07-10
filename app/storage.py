@@ -32,8 +32,13 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "broker_fill_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, broker_event_key TEXT NOT NULL UNIQUE, broker_order_id TEXT, cumulative_filled_quantity REAL NOT NULL CHECK(cumulative_filled_quantity>=0), delta_quantity REAL NOT NULL CHECK(delta_quantity>=0), fill_price REAL NOT NULL CHECK(fill_price>=0), occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, payload TEXT",
     "reconciliation_attempts": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, lookup_type TEXT NOT NULL, lookup_value_redacted TEXT NOT NULL, outcome TEXT NOT NULL, broker_status TEXT, safe_detail TEXT, created_at TEXT NOT NULL, UNIQUE(intent_id, lookup_type, outcome, broker_status, created_at)",
     "telegram_updates": "update_id INTEGER PRIMARY KEY, message_id INTEGER, message_timestamp INTEGER, received_at TEXT NOT NULL, processing_state TEXT NOT NULL, processed_at TEXT, approval_id TEXT, safe_message_type TEXT, normalized_action TEXT, target_hint TEXT, sender_authorized INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT",
-    "approval_workflows": "id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, proposal_id TEXT NOT NULL, telegram_update_id INTEGER UNIQUE, state TEXT NOT NULL, intent_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, manual_review_reason TEXT, version INTEGER NOT NULL DEFAULT 0",
+    "approval_workflows": "id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, proposal_id TEXT NOT NULL, telegram_update_id INTEGER UNIQUE, logical_workflow_key TEXT UNIQUE, state TEXT NOT NULL, intent_id TEXT, validation_status TEXT, safe_detail TEXT, claim_owner TEXT, claim_until TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT, update_processed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, manual_review_reason TEXT, version INTEGER NOT NULL DEFAULT 0",
     "position_lifecycles": "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, broker_position_id TEXT, side TEXT NOT NULL, state TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, opening_quantity REAL NOT NULL, current_quantity REAL NOT NULL, average_entry_price REAL, source TEXT NOT NULL, management_state_archive TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL",
+    # Prospective FIFO accounting.  Historical basis is never inferred: coverage
+    # and confidence are recorded independently in pnl_ledger_status.
+    "position_lots": "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, position_lifecycle_id TEXT, source_fill_event_key TEXT NOT NULL UNIQUE, opened_at TEXT NOT NULL, original_quantity REAL NOT NULL CHECK(original_quantity>0), remaining_quantity REAL NOT NULL CHECK(remaining_quantity>=0), unit_cost REAL NOT NULL CHECK(unit_cost>=0), fees_allocated REAL NOT NULL DEFAULT 0 CHECK(fees_allocated>=0), source TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, closed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL",
+    "realized_pnl_events": "id TEXT PRIMARY KEY, broker_event_key TEXT NOT NULL UNIQUE, intent_id TEXT, symbol TEXT NOT NULL, side TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity>0), gross_proceeds REAL, cost_basis REAL, fees REAL NOT NULL DEFAULT 0, adjustments REAL NOT NULL DEFAULT 0, realized_pl REAL, remaining_position_quantity REAL, occurred_at TEXT NOT NULL, trading_day TEXT NOT NULL, trading_week TEXT NOT NULL, accounting_timezone TEXT NOT NULL, source TEXT NOT NULL, provenance TEXT NOT NULL, confidence TEXT NOT NULL, created_at TEXT NOT NULL",
+    "pnl_ledger_status": "scope TEXT PRIMARY KEY, effective_from TEXT, confidence TEXT NOT NULL, provenance TEXT NOT NULL, last_event_at TEXT, updated_at TEXT NOT NULL",
     "health_heartbeats": "component TEXT PRIMARY KEY, state TEXT NOT NULL, attempted_at TEXT, completed_at TEXT, successful_at TEXT, blocked_reason TEXT, detail TEXT, commit_sha TEXT, updated_at TEXT NOT NULL",
     "positions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, qty REAL, market_value REAL, unrealized_pl REAL, payload TEXT, created_at TEXT",
     "cash_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, equity REAL, cash REAL, settled_cash REAL, realized_pl REAL, unrealized_pl REAL, created_at TEXT",
@@ -126,6 +131,16 @@ class Storage:
         with self.connect() as conn:
             for table, columns in TABLE_DEFINITIONS.items():
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({columns})')
+            # Establish a prospective accounting boundary once.  Coverage before
+            # this instant remains unavailable; repeated startup never advances it.
+            now = iso_now()
+            conn.execute(
+                """INSERT OR IGNORE INTO pnl_ledger_status(
+                       scope,effective_from,confidence,provenance,updated_at)
+                   VALUES('prospective',?,'verified',
+                          'prospective Phase 0 FIFO ledger; pre-boundary history unavailable',?)""",
+                (now, now),
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON trade_proposals(status, expires_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_proposal ON risk_checks(proposal_id)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id)")
@@ -136,6 +151,9 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_reconciliation_intent ON reconciliation_attempts(intent_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_approval_workflows_state ON approval_workflows(state, updated_at)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_position_lifecycle_one_active ON position_lifecycles(symbol) WHERE state='active'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_position_lots_fifo ON position_lots(symbol,opened_at,id) WHERE remaining_quantity>0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_realized_pnl_day ON realized_pnl_events(trading_day,confidence)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_realized_pnl_week ON realized_pnl_events(trading_week,confidence)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_symbols(tier, executable, observation_only)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_symbol ON symbol_research_scores(symbol, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_research_candidate_briefs_symbol ON research_candidate_briefs(symbol, created_at)")
@@ -409,6 +427,42 @@ class Storage:
                     "fill_notification_status": "TEXT",
                     "fill_notification_error": "TEXT",
                 },
+            )
+            add_missing_columns(
+                "approval_workflows",
+                {
+                    "logical_workflow_key": "TEXT",
+                    "validation_status": "TEXT",
+                    "safe_detail": "TEXT",
+                    "claim_owner": "TEXT",
+                    "claim_until": "TEXT",
+                    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                    "last_error_category": "TEXT",
+                    "update_processed_at": "TEXT",
+                },
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_workflows_logical_key "
+                "ON approval_workflows(logical_workflow_key) WHERE logical_workflow_key IS NOT NULL"
+            )
+            # Legacy consumed approvals predate durable intents. They cannot be
+            # safely replayed, but they must never remain invisible. The
+            # deterministic backfill is additive, idempotent, and explicitly
+            # routes them to operator review without broker communication.
+            conn.execute(
+                """INSERT OR IGNORE INTO approval_workflows(
+                       id,approval_id,proposal_id,logical_workflow_key,state,
+                       validation_status,safe_detail,created_at,updated_at,terminal_at,
+                       manual_review_reason,version)
+                   SELECT 'historical-' || a.id,a.id,a.proposal_id,'approval:' || a.id,
+                          'manual_review','historical_ambiguity',
+                          'legacy consumed approval has no durable order intent',
+                          COALESCE(a.consumed_at,a.created_at,?),?, ?,
+                          'legacy consumed approval requires operator review; automatic submission forbidden',0
+                   FROM approvals a
+                   LEFT JOIN order_intents i ON i.approval_id=a.id
+                   WHERE a.consumed_at IS NOT NULL AND a.proposal_id IS NOT NULL AND i.id IS NULL""",
+                (now, now, now),
             )
             add_missing_columns("position_management_state", {"position_lifecycle_id": "TEXT"})
             add_missing_columns("position_management_decisions", {"position_lifecycle_id": "TEXT"})

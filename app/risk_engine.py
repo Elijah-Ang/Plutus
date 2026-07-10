@@ -273,10 +273,33 @@ class RiskEngine:
                     check("approved_universe", False, "symbol not found in static or dynamic paper-tradable profiles")
         daily_loss = context.get("daily_loss")
         weekly_loss = context.get("weekly_loss")
-        check("daily_loss_known", isinstance(daily_loss, (int, float)), "daily loss must come from an authoritative source")
-        check("weekly_loss_known", isinstance(weekly_loss, (int, float)), "weekly loss must come from an authoritative source")
-        check("daily_loss", isinstance(daily_loss, (int, float)) and float(daily_loss) < self.risk.get("stop_if_daily_loss_exceeds", 5), "daily loss limit")
-        check("weekly_loss", isinstance(weekly_loss, (int, float)) and float(weekly_loss) < self.risk.get("stop_if_weekly_loss_exceeds", 10), "weekly loss limit")
+        daily_status = context.get("daily_realized_pl_status")
+        weekly_status = context.get("weekly_realized_pl_status")
+        daily_realized = context.get("daily_realized_pl")
+        weekly_realized = context.get("weekly_realized_pl")
+        if daily_status == "verified" and isinstance(daily_realized, (int, float)):
+            ledger_loss = max(0.0, -float(daily_realized))
+            daily_loss = max(float(daily_loss), ledger_loss) if isinstance(daily_loss, (int, float)) else ledger_loss
+        if weekly_status == "verified" and isinstance(weekly_realized, (int, float)):
+            ledger_loss = max(0.0, -float(weekly_realized))
+            weekly_loss = max(float(weekly_loss), ledger_loss) if isinstance(weekly_loss, (int, float)) else ledger_loss
+        daily_known = isinstance(daily_loss, (int, float))
+        weekly_known = isinstance(weekly_loss, (int, float))
+        # The prospective lot ledger is preferred. Existing absolute account-loss
+        # metrics are a conservative fallback only when marked reliable (numeric
+        # legacy contexts remain authoritative for backward compatibility).
+        reliable_absolute = context.get("absolute_loss_control_reliable", daily_known and weekly_known) is True
+        realized_verified = daily_status == "verified" and weekly_status == "verified"
+        loss_information_safe = realized_verified or (reliable_absolute and daily_known and weekly_known)
+        check(
+            "realized_loss_information",
+            not is_entry or loss_information_safe,
+            "verified realized loss or a reliable stricter absolute loss control is required for new entries",
+        )
+        check("daily_loss_known", not is_entry or daily_known, "daily loss must come from an authoritative source")
+        check("weekly_loss_known", not is_entry or weekly_known, "weekly loss must come from an authoritative source")
+        check("daily_loss", not is_entry or (daily_known and float(daily_loss) < self.risk.get("stop_if_daily_loss_exceeds", 5)), "daily loss limit")
+        check("weekly_loss", not is_entry or (weekly_known and float(weekly_loss) < self.risk.get("stop_if_weekly_loss_exceeds", 10)), "weekly loss limit")
 
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))

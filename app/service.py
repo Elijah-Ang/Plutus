@@ -22,12 +22,18 @@ logger = logging.getLogger("trading_agent")
 SGT = ZoneInfo("Asia/Singapore")
 
 from .approval_parser import parse_approval
+from .approval_workflow import (
+    ApprovalWorkflowConflict,
+    ApprovalWorkflowState,
+    ApprovalWorkflowStore,
+)
 from .data_providers.eodhd import EODHDProvider
 from .dynamic_universe import DynamicUniverseEngine, OBSERVATION, PAPER_TRADABLE, RESEARCH_CANDIDATE
 from .execution import Executor, ExecutionResult
 from .execution import DurableExecutionStore
 from .health import HealthMonitor, record_heartbeat
 from .internet import internet_available
+from .lot_ledger import LotLedger
 from .market_data import normalize_bars
 from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
@@ -151,9 +157,82 @@ class TradingService:
     def _recover_local_workflows(self) -> dict[str, int]:
         """Idempotently surface unfinished local work without submitting orders."""
         recovery = DurableExecutionStore(self.storage).recovery_sweep()
+
+        def load_local_proposal(proposal_id: str) -> dict[str, Any] | None:
+            rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
+            if not rows:
+                return None
+            row = rows[0]
+            try:
+                payload = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            return {**payload, **row, "proposal_id": proposal_id, "source_id": proposal_id, "trading_mode": "paper"}
+
+        def recover_validation(workflow: dict[str, Any], proposal: dict[str, Any] | None):
+            if proposal is None:
+                return "manual_review", None, "proposal record unavailable during restart recovery"
+            expires = _dt(proposal.get("expires_at"))
+            if str(proposal.get("status")) in {"expired", "rejected", "superseded"} or (expires and expires <= datetime.now(UTC)):
+                return "blocked", None, "proposal expired or became ineligible before recovery"
+            # A crash before final validation lacks a fresh broker/account proof.
+            # Surface it explicitly instead of silently reviving or stranding it.
+            return "manual_review", None, "fresh final broker validation cannot be reconstructed automatically"
+
+        def recover_submission(workflow: dict[str, Any], intent: dict[str, Any]) -> str:
+            if self.broker is None:
+                return "unknown"
+            proposal = load_local_proposal(workflow["proposal_id"])
+            if proposal is None:
+                return "terminal"
+            executable = {
+                **proposal,
+                "status": "approved",
+                "symbol": intent["symbol"],
+                "side": intent["side"],
+                "action": intent["intended_action"],
+                "qty": float(intent["requested_quantity"]),
+                "notional": intent.get("requested_notional"),
+                "latest_price": float(intent["reference_price"]),
+                "stop_price": intent.get("intended_stop_price"),
+                "trading_mode": "paper",
+            }
+            context = self._portfolio_context(executable, approval_valid=True)
+            result = Executor(self.broker, self._risk_engine(intent.get("proposal_id"), "recovery_final"), self.storage, self.run_id).execute(
+                executable,
+                context,
+                source_type=str(intent.get("source_type") or "telegram"),
+                approval_id=str(workflow["approval_id"]),
+            )
+            if result.status == "unknown":
+                return "unknown"
+            return "submitted" if result.submitted else "terminal"
+
+        def recover_lookup(_workflow: dict[str, Any], intent: dict[str, Any] | None) -> str:
+            if self.broker is None or intent is None:
+                return "unknown"
+            BrokerReconciler(self.broker, self.storage, self.run_id).reconcile()
+            current = DurableExecutionStore(self.storage).get_intent(intent["id"])
+            if current["state"] in {"submitted", "partially_filled", "cancel_pending"}:
+                return "submitted"
+            if current["state"] in {"filled", "cancelled", "rejected", "expired"}:
+                return "terminal"
+            return "unknown"
+
+        local_recovery = ApprovalWorkflowStore(self.storage).recover(
+            owner_token=f"service:{self.run_id}:{uuid.uuid4()}",
+            proposal_loader=load_local_proposal,
+            run_id=self.run_id,
+            validator=recover_validation,
+            submitter=recover_submission,
+            lookup_reconciler=recover_lookup,
+            max_items=100,
+        )
         consumed_without_intent = self.storage.fetch_all(
-            """SELECT a.id,a.proposal_id FROM approvals a LEFT JOIN order_intents i ON i.approval_id=a.id
-               WHERE a.consumed_at IS NOT NULL AND i.id IS NULL"""
+            """SELECT a.id,a.proposal_id FROM approvals a
+               LEFT JOIN order_intents i ON i.approval_id=a.id
+               LEFT JOIN approval_workflows w ON w.approval_id=a.id
+               WHERE a.consumed_at IS NOT NULL AND i.id IS NULL AND w.id IS NULL"""
         )
         now = iso_now()
         for row in consumed_without_intent:
@@ -168,13 +247,24 @@ class TradingService:
                 (str(uuid.uuid4()), row["id"], row["proposal_id"], "manual_review", now, now, "consumed approval has no durable order intent"),
             )
         received_updates = int(self.storage.fetch_all("SELECT COUNT(*) n FROM telegram_updates WHERE processing_state='received'")[0]["n"])
+        incomplete_approval_workflows = int(
+            self.storage.fetch_all(
+                """SELECT COUNT(*) n FROM approval_workflows
+                   WHERE intent_id IS NULL AND state NOT IN ('blocked','terminal','manual_review')"""
+            )[0]["n"]
+        )
         detail = {
             "received_unprocessed_updates": received_updates,
+            "incomplete_approval_workflows": incomplete_approval_workflows,
             "approvals_without_intents": recovery.approvals_without_intents,
             "intents_awaiting_submission": recovery.intents_awaiting_submission,
             "intents_awaiting_reconciliation": recovery.intents_awaiting_reconciliation,
             "stale_submitted": recovery.stale_submitted,
             "terminal_with_reservations": recovery.terminal_with_reservations,
+            "approval_intents_created": local_recovery.intent_created,
+            "approval_existing_intents_linked": local_recovery.existing_intent_linked,
+            "approval_external_ambiguity": local_recovery.external_ambiguity,
+            "approval_recovery_retryable_failures": local_recovery.failed_retryable,
         }
         state = "degraded" if any(detail.values()) else "healthy"
         self.storage.execute(
@@ -1066,6 +1156,7 @@ class TradingService:
         reservation_snapshot = DurableExecutionStore(self.storage).active_reservations()
         active_reserved_notional = float(reservation_snapshot["active_reserved_notional"])
         active_reserved_stop_risk = float(reservation_snapshot["active_reserved_stop_risk"])
+        canonical_risk = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(positions, account)
         reserved_pct = (active_reserved_notional / equity) * 100 if equity > 0 else float("inf")
 
         # Proposal notional
@@ -1126,6 +1217,7 @@ class TradingService:
             except Exception:
                 pass
 
+        realized = LotLedger(self.storage).summary()
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -1140,6 +1232,13 @@ class TradingService:
             "uses_margin": state["uses_margin"],
             "daily_loss": state["daily_loss"],
             "weekly_loss": state["weekly_loss"],
+            "daily_realized_pl": realized.daily_realized_pl,
+            "weekly_realized_pl": realized.weekly_realized_pl,
+            "daily_realized_pl_status": realized.daily_confidence,
+            "weekly_realized_pl_status": realized.weekly_confidence,
+            # Broker account equity-loss metrics are an existing conservative
+            # control whenever both authoritative values are available.
+            "absolute_loss_control_reliable": isinstance(state["daily_loss"], (int, float)) and isinstance(state["weekly_loss"], (int, float)),
             "buying_power": max(0.0, float(_value(account, "buying_power", 0) or 0) - active_reserved_notional) if account is not None else None,
             "approval_valid": approval_valid,
 
@@ -1160,6 +1259,7 @@ class TradingService:
             "cash": snapshot["cash"],
             "active_reserved_exposure": active_reserved_notional,
             "active_reserved_stop_risk": active_reserved_stop_risk,
+            "held_open_stop_risk": canonical_risk.held_open_stop_risk,
             "unresolved_unknown_order_exposure": sum(
                 float(row.get("active_notional") or 0)
                 for row in self.storage.fetch_all(
@@ -1653,11 +1753,35 @@ class TradingService:
             approval_id = str(uuid.uuid4())
             ack_status = "rejected" if parsed.action == "reject" else "received"
             approval_received_at = iso_now()
-
-            self.storage.execute(
-                "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "accepted" if parsed.accepted else "rejected", iso_now(), str(reply_to_message_id) if reply_to_message_id is not None else None, targeting_method, ack_status, approval_received_at),
-            )
+            workflow_store = ApprovalWorkflowStore(self.storage)
+            approval_workflow = None
+            if parsed.accepted and parsed.proposal_id:
+                try:
+                    approval_workflow = workflow_store.accept_approval(
+                        approval_id=approval_id,
+                        run_id=self.run_id,
+                        proposal_id=str(parsed.proposal_id),
+                        sender_id=sender,
+                        raw_message=text,
+                        parsed_action=parsed.action,
+                        telegram_update_id=int(update_id) if update_id is not None else None,
+                        reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
+                        targeting_method=targeting_method,
+                        acknowledgement_status=ack_status,
+                        approval_received_at=approval_received_at,
+                    )
+                    # Duplicate delivery reuses the original stable approval and
+                    # workflow identity; never continue with the newly generated
+                    # transient UUID.
+                    approval_id = str(approval_workflow["approval_id"])
+                except ApprovalWorkflowConflict:
+                    self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
+                    continue
+            else:
+                self.storage.execute(
+                    "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (approval_id, self.run_id, parsed.proposal_id, sender, text, parsed.action, int(self.telegram.is_authorized(sender)), "rejected", iso_now(), str(reply_to_message_id) if reply_to_message_id is not None else None, targeting_method, ack_status, approval_received_at),
+                )
 
             if not parsed.accepted or not parsed.proposal_id:
                 if parsed.reason == "proposal expired" and parsed.proposal_id:
@@ -1683,8 +1807,17 @@ class TradingService:
                 continue
 
             row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (parsed.proposal_id,))[0]
+            if approval_workflow is None:
+                raise RuntimeError("accepted approval is missing its durable workflow")
             prop_symbol = row.get("symbol", "")
             prop_side = row.get("side", "").lower()
+            if parsed.action == "approve":
+                approval_workflow = workflow_store.transition(
+                    approval_workflow["id"],
+                    ApprovalWorkflowState.VALIDATING,
+                    expected_state=ApprovalWorkflowState.TARGET_RESOLVED,
+                    safe_detail="final local validation started",
+                )
             if parsed.action == "approve" and row.get("emergency_exit_triggered") != 1:
                 proposal_for_sleep_check = {**json.loads(row.get("payload") or "{}"), **row}
                 if self._sleep_mode_blocks_approval(proposal_for_sleep_check):
@@ -1696,9 +1829,19 @@ class TradingService:
                         "UPDATE approvals SET status=?, acknowledgement_status='blocked', acknowledgement_sent_at=?, acknowledgement_delay_seconds=?, final_order_decision='blocked', final_block_reason=? WHERE id=?",
                         (f"sleep_blocked_{approval_id[:8]}", ack_sent, delay_sec, "sleep mode is active", approval_id),
                     )
+                    workflow_store.transition(
+                        approval_workflow["id"],
+                        ApprovalWorkflowState.BLOCKED,
+                        safe_detail="sleep mode blocked approval before intent creation",
+                    )
                     continue
 
             if parsed.action == "reject":
+                workflow_store.transition(
+                    approval_workflow["id"],
+                    ApprovalWorkflowState.BLOCKED,
+                    safe_detail="operator rejected proposal; no intent permitted",
+                )
                 if row.get("emergency_exit_triggered") == 1:
                     self.storage.execute("UPDATE trade_proposals SET status='rejected', emergency_exit_final_decision='cancelled', emergency_exit_user_response='no' WHERE id=? AND status='pending'", (parsed.proposal_id,))
                     self.telegram.send_message(f"❌ Received: NO for {prop_symbol} emergency paper sell proposal. Emergency exit cancelled.")
@@ -1725,9 +1868,19 @@ class TradingService:
                 self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
 
                 if self._check_stale_listener_block(prop_symbol, approval_id):
+                    workflow_store.transition(
+                        approval_workflow["id"],
+                        ApprovalWorkflowState.BLOCKED,
+                        safe_detail="listener freshness check blocked approval",
+                    )
                     continue
 
                 if not self.storage.consume_approval(parsed.proposal_id, approval_id):
+                    workflow_store.transition(
+                        approval_workflow["id"],
+                        ApprovalWorkflowState.BLOCKED,
+                        safe_detail="proposal approval was already consumed",
+                    )
                     self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                     continue
 
@@ -1736,10 +1889,21 @@ class TradingService:
                 proposal = {**json.loads(row.get("payload") or "{}"), **row}
                 success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
                 if success:
+                    workflow = workflow_store.get(approval_workflow["id"])
+                    if workflow["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+                        workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+                        workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+                        workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
                     self.storage.execute("UPDATE trade_proposals SET status='approved', emergency_exit_final_decision='submitted', emergency_exit_user_response='yes' WHERE id=?", (parsed.proposal_id,))
                     self.telegram.send_message(f"✅ Paper order submitted: Sell {prop_symbol} for {proposal.get('qty', 0)} shares. Mode: paper only.")
                     self.storage.audit(self.run_id, "emergency_exit_submitted", {"symbol": prop_symbol, "score": row.get("emergency_exit_score")})
                 else:
+                    workflow = workflow_store.get(approval_workflow["id"])
+                    workflow_state = ApprovalWorkflowState(workflow["state"])
+                    if workflow_state == ApprovalWorkflowState.INTENT_CREATED:
+                        workflow_store.transition(workflow["id"], ApprovalWorkflowState.UNKNOWN, safe_detail=err_reason)
+                    elif workflow_state == ApprovalWorkflowState.VALIDATING:
+                        workflow_store.transition(workflow["id"], ApprovalWorkflowState.BLOCKED, safe_detail=err_reason)
                     self.storage.execute("UPDATE trade_proposals SET status='blocked', emergency_exit_block_reason=?, emergency_exit_user_response='yes' WHERE id=?", (err_reason, parsed.proposal_id))
                     self.telegram.send_message(f"⚠️ Emergency exit was blocked. Reason: {err_reason}. No order was placed.")
                     self.storage.audit(self.run_id, "emergency_exit_blocked", {"symbol": prop_symbol, "reason": err_reason})
@@ -1752,9 +1916,19 @@ class TradingService:
             self.storage.execute("UPDATE approvals SET acknowledgement_sent_at=?, acknowledgement_delay_seconds=? WHERE id=?", (ack_sent, delay_sec, approval_id))
 
             if self._check_stale_listener_block(prop_symbol, approval_id):
+                workflow_store.transition(
+                    approval_workflow["id"],
+                    ApprovalWorkflowState.BLOCKED,
+                    safe_detail="listener freshness check blocked approval",
+                )
                 continue
 
             if not self.storage.consume_approval(parsed.proposal_id, approval_id):
+                workflow_store.transition(
+                    approval_workflow["id"],
+                    ApprovalWorkflowState.BLOCKED,
+                    safe_detail="proposal approval was already consumed",
+                )
                 self.telegram.send_message("I did not take any action because this proposal was already handled earlier.")
                 continue
 
@@ -1792,6 +1966,11 @@ class TradingService:
                 self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
 
             if result.submitted:
+                workflow = workflow_store.get(approval_workflow["id"])
+                if workflow["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
                 self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
                 self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (parsed.proposal_id,))
                 self._mark_position_management_proposal_handled(proposal, "submitted")
@@ -1821,6 +2000,21 @@ class TradingService:
                 continue
             else:
                 decision_status = "unknown" if result.status == "unknown" else "blocked"
+                workflow = workflow_store.get(approval_workflow["id"])
+                workflow_state = ApprovalWorkflowState(workflow["state"])
+                if decision_status == "unknown" and workflow_state == ApprovalWorkflowState.INTENT_CREATED:
+                    workflow_store.transition(
+                        workflow["id"],
+                        ApprovalWorkflowState.UNKNOWN,
+                        safe_detail="broker submission outcome is ambiguous; reconciliation only",
+                    )
+                elif decision_status == "blocked" and workflow_state == ApprovalWorkflowState.VALIDATING:
+                    workflow_store.transition(
+                        workflow["id"],
+                        ApprovalWorkflowState.BLOCKED,
+                        validation_status="blocked",
+                        safe_detail=result.reason,
+                    )
                 self.storage.execute("UPDATE approvals SET acknowledgement_status=? WHERE id=?", (decision_status, approval_id))
                 self.storage.execute("UPDATE trade_proposals SET status=? WHERE id=?", (decision_status, parsed.proposal_id))
                 
@@ -1837,11 +2031,29 @@ class TradingService:
         self.notify_expired_proposals()
         self._expire_pending_batches(notify=True)
         durable_ids = {int(value) for value in processed_update_ids if value is not None}
-        self.storage.complete_telegram_updates(durable_ids)
-        if max_id > 0:
-            self.storage.set_control_state("telegram_last_processed_update_id", str(max_id), "system", "telegram", f"processed_{max_id}", max_id, None, None)
-        if max_id > 0:
-            self.telegram.get_updates(offset=max_id + 1, timeout=0)
+        direct_ids: set[int] = set()
+        workflow_store = ApprovalWorkflowStore(self.storage)
+        for durable_id in durable_ids:
+            workflows = self.storage.fetch_all(
+                "SELECT id FROM approval_workflows WHERE telegram_update_id=?", (durable_id,)
+            )
+            if workflows:
+                try:
+                    workflow_store.mark_update_processed(workflows[0]["id"])
+                except ApprovalWorkflowConflict:
+                    # Business state is not durable yet. Leave the inbox row and
+                    # cursor unchanged so restart recovery cannot hide the update.
+                    continue
+            else:
+                direct_ids.add(durable_id)
+        self.storage.complete_telegram_updates(direct_ids)
+        remaining = self.storage.fetch_all(
+            "SELECT MIN(update_id) first_unprocessed FROM telegram_updates WHERE processing_state!='processed'"
+        )[0]["first_unprocessed"]
+        cursor_id = min(max_id, int(remaining) - 1) if max_id > 0 and remaining is not None else max_id
+        if cursor_id > 0:
+            self.storage.set_control_state("telegram_last_processed_update_id", str(cursor_id), "system", "telegram", f"processed_{cursor_id}", cursor_id, None, None)
+            self.telegram.get_updates(offset=cursor_id + 1, timeout=0)
 
         self._process_sleep_mode_emergency_timeouts()
         record_heartbeat(
@@ -2194,18 +2406,38 @@ class TradingService:
 
         approval_id = str(uuid.uuid4())
         approval_received_at = iso_now()
-        self.storage.execute(
-            "INSERT INTO approvals(id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                approval_id, self.run_id, proposal_id, sender, raw_text, "approve", 1, "accepted", iso_now(),
-                str(batch_row.get("telegram_message_id") or "") or None, "batch", "received", approval_received_at
-            ),
+        workflow_store = ApprovalWorkflowStore(self.storage)
+        approval_workflow = workflow_store.accept_approval(
+            approval_id=approval_id,
+            run_id=self.run_id,
+            proposal_id=proposal_id,
+            sender_id=sender,
+            raw_message=raw_text,
+            parsed_action="approve",
+            telegram_update_id=None,
+            reply_to_message_id=str(batch_row.get("telegram_message_id") or "") or None,
+            targeting_method="batch",
+            acknowledgement_status="received",
+            approval_received_at=approval_received_at,
+        )
+        approval_id = str(approval_workflow["approval_id"])
+        approval_workflow = workflow_store.transition(
+            approval_workflow["id"],
+            ApprovalWorkflowState.VALIDATING,
+            expected_state=ApprovalWorkflowState.TARGET_RESOLVED,
+            safe_detail="batch candidate final local validation started",
         )
 
         if self._check_stale_listener_block(row.get("symbol", ""), approval_id):
+            workflow_store.transition(
+                approval_workflow["id"], ApprovalWorkflowState.BLOCKED, safe_detail="listener freshness check blocked approval"
+            )
             return False, "listener_stale_code_blocked_approval", "listener is running stale code"
 
         if not self.storage.consume_approval(proposal_id, approval_id):
+            workflow_store.transition(
+                approval_workflow["id"], ApprovalWorkflowState.BLOCKED, safe_detail="proposal approval was already consumed"
+            )
             self.telegram.send_message("I did not take any action because this candidate was already handled earlier.")
             return False, "already_handled", "candidate already handled"
 
@@ -2234,6 +2466,11 @@ class TradingService:
             self.storage.link_executed_order_records(result.intent_id)
             self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
         if result.submitted:
+            workflow = workflow_store.get(approval_workflow["id"])
+            if workflow["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+                workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+                workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+                workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
             self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
             self._mark_position_management_proposal_handled(proposal, "submitted")
@@ -2257,6 +2494,19 @@ class TradingService:
             return True, "submitted", None
 
         decision_status = "unknown" if result.status == "unknown" else "blocked"
+        workflow = workflow_store.get(approval_workflow["id"])
+        workflow_state = ApprovalWorkflowState(workflow["state"])
+        if decision_status == "unknown" and workflow_state == ApprovalWorkflowState.INTENT_CREATED:
+            workflow_store.transition(
+                workflow["id"], ApprovalWorkflowState.UNKNOWN, safe_detail="broker submission outcome is ambiguous; reconciliation only"
+            )
+        elif decision_status == "blocked" and workflow_state in {
+            ApprovalWorkflowState.VALIDATING,
+            ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+        }:
+            workflow_store.transition(
+                workflow["id"], ApprovalWorkflowState.BLOCKED, validation_status="blocked", safe_detail=result.reason
+            )
         self.storage.execute("UPDATE approvals SET acknowledgement_status=? WHERE id=?", (decision_status, approval_id))
         self.storage.execute("UPDATE trade_proposals SET status=? WHERE id=?", (decision_status, proposal_id))
         
@@ -2496,7 +2746,7 @@ class TradingService:
 
         existing_orders = self.storage.fetch_all(
             """SELECT id FROM order_intents WHERE symbol=? AND side='sell'
-               AND state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required','filled')""",
+               AND state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')""",
             (symbol,),
         )
         if existing_orders:

@@ -212,6 +212,7 @@ class BrokerReconciler:
                 broker_event_key=event_key,
                 broker_order_id=broker_order_id,
                 occurred_at=str(_value(remote, "filled_at", iso_now())),
+                price_is_cumulative_average=True,
             )
             if float(updated.get("filled_quantity") or 0) > before:
                 outcome["fills_upserted"] = 1
@@ -220,7 +221,21 @@ class BrokerReconciler:
             self._maybe_notify_fill(intent, updated["state"], float(updated["filled_quantity"]), float(updated.get("average_fill_price") or fill_price))
             target = OrderState(updated["state"])
         elif OrderState(intent["state"]) != target:
-            self.intent_store.transition(intent["id"], target, event_type="broker_status_reconciled", broker_order_id=broker_order_id)
+            # Broker REST snapshots and stream events may arrive out of order. A
+            # later observation of "submitted" must never regress a local partial
+            # fill, terminal state, or cancellation-in-progress. Persist the
+            # observation for audit and leave the monotonic local state intact.
+            current = OrderState(intent["state"])
+            if current in {OrderState.PARTIALLY_FILLED, OrderState.CANCEL_PENDING} and target == OrderState.SUBMITTED:
+                self._record_attempt(
+                    intent["id"],
+                    lookup_type,
+                    "stale_status_ignored",
+                    remote_status,
+                    {"retained_state": current.value},
+                )
+            else:
+                self.intent_store.transition(intent["id"], target, event_type="broker_status_reconciled", broker_order_id=broker_order_id)
 
         self._update_proposal_projection(intent, target)
         outcome["updated"] = 1

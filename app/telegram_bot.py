@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
@@ -12,8 +11,8 @@ from .utils import get_secret
 class TelegramBot:
     def __init__(self, token: str | None = None, chat_id: str | None = None, allowed_user_id: str | None = None, timeout: int = 15) -> None:
         self.token = token or get_secret("TELEGRAM_BOT_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        self.allowed_user_id = allowed_user_id or os.getenv("TELEGRAM_ALLOWED_USER_ID")
+        self.chat_id = chat_id or get_secret("TELEGRAM_CHAT_ID")
+        self.allowed_user_id = allowed_user_id or get_secret("TELEGRAM_ALLOWED_USER_ID")
         self.timeout = timeout
         if not self.token:
             raise RuntimeError("Telegram token is not configured")

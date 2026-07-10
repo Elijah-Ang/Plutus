@@ -152,7 +152,7 @@ def stable_client_order_id(action_key: str) -> str:
 
 def broker_status_to_state(status: Any, filled_quantity: float = 0.0) -> OrderState | None:
     normalized = str(getattr(status, "value", status) or "").lower().replace("-", "_")
-    if normalized in {"new", "accepted", "pending_new", "accepted_for_bidding", "stopped", "suspended"}:
+    if normalized in {"new", "accepted", "submitted", "pending_new", "accepted_for_bidding", "stopped", "suspended"}:
         return OrderState.SUBMITTED
     if normalized in {"filled", "fill"}:
         return OrderState.FILLED

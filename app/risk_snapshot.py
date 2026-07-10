@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from typing import Any
 
 from .execution import DurableExecutionStore
+from .lot_ledger import ACCOUNTING_TIMEZONE, LotLedger
 from .utils import iso_now, json_dumps
 
 
@@ -42,6 +43,9 @@ class CanonicalRiskSnapshot:
     symbol_exposure: dict[str, float]
     cluster_exposure: dict[str, float]
     unavailable: tuple[str, ...]
+    daily_realized_pl_status: str = "unavailable"
+    weekly_realized_pl_status: str = "unavailable"
+    realized_pl_timezone: str = ACCOUNTING_TIMEZONE
 
 
 class RiskSnapshotBuilder:
@@ -99,10 +103,15 @@ class RiskSnapshotBuilder:
         if held_stop is None:
             unavailable.append("held_open_stop_risk")
 
-        # The repository does not yet have a complete lot-cost ledger covering all
-        # historical manual/broker activity. Report realized metrics unavailable
-        # instead of fabricating zero; legacy absolute equity-loss controls remain active.
-        unavailable.extend(["daily_realized_pl", "daily_realized_loss_pct", "weekly_realized_pl", "weekly_realized_loss_pct"])
+        realized = LotLedger(self.storage).summary()
+        daily_pl = realized.daily_realized_pl
+        weekly_pl = realized.weekly_realized_pl
+        daily_loss_pct = (max(0.0, -daily_pl) / equity * 100) if daily_pl is not None and equity else None
+        weekly_loss_pct = (max(0.0, -weekly_pl) / equity * 100) if weekly_pl is not None and equity else None
+        if daily_pl is None:
+            unavailable.extend(["daily_realized_pl", "daily_realized_loss_pct"])
+        if weekly_pl is None:
+            unavailable.extend(["weekly_realized_pl", "weekly_realized_loss_pct"])
         return CanonicalRiskSnapshot(
             calculated_at=iso_now(), source_at=source_at, source_status="degraded" if unavailable else "healthy",
             portfolio_equity=equity, filled_gross_exposure=gross if exposures_known else None,
@@ -110,9 +119,12 @@ class RiskSnapshotBuilder:
             projected_gross_exposure=(gross + reserved) if exposures_known else None,
             held_open_stop_risk=held_stop, active_reserved_stop_risk=reserved_stop,
             projected_total_open_risk=(held_stop + reserved_stop) if held_stop is not None else None,
-            daily_realized_pl=None, daily_realized_loss_pct=None, weekly_realized_pl=None, weekly_realized_loss_pct=None,
+            daily_realized_pl=daily_pl, daily_realized_loss_pct=daily_loss_pct,
+            weekly_realized_pl=weekly_pl, weekly_realized_loss_pct=weekly_loss_pct,
             unresolved_unknown_exposure=unknown, buying_power=buying_power, cash=cash,
             symbol_exposure=symbol_exposure, cluster_exposure=cluster_exposure, unavailable=tuple(sorted(set(unavailable))),
+            daily_realized_pl_status=realized.daily_confidence,
+            weekly_realized_pl_status=realized.weekly_confidence,
         )
 
     def persist(self, run_id: str, snapshot: CanonicalRiskSnapshot) -> str:
@@ -133,7 +145,16 @@ class RiskSnapshotBuilder:
                 snapshot.daily_realized_loss_pct, snapshot.weekly_realized_pl, snapshot.weekly_realized_loss_pct,
                 snapshot.unresolved_unknown_exposure, snapshot.buying_power, snapshot.cash,
                 json_dumps(snapshot.symbol_exposure), json_dumps(snapshot.cluster_exposure),
-                json_dumps({"unavailable": snapshot.unavailable, "calculation": "filled_plus_active_reservations"}),
+                json_dumps({
+                    "unavailable": snapshot.unavailable,
+                    "calculation": "filled_plus_active_reservations",
+                    "daily_realized_pl_status": snapshot.daily_realized_pl_status,
+                    "weekly_realized_pl_status": snapshot.weekly_realized_pl_status,
+                    "realized_pl_timezone": snapshot.realized_pl_timezone,
+                    "day_boundary": "00:00 America/New_York",
+                    "week_boundary": "Monday 00:00 America/New_York",
+                    "realized_vs_unrealized": "realized fills only; unrealized excluded",
+                }),
             ),
         )
         return identifier

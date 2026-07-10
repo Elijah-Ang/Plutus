@@ -8,10 +8,13 @@ ERRORS="$ROOT/logs/errors"
 mkdir -p "$RUNTIME" "$ERRORS"
 
 LOCKDIR="$RUNTIME/listener.lockdir"
+CURRENT_COMMIT=$(git rev-parse HEAD 2>/dev/null || print -r -- "unknown")
 RECOVERED=0
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   set +e
-  LOCK_STATE=$("$ROOT/.venv/bin/python" -m app.run_lock "$LOCKDIR" 2>/dev/null)
+  LOCK_STATE=$("$ROOT/.venv/bin/python" -m app.run_lock "$LOCKDIR" \
+    --expected-command "run_telegram_listener.sh" \
+    --expected-repository "$ROOT" --expected-commit "$CURRENT_COMMIT" 2>/dev/null)
   LOCK_RC=$?
   set -e
   if [[ "$LOCK_RC" -ne 10 || "$LOCK_STATE" != "stale" ]]; then
@@ -28,13 +31,12 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   RECOVERED=1
   print -r -- "$(date '+%Y-%m-%dT%H:%M:%S%z') recovered stale listener lock" >> "$RUNTIME/listener.out"
 fi
-print -r -- "$$" > "$LOCKDIR/pid"
-date +%s > "$LOCKDIR/started_at_epoch"
-print -r -- "$ROOT" > "$LOCKDIR/repository_path"
-git rev-parse HEAD > "$LOCKDIR/commit" 2>/dev/null || print -r -- "unknown" > "$LOCKDIR/commit"
+"$ROOT/.venv/bin/python" -m app.run_lock "$LOCKDIR" --write-owner --pid "$$" \
+  --expected-repository "$ROOT" --expected-commit "$CURRENT_COMMIT"
 cleanup_lock() {
   if [[ -f "$LOCKDIR/pid" && "$(<"$LOCKDIR/pid")" == "$$" ]]; then
-    rm -f "$LOCKDIR/pid" "$LOCKDIR/started_at_epoch" "$LOCKDIR/repository_path" "$LOCKDIR/commit"
+    rm -f "$LOCKDIR/pid" "$LOCKDIR/started_at_epoch" "$LOCKDIR/repository_path" "$LOCKDIR/commit" \
+      "$LOCKDIR/command_identity" "$LOCKDIR/process_start_token"
     rmdir "$LOCKDIR" 2>/dev/null || true
   fi
 }

@@ -53,6 +53,14 @@ class DurableExecutionStore:
 
     def __init__(self, storage: Any) -> None:
         self.storage = storage
+        try:
+            rows = storage.fetch_all(
+                "SELECT 1 AS present FROM schema_migrations WHERE version='phase0_execution_integrity_v1' LIMIT 1"
+            )
+        except sqlite3.Error as exc:
+            raise RuntimeError("Phase 0 execution schema is unavailable; run Storage.initialize() before execution") from exc
+        if not rows:
+            raise RuntimeError("Phase 0 execution migration has not completed; broker submission is disabled")
 
     @staticmethod
     def _quantity_and_reference(proposal: dict[str, Any]) -> tuple[float, float, float | None, str, float | None]:
@@ -88,6 +96,13 @@ class DurableExecutionStore:
             raise ValueError("shadow, observation-only and research-only records cannot create order intents")
         if str(proposal.get("trading_mode") or proposal.get("mode") or "paper") != "paper":
             raise PermissionError("durable execution supports paper mode only")
+        expires_at = proposal.get("expires_at")
+        if expires_at:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=UTC)
+            if expiry.astimezone(UTC) <= datetime.now(UTC):
+                raise ValueError("expired approval cannot create an order intent")
         symbol = str(proposal.get("symbol") or "").upper()
         side = str(proposal.get("side") or "").lower()
         if not symbol or side not in {"buy", "sell"}:
@@ -111,6 +126,17 @@ class DurableExecutionStore:
             existing = conn.execute("SELECT * FROM order_intents WHERE logical_action_key=?", (action_key,)).fetchone()
             if existing:
                 return dict(existing)
+            if approval_id:
+                workflow = conn.execute(
+                    "SELECT state,intent_id FROM approval_workflows WHERE approval_id=?",
+                    (approval_id,),
+                ).fetchone()
+                if not workflow:
+                    raise RuntimeError("durable approval workflow is required before intent creation")
+                if workflow["intent_id"]:
+                    raise RuntimeError("approval workflow references an unavailable existing intent")
+                if workflow["state"] != "approved_pending_intent":
+                    raise RuntimeError("approval workflow is not eligible for intent creation")
             conflict = conn.execute(
                 """SELECT id,state FROM order_intents
                    WHERE symbol=? AND side=? AND state IN (?,?,?,?,?,?,?,?) LIMIT 1""",
@@ -129,6 +155,50 @@ class DurableExecutionStore:
             ).fetchone()
             if conflict:
                 raise RuntimeError(f"conflicting active order intent exists: {conflict['state']}")
+            limits = proposal.get("_reservation_limits") or {}
+            if side == "buy" and limits:
+                totals = conn.execute(
+                    """SELECT COALESCE(SUM(active_notional),0) total,
+                              COALESCE(SUM(active_stop_risk),0) stop_risk
+                       FROM risk_reservations WHERE state='active'"""
+                ).fetchone()
+                symbol_total = conn.execute(
+                    "SELECT COALESCE(SUM(active_notional),0) n FROM risk_reservations WHERE state='active' AND symbol=?",
+                    (symbol,),
+                ).fetchone()["n"]
+                cluster_total = 0.0
+                if proposal.get("cluster_name"):
+                    cluster_total = conn.execute(
+                        "SELECT COALESCE(SUM(active_notional),0) n FROM risk_reservations WHERE state='active' AND cluster_name=?",
+                        (proposal["cluster_name"],),
+                    ).fetchone()["n"]
+
+                def enforce(name: str, projected: float, ceiling_key: str) -> None:
+                    ceiling = limits.get(ceiling_key)
+                    if ceiling is not None and projected > float(ceiling) + 1e-9:
+                        raise RuntimeError(f"atomic reservation blocked by {name}")
+
+                enforce(
+                    "total exposure ceiling",
+                    float(limits.get("base_total_notional") or 0) + float(totals["total"]) + reserved_notional,
+                    "total_notional_ceiling",
+                )
+                enforce(
+                    "symbol exposure ceiling",
+                    float(limits.get("base_symbol_notional") or 0) + float(symbol_total) + reserved_notional,
+                    "symbol_notional_ceiling",
+                )
+                enforce(
+                    "cluster exposure ceiling",
+                    float(limits.get("base_cluster_notional") or 0) + float(cluster_total) + reserved_notional,
+                    "cluster_notional_ceiling",
+                )
+                enforce(
+                    "open risk ceiling",
+                    float(limits.get("base_open_risk") or 0) + float(totals["stop_risk"]) + reserved_stop_risk,
+                    "open_risk_ceiling",
+                )
+                enforce("paper buying power", float(totals["total"]) + reserved_notional, "buying_power_ceiling")
             conn.execute(
                 """INSERT INTO order_intents(
                        id,run_id,proposal_id,approval_id,source_id,source_type,logical_action_key,candidate_id,
@@ -228,12 +298,13 @@ class DurableExecutionStore:
                 ),
             )
             if approval_id:
-                conn.execute(
-                    """INSERT INTO approval_workflows(id,approval_id,proposal_id,state,intent_id,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?)
-                       ON CONFLICT(approval_id) DO UPDATE SET intent_id=excluded.intent_id,state='intent_created',updated_at=excluded.updated_at,version=approval_workflows.version+1""",
-                    (str(uuid.uuid4()), approval_id, source_id, "intent_created", intent_id, now, now),
-                )
+                changed = conn.execute(
+                    """UPDATE approval_workflows SET intent_id=?,state='intent_created',updated_at=?,version=version+1
+                       WHERE approval_id=? AND state='approved_pending_intent' AND intent_id IS NULL""",
+                    (intent_id, now, approval_id),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("approval workflow compare-and-swap lost during intent creation")
         return self.get_intent(intent_id)
 
     def get_intent(self, intent_id: str) -> dict[str, Any]:
@@ -326,6 +397,10 @@ class DurableExecutionStore:
         broker_event_key: str,
         broker_order_id: str | None = None,
         occurred_at: str | None = None,
+        fees: float = 0.0,
+        adjustments: float = 0.0,
+        source: str = "broker_fill",
+        price_is_cumulative_average: bool = False,
     ) -> dict[str, Any]:
         cumulative_quantity = float(cumulative_quantity)
         fill_price = float(fill_price)
@@ -343,8 +418,13 @@ class DurableExecutionStore:
             requested = float(intent["requested_quantity"])
             previous = float(intent["filled_quantity"] or 0)
             if cumulative_quantity + 1e-9 < previous:
-                # Persist a deterministic audit event but never reduce filled quantity.
+                # Retain/dedupe the stale broker event but never reduce quantity.
                 counter = int(intent["transition_counter"] or 0) + 1
+                conn.execute(
+                    """INSERT INTO broker_fill_events(id,intent_id,broker_event_key,broker_order_id,cumulative_filled_quantity,
+                           delta_quantity,fill_price,occurred_at,received_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative_quantity, 0.0, fill_price, occurred_at or now, now, json_dumps({"out_of_order": True, "retained_cumulative": previous})),
+                )
                 conn.execute(
                     "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?)",
                     (str(uuid.uuid4()), intent_id, f"{intent_id}:out_of_order_fill:{broker_event_key}", intent["state"], intent["state"], "out_of_order_fill_ignored", json_dumps({"reported": cumulative_quantity, "retained": previous}), now, counter),
@@ -354,16 +434,37 @@ class DurableExecutionStore:
             cumulative = min(cumulative_quantity, requested)
             delta = max(0.0, cumulative - previous)
             prior_avg = float(intent["average_fill_price"] or 0)
-            average = ((previous * prior_avg) + (delta * fill_price)) / cumulative if cumulative > 0 else None
-            target = OrderState.FILLED if cumulative >= requested - 1e-9 else OrderState.PARTIALLY_FILLED
+            delta_fill_price = fill_price
+            if price_is_cumulative_average and delta > 0:
+                delta_fill_price = max(0.0, ((cumulative * fill_price) - (previous * prior_avg)) / delta)
+                average = fill_price
+            else:
+                average = ((previous * prior_avg) + (delta * fill_price)) / cumulative if cumulative > 0 else None
             current = OrderState(intent["state"])
+            late_after_cancel = current == OrderState.CANCELLED and cumulative > previous
+            target = current if late_after_cancel else (OrderState.FILLED if cumulative >= requested - 1e-9 else OrderState.PARTIALLY_FILLED)
             if current != target:
                 validate_transition(current, target)
             counter = int(intent["transition_counter"] or 0) + 1
             conn.execute(
                 """INSERT INTO broker_fill_events(id,intent_id,broker_event_key,broker_order_id,cumulative_filled_quantity,
                        delta_quantity,fill_price,occurred_at,received_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative, delta, fill_price, occurred_at or now, now, json_dumps({"aggregate": True})),
+                (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative, delta, delta_fill_price, occurred_at or now, now, json_dumps({"aggregate": True, "reported_price": fill_price, "price_semantics": "cumulative_average" if price_is_cumulative_average else "delta_execution"})),
+            )
+            # Lot/P&L accounting shares the fill transaction: a crash cannot
+            # commit quantity while omitting its prospective accounting event.
+            from .lot_ledger import LotLedger
+
+            LotLedger.apply_fill_in_transaction(
+                conn,
+                intent=intent,
+                broker_event_key=broker_event_key,
+                delta_quantity=delta,
+                fill_price=delta_fill_price,
+                occurred_at=occurred_at or now,
+                fees=fees,
+                adjustments=adjustments,
+                source=source,
             )
             conn.execute(
                 """UPDATE order_intents SET filled_quantity=?,average_fill_price=?,state=?,broker_order_id=COALESCE(?,broker_order_id),
@@ -371,7 +472,9 @@ class DurableExecutionStore:
                 (cumulative, average, target.value, broker_order_id, now, now if target == OrderState.FILLED else None, counter, intent_id),
             )
             remaining_ratio = max(0.0, requested - cumulative) / requested
-            reservation_state = "released" if target == OrderState.FILLED else "active"
+            reservation_state = "released" if target == OrderState.FILLED or late_after_cancel else "active"
+            if late_after_cancel:
+                remaining_ratio = 0.0
             conn.execute(
                 """UPDATE risk_reservations SET active_notional=initial_notional*?,active_stop_risk=initial_stop_risk*?,
                        state=?,released_at=CASE WHEN ?='released' THEN COALESCE(released_at,?) ELSE released_at END,
@@ -381,7 +484,7 @@ class DurableExecutionStore:
             )
             conn.execute(
                 "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,broker_event_id,filled_quantity,fill_price,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "final_fill" if target == OrderState.FILLED else "partial_fill", broker_event_key, cumulative, fill_price, json_dumps({"delta_quantity": delta}), now, counter),
+                (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "late_fill_after_cancelled" if late_after_cancel else ("final_fill" if target == OrderState.FILLED else "partial_fill"), broker_event_key, cumulative, delta_fill_price, json_dumps({"delta_quantity": delta}), now, counter),
             )
             conn.execute(
                 "UPDATE orders SET broker_order_id=COALESCE(?,broker_order_id),status=?,updated_at=? WHERE id=?",
@@ -427,7 +530,8 @@ class DurableExecutionStore:
         approvals = self.storage.fetch_all(
             """SELECT COUNT(*) AS n FROM approvals a
                LEFT JOIN order_intents i ON i.approval_id=a.id
-               WHERE a.consumed_at IS NOT NULL AND i.id IS NULL"""
+               LEFT JOIN approval_workflows w ON w.approval_id=a.id
+               WHERE a.consumed_at IS NOT NULL AND i.id IS NULL AND w.id IS NULL"""
         )[0]["n"]
         awaiting = self.storage.fetch_all(
             "SELECT COUNT(*) AS n FROM order_intents WHERE state IN ('created','reserved')"
@@ -449,7 +553,7 @@ class DurableExecutionStore:
     def integrity_report(self) -> dict[str, int]:
         checks = {
             "orphaned_approvals": "SELECT COUNT(*) n FROM approvals a LEFT JOIN trade_proposals p ON p.id=a.proposal_id WHERE a.proposal_id IS NOT NULL AND p.id IS NULL",
-            "approvals_without_intents": "SELECT COUNT(*) n FROM approvals a LEFT JOIN order_intents i ON i.approval_id=a.id WHERE a.consumed_at IS NOT NULL AND i.id IS NULL",
+            "approvals_without_intents": "SELECT COUNT(*) n FROM approvals a LEFT JOIN order_intents i ON i.approval_id=a.id LEFT JOIN approval_workflows w ON w.approval_id=a.id WHERE a.consumed_at IS NOT NULL AND i.id IS NULL AND w.id IS NULL",
             "intents_without_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE r.id IS NULL",
             "terminal_intents_with_active_reservations": "SELECT COUNT(*) n FROM order_intents i JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('filled','cancelled','rejected','expired') AND r.state='active'",
             "active_intents_missing_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required') AND r.id IS NULL",
@@ -458,16 +562,40 @@ class DurableExecutionStore:
             "stale_unknown_intents": "SELECT COUNT(*) n FROM order_intents WHERE state='unknown' AND (julianday('now')-julianday(updated_at))*86400>300",
             "stale_partial_fills": "SELECT COUNT(*) n FROM order_intents WHERE state='partially_filled' AND (julianday('now')-julianday(updated_at))*86400>300",
             "position_state_without_active_lifecycle": "SELECT COUNT(*) n FROM position_management_state s LEFT JOIN position_lifecycles l ON l.id=s.position_lifecycle_id AND l.state='active' WHERE s.position_lifecycle_id IS NOT NULL AND l.id IS NULL",
+            "state_latest_event_mismatch": """SELECT COUNT(*) n FROM order_intents i
+                WHERE COALESCE((SELECT e.to_state FROM order_events e WHERE e.intent_id=i.id
+                                ORDER BY e.transition_counter DESC,e.created_at DESC LIMIT 1),'') <> i.state""",
+            "transition_counter_mismatch": """SELECT COUNT(*) n FROM order_intents i
+                WHERE COALESCE((SELECT MAX(e.transition_counter) FROM order_events e WHERE e.intent_id=i.id),-1)
+                      <> i.transition_counter""",
+            "fill_ledger_mismatch": """SELECT COUNT(*) n FROM order_intents i
+                WHERE ABS(COALESCE((SELECT MAX(f.cumulative_filled_quantity) FROM broker_fill_events f
+                                    WHERE f.intent_id=i.id),0)-COALESCE(i.filled_quantity,0))>0.000000001""",
+            "broker_relevant_missing_identity": """SELECT COUNT(*) n FROM order_intents
+                WHERE state IN ('submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')
+                  AND COALESCE(client_order_id,'')='' AND COALESCE(broker_order_id,'')=''""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 
 
 class Executor:
-    def __init__(self, broker: Any, risk_engine: RiskEngine, storage: Any | None = None, run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        broker: Any,
+        risk_engine: RiskEngine,
+        storage: Any | None = None,
+        run_id: str | None = None,
+        fault_hook: Any | None = None,
+    ) -> None:
         self.broker = broker
         self.risk_engine = risk_engine
         self.storage = storage
         self.run_id = run_id
+        self.fault_hook = fault_hook
+
+    def _fault(self, boundary: str, **detail: Any) -> None:
+        if self.fault_hook is not None:
+            self.fault_hook(boundary, detail)
 
     def execute(
         self,
@@ -492,8 +620,66 @@ class Executor:
         if not decision.passed:
             return ExecutionResult(False, "blocked", client_order_id, reason="; ".join(decision.reasons))
 
+        workflow_store = None
+        workflow = None
+        if approval_id:
+            # Persist the final local validation decision before intent creation.
+            # create_or_get_intent then links this workflow in the same SQLite
+            # transaction as the intent and reservation.
+            from .approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
+
+            workflow_store = ApprovalWorkflowStore(self.storage)
+            workflow = workflow_store.get_by_approval(approval_id)
+            if workflow is None:
+                return ExecutionResult(False, "blocked", client_order_id, reason="durable approval workflow is required")
+            if workflow["state"] == ApprovalWorkflowState.VALIDATING.value:
+                workflow_store.transition(
+                    workflow["id"],
+                    ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+                    expected_state=ApprovalWorkflowState.VALIDATING,
+                    validation_status="passed",
+                    safe_detail="final local validation passed",
+                )
+            elif not workflow.get("intent_id") and workflow["state"] != ApprovalWorkflowState.APPROVED_PENDING_INTENT.value:
+                return ExecutionResult(False, "blocked", client_order_id, reason="approval workflow is not executable")
+
+        # Risk evaluation uses a coherent snapshot, while this final reservation
+        # check runs under BEGIN IMMEDIATE. The optional absolute ceilings close
+        # the scanner/listener race between snapshot evaluation and persistence.
+        if str(candidate.get("side", "")).lower() == "buy":
+            equity = float(context.get("portfolio_equity") or 0)
+            config = getattr(self.risk_engine, "config", {}) or {}
+            portfolio = config.get("portfolio_behavior", {})
+            optimizer = config.get("portfolio_optimizer", {})
+            risk_budget = config.get("risk_budget", {})
+            active = DurableExecutionStore(self.storage).active_reservations()
+            requested = float(candidate.get("notional") or 0)
+            if requested <= 0 and candidate.get("qty") is not None:
+                requested = float(candidate["qty"]) * float(candidate.get("latest_price") or 0)
+            if equity > 0:
+                projected_total = float(context.get("proposed_total_exposure_pct") or 0) * equity / 100
+                projected_symbol = float(context.get("proposed_symbol_exposure_pct") or 0) * equity / 100
+                projected_cluster = float(context.get("proposed_cluster_exposure_pct") or 0) * equity / 100
+                current_active = float(active["active_reserved_notional"])
+                candidate["_reservation_limits"] = {
+                    "base_total_notional": max(0.0, projected_total - requested - current_active),
+                    "base_symbol_notional": max(0.0, projected_symbol - requested - float(active["symbol_reserved_notional"].get(candidate.get("symbol"), 0))),
+                    "base_cluster_notional": max(0.0, projected_cluster - requested - float(active["cluster_reserved_notional"].get(candidate.get("cluster_name"), 0))),
+                    "total_notional_ceiling": equity * float(portfolio.get("max_total_portfolio_exposure_pct", 6.0)) / 100,
+                    "symbol_notional_ceiling": equity * float(portfolio.get("max_single_symbol_exposure_pct", 2.5)) / 100,
+                    "cluster_notional_ceiling": equity * float(optimizer.get("max_same_cluster_exposure_pct", 5.0)) / 100,
+                    "base_open_risk": (
+                        float(context["held_open_stop_risk"])
+                        if isinstance(context.get("held_open_stop_risk"), (int, float))
+                        else equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100 + 1.0
+                    ),
+                    "open_risk_ceiling": equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100,
+                    "buying_power_ceiling": float(context["buying_power"]) + current_active if context.get("buying_power") is not None else None,
+                }
+
         store = DurableExecutionStore(self.storage)
         try:
+            self._fault("before_intent_persistence", client_order_id=client_order_id)
             intent = store.create_or_get_intent(
                 candidate,
                 run_id=self.run_id or proposal.get("run_id"),
@@ -504,6 +690,7 @@ class Executor:
             return ExecutionResult(False, "blocked", client_order_id, reason=f"intent persistence blocked: {type(exc).__name__}")
 
         intent_id = str(intent["id"])
+        self._fault("after_intent_and_reservation_commit", intent_id=intent_id)
         state = OrderState(intent["state"])
         if state in BROKER_RELEVANT_STATES or state in TERMINAL_STATES:
             # An existing logical action is never automatically submitted again.
@@ -514,13 +701,22 @@ class Executor:
                 reason="existing durable intent reused; no duplicate broker call",
                 intent_id=intent_id,
             )
+        if workflow_store is not None and workflow is not None:
+            current_workflow = workflow_store.get(workflow["id"])
+            if current_workflow["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+                workflow_store.transition(current_workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
         try:
+            self._fault("immediately_before_broker_invocation", intent_id=intent_id)
             intent = store.transition(
                 intent_id,
                 OrderState.SUBMITTING,
                 event_type="broker_submission_started",
                 expected_state=OrderState.RESERVED,
             )
+            if workflow_store is not None and workflow is not None:
+                current_workflow = workflow_store.get(workflow["id"])
+                if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_PENDING.value:
+                    workflow_store.transition(current_workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
         except InvalidOrderTransition:
             current = store.get_intent(intent_id)
             return ExecutionResult(False, current["state"], current["client_order_id"], reason="another worker owns submission", intent_id=intent_id)
@@ -539,6 +735,7 @@ class Executor:
                 candidate.get("limit_price"),
                 intent["client_order_id"],
             )
+            self._fault("after_broker_success_before_local_update", intent_id=intent_id)
             broker_order_id = str(_value(response, "id", "") or "") or None
             remote_status = str(_value(response, "status", "submitted") or "submitted").lower()
             target = OrderState.SUBMITTED
@@ -546,8 +743,37 @@ class Executor:
                 target = OrderState.FILLED
             elif remote_status == "partially_filled":
                 target = OrderState.PARTIALLY_FILLED
-            store.transition(intent_id, target, event_type="broker_submission_acknowledged", broker_order_id=broker_order_id)
-            return ExecutionResult(True, target.value, intent["client_order_id"], response, intent_id=intent_id)
+            if target in {OrderState.PARTIALLY_FILLED, OrderState.FILLED}:
+                filled_quantity = float(_value(response, "filled_qty", intent["requested_quantity"] if target == OrderState.FILLED else 0) or 0)
+                fill_price = float(_value(response, "filled_avg_price", candidate.get("latest_price")) or 0)
+                if filled_quantity <= 0 or fill_price <= 0:
+                    store.transition(
+                        intent_id,
+                        OrderState.UNKNOWN,
+                        event_type="broker_fill_response_incomplete",
+                        broker_order_id=broker_order_id,
+                        safe_summary="filled response omitted reliable quantity or price; reconciliation required",
+                    )
+                    target = OrderState.UNKNOWN
+                else:
+                    event_key = str(_value(response, "execution_id", "") or f"{broker_order_id or intent['client_order_id']}:{filled_quantity:.12g}:{fill_price:.12g}")
+                    store.record_fill(
+                        intent_id,
+                        cumulative_quantity=filled_quantity,
+                        fill_price=fill_price,
+                        broker_event_key=event_key,
+                        broker_order_id=broker_order_id,
+                        occurred_at=str(_value(response, "filled_at", iso_now())),
+                        price_is_cumulative_average=True,
+                    )
+            else:
+                store.transition(intent_id, target, event_type="broker_submission_acknowledged", broker_order_id=broker_order_id)
+            if workflow_store is not None and workflow is not None:
+                current_workflow = workflow_store.get(workflow["id"])
+                workflow_target = ApprovalWorkflowState.UNKNOWN if target == OrderState.UNKNOWN else ApprovalWorkflowState.SUBMITTED
+                if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_STARTED.value:
+                    workflow_store.transition(current_workflow["id"], workflow_target)
+            return ExecutionResult(target != OrderState.UNKNOWN, target.value, intent["client_order_id"], response, intent_id=intent_id)
         except Exception as exc:
             # The request may have reached the broker. Preserve the exact client ID,
             # retain all reservations, and require lookup proof before any retry.
@@ -558,6 +784,14 @@ class Executor:
                 error_category=type(exc).__name__,
                 safe_summary="broker submission outcome is unknown; reconciliation required",
             )
+            if workflow_store is not None and workflow is not None:
+                current_workflow = workflow_store.get(workflow["id"])
+                if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_STARTED.value:
+                    workflow_store.transition(
+                        current_workflow["id"],
+                        ApprovalWorkflowState.UNKNOWN,
+                        safe_detail="broker submission outcome is unknown; reconciliation required",
+                    )
             return ExecutionResult(
                 False,
                 OrderState.UNKNOWN.value,

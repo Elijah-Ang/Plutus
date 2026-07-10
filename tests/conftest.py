@@ -1,11 +1,48 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import os
 import socket
 import urllib.request
 
 import pytest
 import requests
+
+# Establish a fully synthetic credential boundary before importing application
+# modules. SecretStore refuses Keychain access whenever this marker is present.
+os.environ.update({
+    "TRADING_AGENT_TESTING": "1",
+    "ALPACA_API_KEY": "synthetic-test-alpaca-key",
+    "ALPACA_SECRET_KEY": "synthetic-test-alpaca-secret",
+    "TELEGRAM_BOT_TOKEN": "999999:synthetic-test-token",
+    "TELEGRAM_CHAT_ID": "synthetic-test-chat-id",
+    "TELEGRAM_ALLOWED_USER_ID": "synthetic-test-sender-id",
+    "OPENAI_API_KEY": "synthetic-test-openai-key",
+    "EODHD_API_TOKEN": "synthetic-test-eodhd-token",
+})
+
+
+def _blocked_network(*args, **kwargs):
+    pytest.fail("outbound network access is forbidden in the offline test suite")
+
+
+# Install the process-wide guard before any application import can initialize a
+# client. Individual tests may replace these functions with local fakes.
+socket.create_connection = _blocked_network
+socket.socket.connect = _blocked_network
+requests.sessions.Session.request = _blocked_network
+urllib.request.urlopen = _blocked_network
+try:
+    import httpx
+    httpx.Client.request = _blocked_network
+    httpx.AsyncClient.request = _blocked_network
+except ImportError:
+    httpx = None
+try:
+    import urllib3
+    urllib3.PoolManager.request = _blocked_network
+except ImportError:
+    urllib3 = None
 
 from app.power import PowerStatus
 
@@ -13,13 +50,15 @@ from app.power import PowerStatus
 @pytest.fixture(autouse=True)
 def hard_offline_network_guard(monkeypatch):
     """Fail the suite immediately if production code attempts outbound I/O."""
-    def blocked(*args, **kwargs):
-        pytest.fail("outbound network access is forbidden in the offline test suite")
-
-    monkeypatch.setattr(socket, "create_connection", blocked)
-    monkeypatch.setattr(socket.socket, "connect", blocked)
-    monkeypatch.setattr(requests.sessions.Session, "request", blocked)
-    monkeypatch.setattr(urllib.request, "urlopen", blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked_network)
+    monkeypatch.setattr(socket.socket, "connect", _blocked_network)
+    monkeypatch.setattr(requests.sessions.Session, "request", _blocked_network)
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked_network)
+    if httpx is not None:
+        monkeypatch.setattr(httpx.Client, "request", _blocked_network)
+        monkeypatch.setattr(httpx.AsyncClient, "request", _blocked_network)
+    if urllib3 is not None:
+        monkeypatch.setattr(urllib3.PoolManager, "request", _blocked_network)
 
 
 @pytest.fixture(autouse=True)

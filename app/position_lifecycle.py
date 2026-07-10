@@ -58,12 +58,29 @@ class PositionLifecycleManager:
                         (observed["broker_position_id"], observed["quantity"], observed["average_entry_price"], now, lifecycle["id"]),
                     )
                 else:
+                    lifecycle_id = str(uuid.uuid4())
                     conn.execute(
                         """INSERT INTO position_lifecycles(
                                id,symbol,broker_position_id,side,state,opened_at,opening_quantity,current_quantity,
                                average_entry_price,source,created_at,updated_at)
                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (str(uuid.uuid4()), symbol, observed["broker_position_id"], observed["side"], "active", now, observed["quantity"], observed["quantity"], observed["average_entry_price"], source, now, now),
+                        (lifecycle_id, symbol, observed["broker_position_id"], observed["side"], "active", now, observed["quantity"], observed["quantity"], observed["average_entry_price"], source, now, now),
+                    )
+                    boundary_row = conn.execute(
+                        "SELECT MAX(closed_at) boundary FROM position_lifecycles WHERE symbol=? AND state='closed'",
+                        (symbol,),
+                    ).fetchone()
+                    boundary = boundary_row["boundary"] if boundary_row else None
+                    conn.execute(
+                        """UPDATE order_intents SET position_lifecycle_id=?,updated_at=?
+                           WHERE symbol=? AND side='buy' AND filled_quantity>0 AND position_lifecycle_id IS NULL
+                             AND (? IS NULL OR created_at>?)""",
+                        (lifecycle_id, now, symbol, boundary, boundary),
+                    )
+                    conn.execute(
+                        """UPDATE position_lots SET position_lifecycle_id=?,updated_at=?
+                           WHERE symbol=? AND position_lifecycle_id IS NULL AND (? IS NULL OR opened_at>?)""",
+                        (lifecycle_id, now, symbol, boundary, boundary),
                     )
         return {
             row["symbol"]: row["id"]
