@@ -3,7 +3,8 @@ set -euo pipefail
 
 SOURCE="${0:A:h:h}"
 RELEASE_ROOT="$HOME/TradingAgentReleases"
-[[ -z "$(git -C "$SOURCE" status --porcelain)" ]] || { print -u2 -- "refusing dirty source worktree"; exit 2; }
+DIRTY=$(git -C "$SOURCE" status --porcelain | rg -v '^\?\? scratch/' || true)
+[[ -z "$DIRTY" ]] || { print -u2 -- "refusing dirty source worktree"; exit 2; }
 COMMIT=$(git -C "$SOURCE" rev-parse HEAD)
 BRANCH=$(git -C "$SOURCE" branch --show-current)
 RELEASE_ID="${1:-${COMMIT:0:12}}"
