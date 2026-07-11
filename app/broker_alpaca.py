@@ -86,6 +86,17 @@ class AlpacaBroker(BrokerInterface):
     def get_account(self) -> Any:
         return self._call("get_account", "read", self.trading.get_account)
 
+    def paper_account_identity(self) -> dict[str, Any]:
+        account = self.get_account()
+        base_url = str(getattr(self.trading, "_base_url", ""))
+        paper_client = self.mode == "paper" and "paper" in base_url.lower()
+        return {
+            "verified": bool(paper_client and not bool(getattr(account, "account_blocked", False)) and not bool(getattr(account, "trading_blocked", False))),
+            "mode": self.mode,
+            "endpoint_class": "paper" if paper_client else "ambiguous",
+            "account_status": str(getattr(account, "status", "unknown")),
+        }
+
     def get_positions(self) -> list[Any]:
         return list(self._call("get_positions", "read", self.trading.get_all_positions))
 

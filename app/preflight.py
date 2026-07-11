@@ -4,6 +4,7 @@ import platform
 import socket
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from typing import Any, Callable
 
 from .internet import internet_available
@@ -70,6 +71,13 @@ def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | No
             try:
                 broker.get_account()
                 add("broker", True, "broker reachable")
+                if config.get("phase3", {}).get("active") and (os.getenv("TRADING_AGENT_TESTING") != "1" or config.get("phase3", {}).get("force_in_tests") is True):
+                    identity = broker.paper_account_identity() if hasattr(broker, "paper_account_identity") else {"verified": False}
+                    add("phase3_paper_account_identity", identity.get("verified") is True and identity.get("mode") == "paper", "unambiguous healthy Alpaca paper account required")
+                    from .phase3_risk import Phase3Controller
+                    controller = Phase3Controller(storage, config, "preflight")
+                    healthy, _report = controller.reconciliation_health()
+                    add("phase3_reconciliation_health", healthy, "durable intent/reservation reconciliation must be healthy")
                 market_open = broker.is_market_open()
             except Exception as exc:
                 add("broker", False, f"broker unavailable: {type(exc).__name__}")

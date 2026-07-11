@@ -142,9 +142,11 @@ class Storage:
         with self.connect() as conn:
             from .research_validation import apply_phase1_schema
             from .shadow_strategies import apply_phase2_schema
+            from .phase3_risk import apply_phase3_schema
 
             apply_phase1_schema(conn)
             apply_phase2_schema(conn)
+            apply_phase3_schema(conn)
             now = iso_now()
             if production_paper:
                 existing = conn.execute("SELECT value FROM runtime_metadata WHERE key='environment'").fetchone()
@@ -179,6 +181,9 @@ class Storage:
         with self.connect() as conn:
             for table, columns in TABLE_DEFINITIONS.items():
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({columns})')
+            if not is_production_path(self.path):
+                from .phase3_risk import apply_phase3_schema
+                apply_phase3_schema(conn, record_migration=False)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.
             now = iso_now()

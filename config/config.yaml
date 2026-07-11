@@ -13,6 +13,37 @@ phase2_shadow_strategies:
   risk_reservations_enabled: false
   order_intents_enabled: false
   broker_calls_enabled: false
+phase3:
+  enabled: true
+  active: true
+  mode: ACTIVE_PAPER
+  profile_version: moderate_paper_risk_v1
+  require_manual_approval: true
+  require_paper_account_identity: true
+  require_healthy_reconciliation: true
+  allow_score_based_sizing: false
+  allow_kelly_sizing: false
+  allow_leverage: false
+  promotion:
+    minimum_completed_oos: 100
+    minimum_regimes: 2
+    require_positive_cost_adjusted_expectancy: true
+  risk_profile:
+    base_stop_risk_pct: 0.20
+    add_stop_risk_pct: 0.10
+    max_trade_stop_risk_pct: 0.35
+    max_portfolio_heat_pct: 1.25
+    favorable_portfolio_heat_pct: 1.50
+    defensive_portfolio_heat_pct: 0.50
+    normal_gross_exposure_pct: 30.0
+    favorable_gross_exposure_pct: 40.0
+    hard_gross_exposure_pct: 50.0
+    max_symbol_exposure_pct: 6.0
+    max_cluster_exposure_pct: 15.0
+    daily_loss_throttle_pct: 0.75
+    weekly_loss_throttle_pct: 1.50
+    drawdown_halt_pct: 6.0
+    minimum_average_dollar_volume: 10000000.0
 capabilities:
   live_trading_supported: false
   auto_execution_supported: false
@@ -159,12 +190,12 @@ execution_limits:
   max_pending_buy_proposals: null
 
 risk_budget:
-  risk_per_trade_pct: 0.05
-  max_open_risk_pct: 0.30
-  max_daily_realized_loss_pct: 0.25
-  max_total_portfolio_exposure_pct: 6.0
-  max_single_symbol_exposure_pct: 2.5
-  max_cluster_exposure_pct: 5.0
+  risk_per_trade_pct: 0.20
+  max_open_risk_pct: 1.25
+  max_daily_realized_loss_pct: 0.75
+  max_total_portfolio_exposure_pct: 30.0
+  max_single_symbol_exposure_pct: 6.0
+  max_cluster_exposure_pct: 15.0
   max_adds_only_if_profitable: true
   block_averaging_down: true
 
@@ -483,8 +514,8 @@ risk:
   allow_crypto: false
   allow_fractional: true
   signal_expiry_minutes: 10
-  stop_if_daily_loss_exceeds: 5
-  stop_if_weekly_loss_exceeds: 10
+  stop_if_daily_loss_exceeds: 0.75
+  stop_if_weekly_loss_exceeds: 1.50
   require_final_revalidation: true
   allowed_order_types: [market, limit]
   max_price_age_seconds: 120
@@ -504,9 +535,9 @@ portfolio_behavior:
   block_averaging_down: true
   max_adds_per_symbol_per_day: 1
   max_total_adds_per_symbol: 2
-  max_total_portfolio_exposure_pct: 6.0
-  max_single_symbol_exposure_pct: 2.5
-  max_correlated_us_equity_exposure_pct: 5.0
+  max_total_portfolio_exposure_pct: 30.0
+  max_single_symbol_exposure_pct: 6.0
+  max_correlated_us_equity_exposure_pct: 15.0
   block_new_buy_if_exit_pending: true
   block_new_buy_if_emergency_exit_score_above: 40
 
@@ -528,11 +559,11 @@ position_sizing:
     realistic_paper: null
     performance_calibrated: null
 
-  risk_per_trade_pct: 0.05
-  max_trade_notional_pct_of_equity: 0.25
-  max_position_notional_pct_of_equity: 2.0
-  max_total_portfolio_exposure_pct: 6.0
-  max_cluster_exposure_pct: 5.0
+  risk_per_trade_pct: 0.20
+  max_trade_notional_pct_of_equity: 6.0
+  max_position_notional_pct_of_equity: 6.0
+  max_total_portfolio_exposure_pct: 30.0
+  max_cluster_exposure_pct: 15.0
   min_cash_reserve_pct: 20.0
   max_cash_usage_pct: 10.0
   max_margin_usage_pct: 0.0
@@ -548,10 +579,10 @@ position_sizing:
     max_stop_pct: 8.0
     min_stop_pct: 1.0
   score_multiplier:
-    "65_74": 0.5
+    "65_74": 1.0
     "75_84": 1.0
-    "85_94": 1.25
-    "95_100": 1.5
+    "85_94": 1.0
+    "95_100": 1.0
   volatility_multiplier:
     too_quiet: 0.75
     normal: 1.0
@@ -567,9 +598,9 @@ portfolio_optimizer:
     financials: [XLF]
     energy: [XLE]
   max_same_cluster_positions: 2
-  max_same_cluster_exposure_pct: 5.0
-  max_total_portfolio_exposure_pct: 6.0
-  max_single_symbol_exposure_pct: 2.5
+  max_same_cluster_exposure_pct: 15.0
+  max_total_portfolio_exposure_pct: 30.0
+  max_single_symbol_exposure_pct: 6.0
 
 add_to_position:
   enabled: true

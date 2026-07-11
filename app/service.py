@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time
 import dataclasses
@@ -5486,6 +5487,15 @@ class TradingService:
     def run_cycle(self, run_dynamic_universe: bool = True) -> None:
         self.storage.audit(self.run_id, "scan_cycle_started", {"run_dynamic_universe": run_dynamic_universe})
         BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
+        if self.config.get("phase3", {}).get("active"):
+            from .phase3_risk import Phase3Controller
+            controller = Phase3Controller(self.storage, self.config, self.run_id)
+            states = controller.refresh_strategy_states()
+            healthy, report = controller.reconciliation_health()
+            self.storage.audit(self.run_id, "phase3_active_risk_cycle", {
+                "profile": "moderate_paper_risk_v1", "reconciliation_healthy": healthy,
+                "strategy_states": states, "integrity": report, "manual_approval_required": True,
+            })
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
         self._context_cache = None
@@ -6259,6 +6269,28 @@ class TradingService:
 
         risk_per_trade_pct = float(sizing_cfg.get("risk_per_trade_pct", 0.05))
         risk_budget = equity * (risk_per_trade_pct / 100.0)
+        phase3_enabled = bool(
+            self.config.get("phase3", {}).get("enabled") and self.config.get("phase3", {}).get("active")
+            and (os.getenv("TRADING_AGENT_TESTING") != "1" or self.config.get("phase3", {}).get("force_in_tests") is True)
+        )
+        phase3_context: dict[str, Any] = {}
+        if phase3_enabled:
+            from .phase3_risk import Phase3Controller, drawdown_multiplier as phase3_drawdown_multiplier, regime_multiplier as phase3_regime_multiplier
+
+            controller = Phase3Controller(self.storage, self.config, self.run_id)
+            drawdown_pct = controller.update_equity(float(equity))
+            states = controller.refresh_strategy_states()
+            allocation_mult = controller.allocation("rule_based_v1", states)
+            regime_mult = phase3_regime_multiplier(volatility_regime)
+            drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
+            base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
+            risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
+            risk_budget = equity * (risk_per_trade_pct / 100.0)
+            phase3_context = {
+                "controller": controller, "drawdown_pct": drawdown_pct, "states": states,
+                "allocation_multiplier": allocation_mult, "regime_multiplier": regime_mult,
+                "drawdown_multiplier": drawdown_mult, "scaled_stop_risk_pct": risk_per_trade_pct,
+            }
 
         stop_model = sizing_cfg.get("stop_model", {})
         atr_multiple = float(stop_model.get("atr_multiple", 2.0))
@@ -6330,15 +6362,16 @@ class TradingService:
         risk_based_notional = risk_based_shares * price
 
         score_mult = 1.0
-        score_mult_map = sizing_cfg.get("score_multiplier", {})
-        if score >= 95:
-            score_mult = float(score_mult_map.get("95_100", 1.5))
-        elif score >= 85:
-            score_mult = float(score_mult_map.get("85_94", 1.25))
-        elif score >= 75:
-            score_mult = float(score_mult_map.get("75_84", 1.0))
-        elif score >= 65:
-            score_mult = float(score_mult_map.get("65_74", 0.5))
+        if not phase3_enabled:
+            score_mult_map = sizing_cfg.get("score_multiplier", {})
+            if score >= 95:
+                score_mult = float(score_mult_map.get("95_100", 1.5))
+            elif score >= 85:
+                score_mult = float(score_mult_map.get("85_94", 1.25))
+            elif score >= 75:
+                score_mult = float(score_mult_map.get("75_84", 1.0))
+            elif score >= 65:
+                score_mult = float(score_mult_map.get("65_74", 0.5))
 
         vol_mult = 1.0
         vol_mult_map = sizing_cfg.get("volatility_multiplier", {})
@@ -6449,6 +6482,43 @@ class TradingService:
         final_notional = min(final_notional, allowed_additional_cluster)
         final_notional = min(final_notional, stage_cap)
         final_notional = min(final_notional, max_trade_notional)
+        blocked_reason = None
+
+        if phase3_enabled:
+            state = self._authoritative_runtime_state()
+            canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(state["positions"], state["account"])
+            profile = phase3_context["controller"].profile
+            heat_cap = profile.defensive_portfolio_heat_pct if phase3_context["regime_multiplier"] <= 0.5 else profile.max_portfolio_heat_pct
+            current_heat = canonical.projected_total_open_risk
+            fallback_daily_loss = state.get("daily_loss")
+            fallback_weekly_loss = state.get("weekly_loss")
+            daily_loss_pct = canonical.daily_realized_loss_pct
+            weekly_loss_pct = canonical.weekly_realized_loss_pct
+            if daily_loss_pct is None and isinstance(fallback_daily_loss, (int, float)) and canonical.portfolio_equity:
+                daily_loss_pct = max(0.0, float(fallback_daily_loss)) / canonical.portfolio_equity * 100.0
+            if weekly_loss_pct is None and isinstance(fallback_weekly_loss, (int, float)) and canonical.portfolio_equity:
+                weekly_loss_pct = max(0.0, float(fallback_weekly_loss)) / canonical.portfolio_equity * 100.0
+            if current_heat is None or canonical.portfolio_equity is None or canonical.filled_gross_exposure is None:
+                final_notional = 0.0
+                blocked_reason = "Phase 3 exposure or stop-risk accounting unavailable"
+            elif daily_loss_pct is None or weekly_loss_pct is None:
+                final_notional = 0.0
+                blocked_reason = "Phase 3 realized loss evidence unavailable"
+            elif daily_loss_pct >= profile.daily_loss_throttle_pct or weekly_loss_pct >= profile.weekly_loss_throttle_pct:
+                final_notional = 0.0
+                blocked_reason = "Phase 3 realized loss throttle active"
+            elif phase3_context["drawdown_multiplier"] == 0.0:
+                final_notional = 0.0
+                blocked_reason = "Phase 3 account drawdown halt active"
+            else:
+                allowed_risk = max(0.0, canonical.portfolio_equity * heat_cap / 100.0 - current_heat)
+                final_notional = min(final_notional, allowed_risk / stop_distance_dollars * price if stop_distance_dollars > 0 else 0.0)
+            average_dollar_volume = 0.0
+            if not bars.empty and "volume" in bars.columns and "close" in bars.columns:
+                average_dollar_volume = float((bars["volume"].astype(float).tail(20) * bars["close"].astype(float).tail(20)).mean())
+            if not math.isfinite(average_dollar_volume) or average_dollar_volume < profile.minimum_average_dollar_volume:
+                final_notional = 0.0
+                blocked_reason = "Phase 3 liquidity floor failed"
 
         caps_applied = []
         if target_notional > 0.0:
@@ -6467,9 +6537,8 @@ class TradingService:
 
         # Minimum paper trade notional clamp
         min_notional = float(sizing_cfg.get("min_paper_notional", 5.0))
-        blocked_reason = None
 
-        if final_notional < min_notional:
+        if final_notional < min_notional and blocked_reason is None:
             # Check if clamping to min_notional is safe under hard constraints
             if min_notional <= cash_cap and min_notional <= allowed_additional_single and min_notional <= allowed_additional_total and min_notional <= allowed_additional_cluster:
                 final_notional = min_notional
@@ -6485,6 +6554,22 @@ class TradingService:
 
         final_notional = max(0.0, final_notional)
         suggested_shares = final_notional / price if price > 0 else 0.0
+
+        if phase3_enabled:
+            controller = phase3_context["controller"]
+            decision_id = str(uuid.uuid4())
+            decision = "ELIGIBLE" if final_notional > 0 and not blocked_reason else "BLOCKED"
+            controller.storage.execute("""INSERT INTO phase3_risk_decisions(
+              id,run_id,symbol,strategy_version,decision_time,decision,reason,equity,account_drawdown_pct,
+              base_stop_risk_pct,scaled_stop_risk_pct,stop_price,stop_distance,risk_budget,requested_notional,
+              portfolio_heat_before_pct,portfolio_heat_after_pct,gross_exposure_after_pct,symbol_exposure_after_pct,
+              cluster_exposure_after_pct,regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,profile_version,payload)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (decision_id,self.run_id,symbol,"rule_based_v1",iso_now(),decision,blocked_reason or "within Phase 3 limits",
+               equity,phase3_context["drawdown_pct"],controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct,
+               phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
+               None,None,None,None,None,volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],
+               phase3_context["allocation_multiplier"],"moderate_paper_risk_v1",json_dumps({"score_used_for_sizing":False,"kelly_used":False})))
 
         return {
             "final_notional": final_notional,

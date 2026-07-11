@@ -37,6 +37,19 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(config.get("live_enabled") is False, "live_enabled must be false in this build")
     require(config.get("auto_execution_enabled", False) is False, "auto_execution_enabled must remain false")
     require(config.get("auto_execution_mode", "manual_only") == "manual_only", "auto_execution_mode must be manual_only")
+    phase3 = config.get("phase3", {}) or {}
+    if phase3.get("active"):
+        require(phase3.get("enabled") is True, "active Phase 3 must be enabled")
+        require(phase3.get("mode") == "ACTIVE_PAPER", "Phase 3 mode must be ACTIVE_PAPER")
+        require(phase3.get("require_manual_approval") is True, "Phase 3 requires manual approval for entries and adds")
+        require(phase3.get("allow_score_based_sizing") is False, "uncalibrated score-based sizing is forbidden")
+        require(phase3.get("allow_kelly_sizing") is False, "Kelly sizing is Phase 4 and forbidden")
+        require(phase3.get("allow_leverage") is False, "Phase 3 leverage is forbidden")
+        try:
+            from .phase3_risk import Phase3RiskProfile
+            Phase3RiskProfile.from_config(config)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"invalid Phase 3 risk profile: {exc}")
 
     crypto = config.get("crypto", {}) or {}
     require(crypto.get("live_enabled", False) is False, "crypto.live_enabled must be false")
