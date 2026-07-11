@@ -34,6 +34,8 @@ class MockBroker:
 
     def get_latest_price(self, symbol):
         return type("T", (), {"price": self.price, "timestamp": datetime.now(UTC)})()
+    def get_latest_quote(self, symbol):
+        return {"bid_price": self.price - 0.01, "ask_price": self.price + 0.01, "timestamp": datetime.now(UTC)}
 
     def get_historical_bars(self, symbol, timeframe, limit):
         data = {"close": [500.0] * limit, "volume": [10000.0] * limit}

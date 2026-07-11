@@ -64,6 +64,9 @@ class BatchBroker:
     def get_latest_price(self, symbol):
         return {"price": 100.0, "timestamp": datetime.now(UTC)}
 
+    def get_latest_quote(self, symbol):
+        return {"bid_price": 99.99, "ask_price": 100.01, "timestamp": datetime.now(UTC)}
+
     def get_historical_bars(self, symbol, timeframe, limit=250):
         import pandas as pd
 
@@ -104,7 +107,17 @@ def config() -> dict:
             "max_single_symbol_exposure_pct": 2.5,
             "max_cluster_exposure_pct": 5.0,
         },
-        "position_sizing": {"enabled": True, "min_paper_notional": 5.0, "risk_per_trade_pct": 0.05},
+        "position_sizing": {
+            "enabled": True, "mode": "risk_portfolio", "stage": "moderate_paper", "use_stage_dollar_cap": False,
+            "stage_max_initial_notional_usd": {"moderate_paper": 250.0},
+            "stage_max_add_notional_usd": {"moderate_paper": 100.0},
+            "risk_per_trade_pct": 0.05, "max_trade_notional_pct_equity": 6.0,
+            "max_position_notional_pct_equity": 6.0, "max_total_portfolio_exposure_pct": 30.0,
+            "max_cluster_exposure_pct": 15.0, "min_cash_reserve_pct": 10.0, "max_cash_usage_pct": 10.0,
+            "default_paper_notional_usd": 250.0, "default_add_notional_usd": 100.0,
+            "minimum_executable_notional_usd": 5.0, "add_size_multiplier": 0.5,
+            "stop_model": {"atr_multiple": 2.0, "min_stop_pct": 1.0, "max_stop_pct": 8.0},
+        },
         "portfolio_behavior": {
             "max_total_portfolio_exposure_pct": 6.0,
             "max_single_symbol_exposure_pct": 2.5,
@@ -140,6 +153,15 @@ def make_service(tmp_path):
     return service, storage
 
 
+def sized_candidate(symbol: str, score: float, notional: float, stop_distance: float = 5.0) -> dict:
+    return {
+        "symbol": symbol, "score": score, "final_notional": notional, "price": 100.0,
+        "stop_price": 100.0 - stop_distance, "stop_distance_dollars": stop_distance,
+        "stop_distance_pct": stop_distance, "atr_value": stop_distance / 2.0,
+        "technical_stop_price": 95.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+    }
+
+
 def test_ranked_batch_tables_created(tmp_path):
     storage = Storage(tmp_path / "schema.db")
     storage.initialize()
@@ -157,8 +179,8 @@ def test_risk_budget_allows_multiple_candidates_without_fixed_count_cap(tmp_path
     service, storage = make_service(tmp_path)
     now = datetime.now(UTC)
     candidates = service._rank_candidates([
-        {"symbol": "SPY", "score": 88, "final_notional": 20.0, "price": 100.0, "stop_distance_pct": 5.0},
-        {"symbol": "IWM", "score": 84, "final_notional": 20.0, "price": 100.0, "stop_distance_pct": 5.0},
+        sized_candidate("SPY", 88, 20.0),
+        sized_candidate("IWM", 84, 20.0),
     ], {
         "portfolio_equity": 10000.0,
         "total_exposure_pct": 0.0,
@@ -184,8 +206,8 @@ def test_lower_ranked_candidate_blocked_when_open_risk_budget_exhausted(tmp_path
     service.config["risk_budget"]["max_open_risk_pct"] = 0.08
     now = datetime.now(UTC)
     candidates = service._rank_candidates([
-        {"symbol": "SPY", "score": 90, "final_notional": 30.0, "price": 100.0, "stop_distance_pct": 8.0},
-        {"symbol": "IWM", "score": 80, "final_notional": 30.0, "price": 100.0, "stop_distance_pct": 8.0},
+        sized_candidate("SPY", 90, 30.0, 8.0),
+        sized_candidate("IWM", 80, 30.0, 8.0),
     ], {"portfolio_equity": 1000.0, "total_exposure_pct": 0.0, "single_exposures": {}, "cluster_exposures": {}, "cluster_counts": {}})
 
     allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
@@ -204,14 +226,8 @@ def test_lower_ranked_candidate_blocked_when_open_risk_budget_exhausted(tmp_path
 
 def test_preproposal_risk_block_is_recorded_as_non_actionable(tmp_path):
     service, storage = make_service(tmp_path)
-    candidate = {
-        "symbol": "SPY",
-        "score": 90,
-        "final_notional": 20.0,
-        "price": 100.0,
-        "stop_distance_pct": 5.0,
-        "preproposal_block_reason": "new buy blocked because an exit is pending",
-    }
+    candidate = sized_candidate("SPY", 90, 20.0)
+    candidate["preproposal_block_reason"] = "new buy blocked because an exit is pending"
 
     allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
         service._rank_candidates([candidate], {"portfolio_equity": 10000.0, "total_exposure_pct": 0.0, "single_exposures": {}, "cluster_exposures": {}, "cluster_counts": {}}),
@@ -468,6 +484,8 @@ def test_expired_batch_candidate_cannot_be_approved(tmp_path):
         "reason": "expired batch",
         "order_type": "limit",
         "asset_class": "equity",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
     }
     storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -811,6 +829,8 @@ def risk_proposal() -> dict:
         "reason": "test",
         "order_type": "limit",
         "asset_class": "equity",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
     }
 
 

@@ -44,12 +44,22 @@ def base_config():
 
     config["position_sizing"] = {
         "enabled": True,
-        "base_paper_notional": 10.0,
-        "min_paper_notional": 5.0,
-        "max_initial_paper_notional": 50.0,
-        "max_add_paper_notional": 25.0,
+        "mode": "risk_portfolio",
+        "stage": "moderate_paper",
+        "use_stage_dollar_cap": True,
+        "stage_max_initial_notional_usd": {"moderate_paper": 250.0},
+        "stage_max_add_notional_usd": {"moderate_paper": 100.0},
+        "default_paper_notional_usd": 10.0,
+        "default_add_notional_usd": 10.0,
+        "minimum_executable_notional_usd": 5.0,
         "risk_per_trade_pct": 0.05,
-        "max_position_notional_pct": 2.0,
+        "max_trade_notional_pct_equity": 10.0,
+        "max_position_notional_pct_equity": 10.0,
+        "max_total_portfolio_exposure_pct": 50.0,
+        "max_cluster_exposure_pct": 50.0,
+        "min_cash_reserve_pct": 10.0,
+        "max_cash_usage_pct": 50.0,
+        "add_size_multiplier": 0.5,
         "stop_model": {
             "method": "max_of_atr_or_technical",
             "atr_multiple": 2.0,
@@ -72,6 +82,11 @@ def base_config():
         }
     }
 
+    config["phase3"]["enabled"] = False
+    config["phase3"]["active"] = False
+    config["phase4"]["enabled"] = False
+    config["phase4"]["active"] = False
+
     config["portfolio_optimizer"] = {
         "clusters": {
             "us_broad_market": ["SPY", "DIA", "IWM"],
@@ -90,6 +105,8 @@ def test_calculate_dynamic_size_enabled(temp_storage, base_config):
     # Mock snapshot with $10,000 equity and no exposure
     snapshot = {
         "portfolio_equity": 10000.0,
+        "cash": 10000.0,
+        "buying_power": 10000.0,
         "total_exposure_dollars": 0.0,
         "single_exposures": {},
         "cluster_exposures": {}
@@ -107,12 +124,12 @@ def test_calculate_dynamic_size_enabled(temp_storage, base_config):
     # Base paper notional 10.0 * 1.5 = 15.0 notional
     res = service._calculate_dynamic_size("SPY", 90.0, "normal", 100.0, bars, snapshot)
 
-    assert res["final_notional"] == 15.0
+    assert res["final_notional"] == 250.0
     assert res["score_multiplier"] == 1.5
     assert res["volatility_multiplier"] == 1.0
-    assert res["stop_model_used"] == "max_of_atr_or_technical"
+    assert res["stop_model_used"] == "atr"
     assert res["risk_based_shares"] > 0
-    assert res["score_adjusted_notional"] == 15.0
+    assert res["score_adjusted_notional"] == 375.0
 
 def test_calculate_dynamic_size_volatility_blocks(temp_storage, base_config):
     broker = MockBroker()
@@ -209,7 +226,7 @@ def test_pyramiding_eligibility(temp_storage, base_config):
     with patch("app.service.evaluate_symbol") as mock_eval:
         def side_effect(sym, *args, **kwargs):
             if sym == "SPY":
-                return Signal("ENTRY", "buy", "SPY", "trend filters passed and volatility normal", 0.9, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.1})
+                return Signal("ENTRY", "buy", "SPY", "trend filters passed and volatility normal", 0.9, {"close": 100.0, "ma_50": 95.0, "ma_200": 90.0, "volatility_20": 0.1})
             return Signal("HOLD", None, sym, "not SPY", 0.0, {})
         mock_eval.side_effect = side_effect
 
@@ -239,7 +256,7 @@ def test_shadow_trades_creation(temp_storage, base_config):
     with patch("app.service.evaluate_symbol") as mock_eval:
         def side_effect(sym, *args, **kwargs):
             if sym == "SPY":
-                return Signal("ENTRY", "buy", "SPY", "trend up", 0.8, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.15})
+                return Signal("ENTRY", "buy", "SPY", "trend up", 0.8, {"close": 100.0, "ma_50": 95.0, "ma_200": 90.0, "volatility_20": 0.15})
             return Signal("HOLD", None, sym, "not SPY", 0.0, {})
         mock_eval.side_effect = side_effect
 
@@ -310,7 +327,7 @@ def test_new_buy_persists_initial_risk_fields(temp_storage, base_config):
     with patch("app.service.evaluate_symbol") as mock_eval:
         def side_effect(sym, *args, **kwargs):
             if sym == "SPY":
-                return Signal("ENTRY", "buy", "SPY", "trend filters passed and volatility normal", 0.9, {"close": 100.0, "ma_50": 95.0, "volatility_20": 0.1})
+                return Signal("ENTRY", "buy", "SPY", "trend filters passed and volatility normal", 0.9, {"close": 100.0, "ma_50": 95.0, "ma_200": 90.0, "volatility_20": 0.1})
             return Signal("HOLD", None, sym, "not SPY", 0.0, {})
         mock_eval.side_effect = side_effect
         service.scan()

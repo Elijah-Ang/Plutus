@@ -44,6 +44,8 @@ class MockBroker:
         return True
     def get_latest_price(self, symbol):
         return type("T", (), {"price": 100.0, "timestamp": datetime.now(UTC)})()
+    def get_latest_quote(self, symbol):
+        return {"bid_price": 99.99, "ask_price": 100.01, "timestamp": datetime.now(UTC)}
     def get_historical_bars(self, symbol, timeframe, limit=250):
         import pandas as pd
         return pd.DataFrame({"close": [100.0] * limit, "volume": [1000.0] * limit})

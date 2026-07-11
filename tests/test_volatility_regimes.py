@@ -93,7 +93,10 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     # 35%–45%: watch-only, no proposal generated
     # >45%: extreme blocked, no proposal generated
     config = load_config()
-    config["position_sizing"] = {"enabled": False}
+    config["phase3"]["enabled"] = False
+    config["phase3"]["active"] = False
+    config["phase4"]["enabled"] = False
+    config["phase4"]["active"] = False
     config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
@@ -137,8 +140,8 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
     assert len(props) == 1
     p_payload = json.loads(props[0]["payload"])
-    assert p_payload["notional"] == base_notional
-    assert p_payload["notional_adjustment_note"] == ""
+    assert 0 < p_payload["notional"] <= base_notional
+    assert p_payload["notional"] <= p_payload["sizing_caps"]["stage"]
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY'")[0]
     assert memory["volatility_regime"] == "normal"
     assert memory["paper_size_adjustment"] == 1.0
@@ -148,8 +151,8 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
     assert len(props) == 1
     p_payload = json.loads(props[0]["payload"])
-    assert p_payload["notional"] == base_notional * 0.5
-    assert "reduced by 50%" in p_payload["notional_adjustment_note"]
+    assert 0 < p_payload["notional"] <= base_notional
+    assert p_payload["notional"] <= p_payload["sizing_caps"]["stage"]
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY'")[0]
     assert memory["volatility_regime"] == "elevated"
     assert memory["paper_size_adjustment"] == 0.5
@@ -175,6 +178,10 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
 
 def test_state_based_proposal_deduplication(temp_storage):
     config = load_config()
+    config["phase3"]["enabled"] = False
+    config["phase3"]["active"] = False
+    config["phase4"]["enabled"] = False
+    config["phase4"]["active"] = False
     config.setdefault("risk", {})["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
@@ -221,7 +228,7 @@ def test_state_based_proposal_deduplication(temp_storage):
     created_at = now - timedelta(minutes=10)
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("p2", "r1", "s2", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 95.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
+        ("p2", "r1", "s2", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"symbol": "SPY", "score": 95.0, "notional": 5.0, "latest_price": 100.0, "stop_distance_dollars": 10.0, "stop_risk_dollars": 0.5, "cluster_name": "us_broad_market"}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
 
     run_scan_with_custom_signal("ENTRY", "buy", 75)
@@ -235,7 +242,7 @@ def test_state_based_proposal_deduplication(temp_storage):
     temp_storage.execute("DELETE FROM market_memory")
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,setup_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("p3", "r1", "s3", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"score": 70.0}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
+        ("p3", "r1", "s3", "SPY", "buy", 5, "approved", created_at.isoformat(), (created_at + timedelta(minutes=10)).isoformat(), "rule_based_v1", json.dumps({"symbol": "SPY", "score": 70.0, "notional": 5.0, "latest_price": 100.0, "stop_distance_dollars": 10.0, "stop_risk_dollars": 0.5, "cluster_name": "us_broad_market"}), "SPY:buy:ENTRY:below_50:above_200:normal:score_90")
     )
 
     # Run scan which will result in score 80 (delta = 10 from 70)

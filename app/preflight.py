@@ -4,7 +4,6 @@ import platform
 import socket
 from dataclasses import dataclass
 from datetime import datetime
-import os
 from typing import Any, Callable
 
 from .internet import internet_available
@@ -71,7 +70,7 @@ def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | No
             try:
                 broker.get_account()
                 add("broker", True, "broker reachable")
-                if config.get("phase3", {}).get("active") and (os.getenv("TRADING_AGENT_TESTING") != "1" or config.get("phase3", {}).get("force_in_tests") is True):
+                if config.get("phase3", {}).get("active"):
                     identity = broker.paper_account_identity() if hasattr(broker, "paper_account_identity") else {"verified": False}
                     add("phase3_paper_account_identity", identity.get("verified") is True and identity.get("mode") == "paper", "unambiguous healthy Alpaca paper account required")
                     from .phase3_risk import Phase3Controller

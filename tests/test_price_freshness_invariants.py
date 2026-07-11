@@ -66,21 +66,23 @@ def base_config():
             "mode": "risk_portfolio",
             "stage": "moderate_paper",
             "use_stage_dollar_cap": True,
-            "stage_max_initial_notional": {
+            "stage_max_initial_notional_usd": {
                 "moderate_paper": 250
             },
-            "stage_max_add_notional": {
+            "stage_max_add_notional_usd": {
                 "moderate_paper": 100
             },
             "risk_per_trade_pct": 0.05,
-            "max_trade_notional_pct_of_equity": 0.25,
-            "max_position_notional_pct_of_equity": 2.0,
+            "max_trade_notional_pct_equity": 0.25,
+            "max_position_notional_pct_equity": 2.0,
             "max_total_portfolio_exposure_pct": 6.0,
             "max_cluster_exposure_pct": 5.0,
             "min_cash_reserve_pct": 20.0,
             "max_cash_usage_pct": 10.0,
             "max_margin_usage_pct": 0.0,
-            "base_paper_notional": 50,
+            "default_paper_notional_usd": 250,
+            "default_add_notional_usd": 100,
+            "minimum_executable_notional_usd": 5,
             "add_size_multiplier": 0.5,
             "stop_model": {
                 "method": "max_of_atr_or_technical",
@@ -93,7 +95,9 @@ def base_config():
             "max_same_symbol_exposure_pct": 5.0,
             "max_total_portfolio_exposure_pct": 15.0,
             "max_same_cluster_exposure_pct": 5.0
-        }
+        },
+        "phase3": {"enabled": False, "active": False},
+        "phase4": {"enabled": False, "active": False}
     }
 
 def test_proposal_blocked_if_stale_price_at_scan(temp_storage, base_config):
@@ -220,7 +224,7 @@ def test_approval_time_price_refresh_and_invariant_capping(temp_storage, base_co
             called_proposal = mock_exec.call_args[0][0]
             assert called_proposal["notional"] == 50.0
             assert called_proposal["approved_notional"] == 50.0
-            assert called_proposal["qty"] == 50.0 / 251.0
+            assert called_proposal["qty"] == pytest.approx(50.0 / 251.01)
             
             assert len(service.telegram.messages) > 0
             assert "ADD TO WINNER" in service.telegram.messages[0]

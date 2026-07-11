@@ -43,6 +43,15 @@ from .position_lifecycle import PositionLifecycleManager
 from .risk_engine import RiskCheck, RiskEngine, _dt
 from .risk_snapshot import RiskSnapshotBuilder
 from .position_sizing import effective_notional_policy, notional_from_stop_risk
+from .position_sizing import validate_stop_evidence
+from .formula_versions import (
+    ACCOUNTING_VERSION,
+    EVIDENCE_VERSION,
+    PHASE3_DECISION_VERSION,
+    RISK_DECISION_VERSION,
+    SIZING_POLICY_VERSION,
+    STOP_POLICY_VERSION,
+)
 from .quotes import bounded_marketable_limit, implementation_shortfall_bps, validated_quote
 from .reconciliation import BrokerReconciler
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
@@ -286,7 +295,13 @@ class TradingService:
         return detail
 
     def _risk_engine(self, proposal_id: str, stage: str) -> RiskEngine:
-        return RiskEngine(self.config, lambda c: self.storage.record_check(self.run_id, c.name, c.passed, c.reason, proposal_id, stage))
+        return RiskEngine(
+            self.config,
+            lambda c: self.storage.record_check(
+                self.run_id, c.name, c.passed, c.reason, proposal_id, stage,
+                config_hash=self.config.get("effective_config_hash"),
+            ),
+        )
 
     def _authoritative_runtime_state(self, force: bool = False) -> dict[str, Any]:
         now = time.monotonic()
@@ -324,19 +339,6 @@ class TradingService:
             try:
                 losses = self.broker.get_loss_metrics()
                 losses = dict(losses or {})
-                # Unit-test brokers from the pre-v2 contract are normalized
-                # only inside the isolated test environment. Production paper
-                # callers must provide the explicit versioned fields.
-                if os.getenv("TRADING_AGENT_TESTING") == "1" and "daily_loss_dollars" not in losses and "daily_loss" in losses:
-                    losses.update({
-                        "daily_loss_dollars": losses.get("daily_loss"),
-                        "weekly_loss_dollars": losses.get("weekly_loss"),
-                        "reference_equity": _value(account, "last_equity") or _value(account, "equity"),
-                        "daily_loss_confidence": "verified" if losses.get("daily_loss") is not None else "unavailable",
-                        "weekly_loss_confidence": "verified" if losses.get("weekly_loss") is not None else "unavailable",
-                        "provenance": "test_fixture_legacy_loss_metrics",
-                        "metrics_version": LOSS_METRICS_VERSION,
-                    })
                 state["loss_metrics"] = losses
             except Exception:
                 # Daily equity comparison is still authoritative when present.
@@ -1161,6 +1163,14 @@ class TradingService:
                 return "healthy-pullback add would average down or lacks valid entry price"
             if proposal.get("dip_trap_classification") != "healthy_pullback":
                 return "pullback is no longer classified as healthy"
+            trend = proposal.get("trend_evidence") or proposal.get("indicators") or {}
+            for key in ("ma_50", "ma_200"):
+                value = trend.get(key) if isinstance(trend, dict) else None
+                try:
+                    if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+                        return f"healthy-pullback add requires complete {key.upper()} trend evidence"
+                except (TypeError, ValueError):
+                    return f"healthy-pullback add requires complete {key.upper()} trend evidence"
         return None
 
     def _exit_blocker_label_from_reason(self, no_action_reason: str) -> str:
@@ -1195,6 +1205,7 @@ class TradingService:
         reservation_snapshot = DurableExecutionStore(self.storage).active_reservations()
         active_reserved_notional = float(reservation_snapshot["active_reserved_notional"])
         active_reserved_stop_risk = float(reservation_snapshot["active_reserved_stop_risk"])
+        pending_execution = self._pending_execution_totals()
         canonical_risk = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(positions, account)
         reserved_pct = (active_reserved_notional / equity) * 100 if equity > 0 else float("inf")
 
@@ -1257,6 +1268,8 @@ class TradingService:
                 pass
 
         realized = LotLedger(self.storage).summary()
+        accounting_rows = self.storage.fetch_all("SELECT account_equity_change,realized_fifo_pnl,unrealized_change,external_cash_flow,accounting_version,accounting_confidence FROM cash_snapshots ORDER BY id DESC LIMIT 1")
+        accounting = accounting_rows[0] if accounting_rows else {}
         loss_metrics = build_loss_metrics(
             state.get("loss_metrics"),
             account_equity=equity,
@@ -1283,6 +1296,12 @@ class TradingService:
             "weekly_realized_pl": realized.weekly_realized_pl,
             "daily_realized_pl_status": realized.daily_confidence,
             "weekly_realized_pl_status": realized.weekly_confidence,
+            "account_equity_change": accounting.get("account_equity_change"),
+            "realized_fifo_pnl": accounting.get("realized_fifo_pnl"),
+            "unrealized_change": accounting.get("unrealized_change"),
+            "external_cash_flow": accounting.get("external_cash_flow"),
+            "accounting_version": accounting.get("accounting_version", ACCOUNTING_VERSION),
+            "accounting_confidence": accounting.get("accounting_confidence", "unavailable"),
             # Broker account equity-loss metrics are an existing conservative
             # control whenever both authoritative values are available.
             "absolute_loss_control_reliable": loss_metrics.daily_loss_pct is not None and loss_metrics.weekly_loss_pct is not None,
@@ -1306,6 +1325,11 @@ class TradingService:
             "cash": snapshot["cash"],
             "active_reserved_exposure": active_reserved_notional,
             "active_reserved_stop_risk": active_reserved_stop_risk,
+            "pending_buy_exposure_unknown": bool(pending_execution.get("unknown")),
+            "pending_buy_exposure_unknown_reason": pending_execution.get("unknown_reason"),
+            "pending_buy_exposure_unknown_rows": pending_execution.get("unknown_rows", []),
+            "pending_buy_notional": float(pending_execution.get("total_notional") or 0.0),
+            "pending_buy_stop_risk": float(pending_execution.get("total_stop_risk") or 0.0),
             "held_open_stop_risk": canonical_risk.held_open_stop_risk,
             "unresolved_unknown_order_exposure": sum(
                 float(row.get("active_notional") or 0)
@@ -2387,6 +2411,17 @@ class TradingService:
             except (KeyError, TypeError, ValueError) as exc:
                 block_reason = f"bounded marketable-limit validation failed: {type(exc).__name__}"
 
+        # The stop is persisted as an absolute price. Recompute its dollar
+        # distance against the freshly validated entry quote before the final
+        # risk check so stale proposal geometry cannot be misclassified.
+        if block_reason is None and row.get("emergency_exit_triggered") != 1 and refreshed_price_val is not None:
+            try:
+                persisted_stop = float(proposal.get("stop_price"))
+                if prop_side == "buy" and persisted_stop > 0 and refreshed_price_val > persisted_stop:
+                    proposal["stop_distance_dollars"] = refreshed_price_val - persisted_stop
+            except (TypeError, ValueError):
+                pass
+
         if block_reason is None:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
 
@@ -2438,7 +2473,8 @@ class TradingService:
                 proposal["notional"] = final_notional
                 proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val > 0 else size_dict["suggested_shares"]
             except Exception as e:
-                logger.warning("Recalculate dynamic size failed during revalidation: %s", e)
+                logger.warning("Recalculate dynamic size failed during revalidation: %s", type(e).__name__)
+                block_reason = "final validated sizing could not be recomputed"
 
         # Execute
         proposal["status"] = "approved"
@@ -3192,8 +3228,11 @@ class TradingService:
         positions = self.broker.get_positions()
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
-        strategy_config = __import__("yaml").safe_load((PROJECT_ROOT / "config" / "strategies.yaml").read_text())[STRATEGY_VERSION]
-
+        strategy_config = {
+            "maximum_volatility_20d": 0.45,
+            "stop_drawdown_pct": 0.08,
+            **((self.config.get("strategies", {}) or {}).get(STRATEGY_VERSION, {}) or {}),
+        }
         now = datetime.now(UTC)
         today_start = now.date().isoformat() + "T00:00:00"
 
@@ -3633,7 +3672,7 @@ class TradingService:
                             add_block_reasons.append(f"insufficient score improvement ({add_score_improvement:.2f} < {min_score_imp})")
 
                 # Calculate dynamic sizing
-                final_notional = 5.0
+                final_notional = 0.0
                 suggested_shares = 0.0
                 stop_price = None
                 stop_distance_pct = None
@@ -3643,9 +3682,17 @@ class TradingService:
                 vol_mult = 1.0
                 stop_method = "default"
                 risk_based_shares = 0.0
-                score_adjusted_notional = 5.0
-                vol_adjusted_notional = 5.0
+                score_adjusted_notional = 0.0
+                vol_adjusted_notional = 0.0
                 base_notional = 5.0
+                atr_value = None
+                technical_stop_price = None
+                stop_validation_status = "blocked"
+                sizing_caps: dict[str, float] = {}
+                binding_caps: list[str] = []
+                sizing_policy_version = SIZING_POLICY_VERSION
+                stop_policy_version = STOP_POLICY_VERSION
+                sizing_formula_version = RISK_DECISION_VERSION
                 phase4_mode = "disabled"
                 phase4_exploration_heat_cap_pct = None
                 phase4_exploration_gross_cap_pct = None
@@ -3665,6 +3712,14 @@ class TradingService:
                     score_adjusted_notional = size_dict["score_adjusted_notional"]
                     vol_adjusted_notional = size_dict["vol_adjusted_notional"]
                     base_notional = size_dict["base_notional"]
+                    atr_value = size_dict.get("atr_value")
+                    technical_stop_price = size_dict.get("technical_stop_price")
+                    stop_validation_status = size_dict.get("stop_validation_status", "blocked")
+                    sizing_caps = size_dict.get("sizing_caps") or {}
+                    binding_caps = size_dict.get("binding_caps") or []
+                    sizing_policy_version = size_dict.get("sizing_policy_version", SIZING_POLICY_VERSION)
+                    stop_policy_version = size_dict.get("stop_policy_version", STOP_POLICY_VERSION)
+                    sizing_formula_version = size_dict.get("formula_version", RISK_DECISION_VERSION)
                     phase4_mode = size_dict.get("phase4_mode", "disabled")
                     phase4_exploration_heat_cap_pct = size_dict.get("phase4_exploration_heat_cap_pct")
                     phase4_exploration_gross_cap_pct = size_dict.get("phase4_exploration_gross_cap_pct")
@@ -3850,6 +3905,13 @@ class TradingService:
                     "score_multiplier": score_mult,
                     "volatility_multiplier": vol_mult,
                     "stop_model_used": stop_method,
+                    "stop_validation_status": stop_validation_status,
+                    "stop_policy_version": stop_policy_version,
+                    "technical_stop_price": technical_stop_price,
+                    "sizing_caps": sizing_caps,
+                    "binding_caps": binding_caps,
+                    "sizing_policy_version": sizing_policy_version,
+                    "formula_version": sizing_formula_version,
                     "risk_based_shares": risk_based_shares,
                     "score_adjusted_notional": score_adjusted_notional,
                     "vol_adjusted_notional": vol_adjusted_notional,
@@ -4040,7 +4102,7 @@ class TradingService:
                     "symbol": symbol,
                     "side": "buy",
                     "action": "add" if res.get("is_add") else "entry",
-                    "notional": res.get("final_notional", 5.0)
+                    "notional": res.get("final_notional", 0.0)
                 })
                 mock_prop = {
                     "symbol": symbol,
@@ -4054,11 +4116,18 @@ class TradingService:
                     "price_at": str(res["price_at"]),
                     "historical_bars": len(res["bars"]),
                     "volume": res["volume"],
-                    "notional": res.get("final_notional", 5.0),
+                    "notional": res.get("final_notional", 0.0),
                     "created_at": now.isoformat(),
                     "expires_at": res["expiry"].isoformat(),
                     "strategy_version": res["signal"].strategy_version,
                     "reason": res["signal"].reason,
+                    "stop_price": res.get("stop_price"),
+                    "stop_distance_dollars": res.get("stop_distance_dollars"),
+                    "atr_value": res.get("atr_value"),
+                    "technical_stop_price": res.get("technical_stop_price"),
+                    "stop_model_used": res.get("stop_model_used"),
+                    "stop_validation_status": res.get("stop_validation_status"),
+                    "cluster_name": self._get_symbol_cluster(symbol),
                 }
                 decision = self._risk_engine("mock_id", "proposal").evaluate(mock_prop, port_ctx)
 
@@ -4351,7 +4420,7 @@ class TradingService:
                                     selection_reason = "Selected because it was the strongest eligible candidate."
 
                             # Size adjustment calculation from res
-                            notional = res.get("final_notional", 5.0)
+                            notional = res.get("final_notional", 0.0)
                             qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else (res.get("position_management_sell_qty") or qty_held)
                             if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
                                 notional = float(qty_val or 0.0) * price
@@ -4437,6 +4506,9 @@ class TradingService:
                                 "stop_distance_pct": stop_distance_pct,
                                 "stop_distance_dollars": stop_distance_dollars,
                                 "stop_model_used": stop_model_used,
+                                "stop_validation_status": res.get("stop_validation_status"),
+                                "stop_policy_version": res.get("stop_policy_version", STOP_POLICY_VERSION),
+                                "technical_stop_price": res.get("technical_stop_price"),
                                 "initial_stop_price": stop_price if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
                                 "initial_risk_per_share": (float(price) - float(stop_price)) if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
                                 "initial_risk_pct": stop_distance_pct if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
@@ -4444,7 +4516,13 @@ class TradingService:
                                 "stop_model": stop_model_used,
                                 "stop_source": stop_model_used,
                                 "entry_price_for_r": price,
-                                "risk_model_version": "position_sizing_v1",
+                                "risk_model_version": SIZING_POLICY_VERSION,
+                                "sizing_policy_version": res.get("sizing_policy_version", SIZING_POLICY_VERSION),
+                                "sizing_caps": res.get("sizing_caps", {}),
+                                "binding_caps": res.get("binding_caps", []),
+                                "formula_version": res.get("formula_version", RISK_DECISION_VERSION),
+                                "evidence_version": EVIDENCE_VERSION,
+                                "effective_config_hash": self.config.get("effective_config_hash"),
                                 "r_multiple_unavailable_reason": (
                                     None
                                     if stop_price is not None and price is not None and float(stop_price) < float(price)
@@ -4467,7 +4545,8 @@ class TradingService:
                                 "emergency_exit_auto_execute_due_at": emergency_exit_auto_execute_due_at,
                                 "emergency_exit_final_decision": emergency_exit_final_decision,
                                 "emergency_exit_block_reason": emergency_exit_block_reason,
-                                "atr_value": atr_value,
+                                "atr_value": res.get("atr_value", atr_value),
+                                "trend_evidence": {key: signal.indicators.get(key) for key in ("ma_50", "ma_200")},
                                 "adverse_move_atr": adverse_move_atr,
                                 "minutes_to_close": minutes_to_close,
                                 "position_management_decision_type": pm_decision_type,
@@ -4761,6 +4840,13 @@ class TradingService:
 
                 if is_buy or (is_add and proposal_generated):
                     self.storage.execute(
+                        "UPDATE trade_proposals SET sizing_caps_json=?,formula_versions_json=?,evidence_version=? WHERE id=?",
+                        (json_dumps(proposal.get("sizing_caps") or {}), json_dumps({"stop_policy": STOP_POLICY_VERSION, "sizing_policy": SIZING_POLICY_VERSION, "risk_decision": RISK_DECISION_VERSION, "accounting": ACCOUNTING_VERSION, "evidence": EVIDENCE_VERSION}), EVIDENCE_VERSION, proposal_id),
+                    )
+
+                if is_buy or (is_add and proposal_generated):
+                    sizing_decision_id = str(uuid.uuid4())
+                    self.storage.execute(
                         """INSERT INTO position_sizing_decisions(
                             id, run_id, symbol, timestamp, portfolio_equity, risk_budget,
                             stop_distance_dollars, risk_based_shares, score_adjusted_notional,
@@ -4770,7 +4856,7 @@ class TradingService:
                             stop_source, entry_price_for_r, risk_model_version, r_multiple_unavailable_reason
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
-                            str(uuid.uuid4()), self.run_id, symbol, now.isoformat(),
+                            sizing_decision_id, self.run_id, symbol, now.isoformat(),
                             snapshot["portfolio_equity"], risk_budget, stop_distance_dollars,
                             risk_budget / stop_distance_dollars if stop_distance_dollars and stop_distance_dollars > 0 else 0.0,
                             res.get("score_adjusted_notional"), res.get("vol_adjusted_notional"),
@@ -4781,6 +4867,14 @@ class TradingService:
                             proposal.get("stop_source"), proposal.get("entry_price_for_r"),
                             proposal.get("risk_model_version"), proposal.get("r_multiple_unavailable_reason"),
                         )
+                    )
+                    self.storage.execute(
+                        """UPDATE position_sizing_decisions SET
+                           stop_policy_version=?,sizing_policy_version=?,formula_version=?,sizing_caps_json=?,binding_caps_json=?,evidence_version=?,config_hash=?
+                           WHERE id=?""",
+                        (STOP_POLICY_VERSION, SIZING_POLICY_VERSION, RISK_DECISION_VERSION,
+                         json_dumps(res.get("sizing_caps") or {}), json_dumps(res.get("binding_caps") or []),
+                         EVIDENCE_VERSION, self.config.get("effective_config_hash"), sizing_decision_id),
                     )
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
@@ -5581,8 +5675,19 @@ class TradingService:
             runtime_state = self._authoritative_runtime_state(force=True)
             equity = float(_value(runtime_state.get("account"), "equity", 0) or 0)
             drawdown = Phase3Controller(self.storage, self.config, self.run_id).update_equity(equity)
+            canonical_phase4 = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(runtime_state.get("positions", []), runtime_state.get("account"))
+            reservations_phase4 = DurableExecutionStore(self.storage).active_reservations()
+            pending_phase4 = self._pending_execution_totals()
+            phase4_snapshot = {
+                "heat_before_pct": ((float(canonical_phase4.projected_total_open_risk or 0.0) + float(pending_phase4.get("total_stop_risk") or 0.0)) / equity * 100.0) if equity > 0 else None,
+                "gross_exposure_before_pct": ((float(canonical_phase4.projected_gross_exposure or 0.0) + float(pending_phase4.get("total_notional") or 0.0)) / equity * 100.0) if equity > 0 else None,
+                "symbol_exposure_before": canonical_phase4.symbol_exposure,
+                "cluster_exposure_before": canonical_phase4.cluster_exposure,
+                "pending_risk": float(pending_phase4.get("total_stop_risk") or 0.0),
+                "reserved_risk": float(reservations_phase4.get("active_reserved_stop_risk") or 0.0),
+            }
             self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
-                regime="runtime_mixed_uncertain", drawdown_pct=drawdown
+                regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot
             )
             self.storage.audit(self.run_id, "phase4_active_adaptive_allocation", {
                 "allocation_id": self._phase4_allocation_cache["allocation_id"],
@@ -5590,6 +5695,10 @@ class TradingService:
                 "cash_weight": self._phase4_allocation_cache["cash_weight"],
                 "exploration_heat_pct": self._phase4_allocation_cache.get("exploration_heat_pct", 0.0),
                 "exploration_weights": self._phase4_allocation_cache.get("exploration_weights", {}),
+                "allocation_class": self._phase4_allocation_cache.get("allocation_class", "unallocated"),
+                "operational_kelly_used": self._phase4_allocation_cache.get("operational_kelly_used", False),
+                "binding_caps": self._phase4_allocation_cache.get("binding_caps", {}),
+                "evidence_versions": self._phase4_allocation_cache.get("evidence_versions", {}),
                 "strategy_states": {key: value.state for key, value in self._phase4_allocation_cache.get("estimates", {}).items()},
                 "manual_approval_required": True, "phase3_limits_authoritative": True,
             })
@@ -6319,15 +6428,9 @@ class TradingService:
         }
 
     def _pending_execution_totals(self) -> dict[str, Any]:
-        """Return proposal exposure not yet represented by a reservation.
-
-        Filled positions and partial fills are represented by the broker
-        snapshot and durable reservation ledger respectively. Only pending or
-        approved proposals without an intent are added here, preventing double
-        counting while closing the scanner/listener race.
-        """
+        """Return unreserved pending BUY exposure, failing closed on unknowns."""
         rows = self.storage.fetch_all(
-            """SELECT p.symbol,p.payload,p.notional,p.strategy_version
+            """SELECT p.id,p.symbol,p.payload,p.notional,p.strategy_version,p.status
                FROM trade_proposals p
                LEFT JOIN order_intents i ON i.proposal_id=p.id
                WHERE p.side='buy' AND p.status IN ('pending','approved') AND i.id IS NULL"""
@@ -6339,21 +6442,27 @@ class TradingService:
         exploration_risk_by_strategy: dict[str, float] = {}
         exploration_notional = 0.0
         exploration_stop_risk = 0.0
+        unknown_rows: list[dict[str, Any]] = []
         for row in rows:
+            row_id = str(row.get("id") or "unknown")
             try:
-                payload = json.loads(row.get("payload") or "{}")
-                notional = float(payload.get("notional") or row.get("notional") or 0.0)
-                price = float(payload.get("latest_price") or payload.get("reference_price") or 0.0)
-                stop = float(payload.get("stop_distance_dollars") or 0.0)
-                risk_dollars = float(payload.get("stop_risk_dollars") or payload.get("risk_budget_dollars") or 0.0)
+                raw_payload = row.get("payload")
+                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                if not isinstance(payload, dict):
+                    raise ValueError("payload is not an object")
+                notional = float(payload.get("notional") if payload.get("notional") is not None else row.get("notional"))
+                price = float(payload.get("latest_price") or payload.get("reference_price"))
+                stop = float(payload.get("stop_distance_dollars"))
+                risk_dollars = float(payload.get("stop_risk_dollars") or 0.0)
                 if risk_dollars <= 0 and notional > 0 and price > 0 and stop > 0:
                     risk_dollars = notional / price * stop
-            except (TypeError, ValueError, json.JSONDecodeError):
+                symbol = str(row.get("symbol") or payload.get("symbol") or "").upper()
+                cluster = str(payload.get("cluster_name") or self._get_symbol_cluster(symbol) or "") or None
+                if not symbol or not math.isfinite(notional) or notional <= 0 or not math.isfinite(price) or price <= 0 or not math.isfinite(stop) or stop <= 0 or not math.isfinite(risk_dollars) or risk_dollars <= 0 or not cluster:
+                    raise ValueError("pending buy exposure is incomplete")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                unknown_rows.append({"proposal_id": row_id, "reason": str(exc) or "malformed pending buy exposure"})
                 continue
-            if not math.isfinite(notional) or notional <= 0 or not math.isfinite(risk_dollars) or risk_dollars < 0:
-                continue
-            symbol = str(row.get("symbol") or "").upper()
-            cluster = self._get_symbol_cluster(symbol)
             total_notional += notional
             total_stop_risk += risk_dollars
             by_symbol[symbol] = by_symbol.get(symbol, 0.0) + notional
@@ -6372,518 +6481,367 @@ class TradingService:
             "exploration_notional": exploration_notional,
             "exploration_stop_risk": exploration_stop_risk,
             "exploration_risk_by_strategy": exploration_risk_by_strategy,
+            "unknown": bool(unknown_rows),
+            "unknown_rows": unknown_rows,
+            "unknown_reason": "; ".join(f"{row['proposal_id']}: {row['reason']}" for row in unknown_rows) if unknown_rows else None,
         }
 
     def _calculate_dynamic_size(self, symbol: str, score: float, volatility_regime: str, price: float, bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False) -> dict[str, Any]:
-        sizing_cfg = self.config.get("position_sizing", {})
-        if not isinstance(price, (int, float)) or not math.isfinite(float(price)) or float(price) <= 0:
-            return {"final_notional": 0.0, "suggested_shares": 0.0, "stop_price": None,
-                    "stop_distance_pct": None, "stop_distance_dollars": None, "risk_budget": 0.0,
-                    "risk_budget_dollars": 0.0, "stop_risk_dollars": 0.0, "score_multiplier": 1.0,
-                    "volatility_multiplier": 0.0, "stop_model_used": "blocked_invalid_entry_price",
-                    "risk_based_shares": 0.0, "score_adjusted_notional": 0.0, "vol_adjusted_notional": 0.0,
-                    "base_notional": 0.0, "raw_risk_based_notional": 0.0, "quality_adjusted_notional": 0.0,
-                    "cash_cap": 0.0, "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0,
-                    "stage_cap": 0.0, "equity_cap": 0.0, "absolute_cap": 0.0,
-                    "blocked_reason": "validated entry price unavailable"}
-        if not sizing_cfg.get("enabled", True):
-            base_notional = float(self.config.get("risk", {}).get("max_trade_notional_paper", 5.0))
-            vol_mult = 1.0
-            if volatility_regime == "elevated":
-                vol_mult = 0.5
-                base_notional = base_notional * 0.5
-            elif volatility_regime in ("high", "extreme"):
-                vol_mult = 0.0
-                base_notional = 0.0
-            elif volatility_regime == "too quiet":
-                vol_mult = 0.75
-                base_notional = base_notional * 0.75
+        """Calculate one conservative notional as the minimum of all ceilings.
+
+        This method deliberately has no minimum clamp and no percentage-stop
+        fallback. A missing stop, unknown pending exposure, or unavailable
+        Phase 3/4 risk input returns zero with an auditable blocker.
+        """
+        sizing_cfg = self.config.get("position_sizing", {}) or {}
+        mode = str(sizing_cfg.get("mode"))
+
+        def finite(value: Any, default: float | None = None) -> float | None:
+            try:
+                if value is None or isinstance(value, bool):
+                    return default
+                number = float(value)
+                return number if math.isfinite(number) else default
+            except (TypeError, ValueError):
+                return default
+
+        def empty(reason: str, *, atr_value: float | None = None, technical_stop_price: float | None = None, stop_model: str = "blocked") -> dict[str, Any]:
             return {
-                "final_notional": base_notional,
-                "suggested_shares": base_notional / price if price > 0 else 0.0,
-                "stop_price": price * 0.92,
-                "stop_distance_pct": 8.0,
-                "stop_distance_dollars": price * 0.08,
-                "risk_budget": 0.0,
-                "score_multiplier": 1.0,
-                "volatility_multiplier": vol_mult,
-                "stop_model_used": "fixed_8pct_fallback",
-                "risk_based_shares": 0.0,
-                "score_adjusted_notional": base_notional,
-                "vol_adjusted_notional": base_notional,
-                "base_notional": base_notional,
-                "raw_risk_based_notional": 0.0,
-                "quality_adjusted_notional": base_notional,
-                "cash_cap": 0.0,
-                "position_cap": 0.0,
-                "portfolio_cap": 0.0,
-                "cluster_cap": 0.0,
-                "stage_cap": 0.0,
-                "caps_applied": "none",
-                "blocked_reason": "sizing disabled" if base_notional == 0.0 else None
+                "final_notional": 0.0, "suggested_shares": 0.0, "stop_price": None,
+                "stop_distance_pct": None, "stop_distance_dollars": None, "risk_budget": 0.0,
+                "risk_budget_dollars": 0.0, "stop_risk_dollars": 0.0, "score_multiplier": 1.0,
+                "volatility_multiplier": 0.0, "stop_model_used": stop_model, "stop_validation_status": "blocked",
+                "stop_policy_version": STOP_POLICY_VERSION, "sizing_policy_version": SIZING_POLICY_VERSION,
+                "risk_based_shares": 0.0, "score_adjusted_notional": 0.0, "vol_adjusted_notional": 0.0,
+                "base_notional": 0.0, "raw_risk_based_notional": 0.0, "quality_adjusted_notional": 0.0,
+                "cash_cap": 0.0, "cash_available_cap": 0.0, "cash_usage_cap": 0.0, "buying_power_cap": 0.0,
+                "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0, "stage_cap": 0.0,
+                "equity_cap": 0.0, "absolute_cap": float("inf"), "stop_risk_cap": 0.0,
+                "allocation_cap": 0.0, "exploration_cap": 0.0, "minimum_executable_notional": 0.0,
+                "caps_applied": "none", "binding_caps": [], "sizing_caps": {}, "blocked_reason": reason,
+                "atr_value": atr_value, "technical_stop_price": technical_stop_price,
+                "pending_exposure_unknown": False, "formula_version": RISK_DECISION_VERSION,
             }
 
-        equity = snapshot.get("portfolio_equity", 10000.0)
-        cash = snapshot.get("cash", 0.0)
-        buying_power = snapshot.get("buying_power", 0.0)
-        mode = sizing_cfg.get("mode", "fixed")
+        entry_price = finite(price)
+        if entry_price is None or entry_price <= 0:
+            return empty("validated entry price unavailable")
+        if not sizing_cfg.get("enabled", True):
+            return empty("position sizing is disabled; executable entries require validated risk sizing")
 
+        equity = finite(snapshot.get("portfolio_equity"))
+        cash = finite(snapshot.get("cash"))
+        buying_power = finite(snapshot.get("buying_power"))
+        if equity is None or equity <= 0:
+            return empty("authoritative positive equity unavailable")
+        if cash is None or buying_power is None:
+            return empty("cash or buying-power accounting unavailable")
 
-
-        risk_per_trade_pct = float(sizing_cfg.get("risk_per_trade_pct", 0.05))
-        risk_budget = equity * (risk_per_trade_pct / 100.0)
-        phase3_enabled = bool(
-            self.config.get("phase3", {}).get("enabled") and self.config.get("phase3", {}).get("active")
-            and (os.getenv("TRADING_AGENT_TESTING") != "1" or self.config.get("phase3", {}).get("force_in_tests") is True)
-        )
-        phase3_context: dict[str, Any] = {}
+        phase3_enabled = bool(self.config.get("phase3", {}).get("enabled") and self.config.get("phase3", {}).get("active"))
+        phase3_context: dict[str, Any] = {"phase4_mode": "disabled", "allocation_multiplier": 1.0, "regime_multiplier": 1.0, "drawdown_multiplier": 1.0}
+        risk_per_trade_pct = finite(sizing_cfg.get("risk_per_trade_pct"))
+        if risk_per_trade_pct is None or risk_per_trade_pct < 0:
+            return empty("canonical stop-risk sizing policy is unavailable")
+        base_risk_pct = risk_per_trade_pct
         if phase3_enabled:
             from .phase3_risk import Phase3Controller, drawdown_multiplier as phase3_drawdown_multiplier, regime_multiplier as phase3_regime_multiplier
 
             controller = Phase3Controller(self.storage, self.config, self.run_id)
-            drawdown_pct = controller.update_equity(float(equity))
+            drawdown_pct = controller.update_equity(equity)
             states = controller.refresh_strategy_states()
             allocation_mult = controller.allocation(STRATEGY_VERSION, states)
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
             phase4_mode = "disabled"
-            phase4_exploration_gross_cap_pct = None
-            phase4_exploration_heat_cap_pct = None
+            exploration_gross_cap_pct = None
+            exploration_heat_cap_pct = None
             if self.config.get("phase4", {}).get("active"):
                 from .phase4_allocator import AdaptiveAllocator
                 if self._phase4_allocation_cache is None:
                     self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                         regime=volatility_regime, drawdown_pct=drawdown_pct
                     )
-                phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(STRATEGY_VERSION, {})
-                phase4_mode = str(phase4_policy.get("mode") or "blocked")
+                policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(STRATEGY_VERSION, {})
+                phase4_mode = str(policy.get("mode") or "blocked")
                 if phase4_mode == "exploration":
-                    # Exploration has its own explicit stop-risk budget. It
-                    # never uses Kelly or score sizing and is still reduced by
-                    # the Phase 3 regime/drawdown multipliers.
-                    exploration_stop_risk = float(phase4_policy.get("stop_risk_pct", 0.0))
-                    exploration_max_stop_risk = float(phase4_policy.get("max_stop_risk_pct", exploration_stop_risk))
-                    base_risk_pct = min(exploration_stop_risk, exploration_max_stop_risk)
-                    risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct,
-                                             base_risk_pct * regime_mult * drawdown_mult)
-                    phase4_exploration_gross_cap_pct = float(phase4_policy.get("gross_exposure_cap_pct", 7.5))
-                    phase4_exploration_heat_cap_pct = float(self.config.get("phase4", {}).get("exploration_heat_pct", 0.25))
-                    allocation_mult = risk_per_trade_pct / controller.profile.base_stop_risk_pct if controller.profile.base_stop_risk_pct else 0.0
+                    base_risk_pct = min(float(policy.get("stop_risk_pct", 0.0)), float(policy.get("max_stop_risk_pct", 0.0)))
+                    exploration_gross_cap_pct = float(policy.get("gross_exposure_cap_pct", 7.5))
+                    exploration_heat_cap_pct = float(self.config["phase4"]["exploration_heat_pct"])
+                    allocation_mult = base_risk_pct / controller.profile.base_stop_risk_pct if controller.profile.base_stop_risk_pct else 0.0
                 elif phase4_mode == "adaptive":
-                    allocation_mult = float(phase4_policy.get("allocation_weight", 0.0))
+                    allocation_mult = float(policy.get("allocation_weight", 0.0))
                     base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-                    risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
                 else:
                     allocation_mult = 0.0
                     base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-                    risk_per_trade_pct = 0.0
             else:
                 base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-                risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
-            risk_budget = equity * (risk_per_trade_pct / 100.0)
+            risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
             phase3_context = {
                 "controller": controller, "drawdown_pct": drawdown_pct, "states": states,
                 "allocation_multiplier": allocation_mult, "regime_multiplier": regime_mult,
                 "drawdown_multiplier": drawdown_mult, "scaled_stop_risk_pct": risk_per_trade_pct,
-                "phase4_mode": phase4_mode, "phase4_exploration_gross_cap_pct": phase4_exploration_gross_cap_pct,
-                "phase4_exploration_heat_cap_pct": phase4_exploration_heat_cap_pct,
+                "base_risk_pct": base_risk_pct, "phase4_mode": phase4_mode,
+                "phase4_exploration_gross_cap_pct": exploration_gross_cap_pct,
+                "phase4_exploration_heat_cap_pct": exploration_heat_cap_pct,
             }
+        risk_budget = equity * risk_per_trade_pct / 100.0
 
-        stop_model = sizing_cfg.get("stop_model", {})
-        atr_multiple = float(stop_model.get("atr_multiple", 2.0))
-        max_stop_pct = float(stop_model.get("max_stop_pct", 8.0))
-        min_stop_pct = float(stop_model.get("min_stop_pct", 1.0))
-
-        vol_20 = None
-        if not bars.empty and "volatility_20" in bars.columns:
-            vol_20 = bars["volatility_20"].iloc[-1]
-            if pd.isna(vol_20):
-                vol_20 = None
-
-        atr_value = 0.0
-        if "high" in bars.columns and "low" in bars.columns and "close" in bars.columns:
-            high = bars["high"].astype(float)
-            low = bars["low"].astype(float)
-            close = bars["close"].astype(float)
-            close_prev = close.shift(1)
-            tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
-            atr_series = tr.rolling(20).mean()
-            if not atr_series.empty and not pd.isna(atr_series.iloc[-1]):
+        stop_model_cfg = sizing_cfg.get("stop_model", {}) or {}
+        atr_multiple = finite(stop_model_cfg.get("atr_multiple"))
+        min_stop_pct = finite(stop_model_cfg.get("min_stop_pct"))
+        max_stop_pct = finite(stop_model_cfg.get("max_stop_pct"))
+        if atr_multiple is None or atr_multiple <= 0 or min_stop_pct is None or max_stop_pct is None or min_stop_pct < 0 or max_stop_pct < min_stop_pct:
+            return empty("validated stop policy configuration is unavailable")
+        atr_value: float | None = None
+        technical_stop_price: float | None = None
+        if not bars.empty and {"high", "low", "close"}.issubset(bars.columns):
+            high = pd.to_numeric(bars["high"], errors="coerce")
+            low = pd.to_numeric(bars["low"], errors="coerce")
+            close = pd.to_numeric(bars["close"], errors="coerce")
+            previous_close = close.shift(1)
+            true_range = pd.concat([high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+            atr_series = true_range.rolling(20, min_periods=20).mean().dropna()
+            if not atr_series.empty and math.isfinite(float(atr_series.iloc[-1])) and float(atr_series.iloc[-1]) > 0:
                 atr_value = float(atr_series.iloc[-1])
+            ma50 = close.rolling(50, min_periods=50).mean().iloc[-1] if len(close) >= 50 else None
+            recent_low = low.tail(20).min() if len(low) >= 20 else None
+            technical_candidates = [float(value) for value in (ma50, recent_low) if value is not None and not pd.isna(value) and math.isfinite(float(value)) and 0 < float(value) < entry_price]
+            if technical_candidates:
+                technical_stop_price = min(technical_candidates)
 
-        if atr_value <= 0:
-            if vol_20 is not None:
-                vol_daily = vol_20 / math.sqrt(252)
-                atr_value = price * vol_daily
-            else:
-                atr_value = 0.0
-
-        atr_stop_distance = atr_value * atr_multiple
-
-        technical_stop_distance = 0.0
-        if not bars.empty:
-            close_s = bars["close"].astype(float) if "close" in bars.columns else None
-            ma50 = close_s.rolling(50).mean().iloc[-1] if (close_s is not None and len(bars) >= 50) else None
-            recent_low = bars["low"].iloc[-20:].min() if ("low" in bars.columns and len(bars) >= 20) else None
-
-            tech_level = None
-            if ma50 is not None and not pd.isna(ma50) and recent_low is not None and not pd.isna(recent_low):
-                tech_level = min(ma50, recent_low)
-            elif ma50 is not None and not pd.isna(ma50):
-                tech_level = ma50
-            elif recent_low is not None and not pd.isna(recent_low):
-                tech_level = recent_low
-
-            if tech_level is not None and tech_level < price:
-                technical_stop_distance = price - tech_level
-
-        stop_distance_dollars = max(atr_stop_distance, technical_stop_distance)
-        stop_method = "max_of_atr_or_technical"
-
-        if stop_distance_dollars <= 0:
-            stop_distance_dollars = price * max_stop_pct / 100
-            stop_method = "fallback_max_stop"
-
-        stop_distance_pct = (stop_distance_dollars / price) * 100
-
-        if stop_distance_pct > max_stop_pct:
-            stop_distance_pct = max_stop_pct
-            stop_distance_dollars = price * max_stop_pct / 100
-        elif stop_distance_pct < min_stop_pct:
-            stop_distance_pct = min_stop_pct
-            stop_distance_dollars = price * min_stop_pct / 100
-
-        stop_price = price - stop_distance_dollars
-
-        if (
-            not math.isfinite(float(stop_distance_dollars))
-            or stop_distance_dollars <= 0
-            or not math.isfinite(float(stop_price))
-            or stop_price <= 0
-            or stop_price >= price
-        ):
-            return {
-                "final_notional": 0.0, "suggested_shares": 0.0, "stop_price": None,
-                "stop_distance_pct": None, "stop_distance_dollars": None, "risk_budget": 0.0,
-                "risk_budget_dollars": 0.0, "stop_risk_dollars": 0.0, "score_multiplier": score_mult if 'score_mult' in locals() else 1.0,
-                "volatility_multiplier": vol_mult if 'vol_mult' in locals() else 0.0, "stop_model_used": "blocked_invalid_stop",
-                "risk_based_shares": 0.0, "score_adjusted_notional": 0.0, "vol_adjusted_notional": 0.0,
-                "base_notional": 0.0, "raw_risk_based_notional": 0.0, "quality_adjusted_notional": 0.0,
-                "cash_cap": 0.0, "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0,
-                "stage_cap": 0.0, "equity_cap": 0.0, "absolute_cap": 0.0,
-                "blocked_reason": "validated stop distance unavailable",
-            }
-
-        risk_based_shares = risk_budget / stop_distance_dollars
-        risk_based_notional = risk_based_shares * price
+        stop_candidates: list[tuple[str, float]] = []
+        if atr_value is not None and atr_value * atr_multiple > 0:
+            stop_candidates.append(("atr", atr_value * atr_multiple))
+        if technical_stop_price is not None:
+            stop_candidates.append(("technical", entry_price - technical_stop_price))
+        if not stop_candidates:
+            return empty("validated ATR or technical stop evidence unavailable", atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model="blocked_missing_stop_evidence")
+        stop_distance_dollars = max(distance for _source, distance in stop_candidates)
+        sources = {source for source, distance in stop_candidates if math.isclose(distance, stop_distance_dollars, rel_tol=1e-9, abs_tol=1e-9)}
+        stop_model_used = "atr_and_technical" if len(sources) > 1 else next(iter(sources))
+        stop_price = entry_price - stop_distance_dollars
+        stop_distance_pct = stop_distance_dollars / entry_price * 100.0
+        if stop_distance_pct < min_stop_pct or stop_distance_pct > max_stop_pct:
+            return empty("validated stop is outside configured risk bounds", atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model="blocked_stop_out_of_bounds")
+        stop_evidence = validate_stop_evidence(
+            entry_price=entry_price, stop_price=stop_price, stop_distance_dollars=stop_distance_dollars,
+            atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model_used=stop_model_used,
+            stop_validation_status="validated",
+        )
+        if not stop_evidence["valid"]:
+            return empty(stop_evidence["reason"], atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model="blocked_invalid_stop")
 
         score_mult = 1.0
         if not phase3_enabled:
-            score_mult_map = sizing_cfg.get("score_multiplier", {})
-            if score >= 95:
-                score_mult = float(score_mult_map.get("95_100", 1.5))
-            elif score >= 85:
-                score_mult = float(score_mult_map.get("85_94", 1.25))
-            elif score >= 75:
-                score_mult = float(score_mult_map.get("75_84", 1.0))
-            elif score >= 65:
-                score_mult = float(score_mult_map.get("65_74", 0.5))
-
-        vol_mult = 1.0
-        vol_mult_map = sizing_cfg.get("volatility_multiplier", {})
-        if volatility_regime == "too quiet":
-            vol_mult = float(vol_mult_map.get("too_quiet", 0.75))
-        elif volatility_regime == "normal":
-            vol_mult = float(vol_mult_map.get("normal", 1.0))
-        elif volatility_regime == "elevated":
-            vol_mult = float(vol_mult_map.get("elevated", 0.5))
-        elif volatility_regime == "high":
-            vol_mult = float(vol_mult_map.get("high", 0.25))
-        elif volatility_regime == "extreme":
-            vol_mult = float(vol_mult_map.get("extreme", 0.0))
-
-        if self.storage is None:
-            reservations = {"active_reserved_notional": 0.0, "symbol_reserved_notional": {}, "cluster_reserved_notional": {}}
-            pending = {"total_notional": 0.0, "total_stop_risk": 0.0, "by_symbol": {}, "by_cluster": {}, "exploration_stop_risk": 0.0, "exploration_risk_by_strategy": {}}
-        else:
-            reservations = DurableExecutionStore(self.storage).active_reservations()
-            pending = self._pending_execution_totals()
-        reserved_notional = float(reservations.get("active_reserved_notional") or 0.0)
-        committed_notional = reserved_notional + float(pending.get("total_notional") or 0.0)
-        reserved_by_symbol = reservations.get("symbol_reserved_notional", {})
-        reserved_by_cluster = reservations.get("cluster_reserved_notional", {})
-        committed_symbol = float(reserved_by_symbol.get(symbol.upper(), 0.0)) + float((pending.get("by_symbol") or {}).get(symbol.upper(), 0.0))
-
+            score_map = sizing_cfg.get("score_multiplier", {}) or {}
+            score_mult = float(score_map.get("95_100" if score >= 95 else "85_94" if score >= 85 else "75_84" if score >= 75 else "65_74", 1.0))
+        vol_map = sizing_cfg.get("volatility_multiplier", {}) or {}
+        vol_mult = float(vol_map.get(str(volatility_regime), 1.0))
+        risk_based_shares = risk_budget / stop_distance_dollars if stop_distance_dollars > 0 else 0.0
+        risk_based_notional = risk_based_shares * entry_price
+        try:
+            policy = effective_notional_policy(self.config, equity, is_add=is_add)
+        except (TypeError, ValueError) as exc:
+            return empty(f"canonical notional policy is invalid: {exc}", atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model=stop_model_used)
         if mode == "risk_portfolio":
             target_notional = risk_based_notional * score_mult * vol_mult
             if is_add:
-                add_size_multiplier = float(sizing_cfg.get("add_size_multiplier", 0.5))
-                target_notional = target_notional * add_size_multiplier
-
-            # Cash reserve and usage limit
-            min_cash_reserve_pct = float(sizing_cfg.get("min_cash_reserve_pct", 20.0))
-            min_cash_reserve = equity * (min_cash_reserve_pct / 100.0)
-            usable_cash = max(0.0, cash - min_cash_reserve)
-            max_cash_usage_pct = float(sizing_cfg.get("max_cash_usage_pct", 10.0))
-            max_cash_per_trade = equity * (max_cash_usage_pct / 100.0)
-            buying_power_available = max(0.0, buying_power - committed_notional)
-            cash_cap = min(usable_cash, max_cash_per_trade, buying_power_available)
-
-            # Single position cap
-            max_position_notional_pct_of_equity = float(sizing_cfg.get("max_position_notional_pct_of_equity", 2.0))
-            max_single_exposure = equity * (max_position_notional_pct_of_equity / 100.0)
-            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity + committed_symbol
-            allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
-
-            # Portfolio total exposure cap
-            max_total_portfolio_exposure_pct = float(sizing_cfg.get("max_total_portfolio_exposure_pct", 6.0))
-            max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
-            current_total_value = snapshot["total_exposure_dollars"] + committed_notional
-            allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
-
-            # Cluster exposure cap
-            allowed_additional_cluster = float("inf")
-            c_name = self._get_symbol_cluster(symbol)
-            if c_name:
-                max_cluster_exposure_pct = float(sizing_cfg.get("max_cluster_exposure_pct", 5.0))
-                max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
-                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity + float(reserved_by_cluster.get(c_name, 0.0)) + float((pending.get("by_cluster") or {}).get(c_name, 0.0))
-                allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
-
-            # All notional ceilings come from the single validated policy.
-            policy = effective_notional_policy(self.config, float(equity), is_add=is_add)
-            stage_cap = policy.stage_max_notional_usd if policy.stage_max_notional_usd is not None else float("inf")
-            equity_cap = policy.equity_max_notional_usd if policy.equity_max_notional_usd is not None else float("inf")
-            absolute_cap = policy.absolute_max_notional_usd if policy.absolute_max_notional_usd is not None else float("inf")
-            max_trade_notional = min(equity_cap, absolute_cap)
-            max_trade_notional = min(max_trade_notional, policy.stage_max_notional_usd) if policy.stage_max_notional_usd is not None else max_trade_notional
-            minimum_executable_notional = policy.minimum_executable_notional_usd
+                target_notional *= float(sizing_cfg["add_size_multiplier"])
         else:
-            policy = effective_notional_policy(self.config, float(equity), is_add=is_add)
-            base_paper_notional = policy.default_notional_usd
-            suggested_add_notional = policy.default_notional_usd
-            base_target = suggested_add_notional if is_add else base_paper_notional
-            target_notional = base_target * score_mult * vol_mult
+            target_notional = policy.default_notional_usd * vol_mult
 
-            # Cash cap (disabled in fixed mode)
-            # Fixed-mode legacy/snapshot callers may not provide an account
-            # cash field; the authoritative Phase 3 path always does. Do not
-            # invent a zero ceiling from an omitted optional field.
-            cash_cap = max(0.0, buying_power - committed_notional) if buying_power > 0 else float("inf")
+        if self.storage is None:
+            reservations = {"active_reserved_notional": 0.0, "active_reserved_stop_risk": 0.0, "symbol_reserved_notional": {}, "cluster_reserved_notional": {}}
+            pending = {"total_notional": 0.0, "total_stop_risk": 0.0, "by_symbol": {}, "by_cluster": {}, "exploration_stop_risk": 0.0, "exploration_risk_by_strategy": {}, "unknown": False}
+        else:
+            reservations = DurableExecutionStore(self.storage).active_reservations()
+            pending = self._pending_execution_totals()
+        if pending.get("unknown"):
+            result = empty("pending buy exposure is malformed or incomplete; risk is unknown", atr_value=atr_value, technical_stop_price=technical_stop_price, stop_model=stop_model_used)
+            result.update({"stop_price": stop_price, "stop_distance_pct": stop_distance_pct, "stop_distance_dollars": stop_distance_dollars,
+                           "risk_budget": risk_budget, "risk_budget_dollars": risk_budget, "stop_validation_status": "validated",
+                           "risk_based_shares": risk_based_shares, "raw_risk_based_notional": risk_based_notional,
+                           "base_notional": policy.default_notional_usd, "minimum_executable_notional": policy.minimum_executable_notional_usd,
+                           "pending_exposure_unknown": True, "pending_exposure_unknown_reason": pending.get("unknown_reason")})
+            return result
 
-            # Single position cap
-            max_single_symbol_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_symbol_exposure_pct", 5.0))
-            max_single_exposure = equity * (max_single_symbol_exposure_pct / 100.0)
-            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity + committed_symbol
-            allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
+        reserved_notional = float(reservations.get("active_reserved_notional") or 0.0)
+        reserved_stop_risk = float(reservations.get("active_reserved_stop_risk") or 0.0)
+        pending_notional = float(pending.get("total_notional") or 0.0)
+        pending_stop_risk = float(pending.get("total_stop_risk") or 0.0)
+        committed_notional = reserved_notional + pending_notional
+        reserved_by_symbol = reservations.get("symbol_reserved_notional", {}) or {}
+        reserved_by_cluster = reservations.get("cluster_reserved_notional", {}) or {}
+        committed_symbol = float(reserved_by_symbol.get(symbol.upper(), 0.0)) + float((pending.get("by_symbol") or {}).get(symbol.upper(), 0.0))
+        cluster_name = self._get_symbol_cluster(symbol)
+        committed_cluster = float(reserved_by_cluster.get(cluster_name, 0.0)) + float((pending.get("by_cluster") or {}).get(cluster_name, 0.0)) if cluster_name else 0.0
+        current_symbol_value = float((snapshot.get("single_exposures") or {}).get(symbol.upper(), 0.0)) / 100.0 * equity + committed_symbol
+        current_total_value = float(snapshot.get("total_exposure_dollars") or 0.0) + committed_notional
+        current_cluster_value = float((snapshot.get("cluster_exposures") or {}).get(cluster_name, 0.0)) / 100.0 * equity + committed_cluster if cluster_name else 0.0
 
-            # Portfolio total exposure cap
-            max_total_portfolio_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_total_portfolio_exposure_pct", 15.0))
-            max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
-            current_total_value = snapshot["total_exposure_dollars"] + committed_notional
-            allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
+        min_cash_reserve = equity * float(sizing_cfg["min_cash_reserve_pct"]) / 100.0
+        cash_available_cap = max(0.0, cash - min_cash_reserve)
+        cash_usage_cap = max(0.0, equity * float(sizing_cfg["max_cash_usage_pct"]) / 100.0)
+        cash_cap = min(cash_available_cap, cash_usage_cap)
+        buying_power_committed = pending_notional if snapshot.get("buying_power_includes_active_reservations") else committed_notional
+        buying_power_cap = max(0.0, buying_power - buying_power_committed)
+        symbol_limit = equity * float(sizing_cfg["max_position_notional_pct_equity"]) / 100.0
+        symbol_cap = max(0.0, symbol_limit - current_symbol_value)
+        portfolio_limit = equity * float(sizing_cfg["max_total_portfolio_exposure_pct"]) / 100.0
+        portfolio_cap = max(0.0, portfolio_limit - current_total_value)
+        cluster_cap = float("inf")
+        if cluster_name:
+            cluster_limit = equity * float(sizing_cfg["max_cluster_exposure_pct"]) / 100.0
+            cluster_cap = max(0.0, cluster_limit - current_cluster_value)
 
-            # Cluster exposure cap
-            allowed_additional_cluster = float("inf")
-            c_name = self._get_symbol_cluster(symbol)
-            if c_name:
-                max_cluster_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0))
-                max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
-                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity + float(reserved_by_cluster.get(c_name, 0.0)) + float((pending.get("by_cluster") or {}).get(c_name, 0.0))
-                allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
-
-            # Stage cap is disabled in fixed mode
-            stage_cap = policy.stage_max_notional_usd if policy.stage_max_notional_usd is not None else float("inf")
-            equity_cap = policy.equity_max_notional_usd if policy.equity_max_notional_usd is not None else float("inf")
-            absolute_cap = policy.absolute_max_notional_usd if policy.absolute_max_notional_usd is not None else float("inf")
-            max_trade_notional = min(stage_cap, equity_cap, absolute_cap)
-            minimum_executable_notional = policy.minimum_executable_notional_usd
-
-        # Apply constraints
-        final_notional = target_notional
-        final_notional = min(final_notional, cash_cap)
-        final_notional = min(final_notional, allowed_additional_single)
-        final_notional = min(final_notional, allowed_additional_total)
-        final_notional = min(final_notional, allowed_additional_cluster)
-        final_notional = min(final_notional, stage_cap)
-        final_notional = min(final_notional, equity_cap)
-        final_notional = min(final_notional, absolute_cap)
-        final_notional = min(final_notional, max_trade_notional)
-        blocked_reason = None
+        stage_cap = policy.stage_max_notional_usd if policy.stage_max_notional_usd is not None else float("inf")
+        equity_cap = policy.equity_max_notional_usd if policy.equity_max_notional_usd is not None else float("inf")
+        absolute_cap = policy.absolute_max_notional_usd if policy.absolute_max_notional_usd is not None else float("inf")
+        stop_risk_ceiling = risk_budget
+        if phase3_enabled:
+            stop_risk_ceiling = equity * float(phase3_context["controller"].profile.max_trade_stop_risk_pct) / 100.0
+        stop_risk_cap = notional_from_stop_risk(stop_risk_ceiling, entry_price, stop_distance_dollars)
+        allocation_cap = notional_from_stop_risk(risk_budget, entry_price, stop_distance_dollars) if phase3_enabled else float("inf")
+        exploration_cap = float("inf")
+        extra_caps: dict[str, float] = {}
+        blocked_reason: str | None = None
 
         if phase3_enabled:
             state = self._authoritative_runtime_state()
             canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(state["positions"], state["account"])
             profile = phase3_context["controller"].profile
-            heat_cap = profile.defensive_portfolio_heat_pct if phase3_context["regime_multiplier"] <= 0.5 else profile.max_portfolio_heat_pct
-            if phase3_context.get("phase4_mode") == "exploration":
-                heat_cap = min(heat_cap, float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25))
-            current_heat = (
-                float(canonical.projected_total_open_risk)
-                + float(pending.get("total_stop_risk") or 0.0)
-                if canonical.projected_total_open_risk is not None else None
-            )
-            loss_metrics = build_loss_metrics(
-                state.get("loss_metrics"),
-                account_equity=canonical.portfolio_equity,
-                daily_realized_pl=canonical.daily_realized_pl,
-                weekly_realized_pl=canonical.weekly_realized_pl,
-                daily_confidence=canonical.daily_realized_pl_status,
-                weekly_confidence=canonical.weekly_realized_pl_status,
-            )
-            daily_loss_pct = loss_metrics.daily_loss_pct
-            weekly_loss_pct = loss_metrics.weekly_loss_pct
-            if current_heat is None or canonical.portfolio_equity is None or canonical.filled_gross_exposure is None:
-                final_notional = 0.0
+            if canonical.portfolio_equity is None or canonical.projected_total_open_risk is None or canonical.projected_gross_exposure is None:
                 blocked_reason = "Phase 3 exposure or stop-risk accounting unavailable"
-            elif (daily_loss_pct is None or weekly_loss_pct is None
-                  or loss_metrics.daily_loss_confidence == "unavailable"
-                  or loss_metrics.weekly_loss_confidence == "unavailable"):
-                final_notional = 0.0
-                blocked_reason = "Phase 3 realized loss evidence unavailable"
-            elif daily_loss_pct >= profile.daily_loss_throttle_pct or weekly_loss_pct >= profile.weekly_loss_throttle_pct:
-                final_notional = 0.0
-                blocked_reason = "Phase 3 realized loss throttle active"
-            elif phase3_context["drawdown_multiplier"] == 0.0:
-                final_notional = 0.0
-                blocked_reason = "Phase 3 account drawdown halt active"
             else:
-                allowed_risk = max(0.0, canonical.portfolio_equity * heat_cap / 100.0 - current_heat)
-                final_notional = min(final_notional, allowed_risk / stop_distance_dollars * price if stop_distance_dollars > 0 else 0.0)
+                heat_cap_pct = profile.defensive_portfolio_heat_pct if phase3_context["regime_multiplier"] <= 0.5 else profile.max_portfolio_heat_pct
                 if phase3_context.get("phase4_mode") == "exploration":
-                    gross_cap_pct = float(phase3_context.get("phase4_exploration_gross_cap_pct") or 7.5)
-                    current_gross = max(float(canonical.filled_gross_exposure or 0.0), float(canonical.projected_gross_exposure or 0.0)) + float(pending.get("total_notional") or 0.0)
-                    allowed_gross = max(0.0, canonical.portfolio_equity * gross_cap_pct / 100.0 - current_gross)
-                    final_notional = min(final_notional, allowed_gross)
-                    existing_total_exploration_risk = float(pending.get("exploration_stop_risk") or 0.0)
-                    exploration_heat_remaining = max(
-                        0.0,
-                        canonical.portfolio_equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0
-                        - existing_total_exploration_risk,
+                    heat_cap_pct = min(heat_cap_pct, float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25))
+                current_heat = float(canonical.projected_total_open_risk) + pending_stop_risk
+                heat_remaining = max(0.0, equity * heat_cap_pct / 100.0 - current_heat)
+                extra_caps["phase3_heat_cap"] = notional_from_stop_risk(heat_remaining, entry_price, stop_distance_dollars)
+                current_gross = float(canonical.projected_gross_exposure) + pending_notional
+                gross_cap_pct = profile.favorable_gross_exposure_pct if phase3_context["regime_multiplier"] >= 1.0 else profile.normal_gross_exposure_pct
+                if phase3_context.get("phase4_mode") == "exploration":
+                    gross_cap_pct = min(gross_cap_pct, float(phase3_context.get("phase4_exploration_gross_cap_pct") or 7.5))
+                extra_caps["gross_exposure_cap"] = max(0.0, equity * gross_cap_pct / 100.0 - current_gross)
+                loss_metrics = build_loss_metrics(
+                    state.get("loss_metrics"), account_equity=canonical.portfolio_equity,
+                    daily_realized_pl=canonical.daily_realized_pl, weekly_realized_pl=canonical.weekly_realized_pl,
+                    daily_confidence=canonical.daily_realized_pl_status, weekly_confidence=canonical.weekly_realized_pl_status,
+                )
+                if loss_metrics.daily_loss_pct is None or loss_metrics.weekly_loss_pct is None:
+                    blocked_reason = "Phase 3 realized loss evidence unavailable"
+                elif loss_metrics.daily_loss_pct >= profile.daily_loss_throttle_pct or loss_metrics.weekly_loss_pct >= profile.weekly_loss_throttle_pct:
+                    blocked_reason = "Phase 3 realized loss throttle active"
+                elif phase3_context["drawdown_multiplier"] == 0.0:
+                    blocked_reason = "Phase 3 account drawdown halt active"
+                average_dollar_volume = 0.0
+                if not bars.empty and {"volume", "close"}.issubset(bars.columns):
+                    average_dollar_volume = float((pd.to_numeric(bars["volume"], errors="coerce").tail(20) * pd.to_numeric(bars["close"], errors="coerce").tail(20)).mean())
+                if not math.isfinite(average_dollar_volume) or average_dollar_volume < profile.minimum_average_dollar_volume:
+                    blocked_reason = "Phase 3 liquidity floor failed"
+                if phase3_context.get("phase4_mode") == "exploration":
+                    existing_exploration = float(pending.get("exploration_stop_risk") or 0.0) + reserved_stop_risk
+                    heat_remaining = max(0.0, equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0 - existing_exploration)
+                    strategy_remaining = max(0.0, equity * float(self.config["phase4"]["max_exploration_stop_risk_pct"]) / 100.0 - float((pending.get("exploration_risk_by_strategy") or {}).get(STRATEGY_VERSION, 0.0)))
+                    exploration_cap = min(
+                        notional_from_stop_risk(heat_remaining, entry_price, stop_distance_dollars),
+                        notional_from_stop_risk(strategy_remaining, entry_price, stop_distance_dollars),
+                        extra_caps["gross_exposure_cap"],
                     )
-                    existing_strategy_exploration_risk = float((pending.get("exploration_risk_by_strategy") or {}).get(STRATEGY_VERSION, 0.0))
-                    exploration_strategy_remaining = max(
-                        0.0,
-                        canonical.portfolio_equity * float(self.config.get("phase4", {}).get("max_exploration_stop_risk_pct", 0.10)) / 100.0
-                        - existing_strategy_exploration_risk,
-                    )
-                    # These are stop-risk dollars. Convert them to safe
-                    # position notional using the validated entry price and
-                    # stop distance; never compare risk dollars to notional.
-                    if not math.isfinite(stop_distance_dollars) or stop_distance_dollars <= 0 or not math.isfinite(price) or price <= 0:
-                        final_notional = 0.0
-                        blocked_reason = "exploration sizing evidence or stop distance unavailable"
-                    else:
-                        final_notional = min(
-                            final_notional,
-                            notional_from_stop_risk(exploration_heat_remaining, price, stop_distance_dollars),
-                            notional_from_stop_risk(exploration_strategy_remaining, price, stop_distance_dollars),
-                        )
-            average_dollar_volume = 0.0
-            if not bars.empty and "volume" in bars.columns and "close" in bars.columns:
-                average_dollar_volume = float((bars["volume"].astype(float).tail(20) * bars["close"].astype(float).tail(20)).mean())
-            if not math.isfinite(average_dollar_volume) or average_dollar_volume < profile.minimum_average_dollar_volume:
-                final_notional = 0.0
-                blocked_reason = "Phase 3 liquidity floor failed"
+                    extra_caps["exploration_heat_cap"] = notional_from_stop_risk(heat_remaining, entry_price, stop_distance_dollars)
+                    extra_caps["exploration_strategy_cap"] = notional_from_stop_risk(strategy_remaining, entry_price, stop_distance_dollars)
+                    extra_caps["exploration_gross_cap"] = extra_caps["gross_exposure_cap"]
 
-        caps_applied = []
-        if target_notional > 0.0:
-            if final_notional == stage_cap and stage_cap < target_notional:
-                caps_applied.append("stage_cap")
-            if final_notional == cash_cap and cash_cap < target_notional:
-                caps_applied.append("cash_cap")
-            if final_notional == allowed_additional_single and allowed_additional_single < target_notional:
-                caps_applied.append("position_cap")
-            if final_notional == allowed_additional_total and allowed_additional_total < target_notional:
-                caps_applied.append("portfolio_cap")
-            if final_notional == allowed_additional_cluster and allowed_additional_cluster < target_notional:
-                caps_applied.append("cluster_cap")
-            if final_notional == max_trade_notional and max_trade_notional < target_notional:
-                caps_applied.append("max_trade_notional_cap")
-            if final_notional == equity_cap and equity_cap < target_notional:
-                caps_applied.append("equity_max_cap")
-            if final_notional == absolute_cap and absolute_cap < target_notional:
-                caps_applied.append("absolute_max_cap")
-
-        # The executable minimum is a floor for admission, never an upward
-        # clamp. A constrained result below it is blocked and set to zero.
-        min_notional = float(minimum_executable_notional)
-        if final_notional > 0 and final_notional < min_notional and blocked_reason is None:
+        caps: dict[str, float] = {
+            "stage": stage_cap, "stop_risk": stop_risk_cap, "equity": equity_cap, "cash": cash_cap,
+            "cash_available": cash_available_cap, "cash_usage": cash_usage_cap, "buying_power": buying_power_cap,
+            "symbol": symbol_cap, "cluster": cluster_cap, "portfolio": portfolio_cap,
+            "allocation": allocation_cap, "exploration": exploration_cap, "absolute": absolute_cap,
+            **extra_caps,
+        }
+        finite_caps = {name: value for name, value in caps.items() if math.isfinite(value)}
+        final_notional = min([max(0.0, float(target_notional)), *[max(0.0, value) for value in finite_caps.values()]])
+        if blocked_reason is not None:
+            final_notional = 0.0
+        binding_caps = [name for name, value in finite_caps.items() if target_notional > 0 and value <= final_notional + 1e-9]
+        caps_applied = [name for name, value in finite_caps.items() if target_notional > 0 and value < target_notional - 1e-9]
+        minimum_executable_notional = policy.minimum_executable_notional_usd
+        if final_notional > 0 and final_notional < minimum_executable_notional and blocked_reason is None:
             blocked_reason = "constrained notional is below the executable minimum"
             final_notional = 0.0
-        elif final_notional <= 0 and blocked_reason is None:
-            if cash_cap <= 0:
-                blocked_reason = "cash or buying-power ceiling leaves no executable notional"
-            elif allowed_additional_single <= 0:
-                blocked_reason = "single-symbol exposure ceiling leaves no executable notional"
-            elif allowed_additional_total <= 0:
-                blocked_reason = "portfolio exposure ceiling leaves no executable notional"
-            elif allowed_additional_cluster <= 0:
-                blocked_reason = "cluster exposure ceiling leaves no executable notional"
-            else:
-                blocked_reason = "no safe executable notional remains after constraints"
-
-        if volatility_regime == "extreme" or vol_mult == 0.0:
+        if final_notional <= 0 and blocked_reason is None:
+            blocked_reason = "no safe executable notional remains after ceiling constraints"
+        if vol_mult <= 0 or volatility_regime == "extreme":
             final_notional = 0.0
             blocked_reason = f"blocked by volatility multiplier: {volatility_regime}"
-
         final_notional = max(0.0, final_notional)
-        suggested_shares = final_notional / price if price > 0 else 0.0
+        suggested_shares = final_notional / entry_price
+        sizing_caps = {name: value for name, value in caps.items() if math.isfinite(value)}
 
         if phase3_enabled:
             controller = phase3_context["controller"]
+            state = self._authoritative_runtime_state()
+            canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(state["positions"], state["account"])
+            before_heat_pct = ((float(canonical.projected_total_open_risk or 0.0) + pending_stop_risk) / equity * 100.0)
+            before_gross_pct = ((float(canonical.projected_gross_exposure or 0.0) + pending_notional) / equity * 100.0)
+            before_symbol_pct = dict(canonical.symbol_exposure)
+            before_cluster_pct = dict(canonical.cluster_exposure)
+            after_heat_pct = before_heat_pct + (final_notional / entry_price * stop_distance_dollars / equity * 100.0)
+            after_gross_pct = before_gross_pct + final_notional / equity * 100.0
+            after_symbol_pct = dict(before_symbol_pct); after_symbol_pct[symbol.upper()] = after_symbol_pct.get(symbol.upper(), 0.0) + final_notional / equity * 100.0
+            after_cluster_pct = dict(before_cluster_pct)
+            if cluster_name: after_cluster_pct[cluster_name] = after_cluster_pct.get(cluster_name, 0.0) + final_notional / equity * 100.0
             decision_id = str(uuid.uuid4())
             decision = "ELIGIBLE" if final_notional > 0 and not blocked_reason else "BLOCKED"
-            controller.storage.execute("""INSERT INTO phase3_risk_decisions(
-              id,run_id,symbol,strategy_version,decision_time,decision,reason,equity,account_drawdown_pct,
-              base_stop_risk_pct,scaled_stop_risk_pct,stop_price,stop_distance,risk_budget,requested_notional,
-              portfolio_heat_before_pct,portfolio_heat_after_pct,gross_exposure_after_pct,symbol_exposure_after_pct,
-              cluster_exposure_after_pct,regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,profile_version,payload)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (decision_id,self.run_id,symbol,STRATEGY_VERSION,iso_now(),decision,blocked_reason or "within Phase 3 limits",
-               equity,phase3_context["drawdown_pct"],base_risk_pct,
-               phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
-               None,None,None,None,None,volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],
-               phase3_context["allocation_multiplier"],"moderate_paper_risk_v1",json_dumps({
-                   "score_used_for_sizing":False,
-                   "kelly_used":phase3_context.get("phase4_mode") == "adaptive",
-                   "phase4_mode":phase3_context.get("phase4_mode"),
-                   "exploration_heat_cap_pct":phase3_context.get("phase4_exploration_heat_cap_pct"),
-                   "exploration_gross_cap_pct":phase3_context.get("phase4_exploration_gross_cap_pct"),
-                   "manual_approval_required":True,
-               })))
+            payload = {
+                "score_used_for_sizing": False, "kelly_used": False, "kelly_diagnostic_only": phase3_context.get("phase4_mode") == "adaptive",
+                "phase4_mode": phase3_context.get("phase4_mode"), "sizing_caps": sizing_caps,
+                "binding_caps": binding_caps, "pending_exposure_unknown": bool(pending.get("unknown")),
+                "manual_approval_required": True, "formula_version": PHASE3_DECISION_VERSION,
+                "evidence_version": EVIDENCE_VERSION, "config_hash": self.config.get("effective_config_hash"),
+            }
+            controller.storage.execute(
+                # Keep the audit insert named and count-checked as the schema
+                # grows; the values below correspond to 44 named columns.
+                f"""INSERT INTO phase3_risk_decisions(
+                   id,run_id,symbol,strategy_version,decision_time,decision,reason,equity,account_drawdown_pct,
+                   base_stop_risk_pct,scaled_stop_risk_pct,stop_price,stop_distance,risk_budget,requested_notional,
+                   stop_risk_cap,stage_cap,equity_cap,cash_cap,buying_power_cap,symbol_cap,cluster_cap,portfolio_cap,allocation_cap,exploration_cap,
+                   pending_risk_before,reserved_risk_before,pending_risk_after,reserved_risk_after,
+                   portfolio_heat_before_pct,portfolio_heat_after_pct,gross_exposure_after_pct,symbol_exposure_after_pct,cluster_exposure_after_pct,
+                   regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,binding_caps_json,evidence_version,formula_version,config_hash,profile_version,payload)
+                 VALUES({','.join('?' for _ in range(44))})""",
+                (decision_id,self.run_id,symbol,STRATEGY_VERSION,iso_now(),decision,blocked_reason or "within Phase 3 limits",equity,
+                 phase3_context["drawdown_pct"],phase3_context["base_risk_pct"],phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
+                 sizing_caps.get("stop_risk"),sizing_caps.get("stage"),sizing_caps.get("equity"),sizing_caps.get("cash"),sizing_caps.get("buying_power"),sizing_caps.get("symbol"),sizing_caps.get("cluster"),sizing_caps.get("portfolio"),sizing_caps.get("allocation"),sizing_caps.get("exploration"),
+                 pending_stop_risk,reserved_stop_risk,pending_stop_risk + final_notional / entry_price * stop_distance_dollars,reserved_stop_risk,
+                 before_heat_pct,after_heat_pct,after_gross_pct,after_symbol_pct.get(symbol.upper(), 0.0),after_cluster_pct.get(cluster_name, 0.0) if cluster_name else None,
+                 volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],phase3_context["allocation_multiplier"],json_dumps(binding_caps),EVIDENCE_VERSION,PHASE3_DECISION_VERSION,self.config.get("effective_config_hash"),"moderate_paper_risk_v1",json_dumps(payload)))
 
         return {
-            "final_notional": final_notional,
-            "suggested_shares": suggested_shares,
-            "stop_price": stop_price,
-            "stop_distance_pct": stop_distance_pct,
-            "stop_distance_dollars": stop_distance_dollars,
-            "risk_budget": risk_budget,
-            "risk_budget_dollars": risk_budget,
-            "stop_risk_dollars": final_notional / price * stop_distance_dollars if final_notional > 0 and price > 0 else 0.0,
-            "phase4_mode": phase3_context.get("phase4_mode", "disabled") if phase3_enabled else "disabled",
-            "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct") if phase3_enabled else None,
-            "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct") if phase3_enabled else None,
-            "score_multiplier": score_mult,
-            "volatility_multiplier": vol_mult,
-            "stop_model_used": stop_method,
-            "risk_based_shares": risk_based_shares,
-            "score_adjusted_notional": target_notional,
-            "vol_adjusted_notional": target_notional,
-            "base_notional": float(sizing_cfg.get("default_paper_notional_usd", sizing_cfg.get("base_paper_notional", 50.0))),
-            "raw_risk_based_notional": risk_based_notional,
-            "quality_adjusted_notional": target_notional,
-            "cash_cap": cash_cap,
-            "position_cap": allowed_additional_single,
-            "portfolio_cap": allowed_additional_total,
-            "cluster_cap": allowed_additional_cluster,
-            "stage_cap": stage_cap,
-            "equity_cap": equity_cap,
-            "absolute_cap": absolute_cap,
-            "minimum_executable_notional": min_notional,
-            "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
-            "blocked_reason": blocked_reason
+            "final_notional": final_notional, "suggested_shares": suggested_shares, "stop_price": stop_price,
+            "stop_distance_pct": stop_distance_pct, "stop_distance_dollars": stop_distance_dollars,
+            "risk_budget": risk_budget, "risk_budget_dollars": risk_budget,
+            "stop_risk_dollars": final_notional / entry_price * stop_distance_dollars,
+            "phase4_mode": phase3_context.get("phase4_mode", "disabled"),
+            "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct"),
+            "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct"),
+            "score_multiplier": score_mult, "volatility_multiplier": vol_mult, "stop_model_used": stop_model_used,
+            "stop_validation_status": "validated", "stop_policy_version": STOP_POLICY_VERSION,
+            "atr_value": atr_value, "technical_stop_price": technical_stop_price,
+            "risk_based_shares": risk_based_shares, "score_adjusted_notional": target_notional,
+            "vol_adjusted_notional": target_notional, "base_notional": policy.default_notional_usd,
+            "raw_risk_based_notional": risk_based_notional, "quality_adjusted_notional": target_notional,
+            "cash_cap": cash_cap, "cash_available_cap": cash_available_cap, "cash_usage_cap": cash_usage_cap,
+            "buying_power_cap": buying_power_cap, "position_cap": symbol_cap, "portfolio_cap": portfolio_cap,
+            "cluster_cap": cluster_cap, "stage_cap": stage_cap, "equity_cap": equity_cap, "absolute_cap": absolute_cap,
+            "stop_risk_cap": stop_risk_cap, "allocation_cap": allocation_cap, "exploration_cap": exploration_cap,
+            "minimum_executable_notional": minimum_executable_notional, "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
+            "binding_caps": binding_caps, "sizing_caps": sizing_caps, "blocked_reason": blocked_reason,
+            "pending_exposure_unknown": False, "sizing_policy_version": SIZING_POLICY_VERSION,
+            "formula_version": RISK_DECISION_VERSION,
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6891,7 +6849,7 @@ class TradingService:
         for c in buy_candidates:
             symbol = c["symbol"]
             score = c["score"]
-            notional = c.get("final_notional", 5.0)
+            notional = c.get("final_notional", 0.0)
 
             setup_quality = score
 
@@ -7361,7 +7319,7 @@ class TradingService:
             "max_total_portfolio_exposure_pct": float(rb.get("max_total_portfolio_exposure_pct", pb.get("max_total_portfolio_exposure_pct", 6.0))),
             "max_single_symbol_exposure_pct": float(rb.get("max_single_symbol_exposure_pct", pb.get("max_single_symbol_exposure_pct", 2.5))),
             "max_cluster_exposure_pct": float(rb.get("max_cluster_exposure_pct", optimizer.get("max_same_cluster_exposure_pct", pb.get("max_correlated_us_equity_exposure_pct", 5.0)))),
-            "min_notional": float(sizing.get("minimum_executable_notional_usd", sizing.get("min_paper_notional", 5.0))),
+            "min_notional": float(sizing["minimum_executable_notional_usd"]),
         }
 
     def _buying_power(self, account: Any) -> float:
@@ -7433,9 +7391,19 @@ class TradingService:
             rank = int(candidate.get("final_candidate_rank") or 0)
             raw_notional = float(candidate.get("final_notional", 0.0) or 0.0)
             price = float(candidate.get("price", candidate.get("latest_price", 0.0)) or 0.0)
-            stop_distance_pct = float(candidate.get("stop_distance_pct", 8.0) or 8.0)
-            if stop_distance_pct <= 0:
-                stop_distance_pct = 8.0
+            stop_distance_dollars = candidate.get("stop_distance_dollars")
+            stop_evidence = validate_stop_evidence(
+                entry_price=price,
+                stop_price=candidate.get("stop_price"),
+                stop_distance_dollars=stop_distance_dollars,
+                atr_value=candidate.get("atr_value"),
+                technical_stop_price=candidate.get("technical_stop_price"),
+                stop_model_used=candidate.get("stop_model_used"),
+                stop_validation_status=candidate.get("stop_validation_status"),
+            )
+            stop_distance_pct = None
+            if stop_evidence["valid"] and price > 0:
+                stop_distance_pct = float(stop_evidence["stop_distance_dollars"]) / price * 100.0
 
             cap_reason = None
             reduction_reason = None
@@ -7448,24 +7416,61 @@ class TradingService:
             def pct_to_notional(remaining_pct: float) -> float:
                 return max(0.0, equity * remaining_pct / 100)
 
-            limits = [
-                (pct_to_notional(cfg["max_total_portfolio_exposure_pct"] - total_exposure_after), "portfolio exposure budget"),
-                (pct_to_notional(cfg["max_single_symbol_exposure_pct"] - current_symbol_pct), "single-symbol exposure budget"),
-                (pct_to_notional(cfg["max_cluster_exposure_pct"] - current_cluster_pct), "cluster exposure budget"),
-                (buying_power_remaining, "paper buying power"),
-            ]
-            per_trade_risk_cap_notional = pct_to_notional(cfg["risk_per_trade_pct"]) / (stop_distance_pct / 100)
-            limits.append((per_trade_risk_cap_notional, "per-trade risk budget"))
-            remaining_open_risk_pct = cfg["max_open_risk_pct"] - open_risk_after
-            risk_cap_notional = pct_to_notional(remaining_open_risk_pct) / (stop_distance_pct / 100)
-            limits.append((risk_cap_notional, "open risk budget"))
+            limits: list[tuple[float, str]] = []
+            if not stop_evidence["valid"]:
+                cap_reason = "not actionable - validated ATR or technical stop evidence is required"
+                reduction_reason = stop_evidence["reason"]
+            elif price <= 0 or stop_distance_pct is None or stop_distance_pct <= 0:
+                cap_reason = "not actionable - validated stop geometry is unavailable"
+            else:
+                try:
+                    policy = effective_notional_policy(
+                        self.config, equity, is_add=bool(candidate.get("is_add")),
+                    )
+                    limits.extend((value, f"{name} ceiling") for name, value in policy.named_ceilings().items())
+                except (TypeError, ValueError) as exc:
+                    cap_reason = f"not actionable - canonical notional policy invalid: {exc}"
+                sizing_caps = candidate.get("sizing_caps") or {}
+                if isinstance(sizing_caps, dict):
+                    for name, value in sizing_caps.items():
+                        try:
+                            value_f = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(value_f):
+                            limits.append((value_f, f"{name} ceiling"))
+                if cap_reason is None:
+                    limits.extend([
+                        (pct_to_notional(cfg["max_total_portfolio_exposure_pct"] - total_exposure_after), "portfolio exposure budget"),
+                        (pct_to_notional(cfg["max_single_symbol_exposure_pct"] - current_symbol_pct), "single-symbol exposure budget"),
+                        (pct_to_notional(cfg["max_cluster_exposure_pct"] - current_cluster_pct), "cluster exposure budget"),
+                        (buying_power_remaining, "paper buying power"),
+                    ])
+                    try:
+                        sizing = self.config["position_sizing"]
+                        cash_value = float(canonical.cash)
+                        min_cash_reserve_pct = float(sizing["min_cash_reserve_pct"])
+                        max_cash_usage_pct = float(sizing["max_cash_usage_pct"])
+                        cash_available = max(0.0, cash_value - equity * min_cash_reserve_pct / 100.0)
+                        cash_usage = max(0.0, equity * max_cash_usage_pct / 100.0)
+                        limits.extend([(cash_available, "cash available ceiling"), (cash_usage, "cash usage ceiling")])
+                    except (KeyError, TypeError, ValueError):
+                        cap_reason = "not actionable - canonical cash ceiling policy is unavailable"
+                    if cap_reason is None:
+                        stop_risk_factor = stop_distance_pct / 100.0
+                        per_trade_risk_cap_notional = pct_to_notional(cfg["risk_per_trade_pct"]) / stop_risk_factor
+                        limits.append((per_trade_risk_cap_notional, "per-trade risk budget"))
+                        remaining_open_risk_pct = cfg["max_open_risk_pct"] - open_risk_after
+                        risk_cap_notional = pct_to_notional(remaining_open_risk_pct) / stop_risk_factor
+                        limits.append((risk_cap_notional, "open risk budget"))
 
-            for limit_value, reason in limits:
-                if final_notional > limit_value:
-                    final_notional = max(0.0, limit_value)
-                    reduction_reason = reason
+            if cap_reason is None:
+                for limit_value, reason in limits:
+                    if final_notional > limit_value:
+                        final_notional = max(0.0, limit_value)
+                        reduction_reason = reason
 
-            risk_pct = (final_notional * (stop_distance_pct / 100) / equity) * 100 if equity else 0.0
+            risk_pct = (final_notional * (stop_distance_pct / 100) / equity) * 100 if equity and stop_distance_pct else 0.0
             exposure_pct = (final_notional / equity) * 100 if equity else 0.0
             total_after_candidate = total_exposure_after + exposure_pct
             single_after_candidate = current_symbol_pct + exposure_pct
@@ -7476,6 +7481,8 @@ class TradingService:
             if candidate.get("preproposal_block_reason"):
                 passed = False
                 cap_reason = f"not actionable - pre-proposal risk check failed: {candidate['preproposal_block_reason']}"
+            elif cap_reason:
+                passed = False
             elif raw_notional <= 0 or price <= 0:
                 passed = False
                 cap_reason = "not actionable - no valid size or price"
@@ -7778,7 +7785,7 @@ class TradingService:
             proposed = int(bool(res.get("proposal_generated")))
             action_decision = res.get("performance_action_decision") or ("proposed" if proposed else "shadow_only")
             proposed_notional = res.get("performance_proposed_notional")
-            hypothetical_notional = proposed_notional if proposed_notional is not None else res.get("final_notional", 5.0)
+            hypothetical_notional = proposed_notional if proposed_notional is not None else res.get("final_notional")
             price_age = res.get("performance_price_age_seconds")
             data_freshness = "fresh" if isinstance(price_age, (int, float)) and -5 <= price_age <= self.config.get("risk", {}).get("max_price_age_seconds", 120) else "stale_or_unknown"
 

@@ -205,6 +205,24 @@ class LotLedger:
             daily_boundary=day, weekly_boundary=week, provenance=provenance,
         )
 
+    def cumulative_realized_pl(self, *, as_of: str | datetime | None = None) -> tuple[float | None, str]:
+        """Return cumulative FIFO realized P&L with explicit coverage confidence."""
+        moment = _datetime(as_of)
+        status_rows = self.storage.fetch_all("SELECT * FROM pnl_ledger_status WHERE scope='prospective'")
+        status = status_rows[0] if status_rows else None
+        if not status or not status.get("effective_from"):
+            return None, "unavailable"
+        if str(status.get("confidence")) not in KNOWN_CONFIDENCE:
+            return None, str(status.get("confidence") or "unavailable")
+        rows = self.storage.fetch_all(
+            "SELECT realized_pl,confidence FROM realized_pnl_events WHERE occurred_at<=?",
+            (moment.isoformat(),),
+        )
+        if any(row.get("realized_pl") is None for row in rows) or any(str(row.get("confidence")) not in KNOWN_CONFIDENCE for row in rows):
+            return None, "partially_reconstructed"
+        confidence = "reconstructed" if str(status.get("confidence")) == "reconstructed" or any(str(row.get("confidence")) == "reconstructed" for row in rows) else "verified"
+        return sum(float(row["realized_pl"]) for row in rows), confidence
+
     def _period_summary(self, column: str, key: str, status: Any, moment: datetime) -> tuple[float | None, str]:
         if not status or not status.get("effective_from"):
             return None, "unavailable"

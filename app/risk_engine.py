@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import os
 from typing import Any, Callable
 
+from .formula_versions import EVIDENCE_VERSION, RISK_DECISION_VERSION
 from .loss_controls import LOSS_METRICS_VERSION
-from .position_sizing import effective_notional_policy
+from .position_sizing import effective_notional_policy, validate_stop_evidence
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,17 @@ class RiskEngine:
         check("historical_data", not is_entry or int(proposal.get("historical_bars", 0)) >= self.risk.get("min_historical_bars", 50), "sufficient history required for entries")
         check("volume", not is_entry or (proposal.get("volume") is not None and proposal.get("volume", 0) >= 0), "volume must be present for entries")
         check("price_gap", not is_entry or abs(float(proposal.get("price_gap_pct", 0))) <= self.risk.get("max_price_gap_pct", 15), "suspicious entry price gap blocked")
+        if is_entry:
+            stop_evidence = validate_stop_evidence(
+                entry_price=price,
+                stop_price=proposal.get("stop_price"),
+                stop_distance_dollars=proposal.get("stop_distance_dollars"),
+                atr_value=proposal.get("atr_value"),
+                technical_stop_price=proposal.get("technical_stop_price"),
+                stop_model_used=proposal.get("stop_model_used") or proposal.get("stop_model"),
+                stop_validation_status=proposal.get("stop_validation_status"),
+            )
+            check("validated_stop_evidence", stop_evidence["valid"], stop_evidence["reason"])
 
         positions = int(context.get("open_positions", 0))
         risk_budgeted_mode = self.config.get("portfolio_execution_mode") == "risk_budgeted"
@@ -121,6 +132,11 @@ class RiskEngine:
         if block_if_exit_pending and is_entry and context.get("exit_pending", False):
             exit_reason = context.get("exit_pending_reason") or "an exit is pending"
             check("block_new_buy_if_exit_pending", False, f"new buy blocked because {exit_reason}")
+        check(
+            "pending_buy_exposure_known",
+            not is_entry or context.get("pending_buy_exposure_unknown") is not True,
+            context.get("pending_buy_exposure_unknown_reason") or "pending buy exposure must be complete before a new entry",
+        )
 
         block_if_emergency_exit_score_above = self.config.get("portfolio_behavior", {}).get("block_new_buy_if_emergency_exit_score_above", 40)
         if is_entry and context.get("max_emergency_exit_score", 0.0) > block_if_emergency_exit_score_above:
@@ -144,14 +160,14 @@ class RiskEngine:
                 # explicit policy. Production config validation rejects this.
                 if sizing_cfg.get("mode", "fixed") == "risk_portfolio":
                     equity = float(context.get("portfolio_equity") or 100000.0)
-                    pct = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
+                    pct = float(sizing_cfg.get("max_trade_notional_pct_equity", 0.25))
                     stage = sizing_cfg.get("stage", "moderate_paper")
-                    stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or float("inf"))
+                    stage_cap = float((sizing_cfg.get("stage_max_initial_notional_usd", {}) or {}).get(stage) or float("inf"))
                     limit = min(equity * pct / 100.0, stage_cap, float(limit))
                 else:
-                    limit = min(float(limit), float(sizing_cfg.get("max_initial_paper_notional", limit)))
+                    limit = float(limit)
                 try:
-                    minimum_notional = float(sizing_cfg.get("minimum_executable_notional_usd", sizing_cfg.get("min_paper_notional", 5.0)))
+                    minimum_notional = float(sizing_cfg.get("minimum_executable_notional_usd", 0.0))
                 except (TypeError, ValueError):
                     minimum_notional = None
         else:
@@ -169,6 +185,11 @@ class RiskEngine:
                 minimum_notional is not None and isinstance(notional, (int, float)) and float(notional) >= float(minimum_notional),
                 "entry notional must meet the executable minimum",
             )
+            sizing_caps = proposal.get("sizing_caps") or {}
+            if isinstance(sizing_caps, dict):
+                for cap_name, cap_value in sizing_caps.items():
+                    if isinstance(cap_value, (int, float)) and cap_value == cap_value and cap_value != float("inf"):
+                        check(f"sizing_ceiling_{cap_name}", isinstance(notional, (int, float)) and float(notional) <= float(cap_value) + 1e-9, f"notional exceeds {cap_name} ceiling")
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
         check("duplicate_position", not (is_entry and not is_add and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
 
@@ -353,7 +374,7 @@ class RiskEngine:
         check("side", str(proposal.get("side", "")).lower() in {"buy", "sell"}, "side must be buy or sell")
         check("order_type", proposal.get("order_type", "market") in self.risk.get("allowed_order_types", ["market", "limit"]), "allowed order type required")
         protective_exit = str(context.get("execution_path") or proposal.get("execution_path") or "") == "protective_paper_exit"
-        if final and not protective_exit and os.getenv("TRADING_AGENT_TESTING") != "1":
+        if final and not protective_exit:
             quote_complete = all(proposal.get(key) is not None for key in ("quote_bid", "quote_ask", "quote_timestamp", "quote_spread_bps", "limit_price"))
             check("authoritative_quote", quote_complete, "fresh authoritative quote is required for normal orders")
             check("bounded_limit_order", proposal.get("order_type") == "limit", "normal orders must use bounded marketable-limit orders")

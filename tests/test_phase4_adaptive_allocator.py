@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 
 from app.phase4_allocator import AdaptiveAllocator, STRATEGIES, apply_phase4_schema
+from app.formula_versions import EVIDENCE_VERSION
 from app.storage import Storage
 from app.utils import load_config
 
@@ -27,7 +28,7 @@ def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=N
         first_barrier,ordering_quality,cost_model_version,calculation_version,input_fingerprint,calculated_at,error_category)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (outcome_id,opportunity_id,20,"completed","test outcome", "2026-07-01",f"2026-07-{index + 1:02d}",value,value / 2,
-         value / 2,value,0.02,-0.01,value,value,0,1,"target","good","cost_v1","calc_v1",f"fp-{outcome_id}",
+         value / 2,value,0.02,-0.01,value,value,0,1,"target","good","cost_v1",EVIDENCE_VERSION,f"fp-{outcome_id}",
          calculated_at or now,None))
 
 

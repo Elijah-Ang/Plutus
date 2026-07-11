@@ -45,6 +45,9 @@ def test_effective_notional_policy_rejects_contradictory_minimum():
             "minimum_executable_notional_usd": 50.0,
             "default_paper_notional_usd": 50.0,
             "absolute_max_notional_usd": 10.0,
+            "stage": "moderate_paper",
+            "stage_max_initial_notional_usd": {"moderate_paper": 100.0},
+            "max_trade_notional_pct_equity": 1.0,
         }}, 10000.0)
 
 

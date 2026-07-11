@@ -1,7 +1,7 @@
 # Trading System Transformation Roadmap
 
 Last updated: 2026-07-11
-Authoritative implementation branch: `codex/phase1-evidence-validation`
+Authoritative implementation branch: `main` (paper-only safety/accounting implementation)
 Safety posture: paper-only; live and ordinary automatic execution remain compile-time/runtime blocked.
 
 Implementation commits:
@@ -15,12 +15,16 @@ Implementation commits:
 
 Ledger commit resolution: every Phase 0 cell below that says `pending final commit` resolves to implementation commit `4b6a444`; the final evidence/roadmap commit is recorded separately in the repository history.
 
-Latest offline verification on 2026-07-10:
+Latest historical offline verification on 2026-07-10:
 
 - `.venv/bin/pytest -o addopts='' -q` → `374 passed`, `16 warnings`, in `44.50s`; no failures/skips.
 - Python compilation, `zsh -n`, `git diff --check`, temporary migration rerun, and the ten-check integrity report passed.
 - The hard network guard covered socket, requests, and urllib paths; legacy credential tests use deterministic fake API failures.
 - No production database, launchd service, broker, Telegram endpoint, OpenAI endpoint, or market-data provider was accessed or mutated.
+
+The current safety/accounting implementation supersedes the older counts above.
+Its current offline counts and commit are reported with the release handoff;
+runtime deployment verification remains a separate check.
 - Completion verification after audit repairs: `649 passed`, `16 warnings`, in `43.55s`; dedicated Phase 0 suite `288 passed`; crash matrix `20 passed`; concurrency matrix `12 passed`.
 - SQLite backup rehearsal on a 546,091,008-byte production-source clone: read-only source, `integrity_check=ok`, repeat migration identical, fourteen integrity counters zero after clone-only legacy backfill, and restoration schema/counts exact. See `docs/PHASE0_COMPLETION_EVIDENCE.md`.
 - Safety incident note: an already-scheduled scanner loaded the active working tree at 07:00 UTC and applied the new additive lot/workflow schema to the production database before the read-only clone rehearsal. No order path was invoked by this work, but the strict "production database unmodified" task boundary was therefore not met; see the completion verdict and rollout condition below.
@@ -169,7 +173,7 @@ Phase 2 gate `P2-GATE-001`: each sleeve shows positive cost-aware OOS expectancy
 
 ## Phase 3 — execution quality, protection, and moderate paper risk
 
-Common metadata: rationale = improve execution/protection only after evidence; dependencies = P1/P2 gates and Phase 0 integrity; acceptance = bounded feature-flagged paper experiment with rollback; status pending; commit/evidence none; rollout `L-R`; rollback `L-B`; unresolved questions = Alpaca whole/fractional protective capability results.
+Common metadata: rationale = improve execution/protection only after evidence; dependencies = P1/P2 gates and Phase 0 integrity; acceptance = bounded paper experiment with rollback; status implemented in paper-only mode; rollout `L-R`; rollback `L-B`; unresolved questions = live-readiness and broker protective-capability evidence.
 
 | IDs | Pending requirements |
 |---|---|
@@ -181,11 +185,14 @@ Common metadata: rationale = improve execution/protection only after evidence; d
 | P3-LOSS-001..002 | 0.75% daily throttle; 1.5–2.0% weekly throttle |
 | P3-DD-001..004 | Drawdown multipliers: <2 normal; 2–4 -25%; 4–6 -50%; >6 halt/review |
 
-All proposed Phase 3 values are inactive. Existing effective limits remain authoritative.
+Phase 3 operational risk is active only in paper mode, remains manual-approval gated,
+requires version-matched executable evidence, validated stop evidence, and complete
+authoritative exposure/loss state. Its ceilings remain authoritative and cannot be
+raised by Phase 4.
 
 ## Phase 4 — calibrated adaptive portfolio construction
 
-Common metadata: rationale = separate alpha, risk, execution, uncertainty, and concentration; dependencies = validated sleeves and cost model; acceptance = shadow-first calibrated results with deterministic hard limits; status pending; commit/evidence none; rollout `L-R`; rollback `L-B`; unresolved question = minimum evidence per adaptive update.
+Common metadata: rationale = separate alpha, risk, execution, uncertainty, and concentration; dependencies = validated sleeves and cost model; acceptance = shadow-first calibrated results with deterministic hard limits; status implemented as paper-only adaptive/exploration accounting; rollout `L-R`; rollback `L-B`; unresolved question = sufficient evidence for future adaptive updates.
 
 | IDs | Pending requirements |
 |---|---|
@@ -215,7 +222,7 @@ Common acceptance: reachability, tests, docs, scripts, and runtime references ve
 
 | ID | Item | Disposition | Rationale/dependency | Status | Commit/evidence | Rollout/rollback | Question |
 |---|---|---|---|---|---|---|---|
-| CLN-001 | `config/risk_limits.yaml` | deprecate then archive | no runtime reader; P0-L | pending | audit evidence | L-R/L-B | migration notice duration |
+| CLN-001 | `config/risk_limits.yaml` | absent; responsibilities consolidated | no active file; `config/config.yaml` is authoritative | implemented | configuration validation/docs/tests | L-R/L-B | none |
 | CLN-002 | `scripts/start_agent.sh` | retain documented legacy wrapper | launchd uses `run_once.sh` | pending | reachability audit | L-R/L-B | remove only after operator docs migrate |
 | CLN-003 | unused cash manager | archive after reachability proof | avoid dead policy confusion | pending | tests exist only | L-R/L-B | any operator import? |
 | CLN-004 | market snapshot helper | retain/integrate | storage path is active | pending | service references | L-R/L-B | canonical v2 linkage |

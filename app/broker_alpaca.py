@@ -24,6 +24,14 @@ class AlpacaBroker(BrokerInterface):
     def __init__(self, config: dict[str, Any], api_key: str | None = None, secret_key: str | None = None) -> None:
         self.config = config
         self.mode = config.get("mode", "paper")
+        self.paper_requested = self.mode == "paper"
+        self.configured_trading_endpoint = str(
+            config.get("alpaca", {}).get("paper_trading_endpoint", "https://paper-api.alpaca.markets")
+            if self.paper_requested
+            else config.get("alpaca", {}).get("live_trading_endpoint", "https://api.alpaca.markets")
+        )
+        if self.paper_requested and "paper" not in self.configured_trading_endpoint.lower():
+            raise RuntimeError("paper mode requires an explicitly paper Alpaca trading endpoint")
         if self.mode != "paper":
             # This build has no live capability. Fail before reading any key so
             # live credentials cannot be selected through configuration alone.
@@ -38,7 +46,10 @@ class AlpacaBroker(BrokerInterface):
             from alpaca.trading.client import TradingClient
         except ImportError as exc:
             raise RuntimeError("Install alpaca-py before using AlpacaBroker") from exc
-        self.trading = TradingClient(key, secret, paper=self.mode == "paper")
+        # The public constructor argument and the configured endpoint are both
+        # identity inputs. The SDK's private URL/sandbox fields are only
+        # supplemental evidence in paper_account_identity().
+        self.trading = TradingClient(key, secret, paper=self.paper_requested)
         self.data = StockHistoricalDataClient(key, secret)
         self._crypto_data = None
 
@@ -88,13 +99,31 @@ class AlpacaBroker(BrokerInterface):
 
     def paper_account_identity(self) -> dict[str, Any]:
         account = self.get_account()
-        base_url = str(getattr(self.trading, "_base_url", ""))
-        paper_client = self.mode == "paper" and "paper" in base_url.lower()
+        account_id = getattr(account, "id", None) or getattr(account, "account_number", None)
+        account_status = str(getattr(account, "status", "unknown")).lower()
+        currency = str(getattr(account, "currency", "USD") or "").upper()
+        account_blocked = bool(getattr(account, "account_blocked", False))
+        trading_blocked = bool(getattr(account, "trading_blocked", False))
+        public_constructor_identity = self.paper_requested and self.mode == "paper"
+        configured_paper_endpoint = "paper" in self.configured_trading_endpoint.lower()
+        sdk_base_url = str(getattr(self.trading, "_base_url", ""))
+        sdk_sandbox = getattr(self.trading, "_sandbox", None)
+        sdk_endpoint_evidence = "paper" in sdk_base_url.lower() if sdk_base_url else None
+        endpoint_consistent = sdk_endpoint_evidence in {None, True}
         return {
-            "verified": bool(paper_client and not bool(getattr(account, "account_blocked", False)) and not bool(getattr(account, "trading_blocked", False))),
+            "verified": bool(
+                public_constructor_identity and configured_paper_endpoint and endpoint_consistent
+                and account_id and account_status not in {"blocked", "disabled", "account_blocked"}
+                and not account_blocked and not trading_blocked and currency == "USD"
+            ),
             "mode": self.mode,
-            "endpoint_class": "paper" if paper_client else "ambiguous",
-            "account_status": str(getattr(account, "status", "unknown")),
+            "endpoint_class": "paper" if configured_paper_endpoint and endpoint_consistent else "ambiguous",
+            "account_status": account_status,
+            "account_id_present": bool(account_id),
+            "account_currency": currency,
+            "paper_constructor_requested": public_constructor_identity,
+            "configured_endpoint_paper": configured_paper_endpoint,
+            "sdk_sandbox_evidence": sdk_sandbox,
         }
 
     def get_positions(self) -> list[Any]:
@@ -160,8 +189,6 @@ class AlpacaBroker(BrokerInterface):
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":
             require_live_trading_support()
-        if symbol.upper() == "TEST":
-            return type("MockOrder", (), {"status": "submitted", "id": f"mock-order-{client_order_id}"})()
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         common = dict(symbol=symbol, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=client_order_id, **notional_or_qty)

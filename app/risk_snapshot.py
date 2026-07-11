@@ -6,6 +6,7 @@ from typing import Any
 
 from .execution import DurableExecutionStore
 from .lot_ledger import ACCOUNTING_TIMEZONE, LotLedger
+from .formula_versions import ACCOUNTING_VERSION
 from .utils import iso_now, json_dumps
 
 
@@ -154,6 +155,8 @@ class RiskSnapshotBuilder:
                     "day_boundary": "00:00 America/New_York",
                     "week_boundary": "Monday 00:00 America/New_York",
                     "realized_vs_unrealized": "realized fills only; unrealized excluded",
+                    "accounting_version": ACCOUNTING_VERSION,
+                    "external_cash_flow": "not used as realized loss; unknown remains unknown",
                 }),
             ),
         )

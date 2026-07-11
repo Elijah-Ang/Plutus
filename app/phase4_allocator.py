@@ -12,6 +12,7 @@ import numpy as np
 
 from .execution import DurableExecutionStore
 from .evidence import OPERATIONAL_EVIDENCE_TYPES, SHADOW_OUTCOME, classify_evidence_type
+from .formula_versions import EVIDENCE_VERSION, PHASE4_ALLOCATION_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
@@ -68,7 +69,14 @@ def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
       marginal_risk_json TEXT NOT NULL, component_risk_json TEXT NOT NULL,
       regime TEXT NOT NULL, drawdown_pct REAL NOT NULL, uncertainty_penalty REAL NOT NULL,
       data_quality REAL NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
-      evidence_fingerprint TEXT NOT NULL, payload TEXT NOT NULL);
+      allocation_class TEXT NOT NULL DEFAULT 'unallocated', operational_kelly_used INTEGER NOT NULL DEFAULT 0,
+      kelly_diagnostic_json TEXT, adaptive_allocation_json TEXT, exploration_allocation_json TEXT,
+      unallocated_risk_pct REAL NOT NULL DEFAULT 0,
+      heat_before_pct REAL, heat_after_pct REAL, gross_exposure_before_pct REAL, gross_exposure_after_pct REAL,
+      symbol_exposure_before_json TEXT, symbol_exposure_after_json TEXT,
+      cluster_exposure_before_json TEXT, cluster_exposure_after_json TEXT,
+      pending_risk REAL, reserved_risk REAL, binding_caps_json TEXT, evidence_versions_json TEXT,
+      evidence_fingerprint TEXT NOT NULL, formula_version TEXT, config_hash TEXT, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS phase4_stress_results(
       id TEXT PRIMARY KEY, allocation_id TEXT NOT NULL, scenario TEXT NOT NULL,
       assumed_loss REAL NOT NULL, portfolio_loss REAL NOT NULL, passed INTEGER NOT NULL,
@@ -86,6 +94,20 @@ def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
     """
     for statement in sql.split(";"):
         if statement.strip(): conn.execute(statement)
+    additions = {
+        "allocation_class": "TEXT DEFAULT 'unallocated'", "operational_kelly_used": "INTEGER NOT NULL DEFAULT 0",
+        "kelly_diagnostic_json": "TEXT", "adaptive_allocation_json": "TEXT", "exploration_allocation_json": "TEXT",
+        "unallocated_risk_pct": "REAL NOT NULL DEFAULT 0", "heat_before_pct": "REAL", "heat_after_pct": "REAL",
+        "gross_exposure_before_pct": "REAL", "gross_exposure_after_pct": "REAL",
+        "symbol_exposure_before_json": "TEXT", "symbol_exposure_after_json": "TEXT",
+        "cluster_exposure_before_json": "TEXT", "cluster_exposure_after_json": "TEXT",
+        "pending_risk": "REAL", "reserved_risk": "REAL", "binding_caps_json": "TEXT", "evidence_versions_json": "TEXT",
+        "formula_version": "TEXT", "config_hash": "TEXT",
+    }
+    present = {row[1] for row in conn.execute("PRAGMA table_info(phase4_allocation_decisions)")}
+    for name, definition in additions.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE phase4_allocation_decisions ADD COLUMN {name} {definition}")
     if record_migration:
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
                      (PHASE4_SCHEMA_VERSION, iso_now(), "additive Phase 4 estimates, covariance, allocations, stress, states, and activation"))
@@ -117,7 +139,8 @@ class AdaptiveAllocator:
           FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
           WHERE ro.strategy_version=? AND ro.split_label='out_of_sample' AND r.horizon_sessions=20
             AND r.status='completed' AND r.cost_adjusted_return IS NOT NULL
-            ORDER BY r.exit_session,ro.id""", (strategy,))
+            AND r.calculation_version=?
+            ORDER BY r.exit_session,ro.id""", (strategy, EVIDENCE_VERSION))
         # Executable strategies may use only synchronized executable evidence.
         # Shadow strategies use shadow outcomes for research state transitions;
         # neither population is allowed to cross into the other.
@@ -187,9 +210,16 @@ class AdaptiveAllocator:
         matrix=(1-shrink)*matrix+shrink*target
         return matrix,fallback,counts
 
-    def run(self, *, regime: str, drawdown_pct: float) -> dict[str,Any]:
+    def run(self, *, regime: str, drawdown_pct: float, portfolio_snapshot: Mapping[str, Any] | None = None) -> dict[str,Any]:
         healthy=not any(DurableExecutionStore(self.storage).integrity_report().values())
         estimates={}; evidence={}; fps=[]; now=iso_now()
+        portfolio_snapshot = dict(portfolio_snapshot or {})
+        heat_before = portfolio_snapshot.get("heat_before_pct")
+        gross_before = portfolio_snapshot.get("gross_exposure_before_pct")
+        symbol_before = portfolio_snapshot.get("symbol_exposure_before") or {}
+        cluster_before = portfolio_snapshot.get("cluster_exposure_before") or {}
+        pending_risk = portfolio_snapshot.get("pending_risk")
+        reserved_risk = portfolio_snapshot.get("reserved_risk")
         for strategy in STRATEGIES:
             estimate,rows,fp=self.estimate(strategy); evidence[strategy]=rows; fps.append(fp)
             if not healthy: estimate=StrategyEstimate(**{**asdict(estimate),"state":"SUSPENDED","reason":"durable integrity health failed"})
@@ -261,27 +291,58 @@ class AdaptiveAllocator:
             if strategy in exploration_weights:
                 strategy_policies[strategy]={"mode":"exploration","state":estimate.state,"stop_risk_pct":exploration_weights[strategy],
                                              "max_stop_risk_pct":exploration_max_per_strategy,"gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),
-                                             "kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                                             "allocation_class":"exploration","evidence_version":EVIDENCE_VERSION}
             elif strategy in EXECUTABLE_STRATEGIES and estimate.state=="ACTIVE" and weights[i]>0:
                 strategy_policies[strategy]={"mode":"adaptive","state":estimate.state,"allocation_weight":float(weights[i]),
-                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True}
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                                             "allocation_class":"adaptive","evidence_version":EVIDENCE_VERSION}
             elif strategy not in EXECUTABLE_STRATEGIES:
                 strategy_policies[strategy]={"mode":"research_only","state":estimate.state,"operationally_executable":False,
-                                             "kelly_used":False,"score_sizing_used":False,"manual_approval_required":False,
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":False,
+                                             "allocation_class":"unallocated","evidence_version":EVIDENCE_VERSION,
                                              "reason":"shadow/research strategy cannot receive executable allocation"}
             else:
-                strategy_policies[strategy]={"mode":"blocked","state":estimate.state,"kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
+                strategy_policies[strategy]={"mode":"blocked","state":estimate.state,"kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                                             "allocation_class":"unallocated","evidence_version":EVIDENCE_VERSION}
         fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
+        allocation_class = "adaptive" if float(weights.sum()) > 0 else "exploration" if exploration_weights else "unallocated"
+        unallocated_risk_pct = max(0.0, 1.0 - float(weights.sum()) - float(exploration_heat) / 100.0)
+        binding_caps = {
+            "fractional_kelly_ceiling": fraction,
+            "max_strategy_weight": max_weight,
+            "max_allocated_risk_fraction": max_invested,
+            "max_stress_loss": stress_cap,
+            "exploration_heat_pct": exploration_heat_cap,
+            "exploration_gross_exposure_pct": float(self.cfg.get("exploration_gross_exposure_pct", 7.5)),
+        }
         payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback,
                  "operational_kelly_enabled":False,"operational_allocation_mode":"deterministic_equal_risk",
                  "kelly_diagnostics":kelly_diagnostics,
                  "exploration_heat_pct":exploration_heat,"exploration_heat_cap_pct":exploration_heat_cap,"exploration_weights":exploration_weights,
-                 "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies}
-        self.storage.execute("INSERT OR REPLACE INTO phase4_allocation_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          (aid,self.run_id,now,"ACTIVE_ADAPTIVE_PAPER",ALLOCATOR_VERSION,json_dumps(dict(zip(STRATEGIES,weights.tolist()))),cash,fraction,
-           expected,port_vol,expected_shortfall,stress_loss,json_dumps(dict(zip(STRATEGIES,marginal.tolist()))),json_dumps(dict(zip(STRATEGIES,component.tolist()))),
-           regime,drawdown_pct,statistics.fmean(e.uncertainty for e in estimates.values()),statistics.fmean(e.data_quality for e in estimates.values()),
-           decision,reason,fingerprint,json_dumps(payload)))
+                 "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies,
+                 "allocation_class":allocation_class,"unallocated_risk_pct":unallocated_risk_pct,
+                 "evidence_versions":{strategy:EVIDENCE_VERSION for strategy in STRATEGIES},"formula_version":PHASE4_ALLOCATION_VERSION,
+                 "config_hash":self.config.get("effective_config_hash")}
+        phase4_placeholders = ",".join("?" for _ in range(42))
+        self.storage.execute(
+            f"""INSERT OR REPLACE INTO phase4_allocation_decisions(
+               id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,fractional_kelly_ceiling,
+               expected_portfolio_return,portfolio_volatility,expected_shortfall,stress_loss,marginal_risk_json,component_risk_json,
+               regime,drawdown_pct,uncertainty_penalty,data_quality,decision,reason,allocation_class,operational_kelly_used,
+               kelly_diagnostic_json,adaptive_allocation_json,exploration_allocation_json,unallocated_risk_pct,
+               heat_before_pct,heat_after_pct,gross_exposure_before_pct,gross_exposure_after_pct,
+               symbol_exposure_before_json,symbol_exposure_after_json,cluster_exposure_before_json,cluster_exposure_after_json,
+               pending_risk,reserved_risk,binding_caps_json,evidence_versions_json,evidence_fingerprint,formula_version,config_hash,payload)
+             VALUES({phase4_placeholders})""",
+            (aid,self.run_id,now,"ACTIVE_ADAPTIVE_PAPER",ALLOCATOR_VERSION,json_dumps(dict(zip(STRATEGIES,weights.tolist()))),cash,fraction,
+             expected,port_vol,expected_shortfall,stress_loss,json_dumps(dict(zip(STRATEGIES,marginal.tolist()))),json_dumps(dict(zip(STRATEGIES,component.tolist()))),
+             regime,drawdown_pct,statistics.fmean(e.uncertainty for e in estimates.values()),statistics.fmean(e.data_quality for e in estimates.values()),
+             decision,reason,allocation_class,0,json_dumps(kelly_diagnostics),json_dumps({s:float(weights[i]) for i,s in enumerate(STRATEGIES) if weights[i] > 0}),
+             json_dumps(exploration_weights),unallocated_risk_pct,heat_before,heat_before,gross_before,gross_before,
+             json_dumps(symbol_before),json_dumps(symbol_before),json_dumps(cluster_before),json_dumps(cluster_before),pending_risk,reserved_risk,
+             json_dumps(binding_caps),json_dumps({strategy:EVIDENCE_VERSION for strategy in STRATEGIES}),fingerprint,PHASE4_ALLOCATION_VERSION,
+             self.config.get("effective_config_hash"),json_dumps(payload)))
         for scenario,loss in stress.items():
             sid=_fingerprint([aid,scenario])[:32]
             self.storage.execute("INSERT OR REPLACE INTO phase4_stress_results VALUES(?,?,?,?,?,?,?,?)",
@@ -289,7 +350,11 @@ class AdaptiveAllocator:
         return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"exploration_weights":exploration_weights,
                 "exploration_heat_pct":exploration_heat,"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,
                 "strategy_policies":strategy_policies,"kelly_diagnostics":kelly_diagnostics,
-                "operational_strategies":list(EXECUTABLE_STRATEGIES),"healthy":healthy}
+                "operational_strategies":list(EXECUTABLE_STRATEGIES),"healthy":healthy,
+                "allocation_class":allocation_class,"operational_kelly_used":False,
+                "unallocated_risk_pct":unallocated_risk_pct,"binding_caps":binding_caps,
+                "evidence_versions":{strategy:EVIDENCE_VERSION for strategy in STRATEGIES},
+                "formula_version":PHASE4_ALLOCATION_VERSION}
 
     def _persist_state(self,e:StrategyEstimate,eid:str,now:str)->None:
         old=self.storage.fetch_all("SELECT state FROM phase4_strategy_states WHERE strategy_version=?",(e.strategy_version,)); previous=old[0]["state"] if old else None

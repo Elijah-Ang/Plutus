@@ -65,7 +65,10 @@ def test_telegram_duplicate_and_fallback_routing(temp_storage, base_config):
         "strategy_version": "rule_based_v1",
         "reason": "test_setup",
         "order_type": "market",
-        "asset_class": "equity"
+        "asset_class": "equity",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+        "cluster_name": "us_broad_market"
     }
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,expires_at,created_at,telegram_message_id,payload,strategy_version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",

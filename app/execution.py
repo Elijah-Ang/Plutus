@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -659,12 +658,17 @@ class Executor:
                 require_autonomous_exit_support()
             except PermissionError as exc:
                 return ExecutionResult(False, "blocked", None, reason=str(exc))
-        elif os.getenv("TRADING_AGENT_TESTING") != "1":
+        else:
             quote_fields = ("quote_bid", "quote_ask", "quote_timestamp", "quote_spread_bps", "limit_price")
             if any(proposal.get(field) is None for field in quote_fields) or proposal.get("order_type") != "limit":
                 return ExecutionResult(False, "blocked", None, reason="fresh validated quote and bounded limit price are required for normal orders")
             try:
-                validate_quote_payload(proposal, str(proposal.get("side") or ""), self.risk_engine.config, now=datetime.now(UTC))
+                validate_quote_payload(
+                    proposal,
+                    str(proposal.get("side") or ""),
+                    getattr(self.risk_engine, "config", {}) or {},
+                    now=datetime.now(UTC),
+                )
             except (TypeError, ValueError) as exc:
                 return ExecutionResult(False, "blocked", None, reason=f"quote validation blocked: {exc}")
         if proposal.get("status") != "approved" or context.get("approval_valid") is not True:

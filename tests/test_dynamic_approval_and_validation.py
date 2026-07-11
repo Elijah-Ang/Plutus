@@ -56,8 +56,15 @@ class MockBroker:
     def get_latest_price(self, symbol):
         return type("T", (), {"price": self.price, "timestamp": self.price_time})()
 
+    def get_latest_quote(self, symbol):
+        return {"bid_price": self.price - 0.01, "ask_price": self.price + 0.01, "timestamp": self.price_time}
+
     def get_historical_bars(self, symbol, timeframe, limit=250):
-        return pd.DataFrame({"close": [self.price] * limit, "volume": [10000.0] * limit})
+        return pd.DataFrame({
+            "open": [self.price] * limit, "high": [self.price + 1.0] * limit,
+            "low": [self.price - 1.0] * limit, "close": [self.price] * limit,
+            "volume": [10000.0] * limit,
+        })
 
     def get_account(self):
         return type("A", (), {
@@ -70,7 +77,11 @@ class MockBroker:
         })()
 
     def get_loss_metrics(self):
-        return {"daily_loss": 0.0, "weekly_loss": 0.0}
+        return {
+            "daily_loss_dollars": 0.0, "weekly_loss_dollars": 0.0,
+            "daily_loss_confidence": "verified", "weekly_loss_confidence": "verified",
+            "reference_equity": 1000000.0,
+        }
 
     def get_clock(self):
         return self.clock
@@ -145,6 +156,21 @@ def base_config():
         "dynamic_universe": {
             "enabled": True,
             "paper_only": True
+        },
+        "position_sizing": {
+            "enabled": True, "mode": "risk_portfolio", "stage": "moderate_paper",
+            "use_stage_dollar_cap": True,
+            "stage_max_initial_notional_usd": {"moderate_paper": 250.0},
+            "stage_max_add_notional_usd": {"moderate_paper": 100.0},
+            "risk_per_trade_pct": 0.2, "max_trade_notional_pct_equity": 6.0,
+            "max_position_notional_pct_equity": 6.0, "max_total_portfolio_exposure_pct": 30.0,
+            "max_cluster_exposure_pct": 15.0, "min_cash_reserve_pct": 20.0,
+            "max_cash_usage_pct": 10.0, "default_paper_notional_usd": 250.0,
+            "default_add_notional_usd": 100.0, "minimum_executable_notional_usd": 5.0,
+            "add_size_multiplier": 0.5,
+            "stop_model": {"atr_multiple": 2.0, "min_stop_pct": 1.0, "max_stop_pct": 8.0},
+            "score_multiplier": {"65_74": 1.0, "75_84": 1.0, "85_94": 1.0, "95_100": 1.0},
+            "volatility_multiplier": {"normal": 1.0, "elevated": 0.5, "high": 0.25, "extreme": 0.0, "too_quiet": 0.75},
         }
     }
 
@@ -166,12 +192,18 @@ def helper_create_proposal(storage, symbol, approved_dynamic=False, universe_sou
         "expires_at": (now + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "trend passed",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
         "approved_dynamic_paper_tradable": approved_dynamic,
         "universe_source": universe_source,
         "approved_market_profile": "us_equities",
-        "client_order_id": f"mock-client-id-{pid}"
+        "client_order_id": f"mock-client-id-{pid}",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+        "cluster_name": "us_broad_market",
+        "quote_source": "alpaca_quote", "quote_bid": 99.99, "quote_ask": 100.01,
+        "quote_midpoint": 100.0, "quote_timestamp": now.isoformat(), "quote_spread_bps": 2.0,
+        "limit_price": 100.04
     }
     storage.execute(
         "INSERT INTO trade_proposals(id, run_id, symbol, side, notional, status, created_at, expires_at, strategy_version, payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -196,12 +228,17 @@ def test_static_resolves_profile(temp_storage, base_config):
         "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "trend passed",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
         "approved_dynamic_paper_tradable": False,
         "universe_source": "static",
         "approved_market_profile": "us_equities",
-        "client_order_id": "test-static-client-id"
+        "client_order_id": "test-static-client-id",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+        "quote_source": "alpaca_quote", "quote_bid": 99.99, "quote_ask": 100.01,
+        "quote_midpoint": 100.0, "quote_timestamp": datetime.now(UTC).isoformat(), "quote_spread_bps": 2.0,
+        "limit_price": 100.04
     }
     context = {
         "power_connected": True,
@@ -255,7 +292,7 @@ def test_static_missing_profile_blocked(temp_storage, base_config):
         "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "trend passed",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
         "approved_dynamic_paper_tradable": False,
         "universe_source": "static",
@@ -314,7 +351,7 @@ def test_static_stale_alpaca_blocked(temp_storage, base_config):
         "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "trend passed",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
         "approved_dynamic_paper_tradable": False,
         "universe_source": "static",
@@ -375,12 +412,17 @@ def test_dynamic_resolves_profile(temp_storage, base_config):
         "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "trend passed",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
         "approved_dynamic_paper_tradable": True,
         "universe_source": "dynamic",
         "approved_market_profile": "us_equities",
-        "client_order_id": "test-dynamic-client-id"
+        "client_order_id": "test-dynamic-client-id",
+        "stop_price": 90.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": 90.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+        "quote_source": "alpaca_quote", "quote_bid": 99.99, "quote_ask": 100.01,
+        "quote_midpoint": 100.0, "quote_timestamp": datetime.now(UTC).isoformat(), "quote_spread_bps": 2.0,
+        "limit_price": 100.04
     }
     context = {
         "power_connected": True,

@@ -37,6 +37,9 @@ def _proposal(proposal_id: str = "proposal-1", *, status: str = "approved") -> d
         "latest_price": 100.0,
         "stop_price": 95.0,
         "trading_mode": "paper",
+        "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 99.9,
+        "quote_ask": 100.1, "quote_midpoint": 100.0, "quote_timestamp": now.isoformat(),
+        "quote_spread_bps": 20.0, "limit_price": 100.36,
         "expires_at": (now + timedelta(minutes=10)).isoformat(),
     }
 

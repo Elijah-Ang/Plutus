@@ -31,6 +31,9 @@ def proposal(identifier: str = "proposal-1") -> dict:
         "side": "buy", "action": "entry", "notional": 100.0, "latest_price": 50.0,
         "stop_price": 45.0, "price_at": now.isoformat(), "created_at": now.isoformat(),
         "expires_at": (now + timedelta(minutes=5)).isoformat(), "trading_mode": "paper",
+        "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 49.9,
+        "quote_ask": 50.1, "quote_midpoint": 50.0, "quote_timestamp": now.isoformat(),
+        "quote_spread_bps": 40.0, "limit_price": 50.23,
     }
 
 
@@ -91,7 +94,7 @@ def test_partial_fill_is_monotonic_deduplicated_and_releases_proportionally(tmp_
     store.record_fill(intent["id"], cumulative_quantity=4, fill_price=50, broker_event_key="fill-1")
     store.record_fill(intent["id"], cumulative_quantity=4, fill_price=50, broker_event_key="fill-1")
     assert store.get_intent(intent["id"])["filled_quantity"] == 4
-    assert db.fetch_all("SELECT active_notional FROM risk_reservations")[0]["active_notional"] == 300
+    assert db.fetch_all("SELECT active_notional FROM risk_reservations")[0]["active_notional"] == pytest.approx(301.38)
     store.record_fill(intent["id"], cumulative_quantity=10, fill_price=51, broker_event_key="fill-2")
     final = store.get_intent(intent["id"])
     assert (final["filled_quantity"], final["state"]) == (10, "filled")

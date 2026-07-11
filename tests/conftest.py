@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import os
 import socket
+import sys
+import types
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -20,6 +23,60 @@ os.environ.update({
     "OPENAI_API_KEY": "synthetic-test-openai-key",
     "EODHD_API_TOKEN": "synthetic-test-eodhd-token",
 })
+
+
+# Inject a local SDK double for broker-construction tests. Production code still
+# imports the real alpaca-py package; the offline suite supplies the dependency
+# explicitly instead of using a TEST-symbol or testing-mode execution bypass.
+if "alpaca" not in sys.modules:
+    alpaca = types.ModuleType("alpaca")
+    alpaca_data = types.ModuleType("alpaca.data")
+    alpaca_data_historical = types.ModuleType("alpaca.data.historical")
+    alpaca_trading = types.ModuleType("alpaca.trading")
+    alpaca_trading_client = types.ModuleType("alpaca.trading.client")
+    alpaca_trading_enums = types.ModuleType("alpaca.trading.enums")
+    alpaca_trading_requests = types.ModuleType("alpaca.trading.requests")
+
+    class _FakeTradingClient:
+        def __init__(self, key, secret, paper=True):
+            self.paper = paper
+            self._sandbox = paper
+            self._base_url = "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
+        def get_account(self):
+            return SimpleNamespace(id="offline-paper-account", account_number="offline-paper-account", status="ACTIVE", currency="USD", account_blocked=False, trading_blocked=False)
+        def get_clock(self):
+            return SimpleNamespace(is_open=True, timestamp=datetime.now(UTC), next_close=datetime.now(UTC) + timedelta(hours=1))
+        def get_all_positions(self): return []
+        def get_orders(self, *args, **kwargs): return []
+        def get_order_by_client_id(self, client_order_id): raise RuntimeError("offline order not found")
+        def get_order_by_id(self, order_id): raise RuntimeError("offline order not found")
+        def submit_order(self, **kwargs): return SimpleNamespace(id="offline-order", status="submitted")
+
+    class _FakeStockHistoricalDataClient:
+        def __init__(self, key, secret): pass
+        def get_stock_bars(self, *args, **kwargs): return []
+        def get_stock_latest_trade(self, *args, **kwargs): return SimpleNamespace(price=100.0, timestamp=datetime.now(UTC))
+        def get_stock_latest_quote(self, *args, **kwargs): return SimpleNamespace(bid_price=99.99, ask_price=100.01, timestamp=datetime.now(UTC))
+
+    class _Enum:
+        BUY = "buy"
+        SELL = "sell"
+        DAY = "day"
+
+    class _Request:
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
+
+    alpaca_trading_client.TradingClient = _FakeTradingClient
+    alpaca_data_historical.StockHistoricalDataClient = _FakeStockHistoricalDataClient
+    alpaca_trading_enums.OrderSide = _Enum
+    alpaca_trading_enums.TimeInForce = _Enum
+    alpaca_trading_requests.LimitOrderRequest = _Request
+    alpaca_trading_requests.MarketOrderRequest = _Request
+    sys.modules.update({
+        "alpaca": alpaca, "alpaca.data": alpaca_data, "alpaca.data.historical": alpaca_data_historical,
+        "alpaca.trading": alpaca_trading, "alpaca.trading.client": alpaca_trading_client,
+        "alpaca.trading.enums": alpaca_trading_enums, "alpaca.trading.requests": alpaca_trading_requests,
+    })
 
 
 def _blocked_network(*args, **kwargs):
@@ -81,7 +138,7 @@ def safe_config():
         "approved_strategy_versions": ["rule_based_v2"],
         "risk": {"max_trade_notional_paper": 5, "max_trade_notional_live": 5, "max_trades_per_day": 1,
                  "max_open_positions": 1, "allow_margin": False, "allow_shorting": False,
-                 "allowed_order_types": ["market"], "max_price_age_seconds": 120, "min_historical_bars": 50,
+                 "allowed_order_types": ["market", "limit"], "max_price_age_seconds": 120, "min_historical_bars": 50,
                  "max_price_gap_pct": 15, "stop_if_daily_loss_pct_exceeds": 5, "stop_if_weekly_loss_pct_exceeds": 10,
                  "stop_if_daily_loss_dollars_exceeds": None, "stop_if_weekly_loss_dollars_exceeds": None},
     }
@@ -94,7 +151,12 @@ def proposal():
             "notional": 5, "latest_price": 500, "price_at": now.isoformat(), "historical_bars": 250,
             "volume": 1000, "price_gap_pct": 0, "created_at": now.isoformat(),
             "expires_at": (now + timedelta(minutes=10)).isoformat(), "strategy_version": "rule_based_v2",
-            "reason": "trend passed", "order_type": "market", "asset_class": "equity"}
+            "reason": "trend passed", "order_type": "limit", "asset_class": "equity",
+            "stop_price": 490.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+            "technical_stop_price": 490.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+            "quote_source": "alpaca_quote", "quote_bid": 499.9, "quote_ask": 500.1,
+            "quote_midpoint": 500.0, "quote_timestamp": now.isoformat(), "quote_spread_bps": 4.0,
+            "limit_price": 501.36}
 
 
 @pytest.fixture

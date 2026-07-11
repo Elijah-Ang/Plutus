@@ -313,10 +313,16 @@ class PositionManagementEngine:
             blockers.append("position is not sufficiently profitable")
         if cfg.get("require_price_above_avg_entry", True) and current_price <= avg_entry_price:
             blockers.append("price is not above average entry")
-        if cfg.get("require_price_above_ma50", True) and ma50 is not None and current_price <= ma50:
-            blockers.append("price is below MA50")
-        if cfg.get("require_price_above_ma200_if_available", True) and ma200 is not None and current_price <= ma200:
-            blockers.append("price is below MA200")
+        if cfg.get("require_price_above_ma50", True):
+            if ma50 is None:
+                blockers.append("MA50 trend evidence is missing")
+            elif current_price <= ma50:
+                blockers.append("price is below MA50")
+        if cfg.get("require_price_above_ma200", True):
+            if ma200 is None:
+                blockers.append("MA200 trend evidence is missing")
+            elif current_price <= ma200:
+                blockers.append("price is below MA200")
         if trade_score < float(cfg.get("minimum_trade_score", 85)):
             blockers.append("trade score below healthy-pullback threshold")
         if score_improvement < float(cfg.get("minimum_score_improvement", 5)):
@@ -340,7 +346,7 @@ class PositionManagementEngine:
         classification = self._classify_dip_trap(unrealized_pct, current_price, avg_entry_price, ma50, ma200, giveback, trailing_stop, emergency_exit_score, volatility_regime)
         if blockers:
             return self._decision(symbol, "HOLD", "hold", "not a healthy pullback add: " + "; ".join(blockers), current_price, avg_entry_price, quantity, blockers, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, atr=atr, atr_pct=atr_pct, dip_trap_classification=classification)
-        add_notional = float(cfg.get("suggested_add_notional", self.config.get("position_sizing", {}).get("max_add_paper_notional", 10.0)))
+        add_notional = float(self.config.get("position_sizing", {}).get("default_add_notional_usd", 0.0))
         return self._decision(symbol, "HEALTHY_PULLBACK_ADD", "buy", "healthy pullback inside a winning position; this is not averaging down", current_price, avg_entry_price, quantity, is_actionable=True, unrealized_pct=unrealized_pct, highest=highest, max_profit_pct=max_profit_pct, pullback_pct=pullback_pct, giveback=giveback, current_r=current_r, trailing_stop=trailing_stop, suggested_add_notional=add_notional, atr=atr, atr_pct=atr_pct, dip_trap_classification=classification)
 
     def _classify_dip_trap(self, unrealized_pct: float, current_price: float, avg_entry_price: float, ma50: float | None, ma200: float | None, giveback: float | None, trailing_stop: float | None, emergency_exit_score: float | None, volatility_regime: str) -> str:

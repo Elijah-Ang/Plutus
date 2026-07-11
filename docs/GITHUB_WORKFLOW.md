@@ -19,7 +19,7 @@ This document outlines the rules and best practices for contributing to the Plut
 
 ### Always Safe to Commit
 - Core source files under `app/` (e.g. `app/main.py`, `app/service.py`)
-- Configuration templates (e.g. `config/config.yaml`, `config/risk_limits.yaml`, `config/strategies.yaml`)
+- Configuration source and compatibility files: `config/config.yaml` is authoritative; `config/strategies.yaml` is archived/unused and there is no active `config/risk_limits.yaml`.
 - Shell/Python utility scripts under `scripts/` (e.g. `scripts/run_once.sh`)
 - Automated tests under `tests/`
 - Documentation files under `docs/` and `README.md`

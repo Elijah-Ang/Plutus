@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any
 
 from .execution import DurableExecutionStore
+from .accounting import separate_accounting_components
+from .lot_ledger import LotLedger
 from .order_state import BROKER_RELEVANT_STATES, OrderState, broker_status_to_state
 from .position_lifecycle import PositionLifecycleManager
 from .utils import iso_now, json_dumps
@@ -318,9 +320,30 @@ class BrokerReconciler:
         PositionLifecycleManager(self.storage).reconcile(positions)
         unrealized_values = [_value(position, "unrealized_pl") for position in positions]
         unrealized = sum(float(value) for value in unrealized_values if value is not None) if all(value is not None for value in unrealized_values) else None
+        current_equity = _float_or_none(_value(account, "equity"))
+        current_realized, realized_confidence = LotLedger(self.storage).cumulative_realized_pl(as_of=iso_now())
+        prior_rows = self.storage.fetch_all(
+            "SELECT equity,realized_fifo_pnl,unrealized_pl FROM cash_snapshots ORDER BY id DESC LIMIT 1"
+        )
+        prior = prior_rows[0] if prior_rows else {}
+        components = separate_accounting_components(
+            current_equity=current_equity,
+            previous_equity=prior.get("equity"),
+            current_realized_fifo_pnl=current_realized,
+            previous_realized_fifo_pnl=prior.get("realized_fifo_pnl"),
+            current_unrealized_pl=unrealized,
+            previous_unrealized_pl=prior.get("unrealized_pl"),
+        )
         self.storage.execute(
-            "INSERT INTO cash_snapshots(run_id,equity,cash,settled_cash,realized_pl,unrealized_pl,created_at) VALUES(?,?,?,?,?,?,?)",
-            (self.run_id, _float_or_none(_value(account, "equity")), _float_or_none(_value(account, "cash")), _float_or_none(_value(account, "cash")), None, unrealized, iso_now()),
+            """INSERT INTO cash_snapshots(
+               run_id,equity,cash,settled_cash,realized_pl,unrealized_pl,realized_fifo_pnl,
+               account_equity_change,unrealized_change,external_cash_flow,accounting_version,accounting_confidence,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.run_id, current_equity, _float_or_none(_value(account, "cash")),
+             _float_or_none(_value(account, "settled_cash", _value(account, "cash"))), current_realized, unrealized,
+             current_realized, components.account_equity_change, components.unrealized_change,
+             components.external_cash_flow, components.accounting_version,
+             components.confidence if realized_confidence in {"verified", "reconstructed"} else "unavailable", iso_now()),
         )
         for position in positions:
             self.storage.execute(

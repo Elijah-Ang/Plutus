@@ -15,10 +15,11 @@ import pandas as pd
 
 from .strategy_rule_based import STRATEGY_VERSION, completed_daily_bars, evaluate_symbol
 from .utils import json_dumps
+from .formula_versions import EVIDENCE_VERSION
 
 
 PHASE1_SCHEMA_VERSION = "phase1_evidence_validation_v1"
-OUTCOME_ENGINE_VERSION = "phase1_outcome_v1"
+OUTCOME_ENGINE_VERSION = EVIDENCE_VERSION
 REGIME_VERSION = "spy_trend_vol_v1"
 ELIGIBILITY_VERSION = "phase1_point_in_time_v1"
 FEATURE_VERSION = "rule_based_features_v1"
@@ -188,6 +189,14 @@ class HorizonResult:
     first_barrier: str | None = None
     ordering_quality: str | None = None
     cost_bps: float | None = None
+    outcome_class: str = "executable_trade_path"
+    holding_period_sessions: int | None = None
+    trade_path_gross_return: float | None = None
+    trade_path_spy_return: float | None = None
+    trade_path_cost_adjusted_return: float | None = None
+    fixed_horizon_gross_return: float | None = None
+    fixed_horizon_spy_return: float | None = None
+    fixed_horizon_cost_adjusted_return: float | None = None
 
 
 def _bars_by_session(bars: pd.DataFrame) -> dict[date, Mapping[str, Any]]:
@@ -246,45 +255,62 @@ class CanonicalOutcomeCalculator:
             exit_day = window[-1][0]
             stop_hit = False if stop is not None else None
             target_hit = False if target is not None else None
-            for day, bar in window:
-                high = float(bar.get("high", bar["close"]))
-                low = float(bar.get("low", bar["close"]))
-                hit_stop = stop is not None and (low <= float(stop) if direction > 0 else high >= float(stop))
-                hit_target = target is not None and (high >= float(target) if direction > 0 else low <= float(target))
-                if hit_stop:
-                    stop_hit = True
-                if hit_target:
-                    target_hit = True
-                if hit_stop and hit_target:
-                    first_barrier, ordering_quality = "stop", "ambiguous_same_daily_bar_conservative_stop_first"
-                    exit_price, exit_day = float(stop), day
-                    break
-                if hit_stop:
-                    first_barrier, ordering_quality = "stop", "daily_bar_ordered"
-                    exit_price, exit_day = float(stop), day
-                    break
-                if hit_target:
-                    first_barrier, ordering_quality = "target", "daily_bar_ordered"
-                    exit_price, exit_day = float(target), day
-                    break
-            highs = [float(row.get("high", row["close"])) for _, row in window]
-            lows = [float(row.get("low", row["close"])) for _, row in window]
+            fixed_observation = str(opportunity.execution_type or "").lower() in {
+                "shadow_hypothetical", "observation", "observation_only", "hypothetical", "research_only",
+            } or str(opportunity.source_table or "").startswith("shadow")
+            if fixed_observation:
+                stop_hit = None
+                target_hit = None
+            if not fixed_observation:
+                for day, bar in window:
+                    high = float(bar.get("high", bar["close"]))
+                    low = float(bar.get("low", bar["close"]))
+                    hit_stop = stop is not None and (low <= float(stop) if direction > 0 else high >= float(stop))
+                    hit_target = target is not None and (high >= float(target) if direction > 0 else low <= float(target))
+                    if hit_stop:
+                        stop_hit = True
+                    if hit_target:
+                        target_hit = True
+                    if hit_stop and hit_target:
+                        first_barrier, ordering_quality = "stop", "ambiguous_same_daily_bar_conservative_stop_first"
+                        exit_price, exit_day = float(stop), day
+                        break
+                    if hit_stop:
+                        first_barrier, ordering_quality = "stop", "daily_bar_ordered"
+                        exit_price, exit_day = float(stop), day
+                        break
+                    if hit_target:
+                        first_barrier, ordering_quality = "target", "daily_bar_ordered"
+                        exit_price, exit_day = float(target), day
+                        break
+            exit_index = next((index for index, (day, _bar) in enumerate(window) if day == exit_day), len(window) - 1)
+            attribution_window = window[: exit_index + 1]
+            highs = [float(row.get("high", row["close"])) for _, row in attribution_window]
+            lows = [float(row.get("low", row["close"])) for _, row in attribution_window]
             mfe = ((max(highs) / entry_f) - 1.0) * direction
             mae = ((min(lows) / entry_f) - 1.0) * direction
             if direction < 0:
                 mfe, mae = -((min(lows) / entry_f) - 1.0), -((max(highs) / entry_f) - 1.0)
             gross = (exit_price / entry_f - 1.0) * direction
+            fixed_exit_price = float(window[-1][1]["close"])
+            fixed_gross = (fixed_exit_price / entry_f - 1.0) * direction
             benchmark_return = None
-            if opportunity.benchmark_entry_price is not None and all(d in benchmark for d in sessions):
-                benchmark_return = float(benchmark[sessions[-1]]["close"]) / float(opportunity.benchmark_entry_price) - 1.0
+            benchmark_exit_day = sessions[-1] if fixed_observation else exit_day
+            if opportunity.benchmark_entry_price is not None and benchmark_exit_day in benchmark:
+                benchmark_return = float(benchmark[benchmark_exit_day]["close"]) / float(opportunity.benchmark_entry_price) - 1.0
+            fixed_benchmark_return = None
+            if opportunity.benchmark_entry_price is not None and sessions[-1] in benchmark:
+                fixed_benchmark_return = float(benchmark[sessions[-1]]["close"]) / float(opportunity.benchmark_entry_price) - 1.0
             cost = self.cost_model.round_trip_bps / 10_000.0
             risk = abs(entry_f - float(stop)) / entry_f if stop is not None and float(stop) != entry_f else None
             net = gross - cost
+            fixed_net = fixed_gross - cost
+            outcome_class = "fixed_horizon_observation" if fixed_observation else "executable_trade_path"
             results.append(
                 HorizonResult(
                     horizon_sessions=horizon,
                     status="completed",
-                    reason="canonical_session_outcome_completed",
+                    reason="canonical_fixed_horizon_observation_completed" if fixed_observation else "canonical_session_trade_path_completed",
                     maturity_session=maturity.isoformat(),
                     exit_session=exit_day.isoformat(),
                     gross_return=gross,
@@ -300,6 +326,14 @@ class CanonicalOutcomeCalculator:
                     first_barrier=first_barrier,
                     ordering_quality=ordering_quality or "no_barrier_within_horizon",
                     cost_bps=self.cost_model.round_trip_bps,
+                    outcome_class=outcome_class,
+                    holding_period_sessions=exit_index + 1,
+                    trade_path_gross_return=None if fixed_observation else gross,
+                    trade_path_spy_return=None if fixed_observation else benchmark_return,
+                    trade_path_cost_adjusted_return=None if fixed_observation else net,
+                    fixed_horizon_gross_return=fixed_gross if fixed_observation else None,
+                    fixed_horizon_spy_return=fixed_benchmark_return if fixed_observation else None,
+                    fixed_horizon_cost_adjusted_return=fixed_net if fixed_observation else None,
                 )
             )
         return results
@@ -495,12 +529,15 @@ def apply_phase1_schema(conn: sqlite3.Connection) -> None:
           id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL, horizon_sessions INTEGER NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('completed','maturing','unavailable','failed')),
           reason TEXT NOT NULL, maturity_session TEXT NOT NULL, exit_session TEXT,
+          outcome_class TEXT NOT NULL DEFAULT 'executable_trade_path', holding_period_sessions INTEGER,
           gross_return REAL, spy_return REAL, spy_relative_return REAL,
           cost_adjusted_return REAL, mfe REAL, mae REAL, gross_r_multiple REAL,
           cost_adjusted_r_multiple REAL, stop_hit INTEGER, target_hit INTEGER,
+          trade_path_gross_return REAL, trade_path_spy_return REAL, trade_path_cost_adjusted_return REAL,
+          fixed_horizon_gross_return REAL, fixed_horizon_spy_return REAL, fixed_horizon_cost_adjusted_return REAL,
           first_barrier TEXT, ordering_quality TEXT, cost_model_version TEXT NOT NULL,
           cost_bps REAL, calculation_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL,
-          calculated_at TEXT NOT NULL, error_category TEXT,
+          calculated_at TEXT NOT NULL, error_category TEXT, invalidated_at TEXT,
           UNIQUE(opportunity_id, horizon_sessions));
         CREATE TABLE IF NOT EXISTS research_backfill_jobs(
           id TEXT PRIMARY KEY, source_fingerprint TEXT NOT NULL, status TEXT NOT NULL,
@@ -533,6 +570,27 @@ def apply_phase1_schema(conn: sqlite3.Connection) -> None:
     opportunity_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_opportunities)")}
     if "benchmark_entry_price" not in opportunity_columns:
         conn.execute("ALTER TABLE research_opportunities ADD COLUMN benchmark_entry_price REAL")
+    outcome_columns = {row[1] for row in conn.execute("PRAGMA table_info(research_outcomes)")}
+    outcome_additions = {
+        "outcome_class": "TEXT DEFAULT 'executable_trade_path'",
+        "holding_period_sessions": "INTEGER",
+        "trade_path_gross_return": "REAL",
+        "trade_path_spy_return": "REAL",
+        "trade_path_cost_adjusted_return": "REAL",
+        "fixed_horizon_gross_return": "REAL",
+        "fixed_horizon_spy_return": "REAL",
+        "fixed_horizon_cost_adjusted_return": "REAL",
+        "invalidated_at": "TEXT",
+    }
+    for name, definition in outcome_additions.items():
+        if name not in outcome_columns:
+            conn.execute(f"ALTER TABLE research_outcomes ADD COLUMN {name} {definition}")
+    conn.execute(
+        """UPDATE research_outcomes
+           SET status='failed', reason=?, error_category=?, invalidated_at=?
+           WHERE calculation_version<>? AND status='completed'""",
+        (f"invalidated_calculation_version:{OUTCOME_ENGINE_VERSION}", "outcome_engine_version_changed", datetime.now(UTC).isoformat(), OUTCOME_ENGINE_VERSION),
+    )
     now = datetime.now(UTC).isoformat()
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -596,39 +654,50 @@ class ResearchRepository:
                 "INSERT OR IGNORE INTO research_cost_models(version,parameters_json,source,observed_at,created_at) VALUES(?,?,?,?,?)",
                 (cost_model.version, json_dumps(asdict(cost_model)), cost_model.source, cost_model.observed_at, calculated_at.isoformat()),
             )
+            placeholders = ",".join("?" for _ in range(34))
             for result in results:
                 conn.execute(
-                    """INSERT INTO research_outcomes(
+                    f"""INSERT INTO research_outcomes(
                       id,opportunity_id,horizon_sessions,status,reason,maturity_session,exit_session,
-                      gross_return,spy_return,spy_relative_return,cost_adjusted_return,mfe,mae,
-                      gross_r_multiple,cost_adjusted_r_multiple,stop_hit,target_hit,first_barrier,
-                      ordering_quality,cost_model_version,cost_bps,calculation_version,input_fingerprint,
-                      calculated_at,error_category)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      outcome_class,holding_period_sessions,gross_return,spy_return,spy_relative_return,cost_adjusted_return,mfe,mae,
+                      gross_r_multiple,cost_adjusted_r_multiple,stop_hit,target_hit,
+                      trade_path_gross_return,trade_path_spy_return,trade_path_cost_adjusted_return,
+                      fixed_horizon_gross_return,fixed_horizon_spy_return,fixed_horizon_cost_adjusted_return,
+                      first_barrier,ordering_quality,cost_model_version,cost_bps,calculation_version,input_fingerprint,
+                      calculated_at,error_category,invalidated_at)
+                    VALUES({placeholders})
                     ON CONFLICT(opportunity_id,horizon_sessions) DO UPDATE SET
                       status=excluded.status,reason=excluded.reason,maturity_session=excluded.maturity_session,
-                      exit_session=excluded.exit_session,gross_return=excluded.gross_return,
+                      exit_session=excluded.exit_session,outcome_class=excluded.outcome_class,
+                      holding_period_sessions=excluded.holding_period_sessions,gross_return=excluded.gross_return,
                       spy_return=excluded.spy_return,spy_relative_return=excluded.spy_relative_return,
                       cost_adjusted_return=excluded.cost_adjusted_return,mfe=excluded.mfe,mae=excluded.mae,
-                      gross_r_multiple=excluded.gross_r_multiple,
-                      cost_adjusted_r_multiple=excluded.cost_adjusted_r_multiple,
+                      gross_r_multiple=excluded.gross_r_multiple,cost_adjusted_r_multiple=excluded.cost_adjusted_r_multiple,
                       stop_hit=excluded.stop_hit,target_hit=excluded.target_hit,
+                      trade_path_gross_return=excluded.trade_path_gross_return,
+                      trade_path_spy_return=excluded.trade_path_spy_return,
+                      trade_path_cost_adjusted_return=excluded.trade_path_cost_adjusted_return,
+                      fixed_horizon_gross_return=excluded.fixed_horizon_gross_return,
+                      fixed_horizon_spy_return=excluded.fixed_horizon_spy_return,
+                      fixed_horizon_cost_adjusted_return=excluded.fixed_horizon_cost_adjusted_return,
                       first_barrier=excluded.first_barrier,ordering_quality=excluded.ordering_quality,
                       cost_model_version=excluded.cost_model_version,cost_bps=excluded.cost_bps,
-                      calculation_version=excluded.calculation_version,
-                      input_fingerprint=excluded.input_fingerprint,calculated_at=excluded.calculated_at,
-                      error_category=excluded.error_category""",
+                      calculation_version=excluded.calculation_version,input_fingerprint=excluded.input_fingerprint,
+                      calculated_at=excluded.calculated_at,error_category=excluded.error_category,
+                      invalidated_at=excluded.invalidated_at""",
                     (
                         hashlib.sha256(f"{opportunity_id}|{result.horizon_sessions}".encode()).hexdigest()[:32],
                         opportunity_id, result.horizon_sessions, result.status, result.reason,
-                        result.maturity_session, result.exit_session, result.gross_return, result.spy_return,
-                        result.spy_relative_return, result.cost_adjusted_return, result.mfe, result.mae,
-                        result.gross_r_multiple, result.cost_adjusted_r_multiple,
+                        result.maturity_session, result.exit_session, result.outcome_class, result.holding_period_sessions,
+                        result.gross_return, result.spy_return, result.spy_relative_return, result.cost_adjusted_return,
+                        result.mfe, result.mae, result.gross_r_multiple, result.cost_adjusted_r_multiple,
                         None if result.stop_hit is None else int(result.stop_hit),
-                        None if result.target_hit is None else int(result.target_hit), result.first_barrier,
-                        result.ordering_quality, cost_model.version, result.cost_bps,
+                        None if result.target_hit is None else int(result.target_hit),
+                        result.trade_path_gross_return, result.trade_path_spy_return, result.trade_path_cost_adjusted_return,
+                        result.fixed_horizon_gross_return, result.fixed_horizon_spy_return, result.fixed_horizon_cost_adjusted_return,
+                        result.first_barrier, result.ordering_quality, cost_model.version, result.cost_bps,
                         OUTCOME_ENGINE_VERSION, input_fingerprint, calculated_at.isoformat(),
-                        result.reason if result.status == "failed" else None,
+                        result.reason if result.status == "failed" else None, None,
                     ),
                 )
 
@@ -938,7 +1007,11 @@ def update_service_outcomes(
         opportunity
         for opportunity in opportunities
         if opportunity.id not in states
-        or any(status == "maturing" and maturity <= now.date().isoformat() for status, maturity in states[opportunity.id])
+        or any(
+            (status == "maturing" and maturity <= now.date().isoformat())
+            or status == "failed"
+            for status, maturity in states[opportunity.id]
+        )
     ]
     if bar_cache is not None:
         available = {str(symbol).upper() for symbol, frame in bar_cache.items() if frame is not None and not frame.empty}

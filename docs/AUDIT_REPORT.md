@@ -5,6 +5,11 @@
 **Audit type:** Read-only technical, operational, security, and runtime audit, except for this report and the requested ignored Excel export.  
 **Safety constraint:** No orders, proposals, Telegram messages, config changes, threshold changes, or launchd changes were made.
 
+> Historical snapshot: this report describes the 2026-06-22 audit state and is
+> not the current configuration or runtime authority. For current behavior see
+> [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) and
+> [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md).
+
 ## 1. Executive Summary
 
 TradingAgent is active, running from the correct Projects path, connected to Alpaca Paper and Telegram, scheduled by launchd every 10 minutes, and currently configured for paper trading. The Git working tree was clean before this audit, `main` was synchronized with `origin/main`, and the remote was the expected `git@github.com:Elijah-Ang/Plutus.git`.
@@ -125,7 +130,7 @@ Contains all runtime logic. No duplicate app modules were found. `__pycache__` e
 
 ### `config/`
 
-Contains current tracked behavior and a local ignored kill switch path. `KILL_SWITCH` was absent at audit time. Config files are internally readable but have duplicated risk values between `config.yaml` and `risk_limits.yaml`; runtime primarily reads `config.yaml`, so the second file can drift without effect.
+At the historical audit date this contained current tracked behavior and a local ignored kill switch path. The current source of truth is `config/config.yaml`; the former `risk_limits.yaml` reference is historical and there is no active file.
 
 ### `data/`
 

@@ -53,9 +53,10 @@ The project follows a modular design with clear separation between:
 - `tests/`: Project unit and integration tests.
 
 ## 5. Main Config Files
-- [config.yaml](../config/config.yaml): Sets the bot's modes, watchlist, intervals, and AI model parameters.
-- [risk_limits.yaml](../config/risk_limits.yaml): Sets paper and live boundaries (max notional, open positions, daily trades, and global safety toggles).
-- [strategies.yaml](../config/strategies.yaml): Strategy thresholds (maximum volatility, drawdown stop).
+- [config.yaml](../config/config.yaml): The single documented and validated runtime source for modes, watchlists, safety gates, strategy thresholds, phases, sizing, and execution limits.
+- [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md): Canonical formula versions, units, migration requirements, evidence semantics, and minimum-of-ceilings paper sizing.
+- `strategies.yaml`: Archived/unused compatibility file; runtime does not read it.
+- `risk_limits.yaml`: No active file; its former responsibilities are represented and validated in `config.yaml`.
 
 ## 6. Main App Modules
 - [main.py](../app/main.py): Entry point executing single bounded cycles.
@@ -595,7 +596,7 @@ To support the bot's current 10-minute schedule during trading hours:
 - **Risk/sizing linkage**: Batch-candidate creation backfills `batch_id`, `candidate_id`, and `proposal_id` into ranked opportunity, risk-budget, allocation, and sizing rows. Fill reconciliation adds `order_id`, `broker_order_id`, and `fill_id` where applicable so reports can trace candidate -> risk/sizing -> approval -> order -> fill -> actual outcome.
 - **Forward outcomes**: Pending outcome rows can be updated with 1-day, 5-day, and 20-day forward returns, MAE/MFE, stop-hit, target-hit, and whether actual trades beat shadow alternatives only after the relevant horizon has elapsed. These outcomes are for after-the-fact measurement and are not inputs to live proposal, approval, sizing, exit, or override decisions.
 - **Report redaction**: Performance Lab report exports use the same redaction path as other sheets. API keys, provider secrets, tokens, raw Telegram text, sender IDs, raw provider dumps, and sensitive OpenAI prompt text must not be exported.
-- **Dynamic sizing**: Initial BUY proposals use `position_sizing` rules: score multiplier, volatility multiplier, risk budget, ATR/technical stop distance, min/max paper notional, single-symbol exposure cap, total exposure cap, and cluster exposure cap. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
+- **Dynamic sizing**: Initial BUY and ADD proposals use the versioned `position_sizing` policy: validated ATR/technical stop risk, stage, equity, cash, buying power, symbol, portfolio, cluster, allocation, exploration, and optional absolute ceilings. The final notional is their minimum; it is never raised to meet the executable minimum. High/extreme volatility produces size `0` and blocks/watch-lists the setup.
 - **Portfolio exposure controls**: `portfolio_behavior`, `portfolio_optimizer`, and `risk_budget` cap single-symbol exposure, total exposure, open risk, same-cluster exposure, and paper buying power use. SPY/DIA/IWM and QQQ/XLK are treated as correlated clusters by default.
 - **Add-to-winner**: `add_to_position` permits add-on BUY proposals only when an existing paper position is profitable, the setup score is strong enough, the setup improves, add counts remain within limits, exposure caps pass, and no exit/emergency warning blocks the add. Averaging down is blocked.
 - **Final revalidation**: Approved BUY/ADD orders still refresh price, re-evaluate size and exposure, check market/broker/database/Telegram/internet/paper-mode state, and can block after approval. `YES` means permission to attempt after final safety checks, not guaranteed order.

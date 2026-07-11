@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -25,6 +26,8 @@ sys.excepthook = redacting_excepthook
 
 
 def _load_runtime_environment() -> None:
+    if os.getenv("TRADING_AGENT_RUNTIME") == "production-paper" and os.getenv("TRADING_AGENT_TESTING") == "1":
+        raise RuntimeGuardError("production runtime rejects TRADING_AGENT_TESTING=1")
     # Tests establish synthetic credentials before importing application code.
     # Never consult a developer/production .env inside the offline suite.
     if os.getenv("TRADING_AGENT_TESTING") == "1":
@@ -62,7 +65,13 @@ def run_once(config_path: str | Path | None = None) -> int:
     storage.audit(run_id, "process_started", identity)
     if os.getenv("TRADING_AGENT_STALE_LOCK_RECOVERED") == "1":
         storage.audit(run_id, "stale_lock_recovered", {"lock": "logs/runtime/agent.lockdir"})
-    storage.execute("INSERT INTO config_snapshots(run_id,config_json,created_at) VALUES(?,?,datetime('now'))", (run_id, __import__("json").dumps(redact(config), sort_keys=True)))
+    effective_config_json = json.dumps(redact(config), sort_keys=True, separators=(",", ":"))
+    storage.execute(
+        """INSERT INTO config_snapshots(
+           run_id,config_json,effective_config_json,effective_config_hash,configuration_schema_version,created_at)
+           VALUES(?,?,?,?,?,datetime('now'))""",
+        (run_id, effective_config_json, effective_config_json, str(config.get("effective_config_hash") or ""), config.get("configuration_schema_version")),
+    )
     storage.execute(
         "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('effective_config_hash',?,datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
         (str(config.get("effective_config_hash") or ""),),
@@ -72,7 +81,7 @@ def run_once(config_path: str | Path | None = None) -> int:
             config,
             storage,
             lock_held=os.getenv("TRADING_AGENT_LOCK_HELD") == "1",
-            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="preflight"),
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="preflight", config_hash=config.get("effective_config_hash")),
         )
         if not core_result.passed:
             reasons = "; ".join(c.name for c in core_result.checks if not c.passed)
@@ -91,7 +100,7 @@ def run_once(config_path: str | Path | None = None) -> int:
         research_result = run_research_preflight(
             config,
             storage,
-            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight"),
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight", config_hash=config.get("effective_config_hash")),
         )
         crypto_results = []
         if research_result.passed:
@@ -104,7 +113,7 @@ def run_once(config_path: str | Path | None = None) -> int:
             config,
             storage,
             broker,
-            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="preflight"),
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="preflight", config_hash=config.get("effective_config_hash")),
         )
         failed_trading = [c.name for c in trading_result.checks if not c.passed]
         market_open_failed = "market_open" in failed_trading

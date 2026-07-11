@@ -11,6 +11,17 @@ from app.approval_parser import parse_approval
 from app.utils import format_proposal_message
 from app.ai_review import deterministic_review
 
+
+def _validated_entry_fields(price: float, now: datetime) -> dict:
+    return {
+        "stop_price": price - 10.0, "stop_distance_dollars": 10.0, "atr_value": 5.0,
+        "technical_stop_price": price - 10.0, "stop_model_used": "atr", "stop_validation_status": "validated",
+        "cluster_name": "us_broad_market", "order_type": "limit",
+        "quote_source": "alpaca_quote", "quote_bid": price - 0.01, "quote_ask": price + 0.01,
+        "quote_midpoint": price, "quote_timestamp": now.isoformat(), "quote_spread_bps": 2.0,
+        "limit_price": price + 0.27,
+    }
+
 class MockClock:
     def __init__(self, timestamp=None, next_close=None):
         self.timestamp = timestamp or datetime.now(UTC)
@@ -38,14 +49,18 @@ class MockBroker:
     def get_latest_price(self, symbol):
         return type("T", (), {"price": self.prices.get(symbol, self.price), "timestamp": datetime.now(UTC)})()
 
+    def get_latest_quote(self, symbol):
+        price = self.prices.get(symbol, self.price)
+        return {"bid_price": price - 0.01, "ask_price": price + 0.01, "timestamp": datetime.now(UTC)}
+
     def get_historical_bars(self, symbol, timeframe, limit=50):
         import pandas as pd
         data = {
             "close": [self.prices.get(symbol, self.price)] * limit,
             "volume": [10000.0] * limit,
-            "high": [101.0] * limit,
-            "low": [99.0] * limit,
-            "open": [100.0] * limit,
+            "high": [self.prices.get(symbol, self.price) + 2.0] * limit,
+            "low": [self.prices.get(symbol, self.price) - 2.0] * limit,
+            "open": [self.prices.get(symbol, self.price)] * limit,
             "ma_50": [95.0] * limit,
             "ma_200": [90.0] * limit,
             "volatility_20": [0.15] * limit
@@ -63,7 +78,11 @@ class MockBroker:
         })()
 
     def get_loss_metrics(self):
-        return {"daily_loss": 0.0, "weekly_loss": 0.0}
+        return {
+            "daily_loss_dollars": 0.0, "weekly_loss_dollars": 0.0,
+            "daily_loss_confidence": "verified", "weekly_loss_confidence": "verified",
+            "reference_equity": 1000000.0,
+        }
 
     def get_clock(self):
         return self.clock
@@ -150,6 +169,23 @@ def mock_config():
             "ai_daily_call_limit": 50,
             "ai_max_calls_per_run": 50,
             "ai_review_min_interval_minutes": 0
+        },
+        "phase3": {"enabled": False, "active": False},
+        "phase4": {"enabled": False, "active": False},
+        "position_sizing": {
+            "enabled": True, "mode": "risk_portfolio", "stage": "moderate_paper",
+            "use_stage_dollar_cap": True,
+            "stage_max_initial_notional_usd": {"moderate_paper": 250.0},
+            "stage_max_add_notional_usd": {"moderate_paper": 100.0},
+            "risk_per_trade_pct": 0.2, "max_trade_notional_pct_equity": 6.0,
+            "max_position_notional_pct_equity": 6.0, "max_total_portfolio_exposure_pct": 30.0,
+            "max_cluster_exposure_pct": 15.0, "min_cash_reserve_pct": 20.0,
+            "max_cash_usage_pct": 10.0, "default_paper_notional_usd": 250.0,
+            "default_add_notional_usd": 100.0, "minimum_executable_notional_usd": 5.0,
+            "add_size_multiplier": 0.5,
+            "stop_model": {"atr_multiple": 2.0, "min_stop_pct": 1.0, "max_stop_pct": 8.0},
+            "score_multiplier": {"65_74": 1.0, "75_84": 1.0, "85_94": 1.0, "95_100": 1.0},
+            "volatility_multiplier": {"normal": 1.0, "elevated": 0.5, "high": 0.25, "extreme": 0.0, "too_quiet": 0.75},
         }
     }
 
@@ -223,6 +259,7 @@ def test_telegram_process_reply_to_and_acknowledgements(temp_storage, mock_confi
         "created_at": now.isoformat(),
         "expires_at": expiry.isoformat()
     }
+    proposal_payload.update(_validated_entry_fields(500.0, now))
     
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -314,10 +351,10 @@ def test_pending_buy_blocks_only_duplicate_symbol_not_other_proposals(temp_stora
 
     try:
         service.scan()
-        # Existing SPY remains deduplicated, while unrelated candidates are not
-        # suppressed by a global pending-proposal count.
+        # An incomplete pending buy is unknown risk and blocks all new entries;
+        # it is never silently ignored while unrelated symbols are proposed.
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE status='pending'")
-        assert {row["symbol"] for row in props} == {"SPY", "DIA", "IWM"}
+        assert {row["symbol"] for row in props} == {"SPY"}
         
         suppressed = temp_storage.fetch_all("SELECT * FROM market_memory WHERE candidate_suppression_reason='suppressed_by_candidate_limit'")
         assert suppressed == []
@@ -389,6 +426,7 @@ def test_proposal_conflict_supersedes_others(temp_storage, mock_config):
         "created_at": now.isoformat(),
         "expires_at": expiry.isoformat()
     }
+    spy_payload.update(_validated_entry_fields(500.0, now))
     dia_payload = {
         "symbol": "DIA",
         "side": "buy",
@@ -402,6 +440,7 @@ def test_proposal_conflict_supersedes_others(temp_storage, mock_config):
         "created_at": now.isoformat(),
         "expires_at": expiry.isoformat()
     }
+    dia_payload.update(_validated_entry_fields(350.0, now))
     temp_storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         ("prop-spy", "run_id", "sig-1", "SPY", "buy", 5.0, "pending", now.isoformat(), expiry.isoformat(), "rule_based_v1", json.dumps(spy_payload), "1001")

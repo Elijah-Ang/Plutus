@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from .execution import DurableExecutionStore
 from .evidence import SHADOW_OUTCOME, classify_evidence_type, is_operational_evidence
+from .formula_versions import EVIDENCE_VERSION, PHASE3_DECISION_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
@@ -71,9 +72,13 @@ def apply_phase3_schema(conn: Any, *, record_migration: bool = True) -> None:
       decision_time TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
       equity REAL, account_drawdown_pct REAL, base_stop_risk_pct REAL, scaled_stop_risk_pct REAL,
       stop_price REAL, stop_distance REAL, risk_budget REAL, requested_notional REAL,
+      stop_risk_cap REAL, stage_cap REAL, equity_cap REAL, cash_cap REAL, buying_power_cap REAL,
+      symbol_cap REAL, cluster_cap REAL, portfolio_cap REAL, allocation_cap REAL, exploration_cap REAL,
+      pending_risk_before REAL, reserved_risk_before REAL, pending_risk_after REAL, reserved_risk_after REAL,
       portfolio_heat_before_pct REAL, portfolio_heat_after_pct REAL, gross_exposure_after_pct REAL,
       symbol_exposure_after_pct REAL, cluster_exposure_after_pct REAL, regime TEXT,
       regime_multiplier REAL, drawdown_multiplier REAL, allocation_multiplier REAL,
+      binding_caps_json TEXT, evidence_version TEXT, formula_version TEXT, config_hash TEXT,
       profile_version TEXT NOT NULL, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS phase3_strategy_allocations(
       id TEXT PRIMARY KEY, run_id TEXT NOT NULL, strategy_version TEXT NOT NULL,
@@ -90,6 +95,16 @@ def apply_phase3_schema(conn: Any, *, record_migration: bool = True) -> None:
     """
     for statement in sql.split(";"):
         if statement.strip(): conn.execute(statement)
+    additions = {
+        "stop_risk_cap": "REAL", "stage_cap": "REAL", "equity_cap": "REAL", "cash_cap": "REAL", "buying_power_cap": "REAL",
+        "symbol_cap": "REAL", "cluster_cap": "REAL", "portfolio_cap": "REAL", "allocation_cap": "REAL", "exploration_cap": "REAL",
+        "pending_risk_before": "REAL", "reserved_risk_before": "REAL", "pending_risk_after": "REAL", "reserved_risk_after": "REAL",
+        "binding_caps_json": "TEXT", "evidence_version": "TEXT", "formula_version": "TEXT", "config_hash": "TEXT",
+    }
+    present = {row[1] for row in conn.execute("PRAGMA table_info(phase3_risk_decisions)")}
+    for name, definition in additions.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE phase3_risk_decisions ADD COLUMN {name} {definition}")
     if record_migration:
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
                      (PHASE3_SCHEMA_VERSION, iso_now(), "additive Phase 3 strategy states, allocations, risk decisions, and equity watermark"))
@@ -145,7 +160,8 @@ class Phase3Controller:
             rows = self.storage.fetch_all("""SELECT ro.regime,ro.execution_type,ro.source_table,ro.provenance_json,
               r.cost_adjusted_return,ro.split_label
               FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
-              WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'""", (version,))
+              WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'
+                AND r.calculation_version=?""", (version, EVIDENCE_VERSION))
             oos = [r for r in rows if r.get("split_label") == "out_of_sample" and r.get("cost_adjusted_return") is not None and classify_evidence_type(
                 r.get("execution_type"), r.get("source_table"), r.get("provenance_json")
             ) == SHADOW_OUTCOME]
@@ -173,7 +189,8 @@ class Phase3Controller:
         executable_rows = self.storage.fetch_all("""SELECT ro.regime,ro.execution_type,ro.source_table,ro.provenance_json,
           ro.split_label,r.cost_adjusted_return
           FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
-          WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'""", (STRATEGY_VERSION,))
+          WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'
+            AND r.calculation_version=?""", (STRATEGY_VERSION, EVIDENCE_VERSION))
         executable_oos = [r for r in executable_rows if r.get("split_label") == "out_of_sample" and r.get("cost_adjusted_return") is not None and is_operational_evidence(r)]
         executable_regimes = {str(r.get("regime")) for r in executable_oos if r.get("regime")}
         executable_mean = sum(float(r["cost_adjusted_return"]) for r in executable_oos) / len(executable_oos) if executable_oos else None

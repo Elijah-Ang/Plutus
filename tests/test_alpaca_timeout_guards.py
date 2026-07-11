@@ -161,6 +161,9 @@ def test_order_submission_timeout_is_unknown_and_not_retried(tmp_path):
         "id": "p1", "status": "approved", "symbol": "SPY", "side": "buy", "action": "entry",
         "notional": 5.0, "latest_price": 100.0, "price_at": now.isoformat(),
         "created_at": now.isoformat(), "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 99.99,
+        "quote_ask": 100.01, "quote_midpoint": 100.0, "quote_timestamp": now.isoformat(),
+        "quote_spread_bps": 2.0, "limit_price": 100.27,
     }
     result = Executor(broker, PassingRisk(), storage, "run").execute(proposal, {"approval_valid": True})
 

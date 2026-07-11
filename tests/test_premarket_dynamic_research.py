@@ -29,7 +29,7 @@ class FakeStorage:
     def finish_run(self, run_id, status, detail=None):
         self.finished = (status, detail)
 
-    def record_check(self, run_id, name, passed, reason, proposal_id=None, stage="preflight"):
+    def record_check(self, run_id, name, passed, reason, proposal_id=None, stage="preflight", **kwargs):
         self.checks.append((name, passed, reason, stage))
 
     def fetch_all(self, *args, **kwargs):

@@ -47,7 +47,7 @@ During the June 2026 deployment:
 
 ## Position Sizing and Portfolio Constraints
 
-The system uses a multi-constraint, risk-budgeted position sizing engine when `mode: risk_portfolio` is enabled. It ensures that trades scale dynamically with account equity while protecting cash reserves.
+The system uses the canonical, versioned policy in `config/config.yaml` when `position_sizing.mode: risk_portfolio` is enabled. The configured moderate-paper defaults are `$250` initial and `$100` add; they are targets, not guarantees. A missing validated ATR/technical stop, malformed pending buy exposure, or incomplete MA50/MA200 evidence blocks the affected entry/add.
 
 ### 1. Risk-Based Sizing Formula
 
@@ -55,23 +55,19 @@ The base trade size is driven by account equity and the configured per-trade ris
 
 $$\text{risk\_budget} = \text{equity} \times \frac{\text{risk\_per\_trade\_pct}}{100}$$
 
-$$\text{raw\_risk\_based\_notional} = \frac{\text{risk\_budget}}{\text{stop\_distance\_pct} / 100}$$
+$$\text{raw\_risk\_based\_notional} = \frac{\text{risk\_budget} \times \text{entry\_price}}{\text{stop\_distance\_dollars}}$$
 
 *   **Equity**: Derived from broker account equity (e.g. `$100,000.00`).
-*   **Risk per trade**: Configured in percentage terms (e.g., `0.05` means $0.05\%$, or a multiplier of $0.0005$).
-*   **Stop Distance**: Calculated dynamically using the maximum of ATR-based volatility or technical levels (capped between `min_stop_pct` and `max_stop_pct`).
+*   **Risk per trade**: Configured as a percentage of authoritative equity.
+*   **Stop Distance**: Calculated from validated ATR or technical evidence, bounded by `min_stop_pct`/`max_stop_pct`; percentage/fixed fallback stops are not executable.
 
-### 2. Sizing Multipliers (Quality Adjustments)
+### 2. Sizing target
 
-The raw risk-based size is adjusted based on signal setup quality (Score) and volatility regime:
+The raw risk-based size is adjusted only by the configured volatility regime for operational sizing:
 
-$$\text{target\_notional} = \text{raw\_risk\_based\_notional} \times \text{score\_multiplier} \times \text{volatility\_multiplier}$$
+$$\text{target\_notional} = \text{raw\_risk\_based\_notional} \times \text{volatility\_multiplier}$$
 
-*   **Score Multipliers**:
-    *   95–100: `1.50x`
-    *   85–94: `1.25x`
-    *   75–84: `1.00x`
-    *   65–74: `0.50x`
+Score does not increase Phase 3/4 operational risk. Any diagnostic score fields are persisted separately.
 *   **Volatility Multipliers**:
     *   normal: `1.00x`
     *   too quiet: `0.75x`
@@ -81,7 +77,7 @@ $$\text{target\_notional} = \text{raw\_risk\_based\_notional} \times \text{score
 
 ### 3. Sizing Constraints and Caps
 
-The final notional is sequentially constrained to protect the portfolio:
+The final notional is the minimum of every applicable ceiling: phase stage, validated stop risk, equity, cash, cash available, cash usage, buying power, symbol, cluster, portfolio, allocation, exploration, optional absolute cap, and Phase 3/4 heat/gross limits. Each maximum is only a ceiling. If the result is below `minimum_executable_notional_usd`, the system blocks instead of raising it.
 
 1.  **Cash Reserve Cap**: Sizing is strictly limited by available cash minus a configured minimum reserve percentage:
     $$\text{usable\_cash} = \text{cash} - (\text{equity} \times \text{min\_cash\_reserve\_pct})$$
@@ -90,13 +86,14 @@ The final notional is sequentially constrained to protect the portfolio:
 2.  **Single Position Cap**: Limits maximum symbol exposure (e.g., `2.0%` of equity).
 3.  **Portfolio Exposure Cap**: Limits total active portfolio exposure (e.g., `6.0%` of equity).
 4.  **Cluster Exposure Cap**: Limits total exposure to a single sector/cluster (e.g., `5.0%` of equity).
-5.  **Stage Dollar Cap**: Enforces staging guardrails (e.g., `smoke_test` max $25.00, `moderate_paper` max $250.00).
+5.  **Stage Dollar Cap**: Enforces the configured initial/add stage ceilings. The temporary `$50` absolute cap is not part of the current policy.
 
-### 4. Small-Account and Clamping Rules
+### 4. Small-account and blocking rules
 
 To facilitate testing on small accounts:
-*   A minimum trade clamp allows scaling down to `$5.00` if it is safe under cash/reserve rules.
-*   Fractional shares are supported down to `$1.00`.
-*   If the finalized trade notional is below `$1.00` or breaches cash reserves, the trade is blocked.
+*   `$5.00` is an executable minimum, not a clamp. A constrained result below it is blocked.
+*   Every normal order uses a fresh quote and a bounded limit price.
+*   All ordinary entries/adds require manual Telegram approval and final revalidation.
 
+See [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) for the formula and schema version contract.
 

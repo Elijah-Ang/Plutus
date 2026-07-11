@@ -35,9 +35,15 @@ class MockBroker:
     def get_latest_price(self, symbol):
         return type("T", (), {"price": self.price, "timestamp": datetime.now(UTC)})()
 
+    def get_latest_quote(self, symbol):
+        return {"bid_price": self.price - 0.01, "ask_price": self.price + 0.01, "timestamp": datetime.now(UTC)}
+
     def get_historical_bars(self, symbol, timeframe, limit):
         # Create a mock DataFrame with enough bars
         data = {
+            "open": [500.0] * limit,
+            "high": [502.0] * limit,
+            "low": [498.0] * limit,
             "close": [500.0] * limit,
             "volume": [10000.0] * limit,
         }
@@ -51,7 +57,11 @@ class MockBroker:
         })()
 
     def get_loss_metrics(self):
-        return {"daily_loss": 0.0, "weekly_loss": 0.0}
+        return {
+            "daily_loss_dollars": 0.0, "weekly_loss_dollars": 0.0,
+            "daily_loss_confidence": "verified", "weekly_loss_confidence": "verified",
+            "reference_equity": 100000.0,
+        }
 
 class MockTelegramBot:
     def __init__(self):

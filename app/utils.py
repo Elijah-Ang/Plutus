@@ -235,7 +235,9 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
     else:
         mode_notice = "Paper only"
 
-    if symbol == "TEST" or is_fake_test:
+    if is_fake_test and os.getenv("TRADING_AGENT_TESTING") != "1":
+        raise RuntimeError("fake TEST proposals are restricted to isolated tests")
+    if is_fake_test:
         return (
             f"🧪 Fake paper test proposal\n\n"
             f"This is only testing the Telegram approval flow.\n"

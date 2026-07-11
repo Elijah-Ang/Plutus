@@ -44,7 +44,7 @@ def opportunity(**overrides) -> Opportunity:
         "observed_at": datetime(2026, 1, 2, 15, tzinfo=UTC),
         "entry_price": 100.0,
         "direction": "long",
-        "execution_type": "shadow_hypothetical",
+        "execution_type": "actual_fill",
         "strategy_version": "rule_based_v1",
         "stop_price": 95.0,
         "target_price": 110.0,

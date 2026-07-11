@@ -10,6 +10,7 @@ import pytest
 from app.research_validation import apply_phase1_schema
 from app.shadow_strategies import SHADOW_MODE, STRATEGY_VERSIONS, ShadowStrategyEngine, apply_phase2_schema
 from app.storage import Storage
+from app.formula_versions import EVIDENCE_VERSION
 
 
 def bars(multiplier: float = 1.0, breakout: bool = False) -> pd.DataFrame:
@@ -42,7 +43,7 @@ def test_five_versioned_sleeves_emit_immutable_standard_insights(tmp_path):
     ]
     insights = ShadowStrategyEngine(db, "run-1").evaluate(snapshots, observed_at=datetime(2026, 1, 2, tzinfo=UTC))
     assert set(STRATEGY_VERSIONS).issubset({item.sleeve for item in insights})
-    assert all(item.mode == SHADOW_MODE and item.outcome_engine_version == "phase1_outcome_v1" for item in insights)
+    assert all(item.mode == SHADOW_MODE and item.outcome_engine_version == EVIDENCE_VERSION for item in insights)
     with pytest.raises(FrozenInstanceError):
         insights[0].score = 0  # type: ignore[misc]
     with pytest.raises(Exception, match="immutable"):

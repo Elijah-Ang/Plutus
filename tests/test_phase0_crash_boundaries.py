@@ -91,6 +91,9 @@ def _proposal(identifier="proposal-1", symbol="SPY", side="buy"):
         "latest_price": 10,
         "stop_price": 9,
         "trading_mode": "paper",
+        "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 9.99,
+        "quote_ask": 10.01, "quote_midpoint": 10.0, "quote_timestamp": datetime.now(UTC).isoformat(),
+        "quote_spread_bps": 2.0, "limit_price": 10.04 if side == "buy" else 9.96,
     }
 
 
@@ -187,7 +190,7 @@ def test_crash_04_broker_accepts_then_ambiguous_timeout(tmp_path):
     )
     assert first.status == second.status == "unknown"
     assert first.client_order_id == second.client_order_id and broker.submit_calls == 1
-    assert DurableExecutionStore(storage).active_reservations()["active_reserved_notional"] == 100
+    assert DurableExecutionStore(storage).active_reservations()["active_reserved_notional"] == pytest.approx(100)
 
 
 def test_crash_05_broker_success_before_local_success_update(tmp_path):
@@ -328,7 +331,7 @@ def test_crash_14_restart_with_unknown_intent_is_lookup_only(tmp_path):
     assert result.status == "unknown" and broker.submit_calls == 1
     BrokerReconciler(broker, Storage(storage.path), "restart").reconcile()
     assert broker.submit_calls == 1 and broker.lookup_calls == 1
-    assert DurableExecutionStore(storage).active_reservations()["active_reserved_notional"] == 100
+    assert DurableExecutionStore(storage).active_reservations()["active_reserved_notional"] == pytest.approx(100)
 
 
 def test_crash_15_restart_with_accepted_approval_without_decision(tmp_path):
@@ -361,7 +364,7 @@ def test_crash_17_sequential_yes_all_exhausts_capacity(tmp_path):
     with pytest.raises(RuntimeError, match="atomic reservation blocked"):
         store.create_or_get_intent({**_proposal("b", "QQQ"), "_reservation_limits": limits}, run_id="run", source_type="proposal")
     assert first["state"] == "reserved"
-    assert store.active_reservations()["active_reserved_notional"] == 100
+    assert store.active_reservations()["active_reserved_notional"] == pytest.approx(100)
 
 
 def test_crash_18_emergency_ambiguous_timeout_matches_ordinary(tmp_path):

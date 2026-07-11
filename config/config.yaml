@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v1
+configuration_schema_version: plutus_effective_config_v2
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -7,7 +7,7 @@ phase2_shadow_strategies:
   enabled: true
   mode: SHADOW_ONLY
   schema_version: phase2_shadow_strategies_v1
-  outcome_engine_version: phase1_outcome_v1
+  outcome_engine_version: phase1_outcome_v2_exit_session
   promotion_enabled: false
   proposals_enabled: false
   approvals_enabled: false
@@ -96,6 +96,19 @@ preflight:
     require_market_open: true
 watchlist: [SPY, QQQ, DIA, IWM]
 approved_strategy_versions: [rule_based_v2]
+strategies:
+  rule_based_v2:
+    enabled: true
+    maximum_volatility_20d: 0.45
+    require_ma_200: true
+    stop_drawdown_pct: 0.08
+
+formula_versions:
+  stop_policy: validated_atr_or_technical_stop_v2
+  sizing_policy: canonical_minimum_ceiling_notional_v2
+  risk_decision: risk_engine_ceiling_and_stop_v2
+  accounting: fifo_equity_unrealized_cashflow_v1
+  evidence: phase1_outcome_v2_exit_session
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.
@@ -474,11 +487,10 @@ position_management:
     fallback_max_pullback_pct: 1.0
     require_price_above_avg_entry: true
     require_price_above_ma50: true
-    require_price_above_ma200_if_available: true
+    require_price_above_ma200: true
     require_no_profit_protection_warning: true
     require_no_exit_signal: true
     require_normal_or_elevated_volatility_only: true
-    suggested_add_notional: 50.0
     require_telegram_approval: true
 
 telegram:
@@ -523,7 +535,7 @@ ml_shadow_enabled: false
 risk:
   # Compatibility baseline only when position_sizing.enabled is explicitly false.
   # Active production sizing uses position_sizing.*_notional_usd exclusively.
-  max_trade_notional_paper: 50
+  max_trade_notional_paper: 250
   max_trade_notional_live: 5
   max_trades_per_day: 3
   max_open_positions: 3
@@ -592,10 +604,9 @@ position_sizing:
   max_cash_usage_pct: 10.0
   max_margin_usage_pct: 0.0
 
-  default_paper_notional_usd: 50
-  default_add_notional_usd: 50
+  default_paper_notional_usd: 250
+  default_add_notional_usd: 100
   minimum_executable_notional_usd: 5
-  absolute_max_notional_usd: 50
   add_size_multiplier: 0.5
 
   stop_model:
@@ -604,6 +615,7 @@ position_sizing:
     technical_stop: below_ma50_or_recent_swing_low
     max_stop_pct: 8.0
     min_stop_pct: 1.0
+    require_validated_evidence: true
   score_multiplier:
     "65_74": 1.0
     "75_84": 1.0

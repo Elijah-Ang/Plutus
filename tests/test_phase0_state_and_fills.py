@@ -31,6 +31,10 @@ def _proposal(identifier: str = "p-state", side: str = "buy") -> dict:
         "latest_price": 50,
         "stop_price": 45,
         "trading_mode": "paper",
+        "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 49.9,
+        "quote_ask": 50.1, "quote_midpoint": 50.0,
+        "quote_timestamp": datetime.now(UTC).isoformat(), "quote_spread_bps": 40.0,
+        "limit_price": 50.23 if side == "buy" else 49.77,
     }
 
 
@@ -67,12 +71,14 @@ def test_partial_cancel_preserves_fill_and_releases_only_remaining_reservation(t
     store.transition(intent["id"], OrderState.SUBMITTED, event_type="test")
     store.record_fill(intent["id"], cumulative_quantity=4, fill_price=50, broker_event_key="exec-1")
     before = storage.fetch_all("SELECT active_notional FROM risk_reservations")[0]["active_notional"]
-    assert before == 300
+    assert before == pytest.approx(301.38)
     store.transition(intent["id"], OrderState.CANCELLED, event_type="broker_cancelled_remainder")
     final = store.get_intent(intent["id"])
     reservation = storage.fetch_all("SELECT initial_notional,active_notional,state FROM risk_reservations")[0]
     assert (final["filled_quantity"], final["state"]) == (4, "cancelled")
-    assert reservation == {"initial_notional": 500.0, "active_notional": 0.0, "state": "released"}
+    assert reservation["initial_notional"] == pytest.approx(502.3)
+    assert reservation["active_notional"] == 0.0
+    assert reservation["state"] == "released"
 
 
 def test_duplicate_and_out_of_order_cumulative_fills_are_monotonic(tmp_path):
@@ -167,7 +173,7 @@ def test_late_fill_is_accepted_from_nonterminal_ambiguous_states(tmp_path, start
         store.transition(intent["id"], starting, event_type="test")
     updated = store.record_fill(intent["id"], cumulative_quantity=3, fill_price=50, broker_event_key=f"fill-{starting}")
     assert updated["state"] == "partially_filled" and updated["filled_quantity"] == 3
-    assert store.active_reservations()["active_reserved_notional"] == 350
+    assert store.active_reservations()["active_reserved_notional"] == pytest.approx(351.61)
 
 
 def test_restart_replay_entire_fill_stream_is_idempotent(tmp_path):

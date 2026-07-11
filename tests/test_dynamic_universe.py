@@ -327,6 +327,10 @@ def test_eodhd_rate_limited_cooldown_reports_rate_limited_not_missing_key(temp_s
 def test_marketaux_disabled_missing_key_does_not_block_eodhd_intraday_gate(temp_storage, monkeypatch):
     allow_resilience_environment(monkeypatch)
     cfg = dynamic_config()
+    cfg["phase3"]["enabled"] = False
+    cfg["phase3"]["active"] = False
+    cfg["phase4"]["enabled"] = False
+    cfg["phase4"]["active"] = False
     cfg["news_providers"]["marketaux"]["enabled"] = False
     cfg["dynamic_universe"]["llm_explanations"]["enabled"] = False
     provider = FakeProvider(rows=[{"Code": "SMH", "Type": "ETF", "Exchange": "US"}], bars=liquid_bars())
@@ -1377,6 +1381,10 @@ class RecordingBroker(MockBroker):
 def test_static_and_dynamic_proposal_path_use_alpaca_scanner_data(temp_storage, monkeypatch):
     allow_resilience_environment(monkeypatch)
     cfg = dynamic_config()
+    cfg["phase3"]["enabled"] = False
+    cfg["phase3"]["active"] = False
+    cfg["phase4"]["enabled"] = False
+    cfg["phase4"]["active"] = False
     cfg["risk"]["require_gpt_review_for_buy_proposals"] = False
     cfg["ai"]["ai_review_min_score"] = 65
     now = datetime.now(UTC)

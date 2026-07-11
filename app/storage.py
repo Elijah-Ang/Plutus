@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from .utils import PROJECT_ROOT, iso_now, json_dumps
 from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
+from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION, REQUIRED_SCHEMA_VERSIONS, RISK_DECISION_VERSION
 
 TABLE_DEFINITIONS: dict[str, str] = {
     "runtime_metadata": "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL",
@@ -19,7 +20,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "indicators": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, values_json TEXT, created_at TEXT",
     "signals": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, side TEXT, action TEXT, strategy_version TEXT, reason TEXT, confidence REAL, created_at TEXT, expires_at TEXT, payload TEXT",
     "ml_predictions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, model_version TEXT, prediction TEXT, probability REAL, payload TEXT, created_at TEXT",
-    "risk_checks": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, stage TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT",
+    "risk_checks": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, stage TEXT, name TEXT, passed INTEGER, reason TEXT, checked_at TEXT, formula_version TEXT, evidence_version TEXT, config_hash TEXT",
     "ai_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, summary TEXT, risks TEXT, caution_level TEXT, payload TEXT, created_at TEXT",
     "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
     "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
@@ -44,7 +45,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "pnl_ledger_status": "scope TEXT PRIMARY KEY, effective_from TEXT, confidence TEXT NOT NULL, provenance TEXT NOT NULL, last_event_at TEXT, updated_at TEXT NOT NULL",
     "health_heartbeats": "component TEXT PRIMARY KEY, state TEXT NOT NULL, attempted_at TEXT, completed_at TEXT, successful_at TEXT, blocked_reason TEXT, detail TEXT, commit_sha TEXT, updated_at TEXT NOT NULL",
     "positions": "id INTEGER PRIMARY KEY, run_id TEXT, symbol TEXT, qty REAL, market_value REAL, unrealized_pl REAL, payload TEXT, created_at TEXT",
-    "cash_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, equity REAL, cash REAL, settled_cash REAL, realized_pl REAL, unrealized_pl REAL, created_at TEXT",
+    "cash_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, equity REAL, cash REAL, settled_cash REAL, realized_pl REAL, unrealized_pl REAL, realized_fifo_pnl REAL, account_equity_change REAL, unrealized_change REAL, external_cash_flow REAL, accounting_version TEXT, accounting_confidence TEXT, created_at TEXT",
     "cashout_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, payload TEXT, created_at TEXT",
     "cashout_suggestions": "id INTEGER PRIMARY KEY, run_id TEXT, suggested_withdrawal REAL, reserve REAL, reinvest REAL, reason TEXT, created_at TEXT",
     "errors": "id INTEGER PRIMARY KEY, run_id TEXT, category TEXT, message TEXT, detail TEXT, created_at TEXT",
@@ -55,7 +56,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "shadow_overlap_observations": "id TEXT PRIMARY KEY, run_id TEXT NOT NULL, symbol TEXT NOT NULL, observed_at TEXT NOT NULL, active_sleeves_json TEXT NOT NULL, active_sleeve_count INTEGER NOT NULL, pair_keys_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(run_id,symbol)",
     "shadow_promotion_assessments": "id TEXT PRIMARY KEY, sleeve TEXT NOT NULL, strategy_version TEXT NOT NULL, assessed_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status='NOT_ELIGIBLE'), gate_version TEXT NOT NULL, completed_oos_n INTEGER NOT NULL DEFAULT 0, limitations_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(sleeve,strategy_version)",
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
-    "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
+    "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, effective_config_json TEXT, effective_config_hash TEXT, configuration_schema_version TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
     "market_memory": "id INTEGER PRIMARY KEY, run_id TEXT, market_profile TEXT, symbol TEXT, price REAL, prev_price REAL, price_change REAL, price_change_pct REAL, previous_observation_change_pct REAL, session_start_price REAL, session_change REAL, utc_day_first_observation_change REAL, movement_semantics_version TEXT, volatility REAL, signal TEXT, score REAL, classification TEXT, reason TEXT, proposal_allowed INTEGER, gpt_called INTEGER, created_at TEXT, asset_score REAL, asset_classification TEXT, symbol_rank INTEGER, proposal_generated INTEGER, no_action_reason TEXT, asset_selection_score REAL, trade_decision_score REAL, system_confidence TEXT, gpt_confidence TEXT, gpt_caution TEXT, expiry_minutes INTEGER, expires_at_sgt TEXT, main_risk TEXT, volatility_regime TEXT, volatility_score_contribution REAL, volatility_gate_result TEXT, dedupe_status TEXT, dedupe_reason TEXT, paper_size_adjustment REAL, candidate_suppression_reason TEXT, deferred_ai_review_reason TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
     "telegram_digests": "id INTEGER PRIMARY KEY, run_id TEXT, window_start TEXT, window_end TEXT, sent_at TEXT, symbols TEXT, summary_text TEXT, status TEXT",
@@ -114,6 +115,36 @@ TABLE_DEFINITIONS: dict[str, str] = {
 }
 
 P1_EXECUTION_SCHEMA_VERSION = "p1_execution_safety_v1"
+RUNTIME_SAFETY_SCHEMA_VERSION = "runtime_safety_accounting_v1"
+
+
+RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "risk_checks": {
+        "formula_version": "TEXT", "evidence_version": "TEXT", "config_hash": "TEXT",
+    },
+    "config_snapshots": {
+        "effective_config_json": "TEXT", "effective_config_hash": "TEXT", "configuration_schema_version": "TEXT",
+    },
+    "cash_snapshots": {
+        "realized_fifo_pnl": "REAL", "account_equity_change": "REAL", "unrealized_change": "REAL",
+        "external_cash_flow": "REAL", "accounting_version": "TEXT", "accounting_confidence": "TEXT",
+    },
+    "position_sizing_decisions": {
+        "stop_policy_version": "TEXT", "sizing_policy_version": "TEXT", "formula_version": "TEXT",
+        "sizing_caps_json": "TEXT", "binding_caps_json": "TEXT", "evidence_version": "TEXT", "config_hash": "TEXT",
+    },
+    "trade_proposals": {
+        "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
+    },
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection, additions: dict[str, dict[str, str]]) -> None:
+    for table, columns in additions.items():
+        present = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        for name, column_type in columns.items():
+            if name not in present:
+                conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {column_type}')
 
 
 def apply_p1_execution_schema(conn: sqlite3.Connection, *, record_migration: bool = True) -> None:
@@ -156,8 +187,24 @@ class Storage:
 
     def require_runtime_schema(self, *, production: bool = False) -> None:
         versions = self.schema_versions()
-        if REQUIRED_SCHEMA_VERSION not in versions:
-            raise RuntimeError("Database migration required. Trading remains blocked.")
+        missing_versions = sorted(REQUIRED_SCHEMA_VERSIONS - versions)
+        if missing_versions or REQUIRED_SCHEMA_VERSION not in versions:
+            missing = ", ".join(missing_versions or [REQUIRED_SCHEMA_VERSION])
+            raise RuntimeError(f"Database migration required before runtime start: {missing}")
+        from .runtime_guard import REQUIRED_RUNTIME_TABLE_COLUMNS
+        missing_columns: list[str] = []
+        try:
+            with self.connect() as conn:
+                for table, required_columns in REQUIRED_RUNTIME_TABLE_COLUMNS.items():
+                    present = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                    if not present:
+                        missing_columns.append(f"{table} (table)")
+                    else:
+                        missing_columns.extend(f"{table}.{column}" for column in sorted(required_columns - present))
+        except sqlite3.Error as exc:
+            raise RuntimeError("Database schema inspection failed before runtime start") from exc
+        if missing_columns:
+            raise RuntimeError("Database schema incomplete before runtime start: " + ", ".join(missing_columns))
         if production:
             rows = self.fetch_all("SELECT value FROM runtime_metadata WHERE key='environment'")
             if not rows or rows[0]["value"] != "production-paper":
@@ -177,7 +224,12 @@ class Storage:
             apply_phase2_schema(conn)
             apply_phase3_schema(conn)
             apply_phase4_schema(conn)
+            _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+                (RUNTIME_SAFETY_SCHEMA_VERSION, now, "effective config, formula versions, and explicit accounting columns"),
+            )
             if production_paper:
                 existing = conn.execute("SELECT value FROM runtime_metadata WHERE key='environment'").fetchone()
                 if existing and existing["value"] != "production-paper":
@@ -211,6 +263,7 @@ class Storage:
         with self.connect() as conn:
             for table, columns in TABLE_DEFINITIONS.items():
                 conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({columns})')
+            _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             if not is_production_path(self.path):
                 from .phase3_risk import apply_phase3_schema
                 apply_phase3_schema(conn, record_migration=False)
@@ -881,11 +934,26 @@ class Storage:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
-    def record_check(self, run_id: str, name: str, passed: bool, reason: str, proposal_id: str | None = None, stage: str = "risk") -> None:
+    def record_check(
+        self,
+        run_id: str,
+        name: str,
+        passed: bool,
+        reason: str,
+        proposal_id: str | None = None,
+        stage: str = "risk",
+        *,
+        formula_version: str = RISK_DECISION_VERSION,
+        evidence_version: str = EVIDENCE_VERSION,
+        config_hash: str | None = None,
+    ) -> None:
         if proposal_id is None and stage == "preflight":
             self.execute("INSERT INTO preflight_checks(run_id,name,passed,reason,checked_at) VALUES(?,?,?,?,?)", (run_id, name, int(passed), reason, iso_now()))
         else:
-            self.execute("INSERT INTO risk_checks(run_id,proposal_id,stage,name,passed,reason,checked_at) VALUES(?,?,?,?,?,?,?)", (run_id, proposal_id, stage, name, int(passed), reason, iso_now()))
+            self.execute(
+                "INSERT INTO risk_checks(run_id,proposal_id,stage,name,passed,reason,checked_at,formula_version,evidence_version,config_hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (run_id, proposal_id, stage, name, int(passed), reason, iso_now(), formula_version, evidence_version, config_hash),
+            )
 
     def audit(self, run_id: str | None, event_type: str, detail: Any, actor: str = "system") -> None:
         self.execute("INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(?,?,?,?,?)", (run_id, event_type, actor, json_dumps(detail), iso_now()))

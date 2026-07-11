@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, InvalidOperation
 from typing import Any
@@ -26,9 +25,9 @@ def _timestamp(value: Any) -> datetime | None:
 def validated_quote(broker: Any, symbol: str, config: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     """Fetch and validate a fresh two-sided quote.
 
-    Production never falls back to last trade: a normal order without an
-    authoritative quote is rejected. Test-only fallback keeps unrelated unit
-    fakes deterministic while the quote-specific tests exercise the real gate.
+    Production and tests use the same authoritative two-sided quote contract.
+    A mock broker in a test must inject ``get_latest_quote``; last-trade data is
+    never promoted to an executable quote.
     """
     source = "alpaca_quote"
     getter = getattr(broker, "get_latest_quote", None)
@@ -38,16 +37,7 @@ def validated_quote(broker: Any, symbol: str, config: dict[str, Any], *, now: da
         except BaseException as exc:
             raise ValueError("authoritative quote unavailable") from exc
     else:
-        if os.getenv("TRADING_AGENT_TESTING") != "1":
-            raise ValueError("authoritative quote unavailable")
-        try:
-            trade = broker.get_latest_price(symbol)
-            price = float(_value(trade, "price", 0) or 0)
-            timestamp = _timestamp(_value(trade, "timestamp"))
-        except BaseException as exc:
-            raise ValueError("authoritative quote unavailable") from exc
-        raw = {"bid_price": price, "ask_price": price, "timestamp": timestamp}
-        source = "test_trade_fallback"
+        raise ValueError("authoritative quote unavailable")
 
     bid = _value(raw, "bid_price", _value(raw, "bp"))
     ask = _value(raw, "ask_price", _value(raw, "ap"))
@@ -114,7 +104,7 @@ def bounded_marketable_limit(quote: dict[str, Any], side: str, config: dict[str,
 def validate_quote_payload(payload: dict[str, Any], side: str, config: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     """Validate the quote envelope persisted on a normal order candidate."""
     source = str(payload.get("quote_source") or "")
-    if source != "alpaca_quote" and not (os.getenv("TRADING_AGENT_TESTING") == "1" and source == "test_trade_fallback"):
+    if source != "alpaca_quote":
         raise ValueError("normal order quote source is not authoritative")
     quote = {
         "bid": payload.get("quote_bid"), "ask": payload.get("quote_ask"),

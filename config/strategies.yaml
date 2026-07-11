@@ -1,3 +1,7 @@
+# ARCHIVED CONFIGURATION (unused by runtime as of plutus_effective_config_v2).
+# The documented and validated runtime source is config/config.yaml under the
+# strategies section. Keep this file only as a historical reference until the
+# compatibility cleanup removes it.
 rule_based_v2:
   enabled: true
   maximum_volatility_20d: 0.45

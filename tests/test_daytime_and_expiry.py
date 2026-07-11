@@ -234,6 +234,10 @@ def test_expired_proposal_cannot_execute():
 
 def test_dynamic_expiry_volatility_rules(temp_storage):
     config = load_config()
+    config["phase3"]["enabled"] = False
+    config["phase3"]["active"] = False
+    config["phase4"]["enabled"] = False
+    config["phase4"]["active"] = False
     config["risk"]["require_gpt_review_for_buy_proposals"] = False
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
@@ -404,4 +408,3 @@ def test_us_market_holiday_handling_juneteenth(temp_storage):
         assert row["gpt_called"] == 0
         assert row["signal"] == "HOLD"
         assert row["classification"] == "No action suggested"
-

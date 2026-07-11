@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import warnings
 from typing import Any
+
+from .formula_versions import (
+    ACCOUNTING_VERSION,
+    CONFIGURATION_SCHEMA_VERSION,
+    EVIDENCE_VERSION,
+    PHASE3_DECISION_VERSION,
+    PHASE4_ALLOCATION_VERSION,
+    RISK_DECISION_VERSION,
+    SIZING_POLICY_VERSION,
+    STOP_POLICY_VERSION,
+)
 
 
 class ConfigurationError(ValueError):
@@ -26,7 +38,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
     "phase2_shadow_strategies", "phase3", "phase4", "execution_capabilities", "broker",
-    "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "crypto",
+    "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
     "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
     "proposal_expiry_high_volatility_threshold", "proposal_expiry_low_volatility_threshold", "portfolio_execution_mode",
@@ -55,6 +67,44 @@ STRICT_SECTION_KEYS = {
         "default_paper_notional_usd", "default_add_notional_usd", "minimum_executable_notional_usd", "absolute_max_notional_usd",
         "add_size_multiplier", "stop_model", "score_multiplier", "volatility_multiplier",
     },
+    "phase2_shadow_strategies": {
+        "enabled", "mode", "schema_version", "outcome_engine_version", "promotion_enabled", "proposals_enabled",
+        "approvals_enabled", "telegram_approval_messages_enabled", "risk_reservations_enabled", "order_intents_enabled", "broker_calls_enabled",
+    },
+    "phase3": {
+        "enabled", "active", "mode", "profile_version", "require_manual_approval", "require_paper_account_identity",
+        "require_healthy_reconciliation", "allow_score_based_sizing", "allow_kelly_sizing", "allow_leverage", "promotion", "risk_profile",
+    },
+    "phase4": {
+        "enabled", "active", "mode", "allocator_version", "fractional_kelly", "operational_kelly_enabled", "operational_allocation_mode",
+        "full_kelly_allowed", "llm_trading_decisions", "uncalibrated_score_sizing", "minimum_oos_samples", "minimum_regimes",
+        "shrinkage_prior_samples", "confidence_z", "covariance_shrinkage", "fallback_annual_variance", "deterioration_suspend_z",
+        "evidence_stale_after_days", "max_strategy_weight", "max_allocated_risk_fraction", "max_stress_loss", "exploration_heat_pct",
+        "exploration_stop_risk_pct", "max_exploration_stop_risk_pct", "exploration_gross_exposure_pct", "preserve_cash_on_unreliable_evidence",
+        "require_manual_approval", "phase3_hard_limits_authoritative",
+    },
+    "risk_budget": {
+        "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
+        "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
+    },
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence"},
+}
+
+STRICT_NESTED_KEYS = {
+    "phase3.promotion": {"minimum_completed_oos", "minimum_regimes", "require_positive_cost_adjusted_expectancy"},
+    "phase3.risk_profile": {
+        "base_stop_risk_pct", "add_stop_risk_pct", "max_trade_stop_risk_pct", "max_portfolio_heat_pct",
+        "favorable_portfolio_heat_pct", "defensive_portfolio_heat_pct", "normal_gross_exposure_pct",
+        "favorable_gross_exposure_pct", "hard_gross_exposure_pct", "max_symbol_exposure_pct", "max_cluster_exposure_pct",
+        "daily_loss_throttle_pct", "weekly_loss_throttle_pct", "drawdown_halt_pct", "minimum_average_dollar_volume",
+    },
+    "position_sizing.stop_model": {"method", "atr_multiple", "technical_stop", "max_stop_pct", "min_stop_pct", "require_validated_evidence"},
+    "position_management.healthy_pullback_add": {
+        "enabled", "minimum_unrealized_profit_pct", "minimum_trade_score", "minimum_score_improvement", "max_emergency_exit_score",
+        "max_profit_giveback_ratio", "max_pullback_atr_multiple", "fallback_max_pullback_pct", "require_price_above_avg_entry",
+        "require_price_above_ma50", "require_price_above_ma200", "require_no_profit_protection_warning", "require_no_exit_signal",
+        "require_normal_or_elevated_volatility_only", "require_telegram_approval",
+    },
 }
 
 
@@ -74,10 +124,49 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             value = config.get(section)
             if isinstance(value, dict):
                 errors.extend(f"unknown {section} configuration key: {key}" for key in sorted(set(value) - allowed))
+        for path, allowed in STRICT_NESTED_KEYS.items():
+            value: Any = config
+            for component in path.split("."):
+                value = value.get(component) if isinstance(value, dict) else None
+            if isinstance(value, dict):
+                errors.extend(f"unknown {path} configuration key: {key}" for key in sorted(set(value) - allowed))
         sizing_source = config.get("position_sizing", {}) or {}
-        for required_key in ("minimum_executable_notional_usd", "default_paper_notional_usd", "absolute_max_notional_usd"):
+        for required_key in (
+            "minimum_executable_notional_usd", "default_paper_notional_usd", "default_add_notional_usd",
+            "stage", "stage_max_initial_notional_usd", "stage_max_add_notional_usd", "max_trade_notional_pct_equity",
+            "max_position_notional_pct_equity", "max_total_portfolio_exposure_pct", "max_cluster_exposure_pct",
+        ):
             if required_key not in sizing_source:
                 errors.append(f"position_sizing.{required_key} is required")
+        strategies = config.get("strategies", {}) or {}
+        allowed_strategy_keys = {"enabled", "maximum_volatility_20d", "require_ma_200", "stop_drawdown_pct"}
+        if not isinstance(strategies, dict):
+            errors.append("strategies must be a mapping")
+        else:
+            for strategy_name, strategy_config in strategies.items():
+                if strategy_name != "rule_based_v2":
+                    errors.append(f"unknown strategies key: {strategy_name}")
+                    continue
+                if not isinstance(strategy_config, dict):
+                    errors.append("strategies.rule_based_v2 must be a mapping")
+                    continue
+                errors.extend(
+                    f"unknown strategies.rule_based_v2 configuration key: {key}"
+                    for key in sorted(set(strategy_config) - allowed_strategy_keys)
+                )
+
+    require(config.get("configuration_schema_version") == CONFIGURATION_SCHEMA_VERSION,
+            f"configuration_schema_version must be {CONFIGURATION_SCHEMA_VERSION}")
+    formula_versions = config.get("formula_versions", {}) or {}
+    expected_formulas = {
+        "stop_policy": STOP_POLICY_VERSION,
+        "sizing_policy": SIZING_POLICY_VERSION,
+        "risk_decision": RISK_DECISION_VERSION,
+        "accounting": ACCOUNTING_VERSION,
+        "evidence": EVIDENCE_VERSION,
+    }
+    for key, expected in expected_formulas.items():
+        require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")
 
     mode = config.get("mode", "paper")
     require(mode in {"paper", "live"}, "mode must be paper or live")
@@ -120,6 +209,12 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(exploration_heat is not None and exploration_heat <= 0.25, "Phase 4 exploration heat exceeds the 0.25% bound")
         require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
         require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
+
+    # Safety-critical numeric units are validated recursively. A typo such as
+    # a string percentage or a millisecond value in a seconds field must fail
+    # before a runtime object or database is opened.
+    for section_name in ("risk", "risk_budget", "phase3", "phase4", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
+        _validate_units(config.get(section_name), section_name, errors)
 
     try:
         from .position_sizing import effective_notional_policy
@@ -210,3 +305,33 @@ def _bounded(value: Any, label: str, errors: list[str], minimum: float, maximum:
     if not minimum <= numeric <= maximum:
         errors.append(f"{label} must be between {minimum} and {maximum}")
     return numeric
+
+
+def _validate_units(value: Any, path: str, errors: list[str]) -> None:
+    """Validate numeric safety units without imposing semantics on text keys."""
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        label = f"{path}.{key}"
+        if isinstance(item, dict):
+            _validate_units(item, label, errors)
+            continue
+        unit = None
+        minimum = 0.0
+        maximum = float("inf")
+        if key.endswith("_pct") or key.endswith("_percent"):
+            unit, maximum = "percent", 100.0
+        elif key.endswith("_bps"):
+            unit, maximum = "basis points", 10_000.0
+        elif key.endswith("_seconds") or key.endswith("_minutes") or key.endswith("_hours"):
+            unit = "time"
+        elif "notional" in key or key.endswith("_dollars") or key.endswith("_usd"):
+            unit = "USD"
+        if unit is None or item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            errors.append(f"{label} must be numeric {unit}")
+            continue
+        number = float(item)
+        if not math.isfinite(number) or number < minimum or number > maximum:
+            errors.append(f"{label} has invalid {unit} value")

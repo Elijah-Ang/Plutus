@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from .research_validation import ExchangeSessions, REGIME_VERSION, deterministic_regime
+from .formula_versions import EVIDENCE_VERSION
 from .utils import json_dumps
 
 
@@ -19,7 +20,7 @@ SHADOW_MODE = "SHADOW_ONLY"
 FEATURE_VERSION = "phase2_daily_features_v1"
 UNIVERSE_VERSION = "phase2_runtime_snapshot_v1"
 ELIGIBILITY_VERSION = "phase2_shadow_only_v1"
-OUTCOME_ENGINE_VERSION = "phase1_outcome_v1"
+OUTCOME_ENGINE_VERSION = EVIDENCE_VERSION
 STRATEGY_VERSIONS = MappingProxyType({
     "cross_sectional_momentum": "cross_sectional_momentum_v1",
     "time_series_trend": "time_series_trend_v1",
