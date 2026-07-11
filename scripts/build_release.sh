@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 Path('release-manifest.json').write_text(json.dumps({
   'release_id': os.environ['RELEASE_ID'], 'release_commit': os.environ['COMMIT'],
-  'schema_version': 'phase0_execution_integrity_v3_runtime_isolation', 'mode': 'paper',
+  'schema_version': __import__('app.runtime_guard', fromlist=['REQUIRED_SCHEMA_VERSION']).REQUIRED_SCHEMA_VERSION, 'mode': 'paper',
   'built_at_utc': datetime.now(UTC).isoformat(), 'python_version': platform.python_version(),
   'dependency_fingerprint': os.environ['FINGERPRINT'], 'source_branch': os.environ['BRANCH'],
   'tests_verified': True,

@@ -1,6 +1,18 @@
 mode: paper
 live_enabled: false
 explicit_live_confirmation: false
+phase2_shadow_strategies:
+  enabled: true
+  mode: SHADOW_ONLY
+  schema_version: phase2_shadow_strategies_v1
+  outcome_engine_version: phase1_outcome_v1
+  promotion_enabled: false
+  proposals_enabled: false
+  approvals_enabled: false
+  telegram_approval_messages_enabled: false
+  risk_reservations_enabled: false
+  order_intents_enabled: false
+  broker_calls_enabled: false
 capabilities:
   live_trading_supported: false
   auto_execution_supported: false

@@ -50,6 +50,10 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "errors": "id INTEGER PRIMARY KEY, run_id TEXT, category TEXT, message TEXT, detail TEXT, created_at TEXT",
     "audit_events": "id INTEGER PRIMARY KEY, run_id TEXT, event_type TEXT, actor TEXT, detail TEXT, created_at TEXT",
     "strategy_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, metadata TEXT, created_at TEXT",
+    "shadow_insights": "id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sleeve TEXT NOT NULL, strategy_version TEXT NOT NULL, mode TEXT NOT NULL CHECK(mode='SHADOW_ONLY'), symbol TEXT NOT NULL, observed_at TEXT NOT NULL, direction TEXT NOT NULL, signal TEXT NOT NULL, score REAL NOT NULL, rank INTEGER, entry_price REAL NOT NULL, regime TEXT NOT NULL, regime_version TEXT NOT NULL, feature_version TEXT NOT NULL, universe_version TEXT NOT NULL, eligibility_version TEXT NOT NULL, outcome_engine_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL, feature_snapshot_json TEXT NOT NULL, universe_snapshot_json TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at TEXT NOT NULL",
+    "shadow_portfolio_observations": "id TEXT PRIMARY KEY, insight_id TEXT NOT NULL UNIQUE, sleeve TEXT NOT NULL, strategy_version TEXT NOT NULL, symbol TEXT NOT NULL, observed_at TEXT NOT NULL, target_weight REAL NOT NULL, comparison_portfolio TEXT NOT NULL, status TEXT NOT NULL CHECK(status='SHADOW_ONLY'), created_at TEXT NOT NULL",
+    "shadow_overlap_observations": "id TEXT PRIMARY KEY, run_id TEXT NOT NULL, symbol TEXT NOT NULL, observed_at TEXT NOT NULL, active_sleeves_json TEXT NOT NULL, active_sleeve_count INTEGER NOT NULL, pair_keys_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(run_id,symbol)",
+    "shadow_promotion_assessments": "id TEXT PRIMARY KEY, sleeve TEXT NOT NULL, strategy_version TEXT NOT NULL, assessed_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status='NOT_ELIGIBLE'), gate_version TEXT NOT NULL, completed_oos_n INTEGER NOT NULL DEFAULT 0, limitations_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(sleeve,strategy_version)",
     "model_versions": "id TEXT PRIMARY KEY, name TEXT, version TEXT, trained_at TEXT, features TEXT, symbols TEXT, metrics TEXT, path TEXT",
     "config_snapshots": "id INTEGER PRIMARY KEY, run_id TEXT, config_json TEXT, created_at TEXT",
     "daily_summaries": "id INTEGER PRIMARY KEY, date TEXT UNIQUE, mode TEXT, realized_pl REAL, unrealized_pl REAL, equity REAL, payload TEXT, created_at TEXT",
@@ -136,6 +140,11 @@ class Storage:
         """Deployment-only schema mutation. Ordinary runtime must not call this."""
         self.initialize()
         with self.connect() as conn:
+            from .research_validation import apply_phase1_schema
+            from .shadow_strategies import apply_phase2_schema
+
+            apply_phase1_schema(conn)
+            apply_phase2_schema(conn)
             now = iso_now()
             if production_paper:
                 existing = conn.execute("SELECT value FROM runtime_metadata WHERE key='environment'").fetchone()

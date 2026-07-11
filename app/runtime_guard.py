@@ -8,7 +8,7 @@ from pathlib import Path
 STATE_ROOT = Path.home() / "Library" / "Application Support" / "TradingAgent"
 RELEASE_ROOT = Path.home() / "TradingAgentReleases"
 RUNTIME_LINK = Path.home() / "TradingAgentRuntime"
-REQUIRED_SCHEMA_VERSION = "phase0_execution_integrity_v3_runtime_isolation"
+REQUIRED_SCHEMA_VERSION = "phase2_shadow_strategies_v1"
 
 
 class RuntimeGuardError(RuntimeError):

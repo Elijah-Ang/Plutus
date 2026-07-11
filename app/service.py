@@ -3783,6 +3783,8 @@ class TradingService:
                 res["watchlist_order"] = idx + 1
                 res["total_active_symbols"] = len(active_watchlist)
 
+            self._run_phase2_shadow(profile_results, now)
+
             # Compute true_score_rank among active watchlist candidates
             active_results = [r for r in profile_results if r["symbol"] in active_watchlist]
             def get_vol_regime_rank(regime):
@@ -7363,6 +7365,27 @@ class TradingService:
                 f"UPDATE trade_proposals SET telegram_message_id=? WHERE id IN ({','.join(['?'] * len(proposals))})",
                 (msg_id, *[p["id"] for p in proposals]),
             )
+
+    def _run_phase2_shadow(self, profile_results: list[dict[str, Any]], now: datetime) -> None:
+        phase2 = self.config.get("phase2_shadow_strategies", {})
+        if not phase2.get("enabled", False):
+            return
+        if phase2.get("mode") != "SHADOW_ONLY":
+            raise RuntimeError("Phase 2 strategies require mode=SHADOW_ONLY")
+        from .shadow_strategies import ShadowStrategyEngine
+
+        insights = ShadowStrategyEngine(self.storage, self.run_id).evaluate(profile_results, observed_at=now)
+        self.storage.audit(
+            self.run_id,
+            "phase2_shadow_insights_recorded",
+            {
+                "mode": "SHADOW_ONLY",
+                "insights": len(insights),
+                "active": sum(insight.signal == "active" for insight in insights),
+                "sleeves": sorted({insight.sleeve for insight in insights}),
+                "execution_surfaces_called": 0,
+            },
+        )
 
     def _run_performance_lab(self, profile_results: list[dict[str, Any]], active_watchlist: list[str], positions: list[Any], now: datetime, snapshot: dict[str, Any]) -> None:
         qualified_setups_cnt = 0

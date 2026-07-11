@@ -892,11 +892,26 @@ def project_canonical_to_legacy(storage: Any) -> None:
 
 
 def update_service_outcomes(storage: Any, broker: Any, *, now: datetime, max_updates: int = 25) -> dict[str, Any]:
-    """Single runtime entrypoint for both legacy outcome tables."""
+    """Single runtime entrypoint for legacy and Phase 2 shadow outcomes."""
     repository = ResearchRepository(storage.path)
     repository.migrate()
     opportunities = import_legacy_opportunities(storage, repository)
     with repository.connect() as conn:
+        for row in conn.execute("SELECT * FROM research_opportunities WHERE source_table='shadow_insights'"):
+            item = dict(row)
+            opportunities.append(
+                Opportunity(
+                    id=item["id"], symbol=item["symbol"], observed_at=_utc(item["observed_at"]),
+                    entry_price=item["entry_price"], direction=item["direction"],
+                    execution_type=item["execution_type"], strategy_version=item["strategy_version"],
+                    score=item["score"], blocker=item["blocker"], ai_gate=item["ai_gate"],
+                    stop_price=item["stop_price"], target_price=item["target_price"],
+                    benchmark_entry_price=item["benchmark_entry_price"],
+                    feature_version=item["feature_version"], universe_version=item["universe_version"],
+                    regime_version=item["regime_version"], eligibility_version=item["eligibility_version"],
+                    source_id=item["source_id"], source_table=item["source_table"],
+                )
+            )
         states: dict[str, list[tuple[str, str]]] = {}
         for row in conn.execute("SELECT opportunity_id,status,maturity_session FROM research_outcomes"):
             states.setdefault(row["opportunity_id"], []).append((row["status"], row["maturity_session"]))
