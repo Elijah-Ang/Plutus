@@ -5519,6 +5519,9 @@ class TradingService:
                 "allocation_id": self._phase4_allocation_cache["allocation_id"],
                 "decision": self._phase4_allocation_cache["decision"],
                 "cash_weight": self._phase4_allocation_cache["cash_weight"],
+                "exploration_heat_pct": self._phase4_allocation_cache.get("exploration_heat_pct", 0.0),
+                "exploration_weights": self._phase4_allocation_cache.get("exploration_weights", {}),
+                "strategy_states": {key: value.state for key, value in self._phase4_allocation_cache.get("estimates", {}).items()},
                 "manual_approval_required": True, "phase3_limits_authoritative": True,
             })
         # Reconciliation has refreshed account/position state; force the next
@@ -6655,7 +6658,7 @@ class TradingService:
               cluster_exposure_after_pct,regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,profile_version,payload)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
               (decision_id,self.run_id,symbol,"rule_based_v1",iso_now(),decision,blocked_reason or "within Phase 3 limits",
-               equity,phase3_context["drawdown_pct"],controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct,
+               equity,phase3_context["drawdown_pct"],base_risk_pct,
                phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
                None,None,None,None,None,volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],
                phase3_context["allocation_multiplier"],"moderate_paper_risk_v1",json_dumps({
