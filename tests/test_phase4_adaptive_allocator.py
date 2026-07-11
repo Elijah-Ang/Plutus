@@ -1,18 +1,86 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+
 from app.phase4_allocator import AdaptiveAllocator, STRATEGIES, apply_phase4_schema
 from app.storage import Storage
 from app.utils import load_config
 
 
-def test_no_oos_evidence_preserves_all_cash(tmp_path):
+def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=None):
+    now = datetime.now(UTC).isoformat()
+    opportunity_id = f"op-{strategy}-{index}"
+    storage.execute("""INSERT INTO research_opportunities(
+        id,source_table,source_id,symbol,observed_at,direction,execution_type,entry_price,stop_price,target_price,
+        benchmark_entry_price,actual_exit_price,strategy_version,score,score_version,feature_version,feature_snapshot_json,
+        universe_version,universe_snapshot_json,regime,regime_version,eligibility_version,blocker,blocker_version,ai_gate,
+        ai_gate_version,split_label,provenance_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (opportunity_id,"test","source-" + opportunity_id,"SPY",now,"long","paper",100,98,104,100,101,
+         strategy,70,"score_v1","features_v1",json.dumps({}),"universe_v1",json.dumps({}),regime,"regime_v1",
+         "shadow_v1",None,None,"not_used",None,"out_of_sample",json.dumps({}),now))
+    outcome_id = f"out-{strategy}-{index}"
+    storage.execute("""INSERT INTO research_outcomes(
+        id,opportunity_id,horizon_sessions,status,reason,maturity_session,exit_session,gross_return,spy_return,
+        spy_relative_return,cost_adjusted_return,mfe,mae,gross_r_multiple,cost_adjusted_r_multiple,stop_hit,target_hit,
+        first_barrier,ordering_quality,cost_model_version,calculation_version,input_fingerprint,calculated_at,error_category)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (outcome_id,opportunity_id,20,"completed","test outcome", "2026-07-01",f"2026-07-{index + 1:02d}",value,value / 2,
+         value / 2,value,0.02,-0.01,value,value,0,1,"target","good","cost_v1","calc_v1",f"fp-{outcome_id}",
+         calculated_at or now,None))
+
+
+def test_healthy_immature_strategy_gets_bounded_exploration(tmp_path):
     storage=Storage(tmp_path/"p4.sqlite3"); storage.initialize(); cfg=load_config()
     result=AdaptiveAllocator(storage,cfg,"run-cash").run(regime="mixed_uncertain",drawdown_pct=0.0)
-    assert result["decision"]=="PRESERVE_CASH"
+    assert result["decision"]=="ALLOCATE_EXPLORATION"
     assert result["cash_weight"]==1.0
     assert set(result["weights"])==set(STRATEGIES)
     assert all(value==0 for value in result["weights"].values())
-    assert {row["state"] for row in storage.fetch_all("SELECT state FROM phase4_strategy_states")}=={"THROTTLED"}
+    assert result["exploration_heat_pct"] == .25
+    assert result["exploration_weights"][STRATEGIES[0]] == .05
+    assert all(value <= .05 for value in result["exploration_weights"].values())
+    assert all(policy["kelly_used"] is False for policy in result["strategy_policies"].values() if policy["mode"] == "exploration")
+    assert {row["state"] for row in storage.fetch_all("SELECT state FROM phase4_strategy_states")}=={"EXPLORATION"}
+    assert all(json.loads(row["payload"])["evidence_class"] == "insufficient" for row in storage.fetch_all("SELECT payload FROM phase4_strategy_estimates"))
+
+
+def test_negative_immature_evidence_is_suspended_not_explored(tmp_path):
+    storage=Storage(tmp_path/"p4-negative.sqlite3"); storage.initialize(); cfg=load_config()
+    _outcome(storage, STRATEGIES[0], -.01, index=1)
+    result=AdaptiveAllocator(storage,cfg,"run-negative").run(regime="normal",drawdown_pct=0.0)
+    estimate=result["estimates"][STRATEGIES[0]]
+    assert estimate.state == "SUSPENDED"
+    assert estimate.evidence_class == "negative"
+    assert STRATEGIES[0] not in result["exploration_weights"]
+    persisted=storage.fetch_all("SELECT state,payload FROM phase4_strategy_states WHERE strategy_version=?",(STRATEGIES[0],))[0]
+    assert persisted["state"] == "SUSPENDED"
+    assert json.loads(persisted["payload"])["evidence_class"] == "negative"
+
+
+def test_qualified_strategy_uses_adaptive_allocation(tmp_path):
+    storage=Storage(tmp_path/"p4-qualified.sqlite3"); storage.initialize(); cfg=load_config()
+    for index in range(100):
+        _outcome(storage, STRATEGIES[0], .02 + (index % 5) * .0001, regime="normal" if index % 2 else "favorable", index=index)
+    result=AdaptiveAllocator(storage,cfg,"run-qualified").run(regime="normal",drawdown_pct=0.0)
+    estimate=result["estimates"][STRATEGIES[0]]
+    assert estimate.state == "ACTIVE"
+    assert estimate.evidence_class == "qualified"
+    policy=result["strategy_policies"][STRATEGIES[0]]
+    assert policy["mode"] == "adaptive"
+    assert policy["kelly_used"] is True
+    assert policy["score_sizing_used"] is False
+    assert result["weights"][STRATEGIES[0]] > 0
+
+
+def test_phase4_exploration_defaults_are_bounded():
+    cfg=load_config()["phase4"]
+    assert cfg["exploration_heat_pct"] == .25
+    assert cfg["exploration_stop_risk_pct"] == .05
+    assert cfg["max_exploration_stop_risk_pct"] == .10
+    assert cfg["exploration_gross_exposure_pct"] == 7.5
+    assert cfg["require_manual_approval"] is True
 
 
 def test_fractional_kelly_is_bounded_and_phase3_authoritative():
@@ -21,6 +89,7 @@ def test_fractional_kelly_is_bounded_and_phase3_authoritative():
     assert cfg["full_kelly_allowed"] is False
     assert cfg["phase3_hard_limits_authoritative"] is True
     assert cfg["llm_trading_decisions"] is False
+    assert cfg["uncalibrated_score_sizing"] is False
 
 
 def test_covariance_and_all_stress_scenarios_are_persisted(tmp_path):

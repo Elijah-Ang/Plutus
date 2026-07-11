@@ -305,6 +305,11 @@ class RiskEngine:
         expires = _dt(proposal.get("expires_at"))
         check("signal_time", not is_entry or (created is not None and created <= now and expires is not None and expires > now), "entry signal/proposal must be current")
         check("strategy", not is_entry or proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1"]), "approved entry strategy version required")
+        if is_entry and proposal.get("phase4_mode") == "exploration":
+            check("phase4_exploration_manual_approval", not final or context.get("approval_valid") is True,
+                  "Phase 4 exploration requires explicit manual approval")
+            check("phase4_exploration_score_sizing", proposal.get("score_multiplier", 1.0) == 1.0,
+                  "Phase 4 exploration cannot use score-based sizing")
         check("reason", not is_entry or bool(proposal.get("reason")), "entry strategy reason required")
         check("side", str(proposal.get("side", "")).lower() in {"buy", "sell"}, "side must be buy or sell")
         check("order_type", proposal.get("order_type", "market") in self.risk.get("allowed_order_types", ["market", "limit"]), "allowed order type required")

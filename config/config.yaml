@@ -60,9 +60,14 @@ phase4:
   covariance_shrinkage: 0.50
   fallback_annual_variance: 0.04
   deterioration_suspend_z: 2.0
+  evidence_stale_after_days: 90
   max_strategy_weight: 0.35
   max_allocated_risk_fraction: 0.75
   max_stress_loss: 0.05
+  exploration_heat_pct: 0.25
+  exploration_stop_risk_pct: 0.05
+  max_exploration_stop_risk_pct: 0.10
+  exploration_gross_exposure_pct: 7.5
   preserve_cash_on_unreliable_evidence: true
   require_manual_approval: true
   phase3_hard_limits_authoritative: true

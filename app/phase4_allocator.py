@@ -5,6 +5,7 @@ import json
 import math
 import statistics
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -36,6 +37,7 @@ class StrategyEstimate:
     deterioration_score: float
     state: str
     reason: str
+    evidence_class: str
 
 
 def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
@@ -109,7 +111,21 @@ class AdaptiveAllocator:
           FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
           WHERE ro.strategy_version=? AND ro.split_label='out_of_sample' AND r.horizon_sessions=20
             AND r.status='completed' AND r.cost_adjusted_return IS NOT NULL
-          ORDER BY r.exit_session,ro.id""", (strategy,))
+            ORDER BY r.exit_session,ro.id""", (strategy,))
+
+    def _is_stale(self, rows: Sequence[Mapping[str, Any]]) -> bool:
+        if not rows:
+            return False
+        latest = max((str(row.get("calculated_at") or "") for row in rows), default="")
+        if not latest:
+            return False
+        try:
+            timestamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+            timestamp = timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
+            age_days = (datetime.now(UTC) - timestamp).total_seconds() / 86400.0
+            return age_days > float(self.cfg.get("evidence_stale_after_days", 90))
+        except (TypeError, ValueError, OverflowError):
+            return True
 
     def estimate(self, strategy: str) -> tuple[StrategyEstimate, list[dict[str, Any]], str]:
         rows = self._rows(strategy); values = [float(r["cost_adjusted_return"]) for r in rows]
@@ -117,7 +133,9 @@ class AdaptiveAllocator:
         fp = _fingerprint(rows)
         minimum = int(self.cfg.get("minimum_oos_samples", 100)); min_regimes = int(self.cfg.get("minimum_regimes", 2))
         if not values:
-            return StrategyEstimate(strategy,0,0,None,None,None,None,None,1.0,0.0,1.0,"THROTTLED","no completed OOS evidence"),rows,fp
+            return StrategyEstimate(strategy,0,0,None,None,None,None,None,1.0,0.0,1.0,"EXPLORATION",
+                                    "insufficient evidence: no completed OOS evidence; bounded exploration permitted",
+                                    "insufficient"),rows,fp
         mean = statistics.fmean(values); sd = statistics.stdev(values) if len(values)>1 else 0.0
         se = sd / math.sqrt(len(values)) if len(values)>1 else None
         prior_strength = float(self.cfg.get("shrinkage_prior_samples", 100))
@@ -131,11 +149,14 @@ class AdaptiveAllocator:
         cost_quality = 1.0 if all(r.get("cost_bps") is not None for r in rows) else 0.5
         quality = completeness*regime_quality*cost_quality
         uncertainty = min(1.0,(se or 1.0)/(abs(shrunk)+1e-9))
-        if deterioration >= float(self.cfg.get("deterioration_suspend_z",2.0)): state,reason="SUSPENDED","statistically material recent deterioration"
-        elif len(values)<minimum or len(regimes)<min_regimes: state,reason="THROTTLED","OOS sample or regime coverage incomplete"
-        elif conservative<=0 or calibrated_p<=0.5: state,reason="SUSPENDED","conservative expectancy or calibrated probability is non-positive"
-        else: state,reason="ACTIVE","conservative OOS evidence passed"
-        return StrategyEstimate(strategy,len(values),len(regimes),mean,shrunk,conservative,calibrated_p,se,uncertainty,quality,deterioration,state,reason),rows,fp
+        stale = self._is_stale(rows)
+        if stale: state,reason,evidence_class="SUSPENDED","stale OOS evidence","stale"
+        elif deterioration >= float(self.cfg.get("deterioration_suspend_z",2.0)): state,reason,evidence_class="SUSPENDED","statistically material recent deterioration","deteriorating"
+        elif mean <= 0 or calibrated_p <= 0.5: state,reason,evidence_class="SUSPENDED","negative cost-adjusted evidence","negative"
+        elif len(values)<minimum or len(regimes)<min_regimes: state,reason,evidence_class="EXPLORATION","insufficient OOS sample or regime coverage; bounded exploration permitted","insufficient"
+        elif conservative<=0: state,reason,evidence_class="THROTTLED","positive point estimate but uncertainty is too high for adaptive allocation","insufficient"
+        else: state,reason,evidence_class="ACTIVE","conservative OOS evidence passed","qualified"
+        return StrategyEstimate(strategy,len(values),len(regimes),mean,shrunk,conservative,calibrated_p,se,uncertainty,quality,deterioration,state,reason,evidence_class),rows,fp
 
     def covariance(self, evidence: Mapping[str,list[dict[str,Any]]]) -> tuple[np.ndarray,bool,dict[str,int]]:
         n=len(STRATEGIES); matrix=np.zeros((n,n)); counts={s:len(evidence[s]) for s in STRATEGIES}; fallback=False
@@ -165,7 +186,9 @@ class AdaptiveAllocator:
               (eid,self.run_id,strategy,now,estimate.sample_n,estimate.regime_n,estimate.mean_return,estimate.shrunk_mean_return,
                estimate.conservative_expected_return,estimate.calibrated_positive_probability,estimate.standard_error,
                estimate.uncertainty,estimate.data_quality,estimate.deterioration_score,estimate.state,estimate.reason,
-               ESTIMATOR_VERSION,fp,json_dumps({"cost_adjusted":True,"score_sizing":False}),))
+               ESTIMATOR_VERSION,fp,json_dumps({"cost_adjusted":True,"score_sizing":False,
+                                                 "evidence_class":estimate.evidence_class,
+                                                 "state_version":"phase4_strategy_state_v2"}),))
             self._persist_state(estimate,eid,now)
         cov,fallback,counts=self.covariance(evidence); diag=np.sqrt(np.maximum(np.diag(cov),1e-12)); corr=cov/np.outer(diag,diag)
         cov_id=_fingerprint([self.run_id,counts,cov.tolist()])[:32]
@@ -180,14 +203,53 @@ class AdaptiveAllocator:
             weights[i]=min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
         total=float(weights.sum()); max_invested=float(self.cfg.get("max_allocated_risk_fraction",0.75))
         if total>max_invested: weights*=max_invested/total
-        cash=max(0.0,1.0-float(weights.sum()))
         port_var=float(weights@cov@weights); port_vol=math.sqrt(max(0.0,port_var)); mu=np.array([estimates[s].conservative_expected_return or 0.0 for s in STRATEGIES]); expected=float(weights@mu)
         marginal=(cov@weights)/port_vol if port_vol>0 else np.zeros(len(weights)); component=weights*marginal
-        stress=self._stress(weights); stress_loss=max(stress.values()) if stress else 0.0; expected_shortfall=2.063*port_vol
-        decision="PRESERVE_CASH" if float(weights.sum())==0 else "ALLOCATE_ADAPTIVELY"
-        reason="no strategy has reliable positive OOS evidence" if decision=="PRESERVE_CASH" else "eligible strategies sized below fractional Kelly and hard limits"
+        stress=self._stress(weights); stress_loss=max(stress.values()) if stress else 0.0
+        stress_cap=float(self.cfg.get("max_stress_loss",0.05))
+        if stress_loss > stress_cap and stress_loss > 0:
+            weights *= stress_cap / stress_loss
+            port_var=float(weights@cov@weights); port_vol=math.sqrt(max(0.0,port_var)); expected=float(weights@mu)
+            marginal=(cov@weights)/port_vol if port_vol>0 else np.zeros(len(weights)); component=weights*marginal
+            stress=self._stress(weights); stress_loss=max(stress.values()) if stress else 0.0
+        expected_shortfall=2.063*port_vol
+
+        exploration_heat_cap=float(self.cfg.get("exploration_heat_pct",0.25))
+        exploration_per_strategy=float(self.cfg.get("exploration_stop_risk_pct",0.05))
+        exploration_max_per_strategy=float(self.cfg.get("max_exploration_stop_risk_pct",0.10))
+        exploration_heat=0.0; exploration_weights: dict[str,float] = {}
+        for strategy in STRATEGIES:
+            if estimates[strategy].state != "EXPLORATION" or not healthy:
+                continue
+            remaining=max(0.0, exploration_heat_cap-exploration_heat)
+            risk=min(exploration_per_strategy, exploration_max_per_strategy, remaining)
+            if risk <= 0:
+                continue
+            exploration_weights[strategy]=risk
+            exploration_heat += risk
+        cash=max(0.0,1.0-float(weights.sum()))
+        if float(weights.sum()) > 0:
+            decision="ALLOCATE_ADAPTIVELY"; reason="qualified strategies sized below fractional Kelly and hard limits"
+        elif exploration_weights:
+            decision="ALLOCATE_EXPLORATION"; reason="healthy immature strategies receive bounded manual-approved paper exploration"
+        else:
+            decision="PRESERVE_CASH"; reason="no strategy has reliable positive OOS evidence or safe exploration eligibility"
+        strategy_policies: dict[str,dict[str,Any]] = {}
+        for i, strategy in enumerate(STRATEGIES):
+            estimate=estimates[strategy]
+            if strategy in exploration_weights:
+                strategy_policies[strategy]={"mode":"exploration","state":estimate.state,"stop_risk_pct":exploration_weights[strategy],
+                                             "max_stop_risk_pct":exploration_max_per_strategy,"gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),
+                                             "kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
+            elif estimate.state=="ACTIVE" and weights[i]>0:
+                strategy_policies[strategy]={"mode":"adaptive","state":estimate.state,"allocation_weight":float(weights[i]),
+                                             "kelly_used":True,"score_sizing_used":False,"manual_approval_required":True}
+            else:
+                strategy_policies[strategy]={"mode":"blocked","state":estimate.state,"kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
         fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
-        payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback}
+        payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback,
+                 "exploration_heat_pct":exploration_heat,"exploration_heat_cap_pct":exploration_heat_cap,"exploration_weights":exploration_weights,
+                 "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies}
         self.storage.execute("INSERT OR REPLACE INTO phase4_allocation_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           (aid,self.run_id,now,"ACTIVE_ADAPTIVE_PAPER",ALLOCATOR_VERSION,json_dumps(dict(zip(STRATEGIES,weights.tolist()))),cash,fraction,
            expected,port_vol,expected_shortfall,stress_loss,json_dumps(dict(zip(STRATEGIES,marginal.tolist()))),json_dumps(dict(zip(STRATEGIES,component.tolist()))),
@@ -197,7 +259,9 @@ class AdaptiveAllocator:
             sid=_fingerprint([aid,scenario])[:32]
             self.storage.execute("INSERT OR REPLACE INTO phase4_stress_results VALUES(?,?,?,?,?,?,?,?)",
                                  (sid,aid,scenario,loss,loss,int(loss<=float(self.cfg.get("max_stress_loss",0.05))),"phase4_stress_v1",json_dumps({"deterministic":True})))
-        return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,"healthy":healthy}
+        return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"exploration_weights":exploration_weights,
+                "exploration_heat_pct":exploration_heat,"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,
+                "strategy_policies":strategy_policies,"healthy":healthy}
 
     def _persist_state(self,e:StrategyEstimate,eid:str,now:str)->None:
         old=self.storage.fetch_all("SELECT state FROM phase4_strategy_states WHERE strategy_version=?",(e.strategy_version,)); previous=old[0]["state"] if old else None
@@ -206,8 +270,9 @@ class AdaptiveAllocator:
           ON CONFLICT(strategy_version) DO UPDATE SET state=excluded.state,reason=excluded.reason,estimate_id=excluded.estimate_id,
           evaluated_at=excluded.evaluated_at,activated_at=COALESCE(phase4_strategy_states.activated_at,excluded.activated_at),
           throttled_at=excluded.throttled_at,suspended_at=excluded.suspended_at,recovered_at=COALESCE(excluded.recovered_at,phase4_strategy_states.recovered_at),payload=excluded.payload""",
-          (e.strategy_version,e.state,e.reason,eid,"phase4_strategy_state_v1",now,now if e.state=="ACTIVE" else None,
-           now if e.state=="THROTTLED" else None,now if e.state=="SUSPENDED" else None,recovered,json_dumps({"deterministic":True})))
+          (e.strategy_version,e.state,e.reason,eid,"phase4_strategy_state_v2",now,now if e.state=="ACTIVE" else None,
+           now if e.state=="THROTTLED" else None,now if e.state=="SUSPENDED" else None,recovered,
+           json_dumps({"deterministic":True,"evidence_class":e.evidence_class,"state_version":"phase4_strategy_state_v2"})))
 
     def _stress(self,w:np.ndarray)->dict[str,float]:
         invested=float(w.sum())

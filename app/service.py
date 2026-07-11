@@ -3577,6 +3577,9 @@ class TradingService:
                 score_adjusted_notional = 5.0
                 vol_adjusted_notional = 5.0
                 base_notional = 5.0
+                phase4_mode = "disabled"
+                phase4_exploration_heat_cap_pct = None
+                phase4_exploration_gross_cap_pct = None
 
                 if signal.action == "ENTRY" and signal.side == "buy":
                     size_dict = self._calculate_dynamic_size(symbol, score, volatility_regime, price, bars, snapshot, is_add=is_add)
@@ -3593,6 +3596,9 @@ class TradingService:
                     score_adjusted_notional = size_dict["score_adjusted_notional"]
                     vol_adjusted_notional = size_dict["vol_adjusted_notional"]
                     base_notional = size_dict["base_notional"]
+                    phase4_mode = size_dict.get("phase4_mode", "disabled")
+                    phase4_exploration_heat_cap_pct = size_dict.get("phase4_exploration_heat_cap_pct")
+                    phase4_exploration_gross_cap_pct = size_dict.get("phase4_exploration_gross_cap_pct")
 
                 # Log add-on opportunity
                 if is_add:
@@ -3769,6 +3775,9 @@ class TradingService:
                     "stop_distance_pct": stop_distance_pct,
                     "stop_distance_dollars": stop_distance_dollars,
                     "risk_budget": risk_budget,
+                    "phase4_mode": phase4_mode,
+                    "phase4_exploration_heat_cap_pct": phase4_exploration_heat_cap_pct,
+                    "phase4_exploration_gross_cap_pct": phase4_exploration_gross_cap_pct,
                     "score_multiplier": score_mult,
                     "volatility_multiplier": vol_mult,
                     "stop_model_used": stop_method,
@@ -6299,20 +6308,47 @@ class TradingService:
             allocation_mult = controller.allocation("rule_based_v1", states)
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
+            phase4_mode = "disabled"
+            phase4_exploration_gross_cap_pct = None
+            phase4_exploration_heat_cap_pct = None
             if self.config.get("phase4", {}).get("active"):
                 from .phase4_allocator import AdaptiveAllocator
                 if self._phase4_allocation_cache is None:
                     self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                         regime=volatility_regime, drawdown_pct=drawdown_pct
                     )
-                allocation_mult = float(self._phase4_allocation_cache["weights"].get("rule_based_v1", 0.0))
-            base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-            risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
+                phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get("rule_based_v1", {})
+                phase4_mode = str(phase4_policy.get("mode") or "blocked")
+                if phase4_mode == "exploration":
+                    # Exploration has its own explicit stop-risk budget. It
+                    # never uses Kelly or score sizing and is still reduced by
+                    # the Phase 3 regime/drawdown multipliers.
+                    exploration_stop_risk = float(phase4_policy.get("stop_risk_pct", 0.0))
+                    exploration_max_stop_risk = float(phase4_policy.get("max_stop_risk_pct", exploration_stop_risk))
+                    base_risk_pct = min(exploration_stop_risk, exploration_max_stop_risk)
+                    risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct,
+                                             base_risk_pct * regime_mult * drawdown_mult)
+                    phase4_exploration_gross_cap_pct = float(phase4_policy.get("gross_exposure_cap_pct", 7.5))
+                    phase4_exploration_heat_cap_pct = float(self.config.get("phase4", {}).get("exploration_heat_pct", 0.25))
+                    allocation_mult = risk_per_trade_pct / controller.profile.base_stop_risk_pct if controller.profile.base_stop_risk_pct else 0.0
+                elif phase4_mode == "adaptive":
+                    allocation_mult = float(phase4_policy.get("allocation_weight", 0.0))
+                    base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
+                    risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
+                else:
+                    allocation_mult = 0.0
+                    base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
+                    risk_per_trade_pct = 0.0
+            else:
+                base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
+                risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
             risk_budget = equity * (risk_per_trade_pct / 100.0)
             phase3_context = {
                 "controller": controller, "drawdown_pct": drawdown_pct, "states": states,
                 "allocation_multiplier": allocation_mult, "regime_multiplier": regime_mult,
                 "drawdown_multiplier": drawdown_mult, "scaled_stop_risk_pct": risk_per_trade_pct,
+                "phase4_mode": phase4_mode, "phase4_exploration_gross_cap_pct": phase4_exploration_gross_cap_pct,
+                "phase4_exploration_heat_cap_pct": phase4_exploration_heat_cap_pct,
             }
 
         stop_model = sizing_cfg.get("stop_model", {})
@@ -6512,6 +6548,8 @@ class TradingService:
             canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(state["positions"], state["account"])
             profile = phase3_context["controller"].profile
             heat_cap = profile.defensive_portfolio_heat_pct if phase3_context["regime_multiplier"] <= 0.5 else profile.max_portfolio_heat_pct
+            if phase3_context.get("phase4_mode") == "exploration":
+                heat_cap = min(heat_cap, float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25))
             current_heat = canonical.projected_total_open_risk
             fallback_daily_loss = state.get("daily_loss")
             fallback_weekly_loss = state.get("weekly_loss")
@@ -6536,6 +6574,30 @@ class TradingService:
             else:
                 allowed_risk = max(0.0, canonical.portfolio_equity * heat_cap / 100.0 - current_heat)
                 final_notional = min(final_notional, allowed_risk / stop_distance_dollars * price if stop_distance_dollars > 0 else 0.0)
+                if phase3_context.get("phase4_mode") == "exploration":
+                    gross_cap_pct = float(phase3_context.get("phase4_exploration_gross_cap_pct") or 7.5)
+                    current_gross = max(float(canonical.filled_gross_exposure or 0.0), float(canonical.projected_gross_exposure or 0.0))
+                    allowed_gross = max(0.0, canonical.portfolio_equity * gross_cap_pct / 100.0 - current_gross)
+                    final_notional = min(final_notional, allowed_gross)
+                    # Pending proposals are not yet in the broker snapshot or
+                    # reservation ledger. Count their planned stop risk too,
+                    # so several candidates in one scan cannot collectively
+                    # exceed the exploration heat or strategy ceiling.
+                    existing_exploration = self.storage.fetch_all(
+                        """SELECT strategy_version,COALESCE(SUM(CAST(json_extract(payload,'$.risk_budget') AS REAL)),0) AS risk_budget
+                           FROM trade_proposals
+                           WHERE side='buy' AND status IN ('pending','approved','submitted','filled')
+                             AND json_extract(payload,'$.phase4_mode')='exploration'
+                           GROUP BY strategy_version"""
+                    )
+                    existing_total_exploration_risk = sum(float(row.get("risk_budget") or 0.0) for row in existing_exploration)
+                    existing_strategy_exploration_risk = next(
+                        (float(row.get("risk_budget") or 0.0) for row in existing_exploration
+                         if row.get("strategy_version") == "rule_based_v1"), 0.0
+                    )
+                    exploration_heat_remaining = max(0.0, canonical.portfolio_equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0 - existing_total_exploration_risk)
+                    exploration_strategy_remaining = max(0.0, canonical.portfolio_equity * float(self.config.get("phase4", {}).get("max_exploration_stop_risk_pct", 0.10)) / 100.0 - existing_strategy_exploration_risk)
+                    final_notional = min(final_notional, exploration_heat_remaining, exploration_strategy_remaining)
             average_dollar_volume = 0.0
             if not bars.empty and "volume" in bars.columns and "close" in bars.columns:
                 average_dollar_volume = float((bars["volume"].astype(float).tail(20) * bars["close"].astype(float).tail(20)).mean())
@@ -6560,6 +6622,10 @@ class TradingService:
 
         # Minimum paper trade notional clamp
         min_notional = float(sizing_cfg.get("min_paper_notional", 5.0))
+
+        if phase3_enabled and phase3_context.get("phase4_mode") == "exploration" and final_notional < min_notional and blocked_reason is None:
+            blocked_reason = "Phase 4 exploration heat or per-strategy cap leaves less than the minimum paper notional"
+            final_notional = 0.0
 
         if final_notional < min_notional and blocked_reason is None:
             # Check if clamping to min_notional is safe under hard constraints
@@ -6592,7 +6658,14 @@ class TradingService:
                equity,phase3_context["drawdown_pct"],controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct,
                phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
                None,None,None,None,None,volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],
-               phase3_context["allocation_multiplier"],"moderate_paper_risk_v1",json_dumps({"score_used_for_sizing":False,"kelly_used":False})))
+               phase3_context["allocation_multiplier"],"moderate_paper_risk_v1",json_dumps({
+                   "score_used_for_sizing":False,
+                   "kelly_used":phase3_context.get("phase4_mode") == "adaptive",
+                   "phase4_mode":phase3_context.get("phase4_mode"),
+                   "exploration_heat_cap_pct":phase3_context.get("phase4_exploration_heat_cap_pct"),
+                   "exploration_gross_cap_pct":phase3_context.get("phase4_exploration_gross_cap_pct"),
+                   "manual_approval_required":True,
+               })))
 
         return {
             "final_notional": final_notional,
@@ -6601,6 +6674,9 @@ class TradingService:
             "stop_distance_pct": stop_distance_pct,
             "stop_distance_dollars": stop_distance_dollars,
             "risk_budget": risk_budget,
+            "phase4_mode": phase3_context.get("phase4_mode", "disabled") if phase3_enabled else "disabled",
+            "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct") if phase3_enabled else None,
+            "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct") if phase3_enabled else None,
             "score_multiplier": score_mult,
             "volatility_multiplier": vol_mult,
             "stop_model_used": stop_method,

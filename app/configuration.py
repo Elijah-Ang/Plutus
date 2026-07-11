@@ -57,8 +57,16 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(phase4.get("full_kelly_allowed") is False, "full Kelly is forbidden")
         require(phase4.get("llm_trading_decisions") is False, "LLM trading decisions are forbidden")
         require(phase4.get("uncalibrated_score_sizing") is False, "uncalibrated score sizing is forbidden")
+        require(phase4.get("require_manual_approval") is True, "Phase 4 exploration requires manual approval")
         kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)
         require(kelly is not None and kelly <= 0.25, "Phase 4 fractional Kelly cannot exceed one quarter")
+        exploration_heat = _bounded(phase4.get("exploration_heat_pct"), "phase4.exploration_heat_pct", errors, 0, 0.25)
+        exploration_risk = _bounded(phase4.get("exploration_stop_risk_pct"), "phase4.exploration_stop_risk_pct", errors, 0, 0.10)
+        exploration_max = _bounded(phase4.get("max_exploration_stop_risk_pct"), "phase4.max_exploration_stop_risk_pct", errors, 0, 0.10)
+        exploration_gross = _bounded(phase4.get("exploration_gross_exposure_pct"), "phase4.exploration_gross_exposure_pct", errors, 0, 7.5)
+        require(exploration_heat is not None and exploration_heat <= 0.25, "Phase 4 exploration heat exceeds the 0.25% bound")
+        require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
+        require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
 
     crypto = config.get("crypto", {}) or {}
     require(crypto.get("live_enabled", False) is False, "crypto.live_enabled must be false")
