@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -17,7 +18,9 @@ from .order_state import (
     validate_transition,
 )
 from .risk_engine import RiskEngine
+from .capabilities import require_autonomous_entry_support, require_autonomous_exit_support, require_protective_paper_exit_support
 from .utils import iso_now, json_dumps
+from .quotes import implementation_shortfall_bps, validate_quote_payload
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -204,9 +207,10 @@ class DurableExecutionStore:
                        id,run_id,proposal_id,approval_id,source_id,source_type,logical_action_key,candidate_id,
                        position_lifecycle_id,symbol,side,intended_action,request_basis,approved_quantity_ceiling,
                        approved_notional_ceiling,requested_quantity,requested_notional,filled_quantity,reference_price,intended_stop_price,reserved_notional,
-                       reserved_stop_risk,client_order_id,trading_mode,state,created_at,updated_at,replacement_enabled,
+                       reserved_stop_risk,quote_bid,quote_ask,quote_timestamp,quote_spread_bps,limit_price,implementation_shortfall_bps,
+                       client_order_id,trading_mode,state,created_at,updated_at,replacement_enabled,
                        parent_intent_id,relationship_group_id,relationship_type,order_role,protection_confirmed)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     intent_id,
                     run_id,
@@ -230,6 +234,12 @@ class DurableExecutionStore:
                     stop_price,
                     reserved_notional,
                     reserved_stop_risk,
+                    proposal.get("quote_bid"),
+                    proposal.get("quote_ask"),
+                    proposal.get("quote_timestamp"),
+                    proposal.get("quote_spread_bps"),
+                    proposal.get("limit_price"),
+                    proposal.get("implementation_shortfall_bps"),
                     client_order_id,
                     "paper",
                     OrderState.RESERVED.value,
@@ -279,8 +289,9 @@ class DurableExecutionStore:
                 ),
             )
             conn.execute(
-                """INSERT INTO orders(id,run_id,proposal_id,client_order_id,symbol,side,notional,qty,status,payload,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO orders(id,run_id,proposal_id,client_order_id,symbol,side,notional,qty,status,payload,
+                       quote_bid,quote_ask,quote_timestamp,quote_spread_bps,limit_price,implementation_shortfall_bps,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(client_order_id) DO NOTHING""",
                 (
                     intent_id,
@@ -292,7 +303,12 @@ class DurableExecutionStore:
                     reserved_notional if side == "buy" else proposal.get("notional"),
                     quantity,
                     OrderState.RESERVED.value,
-                    json_dumps({"intent_id": intent_id, "source_type": source_type}),
+                    json_dumps({"intent_id": intent_id, "source_type": source_type,
+                                "quote_bid": proposal.get("quote_bid"), "quote_ask": proposal.get("quote_ask"),
+                                "quote_timestamp": proposal.get("quote_timestamp"), "quote_spread_bps": proposal.get("quote_spread_bps"),
+                                "limit_price": proposal.get("limit_price")}),
+                    proposal.get("quote_bid"), proposal.get("quote_ask"), proposal.get("quote_timestamp"),
+                    proposal.get("quote_spread_bps"), proposal.get("limit_price"), proposal.get("implementation_shortfall_bps"),
                     now,
                     now,
                 ),
@@ -446,6 +462,12 @@ class DurableExecutionStore:
                 average = fill_price
             else:
                 average = ((previous * prior_avg) + (delta * fill_price)) / cumulative if cumulative > 0 else None
+            quote = {
+                "bid": intent["quote_bid"], "ask": intent["quote_ask"],
+                "midpoint": ((float(intent["quote_bid"]) + float(intent["quote_ask"])) / 2.0)
+                if intent["quote_bid"] is not None and intent["quote_ask"] is not None else None,
+            }
+            shortfall = implementation_shortfall_bps(quote, intent["side"], float(average or fill_price))
             current = OrderState(intent["state"])
             late_after_cancel = current == OrderState.CANCELLED and cumulative > previous
             target = current if late_after_cancel else (OrderState.FILLED if cumulative >= requested - 1e-9 else OrderState.PARTIALLY_FILLED)
@@ -474,8 +496,9 @@ class DurableExecutionStore:
             )
             conn.execute(
                 """UPDATE order_intents SET filled_quantity=?,average_fill_price=?,state=?,broker_order_id=COALESCE(?,broker_order_id),
+                       implementation_shortfall_bps=?,
                        updated_at=?,terminal_at=?,transition_counter=? WHERE id=?""",
-                (cumulative, average, target.value, broker_order_id, now, now if target == OrderState.FILLED else None, counter, intent_id),
+                (cumulative, average, target.value, broker_order_id, shortfall, now, now if target == OrderState.FILLED else None, counter, intent_id),
             )
             remaining_ratio = max(0.0, requested - cumulative) / requested
             reservation_state = "released" if target == OrderState.FILLED or late_after_cancel else "active"
@@ -493,23 +516,23 @@ class DurableExecutionStore:
                 (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "late_fill_after_cancelled" if late_after_cancel else ("final_fill" if target == OrderState.FILLED else "partial_fill"), broker_event_key, cumulative, delta_fill_price, json_dumps({"delta_quantity": delta}), now, counter),
             )
             conn.execute(
-                "UPDATE orders SET broker_order_id=COALESCE(?,broker_order_id),status=?,updated_at=? WHERE id=?",
-                (broker_order_id, target.value, now, intent_id),
+                "UPDATE orders SET broker_order_id=COALESCE(?,broker_order_id),status=?,implementation_shortfall_bps=?,updated_at=? WHERE id=?",
+                (broker_order_id, target.value, shortfall, now, intent_id),
             )
             existing_fill = conn.execute("SELECT id FROM fills WHERE order_id=?", (intent_id,)).fetchone()
             if existing_fill:
                 conn.execute(
-                    """UPDATE fills SET qty=?,price=?,filled_at=?,payload=?,
+                    """UPDATE fills SET qty=?,price=?,filled_at=?,payload=?,implementation_shortfall_bps=?,
                        fill_notified_at=CASE WHEN ?='filled' THEN NULL ELSE fill_notified_at END,
                        fill_notification_status=CASE WHEN ?='filled' THEN 'pending' ELSE fill_notification_status END,
                        fill_notification_error=CASE WHEN ?='filled' THEN NULL ELSE fill_notification_error END
                        WHERE order_id=?""",
-                    (cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), target.value, target.value, target.value, intent_id),
+                    (cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), shortfall, target.value, target.value, target.value, intent_id),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notification_status) VALUES(?,?,?,?,?,?,?)",
-                    (intent["run_id"], intent_id, cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), "pending"),
+                    "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,implementation_shortfall_bps,fill_notification_status) VALUES(?,?,?,?,?,?,?,?)",
+                    (intent["run_id"], intent_id, cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), shortfall, "pending"),
                 )
         return self.get_intent(intent_id)
 
@@ -613,6 +636,37 @@ class Executor:
         source_type: str = "proposal",
         approval_id: str | None = None,
     ) -> ExecutionResult:
+        if str(proposal.get("trading_mode") or proposal.get("mode") or "paper") != "paper":
+            return ExecutionResult(False, "blocked", None, reason="paper execution is the only supported execution mode")
+        if source_type == "emergency":
+            try:
+                require_protective_paper_exit_support()
+            except PermissionError as exc:
+                return ExecutionResult(False, "blocked", None, reason=str(exc))
+            if (
+                str(proposal.get("side", "")).lower() != "sell"
+                or int(proposal.get("emergency_exit_triggered") or 0) != 1
+                or not proposal.get("emergency_exit_trigger_reason")
+            ):
+                return ExecutionResult(False, "blocked", None, reason="ordinary workflows cannot use the protective paper-exit path")
+        elif proposal.get("autonomous_entry_requested") is True:
+            try:
+                require_autonomous_entry_support()
+            except PermissionError as exc:
+                return ExecutionResult(False, "blocked", None, reason=str(exc))
+        elif proposal.get("autonomous_exit_requested") is True:
+            try:
+                require_autonomous_exit_support()
+            except PermissionError as exc:
+                return ExecutionResult(False, "blocked", None, reason=str(exc))
+        elif os.getenv("TRADING_AGENT_TESTING") != "1":
+            quote_fields = ("quote_bid", "quote_ask", "quote_timestamp", "quote_spread_bps", "limit_price")
+            if any(proposal.get(field) is None for field in quote_fields) or proposal.get("order_type") != "limit":
+                return ExecutionResult(False, "blocked", None, reason="fresh validated quote and bounded limit price are required for normal orders")
+            try:
+                validate_quote_payload(proposal, str(proposal.get("side") or ""), self.risk_engine.config, now=datetime.now(UTC))
+            except (TypeError, ValueError) as exc:
+                return ExecutionResult(False, "blocked", None, reason=f"quote validation blocked: {exc}")
         if proposal.get("status") != "approved" or context.get("approval_valid") is not True:
             return ExecutionResult(False, "blocked", None, reason="validated approval required")
         if self.storage is None:

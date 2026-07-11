@@ -366,11 +366,12 @@ def test_crash_17_sequential_yes_all_exhausts_capacity(tmp_path):
 
 def test_crash_18_emergency_ambiguous_timeout_matches_ordinary(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker(submit_error=TimeoutError("synthetic"))
+    emergency = {**_proposal("emergency", side="sell"), "emergency_exit_triggered": 1, "emergency_exit_trigger_reason": "synthetic protective trigger"}
     result = Executor(broker, PassingRisk(), storage, "run").execute(
-        _proposal("emergency", side="sell"), {"approval_valid": True}, source_type="emergency"
+        emergency, {"approval_valid": True}, source_type="emergency"
     )
     replay = Executor(broker, PassingRisk(), Storage(storage.path), "restart").execute(
-        _proposal("emergency", side="sell"), {"approval_valid": True}, source_type="emergency"
+        emergency, {"approval_valid": True}, source_type="emergency"
     )
     assert result.status == replay.status == "unknown"
     assert result.client_order_id == replay.client_order_id and broker.submit_calls == 1

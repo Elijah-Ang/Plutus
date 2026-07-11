@@ -474,7 +474,9 @@ def test_revalidate_and_execute_emergency_exit(temp_storage, base_config):
         "id": "prop_emerg_123",
         "symbol": "SPY",
         "qty": 10.0,
-        "latest_price": 100.0
+        "latest_price": 100.0,
+        "emergency_exit_triggered": 1,
+        "emergency_exit_trigger_reason": "test protective trigger",
     }
 
     # Setup matching position in broker

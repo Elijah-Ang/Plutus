@@ -33,10 +33,6 @@ class LossMetrics:
             "weekly_loss_confidence": self.weekly_loss_confidence,
             "loss_provenance": self.loss_provenance,
             "loss_metrics_version": self.metrics_version,
-            # Compatibility aliases are dollars only and are not consumed by
-            # the versioned risk checks.
-            "daily_loss": self.daily_loss_dollars,
-            "weekly_loss": self.weekly_loss_dollars,
         }
 
 

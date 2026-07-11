@@ -83,8 +83,8 @@ def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | No
                 add("broker", False, f"broker unavailable: {type(exc).__name__}")
                 market_open = False
         add("telegram", secret_present("TELEGRAM_BOT_TOKEN") and secret_present("TELEGRAM_ALLOWED_USER_ID"), "Telegram token and authorized user ID required")
-        ai_required = config.get("ai", {}).get("enabled", True)
-        add("openai", not ai_required or secret_present("OPENAI_API_KEY"), "OpenAI key required when AI review enabled")
+        # OpenAI is optional commentary and never a deterministic trading gate.
+        add("openai", True, "optional commentary provider; unavailable AI does not alter trading eligibility")
         add("market_open", not cfg_bool("require_market_open", bool(config.get("require_market_open", True))) or market_open, "market must be open when required")
 
     return _run_checks(build, recorder)

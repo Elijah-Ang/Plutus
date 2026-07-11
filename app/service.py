@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .ai_review import AIReviewer, deterministic_review
-from .capabilities import AUTO_EXECUTION_SUPPORTED
+from .capabilities import AUTO_EXECUTION_SUPPORTED, require_protective_paper_exit_support
 from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active
 
 logger = logging.getLogger("trading_agent")
@@ -42,6 +42,8 @@ from .position_management import PositionManagementDecision, PositionManagementE
 from .position_lifecycle import PositionLifecycleManager
 from .risk_engine import RiskCheck, RiskEngine, _dt
 from .risk_snapshot import RiskSnapshotBuilder
+from .position_sizing import effective_notional_policy, notional_from_stop_risk
+from .quotes import bounded_marketable_limit, implementation_shortfall_bps, validated_quote
 from .reconciliation import BrokerReconciler
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
@@ -301,8 +303,6 @@ class TradingService:
             "account": None,
             "positions": [],
             "orders": [],
-            "daily_loss": None,
-            "weekly_loss": None,
             "loss_metrics": None,
             "uses_margin": None,
         }
@@ -324,21 +324,20 @@ class TradingService:
             try:
                 losses = self.broker.get_loss_metrics()
                 losses = dict(losses or {})
-                # Compatibility adapter for older broker implementations. The
-                # normalized state is explicit and versioned before risk sees it.
-                if "daily_loss_dollars" not in losses and "daily_loss" in losses:
+                # Unit-test brokers from the pre-v2 contract are normalized
+                # only inside the isolated test environment. Production paper
+                # callers must provide the explicit versioned fields.
+                if os.getenv("TRADING_AGENT_TESTING") == "1" and "daily_loss_dollars" not in losses and "daily_loss" in losses:
                     losses.update({
                         "daily_loss_dollars": losses.get("daily_loss"),
                         "weekly_loss_dollars": losses.get("weekly_loss"),
                         "reference_equity": _value(account, "last_equity") or _value(account, "equity"),
                         "daily_loss_confidence": "verified" if losses.get("daily_loss") is not None else "unavailable",
                         "weekly_loss_confidence": "verified" if losses.get("weekly_loss") is not None else "unavailable",
-                        "provenance": "legacy_broker_loss_metrics_dollars",
+                        "provenance": "test_fixture_legacy_loss_metrics",
                         "metrics_version": LOSS_METRICS_VERSION,
                     })
                 state["loss_metrics"] = losses
-                state["daily_loss"] = losses.get("daily_loss_dollars")
-                state["weekly_loss"] = losses.get("weekly_loss_dollars")
             except Exception:
                 # Daily equity comparison is still authoritative when present.
                 equity = _value(account, "equity")
@@ -353,7 +352,6 @@ class TradingService:
                         "provenance": "alpaca_account_snapshot_fallback",
                         "metrics_version": LOSS_METRICS_VERSION,
                     }
-                    state["daily_loss"] = state["loss_metrics"]["daily_loss_dollars"]
 
             cash = _value(account, "cash")
             equity = _value(account, "equity")
@@ -2291,6 +2289,7 @@ class TradingService:
         price_refreshed_at = None
         refreshed_price_age_seconds = None
         price_move_bps_since_proposal = None
+        quote_data = None
         block_reason = None
         now_dt = datetime.now(UTC)
 
@@ -2313,17 +2312,30 @@ class TradingService:
         max_price_age = telegram_cfg.get("approval_max_price_age_seconds", 120)
         max_price_move_bps = telegram_cfg.get("approval_max_price_move_bps", 25)
 
-        # Fetch latest price
+        # Normal orders require a fresh authoritative two-sided quote. The
+        # protective emergency path retains its separately validated paper
+        # market-exit path.
         if block_reason is None and self.broker is not None:
             try:
-                trade = self.broker.get_latest_price(prop_symbol)
-                refreshed_price_val = float(_value(trade, "price", 0) or 0)
-                refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
+                if row.get("emergency_exit_triggered") == 1:
+                    trade = self.broker.get_latest_price(prop_symbol)
+                    refreshed_price_val = float(_value(trade, "price", 0) or 0)
+                    refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
+                else:
+                    quote_data = validated_quote(self.broker, prop_symbol, self.config, now=now_dt)
+                    refreshed_price_val = float(quote_data["ask"] if prop_side == "buy" else quote_data["bid"])
+                    refreshed_price_at = _dt(quote_data["timestamp"])
                 if refreshed_price_at:
                     price_refreshed_at = refreshed_price_at.isoformat()
                     refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
             except Exception as e:
                 logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
+                if row.get("emergency_exit_triggered") != 1:
+                    block_reason = (
+                        "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
+                        if "stale" in str(e).lower() or "future" in str(e).lower()
+                        else "Price refresh failed or price is unavailable"
+                    )
 
         # Check market open status
         market_open = False
@@ -2361,6 +2373,19 @@ class TradingService:
             else:
                 if not market_open:
                     block_reason = "Market is closed"
+
+        if block_reason is None and row.get("emergency_exit_triggered") != 1:
+            try:
+                proposal["quote_bid"] = float(quote_data["bid"])
+                proposal["quote_ask"] = float(quote_data["ask"])
+                proposal["quote_midpoint"] = float(quote_data["midpoint"])
+                proposal["quote_timestamp"] = quote_data["timestamp"]
+                proposal["quote_spread_bps"] = float(quote_data["spread_bps"])
+                proposal["quote_source"] = quote_data["source"]
+                proposal["order_type"] = "limit"
+                proposal["limit_price"] = bounded_marketable_limit(quote_data, prop_side, self.config)
+            except (KeyError, TypeError, ValueError) as exc:
+                block_reason = f"bounded marketable-limit validation failed: {type(exc).__name__}"
 
         if block_reason is None:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
@@ -2417,7 +2442,10 @@ class TradingService:
 
         # Execute
         proposal["status"] = "approved"
+        if row.get("emergency_exit_triggered") == 1:
+            proposal["execution_path"] = "protective_paper_exit"
         context = self._portfolio_context(proposal, approval_valid=True)
+        context["execution_path"] = proposal.get("execution_path")
         result = Executor(
             self.broker,
             self._risk_engine(row.get("id"), "final"),
@@ -2778,6 +2806,12 @@ class TradingService:
                 }
 
     def revalidate_and_execute_emergency_exit(self, proposal: dict[str, Any]) -> tuple[bool, str]:
+        try:
+            require_protective_paper_exit_support()
+        except PermissionError as exc:
+            return False, str(exc)
+        if int(proposal.get("emergency_exit_triggered") or 0) != 1 or not proposal.get("emergency_exit_trigger_reason"):
+            return False, "ordinary workflows cannot use the protective paper-exit path"
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             return False, "not in paper mode / live enabled"
 
@@ -2852,6 +2886,7 @@ class TradingService:
             "latest_price": refreshed_price,
             "price_at": refreshed_at.isoformat(),
             "trading_mode": "paper",
+            "execution_path": "protective_paper_exit",
         }
         context = self._portfolio_context(executable, approval_valid=True)
         result = Executor(
@@ -4416,6 +4451,8 @@ class TradingService:
                                     else ("r_multiple_unavailable_initial_stop_missing" if stop_price is None else "r_multiple_unavailable_initial_stop_invalid")
                                 ),
                                 "risk_budget": risk_budget,
+                                "risk_budget_dollars": res.get("risk_budget_dollars", risk_budget),
+                                "stop_risk_dollars": res.get("stop_risk_dollars", ((float(notional) / float(price) * float(stop_distance_dollars)) if notional > 0 and price > 0 and stop_distance_dollars else 0.0)),
                                 "score_multiplier": score_multiplier,
                                 "volatility_multiplier": volatility_multiplier,
                                 "proposed_total_exposure_pct": port_context.get("proposed_total_exposure_pct"),
@@ -4457,7 +4494,10 @@ class TradingService:
 
                             if proposal_allowed:
                                 if is_buy:
-                                    require_gpt = self.config.get("risk", {}).get("require_gpt_review_for_buy_proposals", True)
+                                    # AI is optional commentary only. It cannot
+                                    # decide direction, size, stop, expiry, or
+                                    # deterministic eligibility.
+                                    require_gpt = False
                                     calls_today = len(self.storage.fetch_all("SELECT id FROM ai_reviews WHERE created_at >= ?", (today_start,)))
                                     last_call = self.storage.fetch_all("SELECT created_at FROM ai_reviews WHERE proposal_id IN (SELECT id FROM trade_proposals WHERE symbol=?) ORDER BY created_at DESC LIMIT 1", (symbol,))
                                     time_since = (now - datetime.fromisoformat(last_call[0]["created_at"].replace("Z", "+00:00")).replace(tzinfo=UTC)).total_seconds() / 60 if last_call else float("inf")
@@ -4479,23 +4519,18 @@ class TradingService:
                                     proposal["gpt_called"] = gpt_called
                                     proposal["review"] = review
 
-                                    if require_gpt and not gpt_called:
-                                        proposal_generated = False
-                                        proposal_allowed = False
-                                        no_action_reason = "deferred due to AI review throttling/unavailability"
-                                        deferred_ai_review_reason = "deferred_ai_review_unavailable"
-                                        final_proposal_message_category = "deferred"
-                                        self.storage.audit(self.run_id, "proposal_deferred", {
-                                            "symbol": symbol, "reason": "deferred_ai_review_unavailable", "score": score
+                                    proposal_generated = True
+                                    no_action_reason = "proposal generated"
+                                    any_generated = True
+                                    if not gpt_called:
+                                        deferred_ai_review_reason = "commentary_unavailable"
+                                        self.storage.audit(self.run_id, "ai_commentary_deferred", {
+                                            "symbol": symbol, "reason": "commentary_unavailable", "eligibility_unchanged": True,
                                         })
-                                    else:
-                                        proposal_generated = True
-                                        no_action_reason = "proposal generated"
-                                        any_generated = True
-                                        if review:
-                                            proposal["ai_review_status"] = "Completed" if gpt_called else "Not available"
-                                            proposal["ai_confidence"] = review.get("gpt_confidence", "Not called")
-                                            proposal["ai_caution"] = review.get("gpt_caution", "Low")
+                                    if review:
+                                        proposal["ai_review_status"] = "Completed" if gpt_called else "Not available"
+                                        proposal["ai_confidence"] = review.get("gpt_confidence", "Not called")
+                                        proposal["ai_caution"] = review.get("gpt_caution", "Low")
                                 elif is_exit:
                                     if emergency_exit_triggered == 1:
                                         # Emergency exits create approval-gated paper sell proposals.
@@ -6283,8 +6318,74 @@ class TradingService:
             "cluster_symbols": cluster_symbols,
         }
 
+    def _pending_execution_totals(self) -> dict[str, Any]:
+        """Return proposal exposure not yet represented by a reservation.
+
+        Filled positions and partial fills are represented by the broker
+        snapshot and durable reservation ledger respectively. Only pending or
+        approved proposals without an intent are added here, preventing double
+        counting while closing the scanner/listener race.
+        """
+        rows = self.storage.fetch_all(
+            """SELECT p.symbol,p.payload,p.notional,p.strategy_version
+               FROM trade_proposals p
+               LEFT JOIN order_intents i ON i.proposal_id=p.id
+               WHERE p.side='buy' AND p.status IN ('pending','approved') AND i.id IS NULL"""
+        )
+        total_notional = 0.0
+        total_stop_risk = 0.0
+        by_symbol: dict[str, float] = {}
+        by_cluster: dict[str, float] = {}
+        exploration_risk_by_strategy: dict[str, float] = {}
+        exploration_notional = 0.0
+        exploration_stop_risk = 0.0
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload") or "{}")
+                notional = float(payload.get("notional") or row.get("notional") or 0.0)
+                price = float(payload.get("latest_price") or payload.get("reference_price") or 0.0)
+                stop = float(payload.get("stop_distance_dollars") or 0.0)
+                risk_dollars = float(payload.get("stop_risk_dollars") or payload.get("risk_budget_dollars") or 0.0)
+                if risk_dollars <= 0 and notional > 0 and price > 0 and stop > 0:
+                    risk_dollars = notional / price * stop
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not math.isfinite(notional) or notional <= 0 or not math.isfinite(risk_dollars) or risk_dollars < 0:
+                continue
+            symbol = str(row.get("symbol") or "").upper()
+            cluster = self._get_symbol_cluster(symbol)
+            total_notional += notional
+            total_stop_risk += risk_dollars
+            by_symbol[symbol] = by_symbol.get(symbol, 0.0) + notional
+            if cluster:
+                by_cluster[cluster] = by_cluster.get(cluster, 0.0) + notional
+            if payload.get("phase4_mode") == "exploration":
+                exploration_notional += notional
+                exploration_stop_risk += risk_dollars
+                strategy = str(row.get("strategy_version") or payload.get("strategy_version") or "")
+                exploration_risk_by_strategy[strategy] = exploration_risk_by_strategy.get(strategy, 0.0) + risk_dollars
+        return {
+            "total_notional": total_notional,
+            "total_stop_risk": total_stop_risk,
+            "by_symbol": by_symbol,
+            "by_cluster": by_cluster,
+            "exploration_notional": exploration_notional,
+            "exploration_stop_risk": exploration_stop_risk,
+            "exploration_risk_by_strategy": exploration_risk_by_strategy,
+        }
+
     def _calculate_dynamic_size(self, symbol: str, score: float, volatility_regime: str, price: float, bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False) -> dict[str, Any]:
         sizing_cfg = self.config.get("position_sizing", {})
+        if not isinstance(price, (int, float)) or not math.isfinite(float(price)) or float(price) <= 0:
+            return {"final_notional": 0.0, "suggested_shares": 0.0, "stop_price": None,
+                    "stop_distance_pct": None, "stop_distance_dollars": None, "risk_budget": 0.0,
+                    "risk_budget_dollars": 0.0, "stop_risk_dollars": 0.0, "score_multiplier": 1.0,
+                    "volatility_multiplier": 0.0, "stop_model_used": "blocked_invalid_entry_price",
+                    "risk_based_shares": 0.0, "score_adjusted_notional": 0.0, "vol_adjusted_notional": 0.0,
+                    "base_notional": 0.0, "raw_risk_based_notional": 0.0, "quality_adjusted_notional": 0.0,
+                    "cash_cap": 0.0, "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0,
+                    "stage_cap": 0.0, "equity_cap": 0.0, "absolute_cap": 0.0,
+                    "blocked_reason": "validated entry price unavailable"}
         if not sizing_cfg.get("enabled", True):
             base_notional = float(self.config.get("risk", {}).get("max_trade_notional_paper", 5.0))
             vol_mult = 1.0
@@ -6454,6 +6555,25 @@ class TradingService:
 
         stop_price = price - stop_distance_dollars
 
+        if (
+            not math.isfinite(float(stop_distance_dollars))
+            or stop_distance_dollars <= 0
+            or not math.isfinite(float(stop_price))
+            or stop_price <= 0
+            or stop_price >= price
+        ):
+            return {
+                "final_notional": 0.0, "suggested_shares": 0.0, "stop_price": None,
+                "stop_distance_pct": None, "stop_distance_dollars": None, "risk_budget": 0.0,
+                "risk_budget_dollars": 0.0, "stop_risk_dollars": 0.0, "score_multiplier": score_mult if 'score_mult' in locals() else 1.0,
+                "volatility_multiplier": vol_mult if 'vol_mult' in locals() else 0.0, "stop_model_used": "blocked_invalid_stop",
+                "risk_based_shares": 0.0, "score_adjusted_notional": 0.0, "vol_adjusted_notional": 0.0,
+                "base_notional": 0.0, "raw_risk_based_notional": 0.0, "quality_adjusted_notional": 0.0,
+                "cash_cap": 0.0, "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0,
+                "stage_cap": 0.0, "equity_cap": 0.0, "absolute_cap": 0.0,
+                "blocked_reason": "validated stop distance unavailable",
+            }
+
         risk_based_shares = risk_budget / stop_distance_dollars
         risk_based_notional = risk_based_shares * price
 
@@ -6482,6 +6602,18 @@ class TradingService:
         elif volatility_regime == "extreme":
             vol_mult = float(vol_mult_map.get("extreme", 0.0))
 
+        if self.storage is None:
+            reservations = {"active_reserved_notional": 0.0, "symbol_reserved_notional": {}, "cluster_reserved_notional": {}}
+            pending = {"total_notional": 0.0, "total_stop_risk": 0.0, "by_symbol": {}, "by_cluster": {}, "exploration_stop_risk": 0.0, "exploration_risk_by_strategy": {}}
+        else:
+            reservations = DurableExecutionStore(self.storage).active_reservations()
+            pending = self._pending_execution_totals()
+        reserved_notional = float(reservations.get("active_reserved_notional") or 0.0)
+        committed_notional = reserved_notional + float(pending.get("total_notional") or 0.0)
+        reserved_by_symbol = reservations.get("symbol_reserved_notional", {})
+        reserved_by_cluster = reservations.get("cluster_reserved_notional", {})
+        committed_symbol = float(reserved_by_symbol.get(symbol.upper(), 0.0)) + float((pending.get("by_symbol") or {}).get(symbol.upper(), 0.0))
+
         if mode == "risk_portfolio":
             target_notional = risk_based_notional * score_mult * vol_mult
             if is_add:
@@ -6494,18 +6626,19 @@ class TradingService:
             usable_cash = max(0.0, cash - min_cash_reserve)
             max_cash_usage_pct = float(sizing_cfg.get("max_cash_usage_pct", 10.0))
             max_cash_per_trade = equity * (max_cash_usage_pct / 100.0)
-            cash_cap = min(usable_cash, max_cash_per_trade)
+            buying_power_available = max(0.0, buying_power - committed_notional)
+            cash_cap = min(usable_cash, max_cash_per_trade, buying_power_available)
 
             # Single position cap
             max_position_notional_pct_of_equity = float(sizing_cfg.get("max_position_notional_pct_of_equity", 2.0))
             max_single_exposure = equity * (max_position_notional_pct_of_equity / 100.0)
-            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity
+            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity + committed_symbol
             allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
 
             # Portfolio total exposure cap
             max_total_portfolio_exposure_pct = float(sizing_cfg.get("max_total_portfolio_exposure_pct", 6.0))
             max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
-            current_total_value = snapshot["total_exposure_dollars"]
+            current_total_value = snapshot["total_exposure_dollars"] + committed_notional
             allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
 
             # Cluster exposure cap
@@ -6514,42 +6647,40 @@ class TradingService:
             if c_name:
                 max_cluster_exposure_pct = float(sizing_cfg.get("max_cluster_exposure_pct", 5.0))
                 max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
-                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity
+                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity + float(reserved_by_cluster.get(c_name, 0.0)) + float((pending.get("by_cluster") or {}).get(c_name, 0.0))
                 allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
 
-            # Stage Dollar Cap
-            stage_cap = float("inf")
-            if sizing_cfg.get("use_stage_dollar_cap", True):
-                stage = sizing_cfg.get("stage", "moderate_paper")
-                if is_add:
-                    stage_cap = float(sizing_cfg.get("stage_max_add_notional", {}).get(stage) or 0.0)
-                else:
-                    stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or 0.0)
-                if stage_cap <= 0.0:
-                    stage_cap = float("inf")
-
-            # Max trade notional limit
-            max_trade_notional_pct_of_equity = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
-            max_trade_notional = equity * (max_trade_notional_pct_of_equity / 100.0)
+            # All notional ceilings come from the single validated policy.
+            policy = effective_notional_policy(self.config, float(equity), is_add=is_add)
+            stage_cap = policy.stage_max_notional_usd if policy.stage_max_notional_usd is not None else float("inf")
+            equity_cap = policy.equity_max_notional_usd if policy.equity_max_notional_usd is not None else float("inf")
+            absolute_cap = policy.absolute_max_notional_usd if policy.absolute_max_notional_usd is not None else float("inf")
+            max_trade_notional = min(equity_cap, absolute_cap)
+            max_trade_notional = min(max_trade_notional, policy.stage_max_notional_usd) if policy.stage_max_notional_usd is not None else max_trade_notional
+            minimum_executable_notional = policy.minimum_executable_notional_usd
         else:
-            base_paper_notional = float(sizing_cfg.get("base_paper_notional", 10.0))
-            suggested_add_notional = float(sizing_cfg.get("suggested_add_notional", 50.0))
+            policy = effective_notional_policy(self.config, float(equity), is_add=is_add)
+            base_paper_notional = policy.default_notional_usd
+            suggested_add_notional = policy.default_notional_usd
             base_target = suggested_add_notional if is_add else base_paper_notional
             target_notional = base_target * score_mult * vol_mult
 
             # Cash cap (disabled in fixed mode)
-            cash_cap = float("inf")
+            # Fixed-mode legacy/snapshot callers may not provide an account
+            # cash field; the authoritative Phase 3 path always does. Do not
+            # invent a zero ceiling from an omitted optional field.
+            cash_cap = max(0.0, buying_power - committed_notional) if buying_power > 0 else float("inf")
 
             # Single position cap
             max_single_symbol_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_symbol_exposure_pct", 5.0))
             max_single_exposure = equity * (max_single_symbol_exposure_pct / 100.0)
-            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity
+            current_symbol_value = snapshot["single_exposures"].get(symbol.upper(), 0.0) / 100.0 * equity + committed_symbol
             allowed_additional_single = max(0.0, max_single_exposure - current_symbol_value)
 
             # Portfolio total exposure cap
             max_total_portfolio_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_total_portfolio_exposure_pct", 15.0))
             max_total_exposure = equity * (max_total_portfolio_exposure_pct / 100.0)
-            current_total_value = snapshot["total_exposure_dollars"]
+            current_total_value = snapshot["total_exposure_dollars"] + committed_notional
             allowed_additional_total = max(0.0, max_total_exposure - current_total_value)
 
             # Cluster exposure cap
@@ -6558,17 +6689,15 @@ class TradingService:
             if c_name:
                 max_cluster_exposure_pct = float(self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0))
                 max_cluster_exposure = equity * (max_cluster_exposure_pct / 100.0)
-                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity
+                current_cluster_value = snapshot["cluster_exposures"].get(c_name, 0.0) / 100.0 * equity + float(reserved_by_cluster.get(c_name, 0.0)) + float((pending.get("by_cluster") or {}).get(c_name, 0.0))
                 allowed_additional_cluster = max(0.0, max_cluster_exposure - current_cluster_value)
 
             # Stage cap is disabled in fixed mode
-            stage_cap = float("inf")
-
-            # Max trade limits
-            if is_add:
-                max_trade_notional = float(sizing_cfg.get("max_add_paper_notional", 100.0))
-            else:
-                max_trade_notional = float(sizing_cfg.get("max_initial_paper_notional", 50.0))
+            stage_cap = policy.stage_max_notional_usd if policy.stage_max_notional_usd is not None else float("inf")
+            equity_cap = policy.equity_max_notional_usd if policy.equity_max_notional_usd is not None else float("inf")
+            absolute_cap = policy.absolute_max_notional_usd if policy.absolute_max_notional_usd is not None else float("inf")
+            max_trade_notional = min(stage_cap, equity_cap, absolute_cap)
+            minimum_executable_notional = policy.minimum_executable_notional_usd
 
         # Apply constraints
         final_notional = target_notional
@@ -6577,6 +6706,8 @@ class TradingService:
         final_notional = min(final_notional, allowed_additional_total)
         final_notional = min(final_notional, allowed_additional_cluster)
         final_notional = min(final_notional, stage_cap)
+        final_notional = min(final_notional, equity_cap)
+        final_notional = min(final_notional, absolute_cap)
         final_notional = min(final_notional, max_trade_notional)
         blocked_reason = None
 
@@ -6587,7 +6718,11 @@ class TradingService:
             heat_cap = profile.defensive_portfolio_heat_pct if phase3_context["regime_multiplier"] <= 0.5 else profile.max_portfolio_heat_pct
             if phase3_context.get("phase4_mode") == "exploration":
                 heat_cap = min(heat_cap, float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25))
-            current_heat = canonical.projected_total_open_risk
+            current_heat = (
+                float(canonical.projected_total_open_risk)
+                + float(pending.get("total_stop_risk") or 0.0)
+                if canonical.projected_total_open_risk is not None else None
+            )
             loss_metrics = build_loss_metrics(
                 state.get("loss_metrics"),
                 account_equity=canonical.portfolio_equity,
@@ -6617,28 +6752,33 @@ class TradingService:
                 final_notional = min(final_notional, allowed_risk / stop_distance_dollars * price if stop_distance_dollars > 0 else 0.0)
                 if phase3_context.get("phase4_mode") == "exploration":
                     gross_cap_pct = float(phase3_context.get("phase4_exploration_gross_cap_pct") or 7.5)
-                    current_gross = max(float(canonical.filled_gross_exposure or 0.0), float(canonical.projected_gross_exposure or 0.0))
+                    current_gross = max(float(canonical.filled_gross_exposure or 0.0), float(canonical.projected_gross_exposure or 0.0)) + float(pending.get("total_notional") or 0.0)
                     allowed_gross = max(0.0, canonical.portfolio_equity * gross_cap_pct / 100.0 - current_gross)
                     final_notional = min(final_notional, allowed_gross)
-                    # Pending proposals are not yet in the broker snapshot or
-                    # reservation ledger. Count their planned stop risk too,
-                    # so several candidates in one scan cannot collectively
-                    # exceed the exploration heat or strategy ceiling.
-                    existing_exploration = self.storage.fetch_all(
-                        """SELECT strategy_version,COALESCE(SUM(CAST(json_extract(payload,'$.risk_budget') AS REAL)),0) AS risk_budget
-                           FROM trade_proposals
-                           WHERE side='buy' AND status IN ('pending','approved','submitted','filled')
-                             AND json_extract(payload,'$.phase4_mode')='exploration'
-                           GROUP BY strategy_version"""
+                    existing_total_exploration_risk = float(pending.get("exploration_stop_risk") or 0.0)
+                    exploration_heat_remaining = max(
+                        0.0,
+                        canonical.portfolio_equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0
+                        - existing_total_exploration_risk,
                     )
-                    existing_total_exploration_risk = sum(float(row.get("risk_budget") or 0.0) for row in existing_exploration)
-                    existing_strategy_exploration_risk = next(
-                        (float(row.get("risk_budget") or 0.0) for row in existing_exploration
-                         if row.get("strategy_version") == STRATEGY_VERSION), 0.0
+                    existing_strategy_exploration_risk = float((pending.get("exploration_risk_by_strategy") or {}).get(STRATEGY_VERSION, 0.0))
+                    exploration_strategy_remaining = max(
+                        0.0,
+                        canonical.portfolio_equity * float(self.config.get("phase4", {}).get("max_exploration_stop_risk_pct", 0.10)) / 100.0
+                        - existing_strategy_exploration_risk,
                     )
-                    exploration_heat_remaining = max(0.0, canonical.portfolio_equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0 - existing_total_exploration_risk)
-                    exploration_strategy_remaining = max(0.0, canonical.portfolio_equity * float(self.config.get("phase4", {}).get("max_exploration_stop_risk_pct", 0.10)) / 100.0 - existing_strategy_exploration_risk)
-                    final_notional = min(final_notional, exploration_heat_remaining, exploration_strategy_remaining)
+                    # These are stop-risk dollars. Convert them to safe
+                    # position notional using the validated entry price and
+                    # stop distance; never compare risk dollars to notional.
+                    if not math.isfinite(stop_distance_dollars) or stop_distance_dollars <= 0 or not math.isfinite(price) or price <= 0:
+                        final_notional = 0.0
+                        blocked_reason = "exploration sizing evidence or stop distance unavailable"
+                    else:
+                        final_notional = min(
+                            final_notional,
+                            notional_from_stop_risk(exploration_heat_remaining, price, stop_distance_dollars),
+                            notional_from_stop_risk(exploration_strategy_remaining, price, stop_distance_dollars),
+                        )
             average_dollar_volume = 0.0
             if not bars.empty and "volume" in bars.columns and "close" in bars.columns:
                 average_dollar_volume = float((bars["volume"].astype(float).tail(20) * bars["close"].astype(float).tail(20)).mean())
@@ -6660,23 +6800,28 @@ class TradingService:
                 caps_applied.append("cluster_cap")
             if final_notional == max_trade_notional and max_trade_notional < target_notional:
                 caps_applied.append("max_trade_notional_cap")
+            if final_notional == equity_cap and equity_cap < target_notional:
+                caps_applied.append("equity_max_cap")
+            if final_notional == absolute_cap and absolute_cap < target_notional:
+                caps_applied.append("absolute_max_cap")
 
-        # Minimum paper trade notional clamp
-        min_notional = float(sizing_cfg.get("min_paper_notional", 5.0))
-
-        if phase3_enabled and phase3_context.get("phase4_mode") == "exploration" and final_notional < min_notional and blocked_reason is None:
-            blocked_reason = "Phase 4 exploration heat or per-strategy cap leaves less than the minimum paper notional"
+        # The executable minimum is a floor for admission, never an upward
+        # clamp. A constrained result below it is blocked and set to zero.
+        min_notional = float(minimum_executable_notional)
+        if final_notional > 0 and final_notional < min_notional and blocked_reason is None:
+            blocked_reason = "constrained notional is below the executable minimum"
             final_notional = 0.0
-
-        if final_notional < min_notional and blocked_reason is None:
-            # Check if clamping to min_notional is safe under hard constraints
-            if min_notional <= cash_cap and min_notional <= allowed_additional_single and min_notional <= allowed_additional_total and min_notional <= allowed_additional_cluster:
-                final_notional = min_notional
-                caps_applied.append("min_trade_clamp")
+        elif final_notional <= 0 and blocked_reason is None:
+            if cash_cap <= 0:
+                blocked_reason = "cash or buying-power ceiling leaves no executable notional"
+            elif allowed_additional_single <= 0:
+                blocked_reason = "single-symbol exposure ceiling leaves no executable notional"
+            elif allowed_additional_total <= 0:
+                blocked_reason = "portfolio exposure ceiling leaves no executable notional"
+            elif allowed_additional_cluster <= 0:
+                blocked_reason = "cluster exposure ceiling leaves no executable notional"
             else:
-                if final_notional < 1.0:
-                    blocked_reason = "notional too small after constraints"
-                    final_notional = 0.0
+                blocked_reason = "no safe executable notional remains after constraints"
 
         if volatility_regime == "extreme" or vol_mult == 0.0:
             final_notional = 0.0
@@ -6715,6 +6860,8 @@ class TradingService:
             "stop_distance_pct": stop_distance_pct,
             "stop_distance_dollars": stop_distance_dollars,
             "risk_budget": risk_budget,
+            "risk_budget_dollars": risk_budget,
+            "stop_risk_dollars": final_notional / price * stop_distance_dollars if final_notional > 0 and price > 0 else 0.0,
             "phase4_mode": phase3_context.get("phase4_mode", "disabled") if phase3_enabled else "disabled",
             "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct") if phase3_enabled else None,
             "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct") if phase3_enabled else None,
@@ -6724,7 +6871,7 @@ class TradingService:
             "risk_based_shares": risk_based_shares,
             "score_adjusted_notional": target_notional,
             "vol_adjusted_notional": target_notional,
-            "base_notional": float(sizing_cfg.get("base_paper_notional", 50.0)),
+            "base_notional": float(sizing_cfg.get("default_paper_notional_usd", sizing_cfg.get("base_paper_notional", 50.0))),
             "raw_risk_based_notional": risk_based_notional,
             "quality_adjusted_notional": target_notional,
             "cash_cap": cash_cap,
@@ -6732,6 +6879,9 @@ class TradingService:
             "portfolio_cap": allowed_additional_total,
             "cluster_cap": allowed_additional_cluster,
             "stage_cap": stage_cap,
+            "equity_cap": equity_cap,
+            "absolute_cap": absolute_cap,
+            "minimum_executable_notional": min_notional,
             "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
             "blocked_reason": blocked_reason
         }
@@ -7211,7 +7361,7 @@ class TradingService:
             "max_total_portfolio_exposure_pct": float(rb.get("max_total_portfolio_exposure_pct", pb.get("max_total_portfolio_exposure_pct", 6.0))),
             "max_single_symbol_exposure_pct": float(rb.get("max_single_symbol_exposure_pct", pb.get("max_single_symbol_exposure_pct", 2.5))),
             "max_cluster_exposure_pct": float(rb.get("max_cluster_exposure_pct", optimizer.get("max_same_cluster_exposure_pct", pb.get("max_correlated_us_equity_exposure_pct", 5.0)))),
-            "min_notional": float(sizing.get("min_paper_notional", 5.0)),
+            "min_notional": float(sizing.get("minimum_executable_notional_usd", sizing.get("min_paper_notional", 5.0))),
         }
 
     def _buying_power(self, account: Any) -> float:

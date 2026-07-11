@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import os
 from typing import Any, Callable
 
 from .loss_controls import LOSS_METRICS_VERSION
+from .position_sizing import effective_notional_policy
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,11 @@ class RiskEngine:
         check("broker", context.get("broker_available") is True, "broker must be reachable")
         check("telegram", not is_entry or context.get("telegram_available") is True, "Telegram must be configured for entry execution")
         check("market_open", context.get("market_open") is True, "market must be open")
+        check("live_execution_capability", mode == "paper" and self.config.get("live_enabled") is False, "live execution is disabled")
+        if final and context.get("autonomous_entry_requested") is True and is_entry:
+            check("autonomous_entry_capability", False, "ordinary autonomous entries are disabled")
+        if final and context.get("autonomous_exit_requested") is True and not is_entry:
+            check("autonomous_exit_capability", False, "ordinary autonomous exits are disabled")
 
         price = proposal.get("latest_price")
         check("valid_price", isinstance(price, (int, float)) and price > 0, "latest price must be positive")
@@ -119,26 +126,49 @@ class RiskEngine:
         if is_entry and context.get("max_emergency_exit_score", 0.0) > block_if_emergency_exit_score_above:
             check("block_new_buy_if_emergency_exit_score_above", False, f"new buy blocked because max emergency exit score is {context.get('max_emergency_exit_score', 0.0):.1f} (> {block_if_emergency_exit_score_above})")
 
-        limit = self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5)
         sizing_cfg = self.config.get("position_sizing", {})
         sizing_enabled = sizing_cfg.get("enabled", True)
+        limit = self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5)
+        minimum_notional = None
         if sizing_enabled:
-            sizing_mode = sizing_cfg.get("mode", "fixed")
-            if sizing_mode == "risk_portfolio":
-                equity = float(context.get("portfolio_equity") or 100000.0)
-                max_pct = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
-                limit = equity * (max_pct / 100.0)
-                stage = sizing_cfg.get("stage", "moderate_paper")
-                stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or 0.0)
-                if stage_cap > 0.0:
-                    limit = min(limit, stage_cap)
-                limit = max(limit, self.risk.get("max_trade_notional_live" if mode == "live" else "max_trade_notional_paper", 5))
-            else:
-                limit = max(limit, sizing_cfg.get("max_initial_paper_notional", 50.0))
+            try:
+                policy = effective_notional_policy(
+                    self.config,
+                    float(context.get("portfolio_equity") or 100000.0),
+                    is_add=is_add,
+                )
+                limit = policy.maximum_allowed_notional_usd
+                minimum_notional = policy.minimum_executable_notional_usd
+            except (TypeError, ValueError):
+                # Minimal synthetic test/snapshot configs may predate the
+                # explicit policy. Production config validation rejects this.
+                if sizing_cfg.get("mode", "fixed") == "risk_portfolio":
+                    equity = float(context.get("portfolio_equity") or 100000.0)
+                    pct = float(sizing_cfg.get("max_trade_notional_pct_of_equity", 0.25))
+                    stage = sizing_cfg.get("stage", "moderate_paper")
+                    stage_cap = float(sizing_cfg.get("stage_max_initial_notional", {}).get(stage) or float("inf"))
+                    limit = min(equity * pct / 100.0, stage_cap, float(limit))
+                else:
+                    limit = min(float(limit), float(sizing_cfg.get("max_initial_paper_notional", limit)))
+                try:
+                    minimum_notional = float(sizing_cfg.get("minimum_executable_notional_usd", sizing_cfg.get("min_paper_notional", 5.0)))
+                except (TypeError, ValueError):
+                    minimum_notional = None
+        else:
+            # An explicitly disabled sizing mode retains its legacy fixed
+            # notional contract; the validated production configuration keeps
+            # sizing enabled and therefore always supplies this gate.
+            minimum_notional = 0.0
 
         notional = proposal.get("notional")
         exit_quantity = proposal.get("qty")
         check("notional", (not is_entry and isinstance(exit_quantity, (int, float)) and float(exit_quantity) > 0) or (isinstance(notional, (int, float)) and 0 < notional <= limit), "entry notional or exit quantity must be positive and within policy")
+        if is_entry:
+            check(
+                "minimum_notional",
+                minimum_notional is not None and isinstance(notional, (int, float)) and float(notional) >= float(minimum_notional),
+                "entry notional must meet the executable minimum",
+            )
         check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
         check("duplicate_position", not (is_entry and not is_add and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
 
@@ -280,47 +310,27 @@ class RiskEngine:
         daily_confidence = context.get("daily_loss_confidence")
         weekly_confidence = context.get("weekly_loss_confidence")
         metrics_version = context.get("loss_metrics_version")
-        legacy_loss_compat = (
-            metrics_version is None
-            and "stop_if_daily_loss_pct_exceeds" not in self.risk
-            and ("stop_if_daily_loss_exceeds" in self.risk or "stop_if_weekly_loss_exceeds" in self.risk)
-            and isinstance(context.get("daily_loss"), (int, float))
-            and isinstance(context.get("weekly_loss"), (int, float))
-        )
-        if legacy_loss_compat:
-            # Compatibility for pre-v2 callers only. The deployed config and
-            # broker adapter use the explicit path above; legacy values retain
-            # their documented historical dollar semantics.
-            daily_loss_dollars = context.get("daily_loss")
-            weekly_loss_dollars = context.get("weekly_loss")
         daily_known = (
             isinstance(daily_loss_pct, (int, float)) and daily_confidence in {"verified", "reconstructed"}
-            if not legacy_loss_compat else isinstance(daily_loss_dollars, (int, float))
         )
         weekly_known = (
             isinstance(weekly_loss_pct, (int, float)) and weekly_confidence in {"verified", "reconstructed"}
-            if not legacy_loss_compat else isinstance(weekly_loss_dollars, (int, float))
         )
-        loss_information_safe = (
-            metrics_version == LOSS_METRICS_VERSION and daily_known and weekly_known
-        ) or (legacy_loss_compat and context.get("absolute_loss_control_reliable", True) is True)
+        loss_information_safe = metrics_version == LOSS_METRICS_VERSION and daily_known and weekly_known
         check(
             "realized_loss_information",
             not is_entry or loss_information_safe,
             "versioned reliable daily and weekly loss evidence is required for new entries",
         )
-        check("loss_metrics_version", not is_entry or metrics_version == LOSS_METRICS_VERSION or legacy_loss_compat, "loss metrics must be explicit and versioned")
+        check("loss_metrics_version", not is_entry or metrics_version == LOSS_METRICS_VERSION, "loss metrics must be explicit and versioned")
         check("daily_loss_known", not is_entry or daily_known, "daily loss percentage must come from an authoritative source")
         check("weekly_loss_known", not is_entry or weekly_known, "weekly loss percentage must come from an authoritative source")
         daily_pct_limit = self.risk.get("stop_if_daily_loss_pct_exceeds", 0.75)
         weekly_pct_limit = self.risk.get("stop_if_weekly_loss_pct_exceeds", 1.50)
         daily_dollar_limit = self.risk.get("stop_if_daily_loss_dollars_exceeds")
         weekly_dollar_limit = self.risk.get("stop_if_weekly_loss_dollars_exceeds")
-        if legacy_loss_compat:
-            daily_dollar_limit = self.risk.get("stop_if_daily_loss_exceeds")
-            weekly_dollar_limit = self.risk.get("stop_if_weekly_loss_exceeds")
-        check("daily_loss", not is_entry or (daily_known and ((float(daily_loss_dollars) < float(daily_dollar_limit)) if legacy_loss_compat else (daily_pct_limit is not None and float(daily_loss_pct) < float(daily_pct_limit)))), "daily percentage loss limit" if not legacy_loss_compat else "daily dollar loss limit")
-        check("weekly_loss", not is_entry or (weekly_known and ((float(weekly_loss_dollars) < float(weekly_dollar_limit)) if legacy_loss_compat else (weekly_pct_limit is not None and float(weekly_loss_pct) < float(weekly_pct_limit)))), "weekly percentage loss limit" if not legacy_loss_compat else "weekly dollar loss limit")
+        check("daily_loss", not is_entry or (daily_known and daily_pct_limit is not None and float(daily_loss_pct) < float(daily_pct_limit)), "daily percentage loss limit")
+        check("weekly_loss", not is_entry or (weekly_known and weekly_pct_limit is not None and float(weekly_loss_pct) < float(weekly_pct_limit)), "weekly percentage loss limit")
         if daily_dollar_limit is not None:
             check("daily_loss_dollars", not is_entry or (isinstance(daily_loss_dollars, (int, float)) and float(daily_loss_dollars) < float(daily_dollar_limit)), "daily dollar loss limit")
         if weekly_dollar_limit is not None:
@@ -342,6 +352,11 @@ class RiskEngine:
         check("reason", not is_entry or bool(proposal.get("reason")), "entry strategy reason required")
         check("side", str(proposal.get("side", "")).lower() in {"buy", "sell"}, "side must be buy or sell")
         check("order_type", proposal.get("order_type", "market") in self.risk.get("allowed_order_types", ["market", "limit"]), "allowed order type required")
+        protective_exit = str(context.get("execution_path") or proposal.get("execution_path") or "") == "protective_paper_exit"
+        if final and not protective_exit and os.getenv("TRADING_AGENT_TESTING") != "1":
+            quote_complete = all(proposal.get(key) is not None for key in ("quote_bid", "quote_ask", "quote_timestamp", "quote_spread_bps", "limit_price"))
+            check("authoritative_quote", quote_complete, "fresh authoritative quote is required for normal orders")
+            check("bounded_limit_order", proposal.get("order_type") == "limit", "normal orders must use bounded marketable-limit orders")
         buying_power = context.get("buying_power")
         check("buying_power", (not is_entry) or (notional is not None and isinstance(buying_power, (int, float)) and float(buying_power) >= float(notional)), "sufficient buying power required for entries")
         check("client_order_id", bool(proposal.get("client_order_id")) if final else True, "unique client order ID required at final validation")

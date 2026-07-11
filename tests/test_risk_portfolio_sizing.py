@@ -236,8 +236,10 @@ def test_risk_portfolio_sizing_small_account():
     
     res = service._calculate_dynamic_size("SPY", 90.0, "normal", 100.0, bars, snapshot)
     
-    # Sizing should succeed at exactly $5 (matching cash usage limit and min_paper_notional clamp)
-    assert res["final_notional"] == 5.0
+    # A constrained result below the executable minimum is blocked; it is not
+    # raised to the minimum by an upward clamp.
+    assert res["final_notional"] == 0.0
+    assert "below the executable minimum" in res["blocked_reason"]
     
     # Account has only $8 cash left.
     # usable cash = 8 - 10 = -$2. usable cash = 0. cash_cap = 0.

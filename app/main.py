@@ -63,6 +63,10 @@ def run_once(config_path: str | Path | None = None) -> int:
     if os.getenv("TRADING_AGENT_STALE_LOCK_RECOVERED") == "1":
         storage.audit(run_id, "stale_lock_recovered", {"lock": "logs/runtime/agent.lockdir"})
     storage.execute("INSERT INTO config_snapshots(run_id,config_json,created_at) VALUES(?,?,datetime('now'))", (run_id, __import__("json").dumps(redact(config), sort_keys=True)))
+    storage.execute(
+        "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('effective_config_hash',?,datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        (str(config.get("effective_config_hash") or ""),),
+    )
     try:
         core_result = run_core_preflight(
             config,

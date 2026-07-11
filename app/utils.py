@@ -150,9 +150,10 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config = load_yaml(path or PROJECT_ROOT / "config" / "config.yaml")
-    from .configuration import validate_config
+    from .configuration import effective_config_hash, validate_config
 
     validate_config(config)
+    config["effective_config_hash"] = effective_config_hash(config)
     return config
 
 

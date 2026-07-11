@@ -1,3 +1,5 @@
+configuration_schema_version: plutus_effective_config_v1
+strict_unknown_keys: true
 mode: paper
 live_enabled: false
 explicit_live_confirmation: false
@@ -73,11 +75,12 @@ phase4:
   preserve_cash_on_unreliable_evidence: true
   require_manual_approval: true
   phase3_hard_limits_authoritative: true
-capabilities:
-  live_trading_supported: false
-  auto_execution_supported: false
+execution_capabilities:
+  live_execution_enabled: false
+  autonomous_entries_enabled: false
+  autonomous_exits_enabled: false
+  protective_paper_exit_enabled: true
 broker: alpaca
-scan_interval_minutes: 10
 require_power: true
 require_market_open: true
 preflight:
@@ -193,16 +196,9 @@ proposal_expiry_notify_on_expiry: true
 proposal_expiry_high_volatility_threshold: 0.20
 proposal_expiry_low_volatility_threshold: 0.12
 
-# Auto-Execution Design (strictly paper-only, disabled by default)
+# Manual approval is mandatory for ordinary paper entries and exits.
 auto_execution_enabled: false
 auto_execution_mode: manual_only
-paper_auto_min_asset_score: 90
-paper_auto_min_trade_score: 90
-paper_auto_max_notional: 1
-paper_auto_max_trades_per_day: 1
-paper_auto_require_no_open_orders: true
-paper_auto_require_final_revalidation: true
-paper_auto_notify_after_execution: true
 
 portfolio_execution_mode: risk_budgeted
 proposal_mode:
@@ -212,11 +208,6 @@ proposal_mode:
   require_individual_approval_per_trade: true
   allow_yes_all_for_paper: true
   yes_all_requires_each_trade_final_revalidation: true
-
-execution_limits:
-  max_new_buy_orders_per_day: null
-  max_new_buy_proposals_per_cycle: null
-  max_pending_buy_proposals: null
 
 risk_budget:
   risk_per_trade_pct: 0.20
@@ -527,8 +518,11 @@ ai:
   ai_review_min_interval_minutes: 30
   ai_daily_call_limit: 10
   ai_max_calls_per_run: 2
+  required_for_trading: false
 ml_shadow_enabled: false
 risk:
+  # Compatibility baseline only when position_sizing.enabled is explicitly false.
+  # Active production sizing uses position_sizing.*_notional_usd exclusively.
   max_trade_notional_paper: 50
   max_trade_notional_live: 5
   max_trades_per_day: 3
@@ -555,7 +549,6 @@ risk:
   max_new_buy_proposals_per_cycle: null
   max_pending_buy_proposals: null
   allow_multiple_exit_proposals: true
-  require_gpt_review_for_buy_proposals: true
 
 portfolio_behavior:
   max_open_positions: 3
@@ -578,29 +571,31 @@ position_sizing:
   stage: moderate_paper
 
   use_stage_dollar_cap: true
-  stage_max_initial_notional:
+  stage_max_initial_notional_usd:
     smoke_test: 25
     moderate_paper: 250
     realistic_paper: null
     performance_calibrated: null
 
-  stage_max_add_notional:
+  stage_max_add_notional_usd:
     smoke_test: 10
     moderate_paper: 100
     realistic_paper: null
     performance_calibrated: null
 
   risk_per_trade_pct: 0.20
-  max_trade_notional_pct_of_equity: 6.0
-  max_position_notional_pct_of_equity: 6.0
+  max_trade_notional_pct_equity: 6.0
+  max_position_notional_pct_equity: 6.0
   max_total_portfolio_exposure_pct: 30.0
   max_cluster_exposure_pct: 15.0
   min_cash_reserve_pct: 20.0
   max_cash_usage_pct: 10.0
   max_margin_usage_pct: 0.0
 
-  base_paper_notional: 50
-  min_paper_notional: 5
+  default_paper_notional_usd: 50
+  default_add_notional_usd: 50
+  minimum_executable_notional_usd: 5
+  absolute_max_notional_usd: 50
   add_size_multiplier: 0.5
 
   stop_model:
@@ -660,6 +655,12 @@ storage:
   export_dir: data/exports
   backup_dir: data/backups
   active_db_must_be_local: true
+
+quotes:
+  max_age_seconds: 15
+  max_spread_bps: 50
+  max_limit_slippage_bps: 25
+  price_increment_usd: 0.01
 
 # 30-Minute Telegram Market Digest Config
 digest:

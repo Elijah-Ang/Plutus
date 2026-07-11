@@ -23,13 +23,13 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "ai_reviews": "id INTEGER PRIMARY KEY, run_id TEXT, proposal_id TEXT, summary TEXT, risks TEXT, caution_level TEXT, payload TEXT, created_at TEXT",
     "trade_proposals": "id TEXT PRIMARY KEY, run_id TEXT, signal_id TEXT, symbol TEXT, side TEXT, notional REAL, status TEXT, created_at TEXT, expires_at TEXT, strategy_version TEXT, payload TEXT, expiry_notified INTEGER DEFAULT 0, telegram_message_id TEXT, proposal_market_rank INTEGER, proposal_eligible_rank INTEGER, selection_reason TEXT, ai_review_status TEXT, ai_confidence TEXT, ai_caution TEXT, true_score_rank INTEGER, watchlist_order INTEGER, setup_key TEXT, cooldown_applied INTEGER, cooldown_remaining_minutes REAL, cooldown_reason TEXT, revival_reason TEXT, last_proposal_status TEXT, score_delta REAL, volatility_regime_change TEXT, exit_priority_applied INTEGER, exit_trigger_reason TEXT, position_drawdown_pct REAL, average_entry_price REAL, latest_position_price REAL, gpt_exit_explanation_status TEXT, gpt_exit_confidence TEXT, gpt_exit_caution TEXT, final_proposal_message_category TEXT, emergency_exit_score REAL, emergency_exit_triggered INTEGER DEFAULT 0, emergency_exit_trigger_reason TEXT, emergency_exit_hard_trigger TEXT, emergency_exit_mode TEXT, emergency_exit_wait_seconds INTEGER, emergency_exit_user_response TEXT, emergency_exit_auto_execute_due_at TEXT, emergency_exit_auto_execute_attempted_at TEXT, emergency_exit_final_decision TEXT, emergency_exit_block_reason TEXT, current_price REAL, atr_value REAL, adverse_move_atr REAL, minutes_to_close REAL, sleep_mode_active INTEGER DEFAULT 0, suppressed_by_sleep_mode INTEGER DEFAULT 0, sleep_mode_reason TEXT, sleep_mode_suppressed_candidate INTEGER DEFAULT 0, sleep_mode_started_at TEXT, sleep_mode_ended_at TEXT",
     "approvals": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, sender_id TEXT, raw_message TEXT, parsed_action TEXT, authorized INTEGER, status TEXT, created_at TEXT, consumed_at TEXT, reply_to_message_id TEXT, proposal_targeting_method TEXT, acknowledgement_status TEXT, approval_received_at TEXT, acknowledgement_sent_at TEXT, acknowledgement_delay_seconds REAL, final_revalidation_started_at TEXT, final_revalidation_completed_at TEXT, price_refreshed_at TEXT, refreshed_price REAL, refreshed_price_age_seconds REAL, price_move_bps_since_proposal REAL, final_order_decision TEXT, final_block_reason TEXT, UNIQUE(proposal_id, status) ON CONFLICT ABORT",
-    "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, created_at TEXT, updated_at TEXT",
-    "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT, fill_notified_at TEXT, fill_notification_status TEXT, fill_notification_error TEXT",
+    "orders": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT UNIQUE, broker_order_id TEXT, client_order_id TEXT UNIQUE, symbol TEXT, side TEXT, notional REAL, qty REAL, status TEXT, payload TEXT, quote_bid REAL, quote_ask REAL, quote_timestamp TEXT, quote_spread_bps REAL, limit_price REAL, implementation_shortfall_bps REAL, created_at TEXT, updated_at TEXT",
+    "fills": "id INTEGER PRIMARY KEY, run_id TEXT, order_id TEXT, qty REAL, price REAL, filled_at TEXT, payload TEXT, implementation_shortfall_bps REAL, fill_notified_at TEXT, fill_notification_status TEXT, fill_notification_error TEXT",
     # Phase 0 execution integrity invariants:
     # - the intent and reservation are committed before any broker submission;
     # - logical_action_key and client_order_id are stable across restarts;
     # - UNKNOWN is non-terminal and retains its reservation until reconciliation proves the outcome.
-    "order_intents": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, approval_id TEXT, source_id TEXT NOT NULL, source_type TEXT NOT NULL, logical_action_key TEXT NOT NULL UNIQUE, candidate_id TEXT, position_lifecycle_id TEXT, symbol TEXT NOT NULL, side TEXT NOT NULL, intended_action TEXT NOT NULL, request_basis TEXT NOT NULL CHECK(request_basis IN ('quantity','notional')), approved_quantity_ceiling REAL, approved_notional_ceiling REAL, requested_quantity REAL NOT NULL, requested_notional REAL, filled_quantity REAL NOT NULL DEFAULT 0 CHECK(filled_quantity>=0), average_fill_price REAL, reference_price REAL NOT NULL CHECK(reference_price>0), intended_stop_price REAL, reserved_notional REAL NOT NULL DEFAULT 0 CHECK(reserved_notional>=0), reserved_stop_risk REAL NOT NULL DEFAULT 0 CHECK(reserved_stop_risk>=0), client_order_id TEXT NOT NULL UNIQUE, trading_mode TEXT NOT NULL CHECK(trading_mode='paper'), state TEXT NOT NULL, submission_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(submission_attempt_count>=0), broker_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, first_submission_at TEXT, last_reconciliation_at TEXT, terminal_at TEXT, last_error_category TEXT, safe_error_summary TEXT, transition_counter INTEGER NOT NULL DEFAULT 0 CHECK(transition_counter>=0), not_found_count INTEGER NOT NULL DEFAULT 0 CHECK(not_found_count>=0), replacement_enabled INTEGER NOT NULL DEFAULT 0 CHECK(replacement_enabled IN (0,1)), parent_intent_id TEXT, relationship_group_id TEXT, relationship_type TEXT, order_role TEXT NOT NULL DEFAULT 'primary', protection_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(protection_confirmed IN (0,1)), CHECK(filled_quantity<=requested_quantity+0.000000001)",
+    "order_intents": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT, approval_id TEXT, source_id TEXT NOT NULL, source_type TEXT NOT NULL, logical_action_key TEXT NOT NULL UNIQUE, candidate_id TEXT, position_lifecycle_id TEXT, symbol TEXT NOT NULL, side TEXT NOT NULL, intended_action TEXT NOT NULL, request_basis TEXT NOT NULL CHECK(request_basis IN ('quantity','notional')), approved_quantity_ceiling REAL, approved_notional_ceiling REAL, requested_quantity REAL NOT NULL, requested_notional REAL, filled_quantity REAL NOT NULL DEFAULT 0 CHECK(filled_quantity>=0), average_fill_price REAL, reference_price REAL NOT NULL CHECK(reference_price>0), intended_stop_price REAL, reserved_notional REAL NOT NULL DEFAULT 0 CHECK(reserved_notional>=0), reserved_stop_risk REAL NOT NULL DEFAULT 0 CHECK(reserved_stop_risk>=0), quote_bid REAL, quote_ask REAL, quote_timestamp TEXT, quote_spread_bps REAL, limit_price REAL, implementation_shortfall_bps REAL, client_order_id TEXT NOT NULL UNIQUE, trading_mode TEXT NOT NULL CHECK(trading_mode='paper'), state TEXT NOT NULL, submission_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(submission_attempt_count>=0), broker_order_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, first_submission_at TEXT, last_reconciliation_at TEXT, terminal_at TEXT, last_error_category TEXT, safe_error_summary TEXT, transition_counter INTEGER NOT NULL DEFAULT 0 CHECK(transition_counter>=0), not_found_count INTEGER NOT NULL DEFAULT 0 CHECK(not_found_count>=0), replacement_enabled INTEGER NOT NULL DEFAULT 0 CHECK(replacement_enabled IN (0,1)), parent_intent_id TEXT, relationship_group_id TEXT, relationship_type TEXT, order_role TEXT NOT NULL DEFAULT 'primary', protection_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(protection_confirmed IN (0,1)), CHECK(filled_quantity<=requested_quantity+0.000000001)",
     "order_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, event_key TEXT NOT NULL UNIQUE, from_state TEXT, to_state TEXT NOT NULL, event_type TEXT NOT NULL, broker_event_id TEXT, filled_quantity REAL, fill_price REAL, safe_detail TEXT, created_at TEXT NOT NULL, transition_counter INTEGER NOT NULL",
     "risk_reservations": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL, cluster_name TEXT, initial_notional REAL NOT NULL CHECK(initial_notional>=0), active_notional REAL NOT NULL CHECK(active_notional>=0), initial_stop_risk REAL NOT NULL CHECK(initial_stop_risk>=0), active_stop_risk REAL NOT NULL CHECK(active_stop_risk>=0), state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, released_at TEXT, release_reason TEXT, version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0)",
     "broker_fill_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, broker_event_key TEXT NOT NULL UNIQUE, broker_order_id TEXT, cumulative_filled_quantity REAL NOT NULL CHECK(cumulative_filled_quantity>=0), delta_quantity REAL NOT NULL CHECK(delta_quantity>=0), fill_price REAL NOT NULL CHECK(fill_price>=0), occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, payload TEXT",
@@ -113,6 +113,33 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "dynamic_universe_schedule_state": "id TEXT PRIMARY KEY, schedule_name TEXT UNIQUE, schedule_type TEXT, due_at TEXT, last_started_at TEXT, last_completed_at TEXT, last_success_at TEXT, last_skipped_at TEXT, last_skip_reason TEXT, missed_count INTEGER DEFAULT 0, catchup_required INTEGER DEFAULT 0, catchup_attempted_at TEXT, catchup_completed_at TEXT, catchup_status TEXT, data_freshness_status TEXT, provider_health_status TEXT, internet_status TEXT, power_status TEXT, battery_pct REAL, stale_after_minutes INTEGER, promotion_allowed INTEGER DEFAULT 0, demotion_allowed INTEGER DEFAULT 0, notes TEXT, created_at TEXT, updated_at TEXT",
 }
 
+P1_EXECUTION_SCHEMA_VERSION = "p1_execution_safety_v1"
+
+
+def apply_p1_execution_schema(conn: sqlite3.Connection, *, record_migration: bool = True) -> None:
+    """Add quote/limit/fill-shortfall fields without rewriting order history."""
+    additions = {
+        "orders": {
+            "quote_bid": "REAL", "quote_ask": "REAL", "quote_timestamp": "TEXT",
+            "quote_spread_bps": "REAL", "limit_price": "REAL", "implementation_shortfall_bps": "REAL",
+        },
+        "fills": {"implementation_shortfall_bps": "REAL"},
+        "order_intents": {
+            "quote_bid": "REAL", "quote_ask": "REAL", "quote_timestamp": "TEXT",
+            "quote_spread_bps": "REAL", "limit_price": "REAL", "implementation_shortfall_bps": "REAL",
+        },
+    }
+    for table, columns in additions.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, column_type in columns.items():
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
+    if record_migration:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (P1_EXECUTION_SCHEMA_VERSION, iso_now(), "quote validation, bounded limit orders, and implementation-shortfall persistence"),
+        )
+
 
 class Storage:
     def __init__(self, path: str | Path = PROJECT_ROOT / "data" / "trading_agent.db") -> None:
@@ -144,6 +171,7 @@ class Storage:
             from .shadow_strategies import apply_phase2_schema
             from .phase3_risk import apply_phase3_schema
             from .phase4_allocator import apply_phase4_schema
+            apply_p1_execution_schema(conn)
 
             apply_phase1_schema(conn)
             apply_phase2_schema(conn)
@@ -188,6 +216,7 @@ class Storage:
                 apply_phase3_schema(conn, record_migration=False)
                 from .phase4_allocator import apply_phase4_schema
                 apply_phase4_schema(conn, record_migration=False)
+                apply_p1_execution_schema(conn, record_migration=False)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.
             now = iso_now()

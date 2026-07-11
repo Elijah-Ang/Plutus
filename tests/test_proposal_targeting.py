@@ -344,12 +344,12 @@ def test_gpt_review_required_blocks_when_unavailable(temp_storage, mock_config):
 
     try:
         service.scan()
-        # Verify no proposal generated
+        # AI is optional commentary and cannot suppress deterministic proposals.
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE status='pending'")
-        assert len(props) == 0
+        assert len(props) > 0
         
         # Verify deferred_ai_review_reason in market_memory
-        deferred = temp_storage.fetch_all("SELECT * FROM market_memory WHERE deferred_ai_review_reason='deferred_ai_review_unavailable'")
+        deferred = temp_storage.fetch_all("SELECT * FROM market_memory WHERE deferred_ai_review_reason='commentary_unavailable'")
         assert len(deferred) > 0
     finally:
         app.service.evaluate_symbol = original_evaluate

@@ -109,6 +109,10 @@ class AlpacaBroker(BrokerInterface):
         from alpaca.data.requests import StockLatestTradeRequest
         return self._call("get_latest_price", "market_data", lambda: self.data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol])
 
+    def get_latest_quote(self, symbol: str) -> Any:
+        from alpaca.data.requests import StockLatestQuoteRequest
+        return self._call("get_latest_quote", "market_data", lambda: self.data.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))[symbol])
+
     def get_historical_bars(self, symbol: str, timeframe: str = "1Day", limit: int = 250) -> Any:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame

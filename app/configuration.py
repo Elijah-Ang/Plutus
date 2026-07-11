@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import warnings
 from typing import Any
 
@@ -21,6 +23,40 @@ DEPRECATED_KEYS = {
 }
 _WARNED_DEPRECATIONS: set[str] = set()
 
+STRICT_TOP_LEVEL_KEYS = {
+    "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
+    "phase2_shadow_strategies", "phase3", "phase4", "execution_capabilities", "broker",
+    "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "crypto",
+    "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
+    "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
+    "proposal_expiry_high_volatility_threshold", "proposal_expiry_low_volatility_threshold", "portfolio_execution_mode",
+    "proposal_mode", "auto_execution_enabled", "auto_execution_mode", "risk_budget", "data_providers", "alpaca", "eodhd", "news_providers", "dynamic_universe",
+    "dynamic_universe_resilience", "position_management", "telegram", "ai", "ml_shadow_enabled", "risk",
+    "portfolio_behavior", "position_sizing", "portfolio_optimizer", "add_to_position", "cash_management", "storage",
+    "digest", "emergency_exit", "quotes",
+}
+
+STRICT_SECTION_KEYS = {
+    "execution_capabilities": {"live_execution_enabled", "autonomous_entries_enabled", "autonomous_exits_enabled", "protective_paper_exit_enabled"},
+    "quotes": {"max_age_seconds", "max_spread_bps", "max_limit_slippage_bps", "price_increment_usd"},
+    "risk": {
+        "max_trade_notional_paper", "max_trade_notional_live", "max_trades_per_day", "max_open_positions",
+        "allow_add_to_existing_position", "block_new_buys_when_any_position_open", "block_new_buys_after_buy_order_submitted_today",
+        "block_same_symbol_rebuy_while_position_open", "allow_margin", "allow_shorting", "allow_options", "allow_crypto",
+        "allow_fractional", "signal_expiry_minutes", "stop_if_daily_loss_pct_exceeds", "stop_if_weekly_loss_pct_exceeds",
+        "stop_if_daily_loss_dollars_exceeds", "stop_if_weekly_loss_dollars_exceeds", "require_final_revalidation", "allowed_order_types",
+        "max_price_age_seconds", "min_historical_bars", "max_price_gap_pct", "max_new_buy_proposals_per_cycle", "max_pending_buy_proposals",
+        "allow_multiple_exit_proposals", "use_gpt_for_exit_explanations", "exit_gpt_max_wait_seconds",
+    },
+    "position_sizing": {
+        "enabled", "mode", "stage", "use_stage_dollar_cap", "stage_max_initial_notional_usd", "stage_max_add_notional_usd",
+        "risk_per_trade_pct", "max_trade_notional_pct_equity", "max_position_notional_pct_equity", "max_total_portfolio_exposure_pct",
+        "max_cluster_exposure_pct", "min_cash_reserve_pct", "max_cash_usage_pct", "max_margin_usage_pct",
+        "default_paper_notional_usd", "default_add_notional_usd", "minimum_executable_notional_usd", "absolute_max_notional_usd",
+        "add_size_multiplier", "stop_model", "score_multiplier", "volatility_multiplier",
+    },
+}
+
 
 def validate_config(config: dict[str, Any]) -> list[str]:
     """Validate safety semantics while retaining compatible non-critical keys."""
@@ -31,12 +67,29 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         if not condition:
             errors.append(message)
 
+    if config.get("strict_unknown_keys") is True:
+        unknown = sorted(set(config) - STRICT_TOP_LEVEL_KEYS)
+        errors.extend(f"unknown top-level configuration key: {key}" for key in unknown)
+        for section, allowed in STRICT_SECTION_KEYS.items():
+            value = config.get(section)
+            if isinstance(value, dict):
+                errors.extend(f"unknown {section} configuration key: {key}" for key in sorted(set(value) - allowed))
+        sizing_source = config.get("position_sizing", {}) or {}
+        for required_key in ("minimum_executable_notional_usd", "default_paper_notional_usd", "absolute_max_notional_usd"):
+            if required_key not in sizing_source:
+                errors.append(f"position_sizing.{required_key} is required")
+
     mode = config.get("mode", "paper")
     require(mode in {"paper", "live"}, "mode must be paper or live")
     require(mode == "paper", "this build is paper-only; mode=live is contradictory")
     require(config.get("live_enabled") is False, "live_enabled must be false in this build")
     require(config.get("auto_execution_enabled", False) is False, "auto_execution_enabled must remain false")
     require(config.get("auto_execution_mode", "manual_only") == "manual_only", "auto_execution_mode must be manual_only")
+    capabilities = config.get("execution_capabilities", {}) or {}
+    require(capabilities.get("live_execution_enabled", False) is False, "live execution capability must remain disabled")
+    require(capabilities.get("autonomous_entries_enabled", False) is False, "autonomous ordinary entries must remain disabled")
+    require(capabilities.get("autonomous_exits_enabled", False) is False, "autonomous ordinary exits must remain disabled")
+    require(capabilities.get("protective_paper_exit_enabled", True) is True, "validated protective paper exit capability must remain enabled")
     phase3 = config.get("phase3", {}) or {}
     if phase3.get("active"):
         require(phase3.get("enabled") is True, "active Phase 3 must be enabled")
@@ -67,6 +120,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(exploration_heat is not None and exploration_heat <= 0.25, "Phase 4 exploration heat exceeds the 0.25% bound")
         require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
         require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
+
+    try:
+        from .position_sizing import effective_notional_policy
+        equity_hint = float((config.get("position_sizing", {}) or {}).get("validation_equity_usd", 10000.0))
+        effective_notional_policy(config, equity_hint)
+        effective_notional_policy(config, equity_hint, is_add=True)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"invalid effective notional policy: {exc}")
 
     crypto = config.get("crypto", {}) or {}
     require(crypto.get("live_enabled", False) is False, "crypto.live_enabled must be false")
@@ -124,6 +185,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if errors:
         raise ConfigurationError("; ".join(errors))
     return emitted
+
+
+def effective_config_hash(config: dict[str, Any]) -> str:
+    """Hash the validated effective configuration without self-reference."""
+    payload = {key: value for key, value in config.items() if key != "effective_config_hash"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _number(config: dict[str, Any], key: str, errors: list[str], minimum: float, maximum: float) -> float | None:

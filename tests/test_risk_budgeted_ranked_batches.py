@@ -118,7 +118,7 @@ def config() -> dict:
             "max_open_positions": 99,
             "allow_margin": False,
             "allow_shorting": False,
-            "allowed_order_types": ["market"],
+            "allowed_order_types": ["limit"],
             "max_price_age_seconds": 120,
             "min_historical_bars": 50,
             "max_price_gap_pct": 15,
@@ -419,6 +419,7 @@ def test_yes_all_blocks_buy_candidates_during_sleep_mode(tmp_path):
 
 def test_batch_exit_approval_allowed_during_sleep_mode(tmp_path):
     service, storage = make_service(tmp_path)
+    service.broker.get_positions = lambda: [{"symbol": "SPY", "qty": 0.05, "avg_entry_price": 100.0, "market_value": 5.0}]
     storage.execute("INSERT OR REPLACE INTO control_state(key, value) VALUES('sleep_mode_active', '1')")
     insert_batch(storage, [("p1", "SPY", "sell", "exit")])
 
@@ -465,7 +466,7 @@ def test_expired_batch_candidate_cannot_be_approved(tmp_path):
         "expires_at": expired,
         "strategy_version": "rule_based_v1",
         "reason": "expired batch",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
     }
     storage.execute(
@@ -808,7 +809,7 @@ def risk_proposal() -> dict:
         "expires_at": (now + timedelta(minutes=10)).isoformat(),
         "strategy_version": "rule_based_v1",
         "reason": "test",
-        "order_type": "market",
+        "order_type": "limit",
         "asset_class": "equity",
     }
 

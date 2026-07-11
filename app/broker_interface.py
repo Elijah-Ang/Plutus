@@ -17,6 +17,9 @@ class BrokerInterface(ABC):
     @abstractmethod
     def get_latest_price(self, symbol: str) -> Any: ...
 
+    def get_latest_quote(self, symbol: str) -> Any:
+        raise NotImplementedError("authoritative quote support is required for normal orders")
+
     @abstractmethod
     def get_historical_bars(self, symbol: str, timeframe: str, limit: int) -> Any: ...
 

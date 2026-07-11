@@ -43,7 +43,12 @@ class AuthoritativeBroker:
     def get_open_orders(self): return []
     def get_clock(self): return SimpleNamespace(is_open=True)
     def is_market_open(self): return True
-    def get_loss_metrics(self): return {"daily_loss": 1.0, "weekly_loss": self.weekly_loss}
+    def get_loss_metrics(self): return {
+        "daily_loss_dollars": 1.0, "weekly_loss_dollars": self.weekly_loss,
+        "reference_equity": 101.0, "daily_loss_confidence": "verified",
+        "weekly_loss_confidence": "verified" if self.weekly_loss is not None else "unavailable",
+        "metrics_version": "loss_controls_v2", "provenance": "test_authoritative",
+    }
 
 
 def make_service(tmp_path, broker):
@@ -64,8 +69,9 @@ def test_final_context_uses_authoritative_values(tmp_path, monkeypatch):
     service, _ = make_service(tmp_path, AuthoritativeBroker(margin=True))
     monkeypatch.setattr(service_module, "internet_available", lambda: False)
     context = service._portfolio_context({"symbol": "SPY", "action": "entry"}, approval_valid=True)
-    assert context["daily_loss"] == 1.0
-    assert context["weekly_loss"] == 2.0
+    assert context["daily_loss_dollars"] == 1.0
+    assert context["weekly_loss_dollars"] == 2.0
+    assert "daily_loss" not in context and "weekly_loss" not in context
     assert context["uses_margin"] is True
     assert context["internet_available"] is False
     assert context["broker_available"] is True
