@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import statistics
+from dataclasses import asdict, dataclass
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from .execution import DurableExecutionStore
+from .shadow_strategies import STRATEGY_VERSIONS
+from .utils import iso_now, json_dumps
+
+
+PHASE4_SCHEMA_VERSION = "phase4_adaptive_paper_allocation_v1"
+ALLOCATOR_VERSION = "adaptive_paper_allocator_v1"
+ESTIMATOR_VERSION = "shrunk_oos_estimator_v1"
+COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
+STRATEGIES = ("rule_based_v1", *tuple(sorted(STRATEGY_VERSIONS.values())))
+
+
+@dataclass(frozen=True)
+class StrategyEstimate:
+    strategy_version: str
+    sample_n: int
+    regime_n: int
+    mean_return: float | None
+    shrunk_mean_return: float | None
+    conservative_expected_return: float | None
+    calibrated_positive_probability: float | None
+    standard_error: float | None
+    uncertainty: float
+    data_quality: float
+    deterioration_score: float
+    state: str
+    reason: str
+
+
+def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS phase4_strategy_estimates(
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, strategy_version TEXT NOT NULL,
+      estimated_at TEXT NOT NULL, sample_n INTEGER NOT NULL, regime_n INTEGER NOT NULL,
+      mean_return REAL, shrunk_mean_return REAL, conservative_expected_return REAL,
+      calibrated_positive_probability REAL, standard_error REAL, uncertainty REAL NOT NULL,
+      data_quality REAL NOT NULL, deterioration_score REAL NOT NULL, state TEXT NOT NULL,
+      reason TEXT NOT NULL, estimator_version TEXT NOT NULL, evidence_fingerprint TEXT NOT NULL,
+      payload TEXT NOT NULL, UNIQUE(run_id,strategy_version));
+    CREATE TABLE IF NOT EXISTS phase4_covariance_snapshots(
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, calculated_at TEXT NOT NULL,
+      strategy_order_json TEXT NOT NULL, covariance_json TEXT NOT NULL,
+      correlation_json TEXT NOT NULL, observation_counts_json TEXT NOT NULL,
+      method TEXT NOT NULL, fallback_used INTEGER NOT NULL, data_quality REAL NOT NULL,
+      payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS phase4_allocation_decisions(
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, decided_at TEXT NOT NULL,
+      mode TEXT NOT NULL CHECK(mode='ACTIVE_ADAPTIVE_PAPER'), allocator_version TEXT NOT NULL,
+      strategy_weights_json TEXT NOT NULL, cash_weight REAL NOT NULL,
+      fractional_kelly_ceiling REAL NOT NULL, expected_portfolio_return REAL,
+      portfolio_volatility REAL, expected_shortfall REAL, stress_loss REAL,
+      marginal_risk_json TEXT NOT NULL, component_risk_json TEXT NOT NULL,
+      regime TEXT NOT NULL, drawdown_pct REAL NOT NULL, uncertainty_penalty REAL NOT NULL,
+      data_quality REAL NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+      evidence_fingerprint TEXT NOT NULL, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS phase4_stress_results(
+      id TEXT PRIMARY KEY, allocation_id TEXT NOT NULL, scenario TEXT NOT NULL,
+      assumed_loss REAL NOT NULL, portfolio_loss REAL NOT NULL, passed INTEGER NOT NULL,
+      stress_version TEXT NOT NULL, payload TEXT NOT NULL,
+      UNIQUE(allocation_id,scenario));
+    CREATE TABLE IF NOT EXISTS phase4_strategy_states(
+      strategy_version TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT NOT NULL,
+      estimate_id TEXT NOT NULL, state_version TEXT NOT NULL, evaluated_at TEXT NOT NULL,
+      activated_at TEXT, throttled_at TEXT, suspended_at TEXT, recovered_at TEXT,
+      payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS phase4_activation_events(
+      id TEXT PRIMARY KEY, release_commit TEXT NOT NULL, activated_at TEXT NOT NULL,
+      status TEXT NOT NULL, allocation_id TEXT NOT NULL, paper_identity_json TEXT NOT NULL,
+      account_json TEXT NOT NULL, integrity_json TEXT NOT NULL, profile_version TEXT NOT NULL);
+    """
+    for statement in sql.split(";"):
+        if statement.strip(): conn.execute(statement)
+    if record_migration:
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+                     (PHASE4_SCHEMA_VERSION, iso_now(), "additive Phase 4 estimates, covariance, allocations, stress, states, and activation"))
+
+
+def _fingerprint(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+class AdaptiveAllocator:
+    def __init__(self, storage: Any, config: Mapping[str, Any], run_id: str) -> None:
+        self.storage, self.config, self.run_id = storage, config, run_id
+        self.cfg = config.get("phase4", {})
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.cfg.get("mode") != "ACTIVE_ADAPTIVE_PAPER": raise ValueError("Phase 4 mode must be ACTIVE_ADAPTIVE_PAPER")
+        fraction = float(self.cfg.get("fractional_kelly", 0))
+        if not 0 < fraction <= 0.25: raise ValueError("fractional Kelly must be positive and no greater than one quarter")
+        if self.cfg.get("full_kelly_allowed") is not False: raise ValueError("full Kelly is forbidden")
+        if self.cfg.get("llm_trading_decisions") is not False: raise ValueError("LLM trading decisions are forbidden")
+
+    def _rows(self, strategy: str) -> list[dict[str, Any]]:
+        return self.storage.fetch_all("""SELECT ro.id,ro.regime,ro.split_label,r.exit_session,
+          r.cost_adjusted_return,r.gross_return,r.cost_bps,r.calculated_at
+          FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
+          WHERE ro.strategy_version=? AND ro.split_label='out_of_sample' AND r.horizon_sessions=20
+            AND r.status='completed' AND r.cost_adjusted_return IS NOT NULL
+          ORDER BY r.exit_session,ro.id""", (strategy,))
+
+    def estimate(self, strategy: str) -> tuple[StrategyEstimate, list[dict[str, Any]], str]:
+        rows = self._rows(strategy); values = [float(r["cost_adjusted_return"]) for r in rows]
+        regimes = {str(r.get("regime")) for r in rows if r.get("regime")}
+        fp = _fingerprint(rows)
+        minimum = int(self.cfg.get("minimum_oos_samples", 100)); min_regimes = int(self.cfg.get("minimum_regimes", 2))
+        if not values:
+            return StrategyEstimate(strategy,0,0,None,None,None,None,None,1.0,0.0,1.0,"THROTTLED","no completed OOS evidence"),rows,fp
+        mean = statistics.fmean(values); sd = statistics.stdev(values) if len(values)>1 else 0.0
+        se = sd / math.sqrt(len(values)) if len(values)>1 else None
+        prior_strength = float(self.cfg.get("shrinkage_prior_samples", 100))
+        shrunk = mean * len(values) / (len(values)+prior_strength)
+        conservative = shrunk - float(self.cfg.get("confidence_z",1.96)) * (se or abs(mean) or 1.0)
+        wins = sum(v>0 for v in values); calibrated_p = (wins+10.0)/(len(values)+20.0)
+        recent = values[-max(5,min(20,len(values)//3 or 1)):]
+        earlier = values[:-len(recent)]
+        deterioration = max(0.0,(statistics.fmean(earlier)-statistics.fmean(recent))/(sd or 1.0)) if earlier else 0.0
+        completeness = min(1.0,len(values)/minimum); regime_quality=min(1.0,len(regimes)/min_regimes)
+        cost_quality = 1.0 if all(r.get("cost_bps") is not None for r in rows) else 0.5
+        quality = completeness*regime_quality*cost_quality
+        uncertainty = min(1.0,(se or 1.0)/(abs(shrunk)+1e-9))
+        if deterioration >= float(self.cfg.get("deterioration_suspend_z",2.0)): state,reason="SUSPENDED","statistically material recent deterioration"
+        elif len(values)<minimum or len(regimes)<min_regimes: state,reason="THROTTLED","OOS sample or regime coverage incomplete"
+        elif conservative<=0 or calibrated_p<=0.5: state,reason="SUSPENDED","conservative expectancy or calibrated probability is non-positive"
+        else: state,reason="ACTIVE","conservative OOS evidence passed"
+        return StrategyEstimate(strategy,len(values),len(regimes),mean,shrunk,conservative,calibrated_p,se,uncertainty,quality,deterioration,state,reason),rows,fp
+
+    def covariance(self, evidence: Mapping[str,list[dict[str,Any]]]) -> tuple[np.ndarray,bool,dict[str,int]]:
+        n=len(STRATEGIES); matrix=np.zeros((n,n)); counts={s:len(evidence[s]) for s in STRATEGIES}; fallback=False
+        maps={s:{str(r.get("exit_session")):float(r["cost_adjusted_return"]) for r in evidence[s] if r.get("exit_session")} for s in STRATEGIES}
+        default_var=float(self.cfg.get("fallback_annual_variance",0.04))
+        for i,a in enumerate(STRATEGIES):
+            av=list(maps[a].values()); matrix[i,i]=float(np.var(av,ddof=1)) if len(av)>=2 else default_var; fallback |= len(av)<2
+            for j in range(i):
+                b=STRATEGIES[j]; common=sorted(set(maps[a])&set(maps[b]))
+                if len(common)>=5: cov=float(np.cov([maps[a][d] for d in common],[maps[b][d] for d in common],ddof=1)[0,1])
+                else:
+                    cov=0.5*math.sqrt(matrix[i,i]*matrix[j,j]); fallback=True
+                matrix[i,j]=matrix[j,i]=cov
+        target=np.diag(np.diag(matrix)); shrink=float(self.cfg.get("covariance_shrinkage",0.5))
+        matrix=(1-shrink)*matrix+shrink*target
+        return matrix,fallback,counts
+
+    def run(self, *, regime: str, drawdown_pct: float) -> dict[str,Any]:
+        healthy=not any(DurableExecutionStore(self.storage).integrity_report().values())
+        estimates={}; evidence={}; fps=[]; now=iso_now()
+        for strategy in STRATEGIES:
+            estimate,rows,fp=self.estimate(strategy); evidence[strategy]=rows; fps.append(fp)
+            if not healthy: estimate=StrategyEstimate(**{**asdict(estimate),"state":"SUSPENDED","reason":"durable integrity health failed"})
+            estimates[strategy]=estimate
+            eid=_fingerprint([self.run_id,strategy,fp])[:32]
+            self.storage.execute("INSERT OR REPLACE INTO phase4_strategy_estimates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (eid,self.run_id,strategy,now,estimate.sample_n,estimate.regime_n,estimate.mean_return,estimate.shrunk_mean_return,
+               estimate.conservative_expected_return,estimate.calibrated_positive_probability,estimate.standard_error,
+               estimate.uncertainty,estimate.data_quality,estimate.deterioration_score,estimate.state,estimate.reason,
+               ESTIMATOR_VERSION,fp,json_dumps({"cost_adjusted":True,"score_sizing":False}),))
+            self._persist_state(estimate,eid,now)
+        cov,fallback,counts=self.covariance(evidence); diag=np.sqrt(np.maximum(np.diag(cov),1e-12)); corr=cov/np.outer(diag,diag)
+        cov_id=_fingerprint([self.run_id,counts,cov.tolist()])[:32]
+        self.storage.execute("INSERT OR REPLACE INTO phase4_covariance_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+          (cov_id,self.run_id,now,json_dumps(STRATEGIES),json_dumps(cov.tolist()),json_dumps(corr.tolist()),json_dumps(counts),
+           COVARIANCE_VERSION,int(fallback),min(e.data_quality for e in estimates.values()),json_dumps({"overlap_penalty":True,"sector_fallback_correlation":0.5})))
+        weights=np.zeros(len(STRATEGIES)); fraction=float(self.cfg["fractional_kelly"]); max_weight=float(self.cfg.get("max_strategy_weight",0.35))
+        for i,s in enumerate(STRATEGIES):
+            e=estimates[s]
+            if e.state!="ACTIVE" or e.conservative_expected_return is None: continue
+            kelly=max(0.0,e.conservative_expected_return/max(cov[i,i],1e-12))*fraction
+            weights[i]=min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
+        total=float(weights.sum()); max_invested=float(self.cfg.get("max_allocated_risk_fraction",0.75))
+        if total>max_invested: weights*=max_invested/total
+        cash=max(0.0,1.0-float(weights.sum()))
+        port_var=float(weights@cov@weights); port_vol=math.sqrt(max(0.0,port_var)); mu=np.array([estimates[s].conservative_expected_return or 0.0 for s in STRATEGIES]); expected=float(weights@mu)
+        marginal=(cov@weights)/port_vol if port_vol>0 else np.zeros(len(weights)); component=weights*marginal
+        stress=self._stress(weights); stress_loss=max(stress.values()) if stress else 0.0; expected_shortfall=2.063*port_vol
+        decision="PRESERVE_CASH" if float(weights.sum())==0 else "ALLOCATE_ADAPTIVELY"
+        reason="no strategy has reliable positive OOS evidence" if decision=="PRESERVE_CASH" else "eligible strategies sized below fractional Kelly and hard limits"
+        fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
+        payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback}
+        self.storage.execute("INSERT OR REPLACE INTO phase4_allocation_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (aid,self.run_id,now,"ACTIVE_ADAPTIVE_PAPER",ALLOCATOR_VERSION,json_dumps(dict(zip(STRATEGIES,weights.tolist()))),cash,fraction,
+           expected,port_vol,expected_shortfall,stress_loss,json_dumps(dict(zip(STRATEGIES,marginal.tolist()))),json_dumps(dict(zip(STRATEGIES,component.tolist()))),
+           regime,drawdown_pct,statistics.fmean(e.uncertainty for e in estimates.values()),statistics.fmean(e.data_quality for e in estimates.values()),
+           decision,reason,fingerprint,json_dumps(payload)))
+        for scenario,loss in stress.items():
+            sid=_fingerprint([aid,scenario])[:32]
+            self.storage.execute("INSERT OR REPLACE INTO phase4_stress_results VALUES(?,?,?,?,?,?,?,?)",
+                                 (sid,aid,scenario,loss,loss,int(loss<=float(self.cfg.get("max_stress_loss",0.05))),"phase4_stress_v1",json_dumps({"deterministic":True})))
+        return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,"healthy":healthy}
+
+    def _persist_state(self,e:StrategyEstimate,eid:str,now:str)->None:
+        old=self.storage.fetch_all("SELECT state FROM phase4_strategy_states WHERE strategy_version=?",(e.strategy_version,)); previous=old[0]["state"] if old else None
+        recovered=now if previous in {"THROTTLED","SUSPENDED"} and e.state=="ACTIVE" else None
+        self.storage.execute("""INSERT INTO phase4_strategy_states VALUES(?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(strategy_version) DO UPDATE SET state=excluded.state,reason=excluded.reason,estimate_id=excluded.estimate_id,
+          evaluated_at=excluded.evaluated_at,activated_at=COALESCE(phase4_strategy_states.activated_at,excluded.activated_at),
+          throttled_at=excluded.throttled_at,suspended_at=excluded.suspended_at,recovered_at=COALESCE(excluded.recovered_at,phase4_strategy_states.recovered_at),payload=excluded.payload""",
+          (e.strategy_version,e.state,e.reason,eid,"phase4_strategy_state_v1",now,now if e.state=="ACTIVE" else None,
+           now if e.state=="THROTTLED" else None,now if e.state=="SUSPENDED" else None,recovered,json_dumps({"deterministic":True})))
+
+    def _stress(self,w:np.ndarray)->dict[str,float]:
+        invested=float(w.sum())
+        return {"spy_down_3":invested*.03,"spy_down_5":invested*.05,"sector_down_7":float(w.max(initial=0))*.07,
+                "volatility_doubles":invested*.04,"two_atr_gap":invested*.06,"correlations_to_one":invested*.08,
+                "largest_position_down_15":float(w.max(initial=0))*.15}

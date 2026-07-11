@@ -50,6 +50,15 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             Phase3RiskProfile.from_config(config)
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"invalid Phase 3 risk profile: {exc}")
+    phase4 = config.get("phase4", {}) or {}
+    if phase4.get("active"):
+        require(phase4.get("enabled") is True, "active Phase 4 must be enabled")
+        require(phase4.get("mode") == "ACTIVE_ADAPTIVE_PAPER", "Phase 4 mode must be ACTIVE_ADAPTIVE_PAPER")
+        require(phase4.get("full_kelly_allowed") is False, "full Kelly is forbidden")
+        require(phase4.get("llm_trading_decisions") is False, "LLM trading decisions are forbidden")
+        require(phase4.get("uncalibrated_score_sizing") is False, "uncalibrated score sizing is forbidden")
+        kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)
+        require(kelly is not None and kelly <= 0.25, "Phase 4 fractional Kelly cannot exceed one quarter")
 
     crypto = config.get("crypto", {}) or {}
     require(crypto.get("live_enabled", False) is False, "crypto.live_enabled must be false")

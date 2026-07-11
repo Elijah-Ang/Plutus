@@ -143,10 +143,12 @@ class Storage:
             from .research_validation import apply_phase1_schema
             from .shadow_strategies import apply_phase2_schema
             from .phase3_risk import apply_phase3_schema
+            from .phase4_allocator import apply_phase4_schema
 
             apply_phase1_schema(conn)
             apply_phase2_schema(conn)
             apply_phase3_schema(conn)
+            apply_phase4_schema(conn)
             now = iso_now()
             if production_paper:
                 existing = conn.execute("SELECT value FROM runtime_metadata WHERE key='environment'").fetchone()
@@ -184,6 +186,8 @@ class Storage:
             if not is_production_path(self.path):
                 from .phase3_risk import apply_phase3_schema
                 apply_phase3_schema(conn, record_migration=False)
+                from .phase4_allocator import apply_phase4_schema
+                apply_phase4_schema(conn, record_migration=False)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.
             now = iso_now()

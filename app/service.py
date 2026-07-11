@@ -151,6 +151,7 @@ class TradingService:
         self.ai = AIReviewer(config.get("ai", {}))
         self._context_cache: tuple[float, dict[str, Any]] | None = None
         self._phase1_bar_cache: dict[str, Any] = {}
+        self._phase4_allocation_cache: dict[str, Any] | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
@@ -5496,6 +5497,21 @@ class TradingService:
                 "profile": "moderate_paper_risk_v1", "reconciliation_healthy": healthy,
                 "strategy_states": states, "integrity": report, "manual_approval_required": True,
             })
+        if self.config.get("phase4", {}).get("active"):
+            from .phase4_allocator import AdaptiveAllocator
+            from .phase3_risk import Phase3Controller
+            runtime_state = self._authoritative_runtime_state(force=True)
+            equity = float(_value(runtime_state.get("account"), "equity", 0) or 0)
+            drawdown = Phase3Controller(self.storage, self.config, self.run_id).update_equity(equity)
+            self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
+                regime="runtime_mixed_uncertain", drawdown_pct=drawdown
+            )
+            self.storage.audit(self.run_id, "phase4_active_adaptive_allocation", {
+                "allocation_id": self._phase4_allocation_cache["allocation_id"],
+                "decision": self._phase4_allocation_cache["decision"],
+                "cash_weight": self._phase4_allocation_cache["cash_weight"],
+                "manual_approval_required": True, "phase3_limits_authoritative": True,
+            })
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
         self._context_cache = None
@@ -6283,6 +6299,13 @@ class TradingService:
             allocation_mult = controller.allocation("rule_based_v1", states)
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
+            if self.config.get("phase4", {}).get("active"):
+                from .phase4_allocator import AdaptiveAllocator
+                if self._phase4_allocation_cache is None:
+                    self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
+                        regime=volatility_regime, drawdown_pct=drawdown_pct
+                    )
+                allocation_mult = float(self._phase4_allocation_cache["weights"].get("rule_based_v1", 0.0))
             base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
             risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
             risk_budget = equity * (risk_per_trade_pct / 100.0)

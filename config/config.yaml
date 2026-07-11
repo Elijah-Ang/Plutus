@@ -44,6 +44,28 @@ phase3:
     weekly_loss_throttle_pct: 1.50
     drawdown_halt_pct: 6.0
     minimum_average_dollar_volume: 10000000.0
+phase4:
+  enabled: true
+  active: true
+  mode: ACTIVE_ADAPTIVE_PAPER
+  allocator_version: adaptive_paper_allocator_v1
+  fractional_kelly: 0.20
+  full_kelly_allowed: false
+  llm_trading_decisions: false
+  uncalibrated_score_sizing: false
+  minimum_oos_samples: 100
+  minimum_regimes: 2
+  shrinkage_prior_samples: 100
+  confidence_z: 1.96
+  covariance_shrinkage: 0.50
+  fallback_annual_variance: 0.04
+  deterioration_suspend_z: 2.0
+  max_strategy_weight: 0.35
+  max_allocated_risk_fraction: 0.75
+  max_stress_loss: 0.05
+  preserve_cash_on_unreliable_evidence: true
+  require_manual_approval: true
+  phase3_hard_limits_authoritative: true
 capabilities:
   live_trading_supported: false
   auto_execution_supported: false
