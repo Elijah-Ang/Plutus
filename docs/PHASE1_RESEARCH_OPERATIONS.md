@@ -37,7 +37,7 @@ Actual fills, proposals without fills, blocked hypothetical setups, shadow hypot
 
 ## Leakage controls
 
-- Historical simulation calls the production `rule_based_v1` evaluator on an expanding prefix ending before the simulated entry session.
+- Historical simulation calls the production `rule_based_v2` evaluator on an expanding prefix ending before the simulated entry session. It requires 200 completed daily bars and valid MA50/MA200 values.
 - Every opportunity stores strategy, score, feature, universe, regime, eligibility, blocker, and AI-gate versions.
 - Universe membership must be supplied as-of each decision date. Current membership is not an acceptable historical substitute.
 - Revised bars, corporate actions, delistings, and symbol changes require bundle provenance. Missing provenance is reported as unavailable or a limitation.

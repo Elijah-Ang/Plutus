@@ -33,7 +33,7 @@ def base_config():
         },
         "broker": "alpaca",
         "watchlist": ["SPY"],
-        "approved_strategy_versions": ["rule_based_v1"],
+        "approved_strategy_versions": ["rule_based_v2"],
         "storage": {
             "sqlite_path": "data/test_trading.db"
         },

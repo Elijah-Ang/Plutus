@@ -131,6 +131,10 @@ def test_nonverified_realized_loss_blocks_entry_without_reliable_absolute_fallba
     context.update(
         daily_realized_pl_status=status,
         weekly_realized_pl_status=status,
+        daily_loss_pct=None,
+        weekly_loss_pct=None,
+        daily_loss_confidence="unavailable",
+        weekly_loss_confidence="unavailable",
         absolute_loss_control_reliable=False,
     )
     decision = RiskEngine(safe_config).evaluate(proposal, context)
@@ -142,10 +146,15 @@ def test_verified_realized_loss_is_enforced_without_broker_fallback(safe_config,
     context.update(
         daily_loss=None,
         weekly_loss=None,
-        daily_realized_pl=-safe_config["risk"]["stop_if_daily_loss_exceeds"],
+        daily_loss_dollars=5.0,
+        weekly_loss_dollars=0.0,
+        daily_loss_pct=5.0,
+        weekly_loss_pct=0.0,
+        daily_loss_confidence="verified",
+        weekly_loss_confidence="verified",
+        daily_realized_pl=-5.0,
         weekly_realized_pl=0.0,
-        daily_realized_pl_status="verified",
-        weekly_realized_pl_status="verified",
+        loss_metrics_version="loss_controls_v2",
         absolute_loss_control_reliable=False,
     )
     decision = RiskEngine(safe_config).evaluate(proposal, context)
@@ -158,8 +167,10 @@ def test_unavailable_realized_loss_does_not_block_risk_reducing_exit(safe_config
     context.update(
         daily_loss=None,
         weekly_loss=None,
-        daily_realized_pl_status="unavailable",
-        weekly_realized_pl_status="unavailable",
+        daily_loss_pct=None,
+        weekly_loss_pct=None,
+        daily_loss_confidence="unavailable",
+        weekly_loss_confidence="unavailable",
         absolute_loss_control_reliable=False,
     )
     decision = RiskEngine(safe_config).evaluate(exit_proposal, context)
@@ -168,13 +179,17 @@ def test_unavailable_realized_loss_does_not_block_risk_reducing_exit(safe_config
     assert relevant["daily_loss_known"] and relevant["weekly_loss_known"]
 
 
-def test_absolute_loss_limit_remains_active_and_percentages_are_display_only(safe_config, proposal, context):
+def test_dollar_loss_limit_is_separate_from_percentage_loss(safe_config, proposal, context):
+    safe_config["risk"]["stop_if_daily_loss_dollars_exceeds"] = 5.0
     context.update(
-        daily_loss=safe_config["risk"]["stop_if_daily_loss_exceeds"],
-        weekly_loss=0,
-        daily_realized_pl_status="verified",
-        weekly_realized_pl_status="verified",
+        daily_loss_dollars=5.0,
+        weekly_loss_dollars=0.0,
+        daily_loss_pct=0.5,
+        weekly_loss_pct=0.0,
+        daily_loss_confidence="verified",
+        weekly_loss_confidence="verified",
+        loss_metrics_version="loss_controls_v2",
     )
     decision = RiskEngine(safe_config).evaluate(proposal, context)
-    assert not next(item for item in decision.checks if item.name == "daily_loss").passed
-    assert not any(item.name in {"daily_realized_loss_pct_limit", "weekly_realized_loss_pct_limit"} for item in decision.checks)
+    assert not next(item for item in decision.checks if item.name == "daily_loss_dollars").passed
+    assert next(item for item in decision.checks if item.name == "daily_loss").passed

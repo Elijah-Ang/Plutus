@@ -37,7 +37,7 @@ def test_sleeves_fail_closed_without_evidence_and_can_recover(tmp_path):
     storage = db(tmp_path); controller = Phase3Controller(storage, config(), "run")
     states = controller.refresh_strategy_states()
     assert set(states.values()) == {"THROTTLED"}
-    assert len(storage.fetch_all("SELECT * FROM phase3_strategy_states")) == 5
+    assert len(storage.fetch_all("SELECT * FROM phase3_strategy_states")) == 6
 
 
 def test_equity_drawdown_halts_at_six_percent(tmp_path):

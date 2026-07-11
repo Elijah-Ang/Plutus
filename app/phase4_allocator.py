@@ -11,7 +11,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .execution import DurableExecutionStore
+from .evidence import OPERATIONAL_EVIDENCE_TYPES, SHADOW_OUTCOME, classify_evidence_type
 from .shadow_strategies import STRATEGY_VERSIONS
+from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
 
@@ -19,7 +21,8 @@ PHASE4_SCHEMA_VERSION = "phase4_adaptive_paper_allocation_v1"
 ALLOCATOR_VERSION = "adaptive_paper_allocator_v1"
 ESTIMATOR_VERSION = "shrunk_oos_estimator_v1"
 COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
-STRATEGIES = ("rule_based_v1", *tuple(sorted(STRATEGY_VERSIONS.values())))
+EXECUTABLE_STRATEGIES = (STRATEGY_VERSION,)
+STRATEGIES = (*EXECUTABLE_STRATEGIES, *tuple(sorted(STRATEGY_VERSIONS.values())))
 
 
 @dataclass(frozen=True)
@@ -104,14 +107,24 @@ class AdaptiveAllocator:
         if not 0 < fraction <= 0.25: raise ValueError("fractional Kelly must be positive and no greater than one quarter")
         if self.cfg.get("full_kelly_allowed") is not False: raise ValueError("full Kelly is forbidden")
         if self.cfg.get("llm_trading_decisions") is not False: raise ValueError("LLM trading decisions are forbidden")
+        if self.cfg.get("operational_kelly_enabled") is not False: raise ValueError("operational Kelly must remain disabled")
+        if self.cfg.get("operational_allocation_mode") != "deterministic_equal_risk":
+            raise ValueError("operational allocation must be deterministic equal risk")
 
     def _rows(self, strategy: str) -> list[dict[str, Any]]:
-        return self.storage.fetch_all("""SELECT ro.id,ro.regime,ro.split_label,r.exit_session,
-          r.cost_adjusted_return,r.gross_return,r.cost_bps,r.calculated_at
+        rows = self.storage.fetch_all("""SELECT ro.id,ro.regime,ro.split_label,ro.execution_type,ro.source_table,
+          ro.provenance_json,r.exit_session,r.cost_adjusted_return,r.gross_return,r.cost_bps,r.calculated_at
           FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
           WHERE ro.strategy_version=? AND ro.split_label='out_of_sample' AND r.horizon_sessions=20
             AND r.status='completed' AND r.cost_adjusted_return IS NOT NULL
             ORDER BY r.exit_session,ro.id""", (strategy,))
+        # Executable strategies may use only synchronized executable evidence.
+        # Shadow strategies use shadow outcomes for research state transitions;
+        # neither population is allowed to cross into the other.
+        allowed = OPERATIONAL_EVIDENCE_TYPES if strategy in EXECUTABLE_STRATEGIES else {SHADOW_OUTCOME}
+        return [row for row in rows if classify_evidence_type(
+            row.get("execution_type"), row.get("source_table"), row.get("provenance_json")
+        ) in allowed]
 
     def _is_stale(self, rows: Sequence[Mapping[str, Any]]) -> bool:
         if not rows:
@@ -196,11 +209,19 @@ class AdaptiveAllocator:
           (cov_id,self.run_id,now,json_dumps(STRATEGIES),json_dumps(cov.tolist()),json_dumps(corr.tolist()),json_dumps(counts),
            COVARIANCE_VERSION,int(fallback),min(e.data_quality for e in estimates.values()),json_dumps({"overlap_penalty":True,"sector_fallback_correlation":0.5})))
         weights=np.zeros(len(STRATEGIES)); fraction=float(self.cfg["fractional_kelly"]); max_weight=float(self.cfg.get("max_strategy_weight",0.35))
+        kelly_diagnostics: dict[str, float] = {}
         for i,s in enumerate(STRATEGIES):
             e=estimates[s]
             if e.state!="ACTIVE" or e.conservative_expected_return is None: continue
             kelly=max(0.0,e.conservative_expected_return/max(cov[i,i],1e-12))*fraction
-            weights[i]=min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
+            kelly_diagnostics[s] = min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
+        # Kelly/covariance remain diagnostics.  Operational allocation is
+        # deterministic and only executable strategies can receive it.
+        active_executable = [s for s in EXECUTABLE_STRATEGIES if estimates[s].state == "ACTIVE"]
+        if active_executable:
+            equal_weight = min(max_weight, 1.0 / len(active_executable))
+            for strategy in active_executable:
+                weights[STRATEGIES.index(strategy)] = equal_weight
         total=float(weights.sum()); max_invested=float(self.cfg.get("max_allocated_risk_fraction",0.75))
         if total>max_invested: weights*=max_invested/total
         port_var=float(weights@cov@weights); port_vol=math.sqrt(max(0.0,port_var)); mu=np.array([estimates[s].conservative_expected_return or 0.0 for s in STRATEGIES]); expected=float(weights@mu)
@@ -218,7 +239,7 @@ class AdaptiveAllocator:
         exploration_per_strategy=float(self.cfg.get("exploration_stop_risk_pct",0.05))
         exploration_max_per_strategy=float(self.cfg.get("max_exploration_stop_risk_pct",0.10))
         exploration_heat=0.0; exploration_weights: dict[str,float] = {}
-        for strategy in STRATEGIES:
+        for strategy in EXECUTABLE_STRATEGIES:
             if estimates[strategy].state != "EXPLORATION" or not healthy:
                 continue
             remaining=max(0.0, exploration_heat_cap-exploration_heat)
@@ -241,13 +262,19 @@ class AdaptiveAllocator:
                 strategy_policies[strategy]={"mode":"exploration","state":estimate.state,"stop_risk_pct":exploration_weights[strategy],
                                              "max_stop_risk_pct":exploration_max_per_strategy,"gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),
                                              "kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
-            elif estimate.state=="ACTIVE" and weights[i]>0:
+            elif strategy in EXECUTABLE_STRATEGIES and estimate.state=="ACTIVE" and weights[i]>0:
                 strategy_policies[strategy]={"mode":"adaptive","state":estimate.state,"allocation_weight":float(weights[i]),
-                                             "kelly_used":True,"score_sizing_used":False,"manual_approval_required":True}
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True}
+            elif strategy not in EXECUTABLE_STRATEGIES:
+                strategy_policies[strategy]={"mode":"research_only","state":estimate.state,"operationally_executable":False,
+                                             "kelly_used":False,"score_sizing_used":False,"manual_approval_required":False,
+                                             "reason":"shadow/research strategy cannot receive executable allocation"}
             else:
                 strategy_policies[strategy]={"mode":"blocked","state":estimate.state,"kelly_used":False,"score_sizing_used":False,"manual_approval_required":True}
         fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
         payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback,
+                 "operational_kelly_enabled":False,"operational_allocation_mode":"deterministic_equal_risk",
+                 "kelly_diagnostics":kelly_diagnostics,
                  "exploration_heat_pct":exploration_heat,"exploration_heat_cap_pct":exploration_heat_cap,"exploration_weights":exploration_weights,
                  "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies}
         self.storage.execute("INSERT OR REPLACE INTO phase4_allocation_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -261,7 +288,8 @@ class AdaptiveAllocator:
                                  (sid,aid,scenario,loss,loss,int(loss<=float(self.cfg.get("max_stress_loss",0.05))),"phase4_stress_v1",json_dumps({"deterministic":True})))
         return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"exploration_weights":exploration_weights,
                 "exploration_heat_pct":exploration_heat,"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,
-                "strategy_policies":strategy_policies,"healthy":healthy}
+                "strategy_policies":strategy_policies,"kelly_diagnostics":kelly_diagnostics,
+                "operational_strategies":list(EXECUTABLE_STRATEGIES),"healthy":healthy}
 
     def _persist_state(self,e:StrategyEstimate,eid:str,now:str)->None:
         old=self.storage.fetch_all("SELECT state FROM phase4_strategy_states WHERE strategy_version=?",(e.strategy_version,)); previous=old[0]["state"] if old else None

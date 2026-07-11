@@ -35,6 +35,7 @@ from .execution import DurableExecutionStore
 from .health import HealthMonitor, record_heartbeat
 from .internet import internet_available
 from .lot_ledger import LotLedger
+from .loss_controls import LOSS_METRICS_VERSION, build_loss_metrics
 from .market_data import normalize_bars
 from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
@@ -44,6 +45,7 @@ from .risk_snapshot import RiskSnapshotBuilder
 from .reconciliation import BrokerReconciler
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
+from .strategy_rule_based import STRATEGY_VERSION
 from .telegram_bot import TelegramBot
 from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason, format_sgt
 
@@ -301,6 +303,7 @@ class TradingService:
             "orders": [],
             "daily_loss": None,
             "weekly_loss": None,
+            "loss_metrics": None,
             "uses_margin": None,
         }
         try:
@@ -320,14 +323,37 @@ class TradingService:
 
             try:
                 losses = self.broker.get_loss_metrics()
-                state["daily_loss"] = losses.get("daily_loss")
-                state["weekly_loss"] = losses.get("weekly_loss")
+                losses = dict(losses or {})
+                # Compatibility adapter for older broker implementations. The
+                # normalized state is explicit and versioned before risk sees it.
+                if "daily_loss_dollars" not in losses and "daily_loss" in losses:
+                    losses.update({
+                        "daily_loss_dollars": losses.get("daily_loss"),
+                        "weekly_loss_dollars": losses.get("weekly_loss"),
+                        "reference_equity": _value(account, "last_equity") or _value(account, "equity"),
+                        "daily_loss_confidence": "verified" if losses.get("daily_loss") is not None else "unavailable",
+                        "weekly_loss_confidence": "verified" if losses.get("weekly_loss") is not None else "unavailable",
+                        "provenance": "legacy_broker_loss_metrics_dollars",
+                        "metrics_version": LOSS_METRICS_VERSION,
+                    })
+                state["loss_metrics"] = losses
+                state["daily_loss"] = losses.get("daily_loss_dollars")
+                state["weekly_loss"] = losses.get("weekly_loss_dollars")
             except Exception:
                 # Daily equity comparison is still authoritative when present.
                 equity = _value(account, "equity")
                 last_equity = _value(account, "last_equity")
                 if equity is not None and last_equity is not None:
-                    state["daily_loss"] = max(0.0, float(last_equity) - float(equity))
+                    state["loss_metrics"] = {
+                        "daily_loss_dollars": max(0.0, float(last_equity) - float(equity)),
+                        "weekly_loss_dollars": None,
+                        "reference_equity": float(last_equity),
+                        "daily_loss_confidence": "verified",
+                        "weekly_loss_confidence": "unavailable",
+                        "provenance": "alpaca_account_snapshot_fallback",
+                        "metrics_version": LOSS_METRICS_VERSION,
+                    }
+                    state["daily_loss"] = state["loss_metrics"]["daily_loss_dollars"]
 
             cash = _value(account, "cash")
             equity = _value(account, "equity")
@@ -1233,6 +1259,15 @@ class TradingService:
                 pass
 
         realized = LotLedger(self.storage).summary()
+        loss_metrics = build_loss_metrics(
+            state.get("loss_metrics"),
+            account_equity=equity,
+            daily_realized_pl=realized.daily_realized_pl,
+            weekly_realized_pl=realized.weekly_realized_pl,
+            daily_confidence=realized.daily_confidence,
+            weekly_confidence=realized.weekly_confidence,
+            realized_provenance=realized.provenance,
+        )
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -1245,15 +1280,14 @@ class TradingService:
             "duplicate_order": any(str(_value(o, "symbol", "")).upper() == symbol for o in orders),
             "same_symbol_position": any(str(_value(p, "symbol", "")).upper() == symbol for p in positions),
             "uses_margin": state["uses_margin"],
-            "daily_loss": state["daily_loss"],
-            "weekly_loss": state["weekly_loss"],
+            **loss_metrics.as_context(),
             "daily_realized_pl": realized.daily_realized_pl,
             "weekly_realized_pl": realized.weekly_realized_pl,
             "daily_realized_pl_status": realized.daily_confidence,
             "weekly_realized_pl_status": realized.weekly_confidence,
             # Broker account equity-loss metrics are an existing conservative
             # control whenever both authoritative values are available.
-            "absolute_loss_control_reliable": isinstance(state["daily_loss"], (int, float)) and isinstance(state["weekly_loss"], (int, float)),
+            "absolute_loss_control_reliable": loss_metrics.daily_loss_pct is not None and loss_metrics.weekly_loss_pct is not None,
             "buying_power": max(0.0, float(_value(account, "buying_power", 0) or 0) - active_reserved_notional) if account is not None else None,
             "approval_valid": approval_valid,
 
@@ -3123,7 +3157,7 @@ class TradingService:
         positions = self.broker.get_positions()
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
-        strategy_config = __import__("yaml").safe_load((PROJECT_ROOT / "config" / "strategies.yaml").read_text())["rule_based_v1"]
+        strategy_config = __import__("yaml").safe_load((PROJECT_ROOT / "config" / "strategies.yaml").read_text())[STRATEGY_VERSION]
 
         now = datetime.now(UTC)
         today_start = now.date().isoformat() + "T00:00:00"
@@ -6308,7 +6342,7 @@ class TradingService:
             controller = Phase3Controller(self.storage, self.config, self.run_id)
             drawdown_pct = controller.update_equity(float(equity))
             states = controller.refresh_strategy_states()
-            allocation_mult = controller.allocation("rule_based_v1", states)
+            allocation_mult = controller.allocation(STRATEGY_VERSION, states)
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
             phase4_mode = "disabled"
@@ -6320,7 +6354,7 @@ class TradingService:
                     self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                         regime=volatility_regime, drawdown_pct=drawdown_pct
                     )
-                phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get("rule_based_v1", {})
+                phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(STRATEGY_VERSION, {})
                 phase4_mode = str(phase4_policy.get("mode") or "blocked")
                 if phase4_mode == "exploration":
                     # Exploration has its own explicit stop-risk budget. It
@@ -6554,18 +6588,22 @@ class TradingService:
             if phase3_context.get("phase4_mode") == "exploration":
                 heat_cap = min(heat_cap, float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25))
             current_heat = canonical.projected_total_open_risk
-            fallback_daily_loss = state.get("daily_loss")
-            fallback_weekly_loss = state.get("weekly_loss")
-            daily_loss_pct = canonical.daily_realized_loss_pct
-            weekly_loss_pct = canonical.weekly_realized_loss_pct
-            if daily_loss_pct is None and isinstance(fallback_daily_loss, (int, float)) and canonical.portfolio_equity:
-                daily_loss_pct = max(0.0, float(fallback_daily_loss)) / canonical.portfolio_equity * 100.0
-            if weekly_loss_pct is None and isinstance(fallback_weekly_loss, (int, float)) and canonical.portfolio_equity:
-                weekly_loss_pct = max(0.0, float(fallback_weekly_loss)) / canonical.portfolio_equity * 100.0
+            loss_metrics = build_loss_metrics(
+                state.get("loss_metrics"),
+                account_equity=canonical.portfolio_equity,
+                daily_realized_pl=canonical.daily_realized_pl,
+                weekly_realized_pl=canonical.weekly_realized_pl,
+                daily_confidence=canonical.daily_realized_pl_status,
+                weekly_confidence=canonical.weekly_realized_pl_status,
+            )
+            daily_loss_pct = loss_metrics.daily_loss_pct
+            weekly_loss_pct = loss_metrics.weekly_loss_pct
             if current_heat is None or canonical.portfolio_equity is None or canonical.filled_gross_exposure is None:
                 final_notional = 0.0
                 blocked_reason = "Phase 3 exposure or stop-risk accounting unavailable"
-            elif daily_loss_pct is None or weekly_loss_pct is None:
+            elif (daily_loss_pct is None or weekly_loss_pct is None
+                  or loss_metrics.daily_loss_confidence == "unavailable"
+                  or loss_metrics.weekly_loss_confidence == "unavailable"):
                 final_notional = 0.0
                 blocked_reason = "Phase 3 realized loss evidence unavailable"
             elif daily_loss_pct >= profile.daily_loss_throttle_pct or weekly_loss_pct >= profile.weekly_loss_throttle_pct:
@@ -6596,7 +6634,7 @@ class TradingService:
                     existing_total_exploration_risk = sum(float(row.get("risk_budget") or 0.0) for row in existing_exploration)
                     existing_strategy_exploration_risk = next(
                         (float(row.get("risk_budget") or 0.0) for row in existing_exploration
-                         if row.get("strategy_version") == "rule_based_v1"), 0.0
+                         if row.get("strategy_version") == STRATEGY_VERSION), 0.0
                     )
                     exploration_heat_remaining = max(0.0, canonical.portfolio_equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0 - existing_total_exploration_risk)
                     exploration_strategy_remaining = max(0.0, canonical.portfolio_equity * float(self.config.get("phase4", {}).get("max_exploration_stop_risk_pct", 0.10)) / 100.0 - existing_strategy_exploration_risk)
@@ -6657,7 +6695,7 @@ class TradingService:
               portfolio_heat_before_pct,portfolio_heat_after_pct,gross_exposure_after_pct,symbol_exposure_after_pct,
               cluster_exposure_after_pct,regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,profile_version,payload)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (decision_id,self.run_id,symbol,"rule_based_v1",iso_now(),decision,blocked_reason or "within Phase 3 limits",
+              (decision_id,self.run_id,symbol,STRATEGY_VERSION,iso_now(),decision,blocked_reason or "within Phase 3 limits",
                equity,phase3_context["drawdown_pct"],base_risk_pct,
                phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
                None,None,None,None,None,volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],

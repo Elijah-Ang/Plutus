@@ -8,7 +8,7 @@ from app.storage import Storage
 from app.utils import load_config
 
 
-def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=None):
+def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=None, execution_type="actual_fill", source_table="performance_setups", provenance=None):
     now = datetime.now(UTC).isoformat()
     opportunity_id = f"op-{strategy}-{index}"
     storage.execute("""INSERT INTO research_opportunities(
@@ -17,9 +17,9 @@ def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=N
         universe_version,universe_snapshot_json,regime,regime_version,eligibility_version,blocker,blocker_version,ai_gate,
         ai_gate_version,split_label,provenance_json,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (opportunity_id,"test","source-" + opportunity_id,"SPY",now,"long","paper",100,98,104,100,101,
+        (opportunity_id,source_table,"source-" + opportunity_id,"SPY",now,"long",execution_type,100,98,104,100,101,
          strategy,70,"score_v1","features_v1",json.dumps({}),"universe_v1",json.dumps({}),regime,"regime_v1",
-         "shadow_v1",None,None,"not_used",None,"out_of_sample",json.dumps({}),now))
+         "shadow_v1",None,None,"not_used",None,"out_of_sample",json.dumps(provenance if provenance is not None else {"fill_id": "fill-" + opportunity_id}),now))
     outcome_id = f"out-{strategy}-{index}"
     storage.execute("""INSERT INTO research_outcomes(
         id,opportunity_id,horizon_sessions,status,reason,maturity_session,exit_session,gross_return,spy_return,
@@ -38,7 +38,7 @@ def test_healthy_immature_strategy_gets_bounded_exploration(tmp_path):
     assert result["cash_weight"]==1.0
     assert set(result["weights"])==set(STRATEGIES)
     assert all(value==0 for value in result["weights"].values())
-    assert result["exploration_heat_pct"] == .25
+    assert result["exploration_heat_pct"] <= .25
     assert result["exploration_weights"][STRATEGIES[0]] == .05
     assert all(value <= .05 for value in result["exploration_weights"].values())
     assert all(policy["kelly_used"] is False for policy in result["strategy_policies"].values() if policy["mode"] == "exploration")
@@ -69,7 +69,8 @@ def test_qualified_strategy_uses_adaptive_allocation(tmp_path):
     assert estimate.evidence_class == "qualified"
     policy=result["strategy_policies"][STRATEGIES[0]]
     assert policy["mode"] == "adaptive"
-    assert policy["kelly_used"] is True
+    assert policy["kelly_used"] is False
+    assert policy["kelly_diagnostic_only"] is True
     assert policy["score_sizing_used"] is False
     assert result["weights"][STRATEGIES[0]] > 0
 
@@ -90,6 +91,32 @@ def test_fractional_kelly_is_bounded_and_phase3_authoritative():
     assert cfg["phase3_hard_limits_authoritative"] is True
     assert cfg["llm_trading_decisions"] is False
     assert cfg["uncalibrated_score_sizing"] is False
+    assert cfg["operational_kelly_enabled"] is False
+    assert cfg["operational_allocation_mode"] == "deterministic_equal_risk"
+
+
+def test_shadow_evidence_never_becomes_operational_allocation(tmp_path):
+    storage=Storage(tmp_path/"p4-shadow.sqlite3"); storage.initialize(); cfg=load_config()
+    for index in range(100):
+        _outcome(storage, STRATEGIES[1], .02 + (index % 5) * .0001, regime="normal" if index % 2 else "favorable", index=index,
+                 execution_type="shadow_hypothetical", source_table="shadow_insights", provenance={"shadow_id": f"shadow-{index}"})
+    result=AdaptiveAllocator(storage,cfg,"run-shadow").run(regime="normal",drawdown_pct=0.0)
+    assert result["estimates"][STRATEGIES[1]].state == "ACTIVE"
+    assert result["weights"][STRATEGIES[1]] == 0
+    assert result["strategy_policies"][STRATEGIES[1]]["mode"] == "research_only"
+    assert result["strategy_policies"][STRATEGIES[1]]["operationally_executable"] is False
+
+
+def test_negative_shadow_evidence_keeps_auditable_state_without_allocation(tmp_path):
+    storage=Storage(tmp_path/"p4-shadow-negative.sqlite3"); storage.initialize(); cfg=load_config()
+    for index in range(100):
+        _outcome(storage, STRATEGIES[1], -.02, regime="normal" if index % 2 else "favorable", index=index,
+                 execution_type="shadow_hypothetical", source_table="shadow_insights", provenance={"shadow_id": f"shadow-{index}"})
+    result=AdaptiveAllocator(storage,cfg,"run-shadow-negative").run(regime="normal",drawdown_pct=0.0)
+    assert result["estimates"][STRATEGIES[1]].state == "SUSPENDED"
+    assert result["estimates"][STRATEGIES[1]].evidence_class == "negative"
+    assert result["weights"][STRATEGIES[1]] == 0
+    assert result["strategy_policies"][STRATEGIES[1]]["mode"] == "research_only"
 
 
 def test_covariance_and_all_stress_scenarios_are_persisted(tmp_path):

@@ -1,7 +1,7 @@
-rule_based_v1:
+rule_based_v2:
   enabled: true
   maximum_volatility_20d: 0.45
-  require_ma_200_when_available: true
+  require_ma_200: true
   stop_drawdown_pct: 0.08
 ml_shadow:
   enabled: false

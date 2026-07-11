@@ -78,11 +78,12 @@ def default_service_power_and_internet(monkeypatch):
 def safe_config():
     return {
         "mode": "paper", "live_enabled": False, "explicit_live_confirmation": False,
-        "approved_strategy_versions": ["rule_based_v1"],
+        "approved_strategy_versions": ["rule_based_v2"],
         "risk": {"max_trade_notional_paper": 5, "max_trade_notional_live": 5, "max_trades_per_day": 1,
                  "max_open_positions": 1, "allow_margin": False, "allow_shorting": False,
                  "allowed_order_types": ["market"], "max_price_age_seconds": 120, "min_historical_bars": 50,
-                 "max_price_gap_pct": 15, "stop_if_daily_loss_exceeds": 5, "stop_if_weekly_loss_exceeds": 10},
+                 "max_price_gap_pct": 15, "stop_if_daily_loss_pct_exceeds": 5, "stop_if_weekly_loss_pct_exceeds": 10,
+                 "stop_if_daily_loss_dollars_exceeds": None, "stop_if_weekly_loss_dollars_exceeds": None},
     }
 
 
@@ -92,7 +93,7 @@ def proposal():
     return {"id": "p1", "status": "pending", "symbol": "QQQ", "side": "buy", "action": "entry",
             "notional": 5, "latest_price": 500, "price_at": now.isoformat(), "historical_bars": 250,
             "volume": 1000, "price_gap_pct": 0, "created_at": now.isoformat(),
-            "expires_at": (now + timedelta(minutes=10)).isoformat(), "strategy_version": "rule_based_v1",
+            "expires_at": (now + timedelta(minutes=10)).isoformat(), "strategy_version": "rule_based_v2",
             "reason": "trend passed", "order_type": "market", "asset_class": "equity"}
 
 
@@ -101,6 +102,10 @@ def context():
     return {"power_connected": True, "internet_available": True, "database_writable": True,
             "broker_available": True, "telegram_available": True, "market_open": True, "kill_switch": False,
             "open_positions": 0, "trades_today": 0, "duplicate_order": False, "same_symbol_position": False,
-            "uses_margin": False, "daily_loss": 0, "weekly_loss": 0, "buying_power": 100,
+            "uses_margin": False, "daily_loss": 0, "weekly_loss": 0,
+            "daily_loss_dollars": 0, "weekly_loss_dollars": 0,
+            "daily_loss_pct": 0, "weekly_loss_pct": 0, "loss_reference_equity": 100,
+            "daily_loss_confidence": "verified", "weekly_loss_confidence": "verified",
+            "loss_provenance": "test", "loss_metrics_version": "loss_controls_v2", "buying_power": 100,
             "proposed_total_exposure_pct": 0.05, "proposed_symbol_exposure_pct": 0.05,
             "proposed_cluster_positions_count": 1, "proposed_cluster_exposure_pct": 0.05}

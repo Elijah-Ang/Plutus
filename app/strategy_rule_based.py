@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from .features import build_features
 
-STRATEGY_VERSION = "rule_based_v1"
+STRATEGY_VERSION = "rule_based_v2"
+MIN_COMPLETED_DAILY_BARS = 200
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -21,14 +25,41 @@ class Signal:
     strategy_version: str = STRATEGY_VERSION
 
 
+def completed_daily_bars(bars: pd.DataFrame, *, as_of: datetime | None = None) -> pd.DataFrame:
+    """Normalize the same completed-bar point-in-time input for research/runtime."""
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    required = {"close", "volume"}
+    if not required.issubset(bars.columns):
+        return pd.DataFrame()
+    frame = bars.copy().sort_index()
+    frame = frame.dropna(subset=["close", "volume"])
+    moment = as_of or datetime.now(UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    current_session = moment.astimezone(MARKET_TIMEZONE).date()
+    try:
+        session_dates = pd.DatetimeIndex(frame.index).tz_localize(None).date
+        frame = frame.loc[[date != current_session for date in session_dates]]
+    except (TypeError, ValueError):
+        # Non-datetime indexes are still valid for historical point-in-time
+        # fixtures; only a known current-session date is excluded.
+        pass
+    return frame
+
+
 def evaluate_symbol(symbol: str, bars: pd.DataFrame, has_position: bool = False, has_open_order: bool = False, market_open: bool = True, maximum_volatility_20d: float = 0.50, stop_drawdown_pct: float = 0.08, position_drawdown_pct: float = 0.0) -> Signal:
-    features = build_features(bars)
-    if len(features) < 50:
-        return Signal("HOLD", None, symbol, "insufficient history", 0.0, {})
+    completed = completed_daily_bars(bars)
+    if len(completed) < MIN_COMPLETED_DAILY_BARS:
+        return Signal("HOLD", None, symbol, "insufficient completed daily history", 0.0, {})
+    features = build_features(completed)
+    row = features.iloc[-1]
+    if pd.isna(row.get("ma_50")) or pd.isna(row.get("ma_200")):
+        return Signal("HOLD", None, symbol, "missing MA50/MA200; fail-safe HOLD", 0.0, {})
     row = features.iloc[-1]
     indicators = {k: (None if pd.isna(v) else float(v)) for k, v in row.items()}
     above_50 = row["close"] > row["ma_50"]
-    above_200 = pd.isna(row["ma_200"]) or row["close"] > row["ma_200"]
+    above_200 = row["close"] > row["ma_200"]
     
     vol_20 = indicators.get("volatility_20")
     

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
 
+from .loss_controls import LOSS_METRICS_VERSION
+
 
 @dataclass(frozen=True)
 class RiskCheck:
@@ -271,40 +273,67 @@ class RiskEngine:
                         check("approved_universe", False, "symbol not found in static or dynamic paper-tradable profiles")
                 else:
                     check("approved_universe", False, "symbol not found in static or dynamic paper-tradable profiles")
-        daily_loss = context.get("daily_loss")
-        weekly_loss = context.get("weekly_loss")
-        daily_status = context.get("daily_realized_pl_status")
-        weekly_status = context.get("weekly_realized_pl_status")
-        daily_realized = context.get("daily_realized_pl")
-        weekly_realized = context.get("weekly_realized_pl")
-        if daily_status == "verified" and isinstance(daily_realized, (int, float)):
-            ledger_loss = max(0.0, -float(daily_realized))
-            daily_loss = max(float(daily_loss), ledger_loss) if isinstance(daily_loss, (int, float)) else ledger_loss
-        if weekly_status == "verified" and isinstance(weekly_realized, (int, float)):
-            ledger_loss = max(0.0, -float(weekly_realized))
-            weekly_loss = max(float(weekly_loss), ledger_loss) if isinstance(weekly_loss, (int, float)) else ledger_loss
-        daily_known = isinstance(daily_loss, (int, float))
-        weekly_known = isinstance(weekly_loss, (int, float))
-        # The prospective lot ledger is preferred. Existing absolute account-loss
-        # metrics are a conservative fallback only when marked reliable (numeric
-        # legacy contexts remain authoritative for backward compatibility).
-        reliable_absolute = context.get("absolute_loss_control_reliable", daily_known and weekly_known) is True
-        realized_verified = daily_status == "verified" and weekly_status == "verified"
-        loss_information_safe = realized_verified or (reliable_absolute and daily_known and weekly_known)
+        daily_loss_pct = context.get("daily_loss_pct")
+        weekly_loss_pct = context.get("weekly_loss_pct")
+        daily_loss_dollars = context.get("daily_loss_dollars")
+        weekly_loss_dollars = context.get("weekly_loss_dollars")
+        daily_confidence = context.get("daily_loss_confidence")
+        weekly_confidence = context.get("weekly_loss_confidence")
+        metrics_version = context.get("loss_metrics_version")
+        legacy_loss_compat = (
+            metrics_version is None
+            and "stop_if_daily_loss_pct_exceeds" not in self.risk
+            and ("stop_if_daily_loss_exceeds" in self.risk or "stop_if_weekly_loss_exceeds" in self.risk)
+            and isinstance(context.get("daily_loss"), (int, float))
+            and isinstance(context.get("weekly_loss"), (int, float))
+        )
+        if legacy_loss_compat:
+            # Compatibility for pre-v2 callers only. The deployed config and
+            # broker adapter use the explicit path above; legacy values retain
+            # their documented historical dollar semantics.
+            daily_loss_dollars = context.get("daily_loss")
+            weekly_loss_dollars = context.get("weekly_loss")
+        daily_known = (
+            isinstance(daily_loss_pct, (int, float)) and daily_confidence in {"verified", "reconstructed"}
+            if not legacy_loss_compat else isinstance(daily_loss_dollars, (int, float))
+        )
+        weekly_known = (
+            isinstance(weekly_loss_pct, (int, float)) and weekly_confidence in {"verified", "reconstructed"}
+            if not legacy_loss_compat else isinstance(weekly_loss_dollars, (int, float))
+        )
+        loss_information_safe = (
+            metrics_version == LOSS_METRICS_VERSION and daily_known and weekly_known
+        ) or (legacy_loss_compat and context.get("absolute_loss_control_reliable", True) is True)
         check(
             "realized_loss_information",
             not is_entry or loss_information_safe,
-            "verified realized loss or a reliable stricter absolute loss control is required for new entries",
+            "versioned reliable daily and weekly loss evidence is required for new entries",
         )
-        check("daily_loss_known", not is_entry or daily_known, "daily loss must come from an authoritative source")
-        check("weekly_loss_known", not is_entry or weekly_known, "weekly loss must come from an authoritative source")
-        check("daily_loss", not is_entry or (daily_known and float(daily_loss) < self.risk.get("stop_if_daily_loss_exceeds", 5)), "daily loss limit")
-        check("weekly_loss", not is_entry or (weekly_known and float(weekly_loss) < self.risk.get("stop_if_weekly_loss_exceeds", 10)), "weekly loss limit")
+        check("loss_metrics_version", not is_entry or metrics_version == LOSS_METRICS_VERSION or legacy_loss_compat, "loss metrics must be explicit and versioned")
+        check("daily_loss_known", not is_entry or daily_known, "daily loss percentage must come from an authoritative source")
+        check("weekly_loss_known", not is_entry or weekly_known, "weekly loss percentage must come from an authoritative source")
+        daily_pct_limit = self.risk.get("stop_if_daily_loss_pct_exceeds", 0.75)
+        weekly_pct_limit = self.risk.get("stop_if_weekly_loss_pct_exceeds", 1.50)
+        daily_dollar_limit = self.risk.get("stop_if_daily_loss_dollars_exceeds")
+        weekly_dollar_limit = self.risk.get("stop_if_weekly_loss_dollars_exceeds")
+        if legacy_loss_compat:
+            daily_dollar_limit = self.risk.get("stop_if_daily_loss_exceeds")
+            weekly_dollar_limit = self.risk.get("stop_if_weekly_loss_exceeds")
+        check("daily_loss", not is_entry or (daily_known and ((float(daily_loss_dollars) < float(daily_dollar_limit)) if legacy_loss_compat else (daily_pct_limit is not None and float(daily_loss_pct) < float(daily_pct_limit)))), "daily percentage loss limit" if not legacy_loss_compat else "daily dollar loss limit")
+        check("weekly_loss", not is_entry or (weekly_known and ((float(weekly_loss_dollars) < float(weekly_dollar_limit)) if legacy_loss_compat else (weekly_pct_limit is not None and float(weekly_loss_pct) < float(weekly_pct_limit)))), "weekly percentage loss limit" if not legacy_loss_compat else "weekly dollar loss limit")
+        if daily_dollar_limit is not None:
+            check("daily_loss_dollars", not is_entry or (isinstance(daily_loss_dollars, (int, float)) and float(daily_loss_dollars) < float(daily_dollar_limit)), "daily dollar loss limit")
+        if weekly_dollar_limit is not None:
+            check("weekly_loss_dollars", not is_entry or (isinstance(weekly_loss_dollars, (int, float)) and float(weekly_loss_dollars) < float(weekly_dollar_limit)), "weekly dollar loss limit")
 
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))
         check("signal_time", not is_entry or (created is not None and created <= now and expires is not None and expires > now), "entry signal/proposal must be current")
-        check("strategy", not is_entry or proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1"]), "approved entry strategy version required")
+        # Explicit production config approves only the current version. A
+        # missing list is a legacy snapshot; retain compatibility for stored
+        # v1 proposals without changing the deployed config's explicit v2
+        # allowlist.
+        check("strategy", not is_entry or proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1", "rule_based_v2"]), "approved entry strategy version required")
         if is_entry and proposal.get("phase4_mode") == "exploration":
             check("phase4_exploration_manual_approval", not final or context.get("approval_valid") is True,
                   "Phase 4 exploration requires explicit manual approval")

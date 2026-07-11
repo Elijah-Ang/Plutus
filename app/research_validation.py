@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
 
-from .strategy_rule_based import STRATEGY_VERSION, evaluate_symbol
+from .strategy_rule_based import STRATEGY_VERSION, completed_daily_bars, evaluate_symbol
 from .utils import json_dumps
 
 
@@ -326,7 +326,7 @@ class PointInTimeSimulator:
     """Expanding-window simulator that calls production strategy logic directly."""
 
     def __init__(self, minimum_history: int = 200) -> None:
-        self.minimum_history = minimum_history
+        self.minimum_history = max(200, int(minimum_history))
 
     def opportunities(
         self,
@@ -338,8 +338,9 @@ class PointInTimeSimulator:
         maximum_volatility_20d: float = 0.50,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        bars = bars.sort_index()
-        spy_bars = spy_bars.sort_index()
+        # Runtime and simulation use the same completed daily-bar boundary.
+        bars = completed_daily_bars(bars)
+        spy_bars = completed_daily_bars(spy_bars)
         for end in range(self.minimum_history, len(bars)):
             decision_day = _session_date(bars.index[end])
             eligible, universe_version = membership(symbol, decision_day)

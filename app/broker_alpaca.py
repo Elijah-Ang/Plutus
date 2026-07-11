@@ -176,8 +176,8 @@ class AlpacaBroker(BrokerInterface):
     def get_clock(self) -> Any:
         return self._call("get_clock", "read", self.trading.get_clock)
 
-    def get_loss_metrics(self) -> dict[str, float | None]:
-        """Return positive loss amounts from authoritative Alpaca data."""
+    def get_loss_metrics(self) -> dict[str, float | str | None]:
+        """Return explicit, versioned dollar loss metrics from Alpaca."""
         account = self.get_account()
         equity = float(account.equity)
         last_equity = float(account.last_equity)
@@ -199,7 +199,15 @@ class AlpacaBroker(BrokerInterface):
                 weekly_loss = max(0.0, equities[0] - equities[-1])
         except Exception:
             weekly_loss = None
-        return {"daily_loss": daily_loss, "weekly_loss": weekly_loss}
+        return {
+            "daily_loss_dollars": daily_loss,
+            "weekly_loss_dollars": weekly_loss,
+            "reference_equity": last_equity,
+            "daily_loss_confidence": "verified",
+            "weekly_loss_confidence": "verified" if weekly_loss is not None else "unavailable",
+            "provenance": "alpaca_account_and_portfolio_history",
+            "metrics_version": "loss_controls_v2",
+        }
 
     def is_market_open(self) -> bool:
         return bool(self.get_clock().is_open)

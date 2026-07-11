@@ -23,8 +23,8 @@ cost-adjusted out-of-sample outcomes. Positive expectancy, at least two regimes,
 minimum sample size, and healthy reconciliation are required for `ACTIVE`.
 Incomplete evidence is `THROTTLED`; negative evidence or unhealthy reconciliation
 is `SUSPENDED`. Re-evaluation each cycle provides deterministic recovery. The
-existing `rule_based_v1` remains eligible, and risk is equal-weighted across only
-eligible active strategies.
+The executable `rule_based_v2` remains eligible, and risk is equal-weighted
+across only the executable strategy. Shadow strategy states remain research-only.
 
 Deployment requires schema `phase3_moderate_paper_risk_v1`, a verified SQLite
 backup, an immutable paper release, an unambiguous healthy Alpaca paper endpoint,

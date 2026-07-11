@@ -50,6 +50,8 @@ phase4:
   mode: ACTIVE_ADAPTIVE_PAPER
   allocator_version: adaptive_paper_allocator_v1
   fractional_kelly: 0.20
+  operational_kelly_enabled: false
+  operational_allocation_mode: deterministic_equal_risk
   full_kelly_allowed: false
   llm_trading_decisions: false
   uncalibrated_score_sizing: false
@@ -90,7 +92,7 @@ preflight:
     require_broker: true
     require_market_open: true
 watchlist: [SPY, QQQ, DIA, IWM]
-approved_strategy_versions: [rule_based_v1]
+approved_strategy_versions: [rule_based_v2]
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.
@@ -541,8 +543,10 @@ risk:
   allow_crypto: false
   allow_fractional: true
   signal_expiry_minutes: 10
-  stop_if_daily_loss_exceeds: 0.75
-  stop_if_weekly_loss_exceeds: 1.50
+  stop_if_daily_loss_pct_exceeds: 0.75
+  stop_if_weekly_loss_pct_exceeds: 1.50
+  stop_if_daily_loss_dollars_exceeds: null
+  stop_if_weekly_loss_dollars_exceeds: null
   require_final_revalidation: true
   allowed_order_types: [market, limit]
   max_price_age_seconds: 120
