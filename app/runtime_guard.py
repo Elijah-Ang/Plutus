@@ -25,6 +25,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "order_intents": {"id", "logical_action_key", "client_order_id", "reserved_notional", "reserved_stop_risk", "state", "trading_mode"},
     "risk_reservations": {"intent_id", "active_notional", "active_stop_risk", "state"},
     "reconciliation_attempts": {"intent_id", "outcome", "created_at"},
+    "telegram_updates": {"update_id", "message_id", "message_timestamp", "received_at", "processing_state"},
     "research_outcomes": {"opportunity_id", "horizon_sessions", "status", "exit_session", "calculation_version", "outcome_class"},
     "phase3_risk_decisions": {"run_id", "requested_notional", "binding_caps_json", "evidence_version", "formula_version"},
     "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json"},

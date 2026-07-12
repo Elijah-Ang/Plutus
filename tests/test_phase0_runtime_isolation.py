@@ -40,6 +40,8 @@ def test_explicit_migration_is_required_for_runtime_schema(tmp_path):
     db.apply_explicit_migrations()
     assert REQUIRED_SCHEMA_VERSION in db.schema_versions()
     db.require_runtime_schema()
+    columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(telegram_updates)")}
+    assert "message_timestamp" in columns
 
 
 def test_runtime_scripts_keep_locks_and_logs_outside_release_tree():

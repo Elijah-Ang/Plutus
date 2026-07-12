@@ -136,6 +136,9 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "trade_proposals": {
         "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
     },
+    "telegram_updates": {
+        "message_timestamp": "INTEGER",
+    },
 }
 
 
