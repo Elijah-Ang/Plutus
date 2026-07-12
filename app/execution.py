@@ -19,6 +19,7 @@ from .order_state import (
 from .risk_engine import RiskEngine
 from .capabilities import require_autonomous_entry_support, require_autonomous_exit_support, require_protective_paper_exit_support
 from .utils import iso_now, json_dumps
+from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
 from .quotes import implementation_shortfall_bps, validate_quote_payload
 
 
@@ -202,14 +203,15 @@ class DurableExecutionStore:
                 )
                 enforce("paper buying power", float(totals["total"]) + reserved_notional, "buying_power_ceiling")
             conn.execute(
-                """INSERT INTO order_intents(
+                f"""INSERT INTO order_intents(
                        id,run_id,proposal_id,approval_id,source_id,source_type,logical_action_key,candidate_id,
                        position_lifecycle_id,symbol,side,intended_action,request_basis,approved_quantity_ceiling,
                        approved_notional_ceiling,requested_quantity,requested_notional,filled_quantity,reference_price,intended_stop_price,reserved_notional,
                        reserved_stop_risk,quote_bid,quote_ask,quote_timestamp,quote_spread_bps,limit_price,implementation_shortfall_bps,
                        client_order_id,trading_mode,state,created_at,updated_at,replacement_enabled,
-                       parent_intent_id,relationship_group_id,relationship_type,order_role,protection_confirmed)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       parent_intent_id,relationship_group_id,relationship_type,order_role,protection_confirmed,
+                       strategy_version,entry_regime,entry_score,initial_risk_dollars,config_hash,evidence_version,formula_version)
+                   VALUES({','.join('?' for _ in range(46))})""",
                 (
                     intent_id,
                     run_id,
@@ -250,6 +252,13 @@ class DurableExecutionStore:
                     proposal.get("relationship_type"),
                     proposal.get("order_role", "primary"),
                     int(bool(proposal.get("protection_confirmed", False))),
+                    proposal.get("strategy_version"),
+                    proposal.get("entry_regime", proposal.get("volatility_regime")),
+                    proposal.get("entry_score", proposal.get("score")),
+                    proposal.get("initial_risk_dollars"),
+                    proposal.get("config_hash"),
+                    proposal.get("evidence_version", EVIDENCE_VERSION),
+                    proposal.get("formula_version", ACCOUNTING_VERSION),
                 ),
             )
             conn.execute(

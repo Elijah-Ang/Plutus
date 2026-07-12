@@ -1546,6 +1546,13 @@ class TradingService:
                     self.storage.audit(self.run_id, "telegram_command", {"command": "/status", "authorized": self.telegram.is_authorized(sender)})
                     self.telegram.send_message(status_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                     continue
+                if cmd == "/performance":
+                    from .strategy_performance import StrategyPerformanceEngine
+
+                    performance_text = StrategyPerformanceEngine(self.storage, self.config).format_report()
+                    self.storage.audit(self.run_id, "telegram_command", {"command": "/performance", "authorized": True, "report_only": True})
+                    self.telegram.send_message(performance_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
+                    continue
                 else:
                     response = self.telegram.handle_command(text, sender)
                     self.storage.audit(self.run_id, "telegram_command", {"command": text.split()[0], "authorized": self.telegram.is_authorized(sender)})
@@ -5717,6 +5724,29 @@ class TradingService:
         self.check_and_send_digest()
         self.storage.audit(self.run_id, "scan_cycle_completed", {"run_dynamic_universe": run_dynamic_universe})
         self._update_forward_outcomes()
+        self._refresh_strategy_performance()
+
+    def _refresh_strategy_performance(self) -> None:
+        """Refresh report-only scorecards after evidence work has completed."""
+        if not (self.config.get("profitability_engine", {}) or {}).get("enabled", True):
+            return
+        started_at = iso_now()
+        try:
+            from .strategy_performance import StrategyPerformanceEngine
+
+            snapshots = StrategyPerformanceEngine(self.storage, self.config).refresh_all()
+            detail = {
+                "strategy_count": len(snapshots),
+                "states": {key: snapshot.recommendation_state for key, snapshot in snapshots.items()},
+                "enforcement_enabled": False,
+                "report_only": True,
+            }
+            record_heartbeat(self.storage, "strategy_performance", "healthy", attempted_at=started_at, completed_at=iso_now(), successful_at=iso_now(), detail=detail)
+            self.storage.audit(self.run_id, "strategy_performance_refresh_complete", detail)
+        except Exception as exc:
+            detail = {"error_type": type(exc).__name__, "report_only": True, "enforcement_enabled": False}
+            record_heartbeat(self.storage, "strategy_performance", "failed", attempted_at=started_at, completed_at=iso_now(), blocked_reason="scorecard refresh failed", detail=detail)
+            self.storage.audit(self.run_id, "strategy_performance_refresh_failed", detail)
 
     def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):

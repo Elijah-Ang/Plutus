@@ -15,6 +15,9 @@ from .formula_versions import (
     RISK_DECISION_VERSION,
     SIZING_POLICY_VERSION,
     STOP_POLICY_VERSION,
+    STRATEGY_PERFORMANCE_VERSION,
+    STRATEGY_POLICY_VERSION,
+    STRATEGY_PERFORMANCE_SCHEMA_VERSION,
 )
 
 
@@ -37,7 +40,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
-    "phase2_shadow_strategies", "phase3", "phase4", "execution_capabilities", "broker",
+    "phase2_shadow_strategies", "phase3", "phase4", "profitability_engine", "execution_capabilities", "broker",
     "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
     "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
@@ -87,7 +90,14 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy"},
+    "profitability_engine": {
+        "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
+        "minimum_completed_samples", "minimum_regimes", "evidence_stale_after_days", "maturity_research_only_max",
+        "maturity_exploration_max", "maturity_throttled_max", "score_exploration_threshold", "score_throttled_threshold",
+        "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
+        "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
+    },
 }
 
 STRICT_NESTED_KEYS = {
@@ -164,9 +174,26 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "risk_decision": RISK_DECISION_VERSION,
         "accounting": ACCOUNTING_VERSION,
         "evidence": EVIDENCE_VERSION,
+        "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
+        "strategy_policy": STRATEGY_POLICY_VERSION,
     }
     for key, expected in expected_formulas.items():
         require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")
+
+    profitability = config.get("profitability_engine", {}) or {}
+    require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")
+    require(profitability.get("enforcement_enabled") is False, "profitability_engine.enforcement_enabled must remain false in Build 1")
+    require(profitability.get("performance_version") == STRATEGY_PERFORMANCE_VERSION, f"profitability_engine.performance_version must be {STRATEGY_PERFORMANCE_VERSION}")
+    require(profitability.get("policy_version") == STRATEGY_POLICY_VERSION, f"profitability_engine.policy_version must be {STRATEGY_POLICY_VERSION}")
+    require(profitability.get("schema_version") == STRATEGY_PERFORMANCE_SCHEMA_VERSION, f"profitability_engine.schema_version must be {STRATEGY_PERFORMANCE_SCHEMA_VERSION}")
+    require(profitability.get("primary_horizon_sessions") == 20, "profitability_engine.primary_horizon_sessions must be 20")
+    if profitability:
+        score_thresholds = [profitability.get("score_exploration_threshold"), profitability.get("score_throttled_threshold"), profitability.get("score_active_threshold")]
+        if all(value is not None for value in score_thresholds):
+            require(score_thresholds == [45, 60, 75], "profitability_engine score thresholds must remain 45, 60, 75")
+        maturity_thresholds = [profitability.get("maturity_research_only_max"), profitability.get("maturity_exploration_max"), profitability.get("maturity_throttled_max")]
+        if all(value is not None for value in maturity_thresholds):
+            require(maturity_thresholds == [19, 49, 99], "profitability_engine maturity ceilings must remain 19, 49, 99")
 
     mode = config.get("mode", "paper")
     require(mode in {"paper", "live"}, "mode must be paper or live")
@@ -213,7 +240,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail
     # before a runtime object or database is opened.
-    for section_name in ("risk", "risk_budget", "phase3", "phase4", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
+    for section_name in ("risk", "risk_budget", "phase3", "phase4", "profitability_engine", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
         _validate_units(config.get(section_name), section_name, errors)
 
     try:

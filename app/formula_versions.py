@@ -12,6 +12,9 @@ PHASE3_DECISION_VERSION = "phase3_risk_audit_v2"
 PHASE4_ALLOCATION_VERSION = "phase4_allocation_audit_v2"
 ACCOUNTING_VERSION = "fifo_equity_unrealized_cashflow_v1"
 EVIDENCE_VERSION = "phase1_outcome_v2_exit_session"
+STRATEGY_PERFORMANCE_VERSION = "strategy_performance_v1"
+STRATEGY_POLICY_VERSION = "strategy_policy_v1"
+STRATEGY_PERFORMANCE_SCHEMA_VERSION = "strategy_profitability_engine_v1"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -23,5 +26,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         "phase3_moderate_paper_risk_v1",
         "phase4_adaptive_paper_allocation_v1",
         "runtime_safety_accounting_v1",
+        STRATEGY_PERFORMANCE_SCHEMA_VERSION,
     }
 )

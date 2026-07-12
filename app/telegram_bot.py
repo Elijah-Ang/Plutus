@@ -85,7 +85,8 @@ class TelegramBot:
             "/report": "Run scripts/export_excel.sh for the current report.",
             "/cashout": "Cash-out is recommendation-only; no funds will move.",
             "/pending": "Pending proposals are read from the local database.",
-            "/help": "/status /pause /resume /killswitch /report /cashout /pending /help",
+            "/performance": "Strategy performance is available from the latest persisted report-only scorecard.",
+            "/help": "/status /performance /pause /resume /killswitch /report /cashout /pending /help",
         }
         return messages.get(command, "Unknown command. Use /help.")
 

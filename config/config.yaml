@@ -75,6 +75,31 @@ phase4:
   preserve_cash_on_unreliable_evidence: true
   require_manual_approval: true
   phase3_hard_limits_authoritative: true
+profitability_engine:
+  enabled: true
+  enforcement_enabled: false
+  performance_version: strategy_performance_v1
+  policy_version: strategy_policy_v1
+  schema_version: strategy_profitability_engine_v1
+  primary_horizon_sessions: 20
+  minimum_completed_samples: 100
+  minimum_regimes: 2
+  evidence_stale_after_days: 90
+  maturity_research_only_max: 19
+  maturity_exploration_max: 49
+  maturity_throttled_max: 99
+  score_exploration_threshold: 45
+  score_throttled_threshold: 60
+  score_active_threshold: 75
+  hard_max_drawdown_r: 6.0
+  hard_max_losing_streak: 8
+  hard_max_divergence_r: 1.5
+  target_expectancy_r: 0.25
+  target_profit_factor: 1.75
+  target_drawdown_r: 3.0
+  target_losing_streak: 4
+  target_shortfall_bps: 20
+  target_divergence_r: 0.5
 execution_capabilities:
   live_execution_enabled: false
   autonomous_entries_enabled: false
@@ -109,6 +134,8 @@ formula_versions:
   risk_decision: risk_engine_ceiling_and_stop_v2
   accounting: fifo_equity_unrealized_cashflow_v1
   evidence: phase1_outcome_v2_exit_session
+  strategy_performance: strategy_performance_v1
+  strategy_policy: strategy_policy_v1
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
 from .utils import iso_now
 
 
@@ -95,16 +97,55 @@ class LotLedger:
         base_confidence = str(status["confidence"]) if status else "unavailable"
         provenance = str(status["provenance"]) if status else "migration coverage not established"
 
+        def value(obj: Any, key: str, default: Any = None) -> Any:
+            try:
+                return obj[key]
+            except (KeyError, IndexError, TypeError):
+                return getattr(obj, key, default)
+
+        proposal = None
+        proposal_id = value(intent, "proposal_id")
+        if proposal_id:
+            proposal = conn.execute("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)).fetchone()
+        proposal_payload: dict[str, Any] = {}
+        if proposal is not None and proposal["payload"]:
+            try:
+                decoded = json.loads(proposal["payload"])
+                proposal_payload = decoded if isinstance(decoded, dict) else {}
+            except (TypeError, ValueError):
+                proposal_payload = {}
+
+        def metadata(key: str, *, proposal_key: str | None = None) -> Any:
+            explicit = value(intent, key)
+            if explicit is not None:
+                return explicit
+            if proposal is not None and key in proposal.keys():
+                explicit = proposal[key]
+                if explicit is not None:
+                    return explicit
+            return proposal_payload.get(proposal_key or key)
+
+        strategy_version = metadata("strategy_version")
+        entry_regime = metadata("entry_regime", proposal_key="volatility_regime")
+        entry_score = metadata("entry_score", proposal_key="score")
+        initial_risk_dollars = metadata("initial_risk_dollars")
+        config_hash = metadata("config_hash")
+        evidence_version = metadata("evidence_version") or EVIDENCE_VERSION
+        formula_version = metadata("formula_version") or ACCOUNTING_VERSION
+
         if side == "buy":
             conn.execute(
                 """INSERT OR IGNORE INTO position_lots(
                        id,symbol,position_lifecycle_id,source_fill_event_key,opened_at,original_quantity,
-                       remaining_quantity,unit_cost,fees_allocated,source,provenance,confidence,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       remaining_quantity,unit_cost,fees_allocated,source,provenance,confidence,created_at,updated_at,
+                       strategy_version,entry_proposal_id,entry_intent_id,entry_regime,entry_score,initial_risk_dollars,
+                       config_hash,evidence_version,formula_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(uuid.uuid4()), symbol, intent["position_lifecycle_id"], broker_event_key,
                     occurred_at, quantity, quantity, price, fees, source, provenance,
-                    base_confidence, now, now,
+                    base_confidence, now, now, strategy_version, proposal_id, value(intent, "id"), entry_regime,
+                    entry_score, initial_risk_dollars, config_hash, evidence_version, formula_version,
                 ),
             )
         elif side == "sell":
@@ -112,6 +153,7 @@ class LotLedger:
             basis = 0.0
             known_qty = 0.0
             confidences: set[str] = set()
+            consumption_rows: list[tuple[Any, ...]] = []
             lots = conn.execute(
                 """SELECT * FROM position_lots WHERE symbol=? AND remaining_quantity>0
                    ORDER BY opened_at,id""",
@@ -131,6 +173,24 @@ class LotLedger:
                 conn.execute(
                     "UPDATE position_lots SET remaining_quantity=?,closed_at=?,updated_at=? WHERE id=?",
                     (new_remaining, occurred_at if new_remaining <= 1e-9 else None, now, lot["id"]),
+                )
+                allocated_proceeds = consumed * price
+                allocated_cost_basis = consumed * float(lot["unit_cost"])
+                allocated_buy_fees = float(lot["fees_allocated"] or 0) * (consumed / float(lot["original_quantity"]))
+                allocated_sell_fees = fees * (consumed / quantity)
+                allocated_adjustments = adjustments * (consumed / quantity)
+                lot_confidence = str(lot["confidence"] or "unavailable")
+                consumption_confidence = lot_confidence if lot_confidence in KNOWN_CONFIDENCE and base_confidence in KNOWN_CONFIDENCE else "partially_reconstructed"
+                consumption_rows.append(
+                    (
+                        str(uuid.uuid4()), broker_event_key, value(intent, "id"),
+                        lot["position_lifecycle_id"] or value(intent, "position_lifecycle_id"), lot["id"],
+                        lot["strategy_version"], consumed, allocated_proceeds, allocated_cost_basis,
+                        allocated_buy_fees, allocated_sell_fees,
+                        allocated_proceeds - allocated_cost_basis - allocated_buy_fees - allocated_sell_fees + allocated_adjustments
+                        if consumption_confidence in KNOWN_CONFIDENCE else None,
+                        occurred_at, consumption_confidence, ACCOUNTING_VERSION,
+                    )
                 )
             fully_based = remaining <= 1e-9
             confidence = base_confidence
@@ -160,6 +220,14 @@ class LotLedger:
                     remaining_position, occurred_at, day, week, ACCOUNTING_TIMEZONE, source,
                     provenance, confidence, now,
                 ),
+            )
+            conn.executemany(
+                """INSERT OR IGNORE INTO lot_consumptions(
+                     id,broker_event_key,sell_intent_id,position_lifecycle_id,lot_id,strategy_version,
+                     quantity,allocated_proceeds,allocated_cost_basis,allocated_buy_fees,allocated_sell_fees,
+                     realized_pnl,occurred_at,confidence,accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                consumption_rows,
             )
         else:
             raise ValueError(f"unsupported fill side for FIFO ledger: {side}")
