@@ -52,7 +52,9 @@ def _engine_config() -> dict:
         "approved_strategy_versions": ["rule_based_v2"],
         "profitability_engine": {
             "enabled": True, "enforcement_enabled": False,
-            "minimum_completed_samples": 100, "minimum_regimes": 2,
+            "minimum_shadow_oos_samples": 100, "minimum_actual_paper_for_throttled": 20,
+            "minimum_actual_paper_for_active": 50, "minimum_samples_per_regime": 10,
+            "minimum_actual_paper_for_divergence_penalty": 20, "minimum_regimes": 2,
             "evidence_stale_after_days": 90,
         },
     }
@@ -94,22 +96,58 @@ def test_regime_execution_and_concentration_divergence_metrics():
     assert metrics["median_absolute_implementation_shortfall_bps"] == pytest.approx(8.0)
 
 
+def test_concentration_uses_r_multiples_not_dollar_pnl():
+    rows = [
+        PerformanceObservation(symbol="SPY", r_multiple=1.0, net_pnl=1_000_000.0),
+        PerformanceObservation(symbol="QQQ", r_multiple=1.0, net_pnl=1.0),
+        PerformanceObservation(symbol="IWM", r_multiple=1.0, net_pnl=1.0),
+        PerformanceObservation(symbol="DIA", r_multiple=1.0, net_pnl=1.0),
+        PerformanceObservation(symbol="XLK", r_multiple=1.0, net_pnl=1.0),
+        PerformanceObservation(symbol="XLF", r_multiple=1.0, net_pnl=1.0),
+    ]
+    assert top_five_profit_contribution(rows) == pytest.approx(5 / 6)
+    assert largest_symbol_profit_contribution(rows) == pytest.approx(1 / 6)
+
+
+def test_immature_regimes_are_reported_but_excluded_from_mature_metrics():
+    rows = [_obs(0.5, index=i, regime="mature") for i in range(10)] + [_obs(-10.0, index=20, regime="immature")]
+    metrics, _ = calculate_metrics(rows, settings={"minimum_samples_per_regime": 10})
+    assert set(metrics["mature_regime_metrics"]) == {"mature"}
+    assert set(metrics["immature_regime_metrics"]) == {"immature"}
+    assert metrics["positive_regime_ratio"] == 1.0
+    assert metrics["worst_regime_expectancy_r"] == pytest.approx(0.5)
+
+
+def test_divergence_is_diagnostic_but_unpenalized_below_actual_maturity():
+    metrics = {
+        "shadow_paper_expectancy_divergence_r": 10.0,
+        "trade_counts": {"shadow_oos": 100, "actual_paper": 19},
+    }
+    _components, _quality, penalties = score_components(metrics, {"minimum_actual_paper_for_divergence_penalty": 20})
+    assert penalties["divergence"] == 0.0
+
+
 def test_exact_component_weights_and_score_penalties():
     metrics = {
-        "expectancy_r": 0.25, "profit_factor": 1.75, "win_rate": 1.0,
+        "expectancy_r": 0.25, "profit_factor": 1.75, "payoff_ratio": 2.0, "win_rate": 1.0,
         "maximum_drawdown_r": 0.0, "worst_losing_streak": 0,
         "recent_20_trade_expectancy_r": 0.25, "positive_rolling_20_window_ratio": 1.0,
         "positive_regime_ratio": 1.0, "worst_regime_expectancy_r": 0.25,
         "submitted_order_fill_rate": 1.0, "median_absolute_implementation_shortfall_bps": 0.0,
         "cost_drag_ratio": 0.0, "sample_count": 100, "evidence_recency_days": 0.0,
-        "attribution_confidence": 1.0, "version_completeness": 1.0,
+        "attribution_confidence": 1.0, "version_completeness": 1.0, "trade_counts": {"shadow_oos": 100, "actual_paper": 20},
         "top_five_profit_contribution": 1.0, "largest_symbol_profit_contribution": 1.0,
         "shadow_paper_expectancy_divergence_r": 0.5,
     }
-    components, quality, penalties = score_components(metrics, {"minimum_completed_samples": 100, "evidence_stale_after_days": 90})
+    components, quality, penalties = score_components(metrics, {"minimum_shadow_oos_samples": 100, "minimum_actual_paper_for_divergence_penalty": 20, "evidence_stale_after_days": 90})
     assert components == {"profitability": 30.0, "downside": 20.0, "stability": 15.0, "regime": 15.0, "execution": 10.0, "evidence": 10.0}
     assert penalties == {"concentration": 10.0, "divergence": 10.0}
     assert quality == pytest.approx(80.0)
+
+    selective = dict(metrics, expectancy_r=0.25, profit_factor=1.0, payoff_ratio=0.0, maximum_drawdown_r=0.0, worst_losing_streak=4)
+    selective_components, _quality, _penalties = score_components(selective, {"minimum_shadow_oos_samples": 100, "minimum_actual_paper_for_divergence_penalty": 20, "evidence_stale_after_days": 90})
+    assert selective_components["profitability"] == pytest.approx(30 * 0.60)
+    assert selective_components["downside"] == pytest.approx(20 * 0.70)
 
 
 @pytest.mark.parametrize("quality,expected", [(44.999, "RESEARCH_ONLY"), (45.0, "EXPLORATION"), (60.0, "THROTTLED"), (75.0, "ACTIVE")])
@@ -119,18 +157,18 @@ def test_quality_score_boundaries(tmp_path, monkeypatch, quality, expected):
     monkeypatch.setattr("app.strategy_performance.score_components", lambda metrics, settings: ({"profitability": quality}, quality, {"concentration": 0.0, "divergence": 0.0}))
     engine = StrategyPerformanceEngine(db, _engine_config(), as_of="2026-02-10T00:00:00+00:00")
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
-    monkeypatch.setattr(engine, "_actual_observations", lambda: [])
+    monkeypatch.setattr(engine, "_actual_observations", lambda: [_obs(0.5, index=100 + i, evidence_class="actual_paper", regime="favorable" if i % 2 else "normal") for i in range(50)])
     assert engine.refresh_strategy("rule_based_v2").recommendation_state == expected
 
 
-@pytest.mark.parametrize("count,expected", [(1, "RESEARCH_ONLY"), (20, "EXPLORATION"), (50, "THROTTLED"), (100, "ACTIVE")])
-def test_maturity_state_ceilings(tmp_path, monkeypatch, count, expected):
+@pytest.mark.parametrize("actual_count,expected", [(0, "EXPLORATION"), (19, "EXPLORATION"), (20, "THROTTLED"), (49, "THROTTLED"), (50, "ACTIVE")])
+def test_maturity_state_ceilings(tmp_path, monkeypatch, actual_count, expected):
     db = _database(tmp_path)
-    observations = [_obs(0.5, index=i, regime="favorable" if i % 2 else "normal") for i in range(count)]
+    observations = [_obs(0.5, index=i, regime="favorable" if i % 2 else "normal") for i in range(100)]
     monkeypatch.setattr("app.strategy_performance.score_components", lambda metrics, settings: ({"profitability": 100.0}, 100.0, {"concentration": 0.0, "divergence": 0.0}))
     engine = StrategyPerformanceEngine(db, _engine_config(), as_of="2026-02-10T00:00:00+00:00")
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
-    monkeypatch.setattr(engine, "_actual_observations", lambda: [])
+    monkeypatch.setattr(engine, "_actual_observations", lambda: [_obs(0.5, index=100 + i, evidence_class="actual_paper", regime="favorable" if i % 2 else "normal") for i in range(actual_count)])
     assert engine.refresh_strategy("rule_based_v2").recommendation_state == expected
 
 
@@ -152,6 +190,25 @@ def test_fifo_partial_complete_sells_allocate_each_lot_and_count_one_lifecycle(t
     snapshot = StrategyPerformanceEngine(db, _engine_config(), as_of="2026-01-04T00:00:00+00:00").refresh_strategy("rule_based_v2")
     assert snapshot.metrics["trade_counts"] == {"shadow_oos": 0, "actual_paper": 1, "total": 1}
     assert db.fetch_all("SELECT COUNT(*) n FROM strategy_trade_records WHERE evidence_class='actual_paper' AND attribution_status='complete'")[0]["n"] == 1
+
+
+def test_partial_fills_allocate_but_never_exceed_intent_initial_risk(tmp_path):
+    db = _database(tmp_path)
+    intent = {"id": "buy-partial", "symbol": "SPY", "side": "buy", "position_lifecycle_id": "lc", "requested_quantity": 10, "initial_risk_dollars": 100}
+    with db.connect() as conn:
+        LotLedger.apply_fill_in_transaction(conn, intent=intent, broker_event_key="p1", delta_quantity=4, fill_price=10, occurred_at="2026-01-01T14:00:00+00:00")
+        LotLedger.apply_fill_in_transaction(conn, intent=intent, broker_event_key="p2", delta_quantity=6, fill_price=11, occurred_at="2026-01-01T15:00:00+00:00")
+        LotLedger.apply_fill_in_transaction(conn, intent=intent, broker_event_key="p2", delta_quantity=6, fill_price=11, occurred_at="2026-01-01T15:00:00+00:00")
+    risks = [row["initial_risk_dollars"] for row in db.fetch_all("SELECT initial_risk_dollars FROM position_lots ORDER BY opened_at")]
+    assert risks == pytest.approx([40.0, 60.0])
+    assert sum(risks) == pytest.approx(100.0)
+
+
+def test_performance_report_states_enforcement_without_report_only_wording(tmp_path):
+    db = _database(tmp_path)
+    report = StrategyPerformanceEngine(db, {"profitability_engine": {"enforcement_enabled": True}}).format_report()
+    assert "Enforcement: enabled" in report
+    assert "report-only" not in report.lower()
 
 
 def test_mixed_strategy_attribution_is_unavailable_and_excluded(tmp_path):

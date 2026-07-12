@@ -134,6 +134,13 @@ class LotLedger:
         formula_version = metadata("formula_version") or ACCOUNTING_VERSION
 
         if side == "buy":
+            requested_quantity = float(value(intent, "approved_quantity") or value(intent, "requested_quantity") or quantity)
+            original_risk = float(initial_risk_dollars) if initial_risk_dollars is not None else None
+            allocated_risk = None
+            if original_risk is not None:
+                prior = conn.execute("SELECT COALESCE(SUM(initial_risk_dollars),0) total FROM position_lots WHERE entry_intent_id=?", (value(intent, "id"),)).fetchone()
+                remaining_risk = max(0.0, original_risk - float(prior["total"] or 0.0))
+                allocated_risk = min(remaining_risk, original_risk * quantity / max(requested_quantity, quantity))
             conn.execute(
                 """INSERT OR IGNORE INTO position_lots(
                        id,symbol,position_lifecycle_id,source_fill_event_key,opened_at,original_quantity,
@@ -145,7 +152,7 @@ class LotLedger:
                     str(uuid.uuid4()), symbol, intent["position_lifecycle_id"], broker_event_key,
                     occurred_at, quantity, quantity, price, fees, source, provenance,
                     base_confidence, now, now, strategy_version, proposal_id, value(intent, "id"), entry_regime,
-                    entry_score, initial_risk_dollars, config_hash, evidence_version, formula_version,
+                    entry_score, allocated_risk, config_hash, evidence_version, formula_version,
                 ),
             )
         elif side == "sell":

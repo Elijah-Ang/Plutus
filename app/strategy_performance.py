@@ -186,13 +186,13 @@ def regime_metrics(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) -
     }
 
 
-def positive_regime_ratio(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) -> float | None:
-    metrics = regime_metrics(rows)
+def positive_regime_ratio(rows: Sequence[PerformanceObservation | Mapping[str, Any]], minimum_samples: int = 1) -> float | None:
+    metrics = {name: item for name, item in regime_metrics(rows).items() if int(item["count"]) >= minimum_samples}
     return None if not metrics else sum((item["expectancy_r"] or 0) > 0 for item in metrics.values()) / len(metrics)
 
 
-def worst_regime_expectancy(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) -> float | None:
-    values = [float(item["expectancy_r"]) for item in regime_metrics(rows).values() if item["expectancy_r"] is not None]
+def worst_regime_expectancy(rows: Sequence[PerformanceObservation | Mapping[str, Any]], minimum_samples: int = 1) -> float | None:
+    values = [float(item["expectancy_r"]) for item in regime_metrics(rows).values() if int(item["count"]) >= minimum_samples and item["expectancy_r"] is not None]
     return min(values) if values else None
 
 
@@ -212,7 +212,7 @@ def cost_drag_ratio(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) 
 
 
 def top_five_profit_contribution(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) -> float | None:
-    profits = sorted((max(0.0, float(_value(row, "net_pnl") if _finite(_value(row, "net_pnl")) is not None else _value(row, "r_multiple") or 0.0)) for row in rows), reverse=True)
+    profits = sorted((max(0.0, float(_value(row, "r_multiple") or 0.0)) for row in rows), reverse=True)
     total = sum(profits)
     return None if total == 0 else sum(profits[:5]) / total
 
@@ -220,9 +220,7 @@ def top_five_profit_contribution(rows: Sequence[PerformanceObservation | Mapping
 def largest_symbol_profit_contribution(rows: Sequence[PerformanceObservation | Mapping[str, Any]]) -> float | None:
     grouped: dict[str, float] = {}
     for row in rows:
-        value = _finite(_value(row, "net_pnl"))
-        if value is None:
-            value = _finite(_value(row, "r_multiple"))
+        value = _finite(_value(row, "r_multiple"))
         if value is not None:
             grouped[str(_value(row, "symbol") or "unknown")] = grouped.get(str(_value(row, "symbol") or "unknown"), 0.0) + max(0.0, value)
     total = sum(grouped.values())
@@ -364,12 +362,12 @@ def score_components(metrics: Mapping[str, Any], settings: Mapping[str, Any] | N
 
     pf = metrics.get("profit_factor")
     pf_quality = 1.0 if pf == float("inf") else _clamp((float(pf) - 1.0) / max(target_profit_factor - 1.0, 1e-9)) if pf is not None else 0.0
-    profitability_quality = statistics.fmean(
-        [_clamp(float(metrics.get("expectancy_r") or 0.0) / max(target_expectancy, 1e-9)), pf_quality, _clamp(metrics.get("win_rate"))]
-    )
-    downside_quality = statistics.fmean(
-        [1.0 - _clamp(float(metrics.get("maximum_drawdown_r") or 0.0) / max(target_drawdown, 1e-9)), 1.0 - _clamp(float(metrics.get("worst_losing_streak") or 0.0) / max(target_streak, 1e-9))]
-    )
+    expectancy_quality = _clamp(float(metrics.get("expectancy_r") or 0.0) / max(target_expectancy, 1e-9))
+    payoff_quality = _clamp(float(metrics.get("payoff_ratio") or 0.0) / max(float(cfg.get("target_payoff_ratio", 2.0)), 1e-9))
+    profitability_quality = 0.60 * expectancy_quality + 0.30 * pf_quality + 0.10 * payoff_quality
+    drawdown_quality = 1.0 - _clamp(float(metrics.get("maximum_drawdown_r") or 0.0) / max(target_drawdown, 1e-9))
+    streak_quality = 1.0 - _clamp(float(metrics.get("worst_losing_streak") or 0.0) / max(target_streak, 1e-9))
+    downside_quality = 0.70 * drawdown_quality + 0.30 * streak_quality
     recent_positive = 1.0 if (metrics.get("recent_20_trade_expectancy_r") or 0.0) > 0 else 0.0
     stability_quality = statistics.fmean([recent_positive, _clamp(metrics.get("positive_rolling_20_window_ratio")), 1.0 - _clamp(abs(float(metrics.get("recent_20_trade_expectancy_r") or 0.0) - float(metrics.get("expectancy_r") or 0.0)) / max(target_expectancy, 1e-9))])
     regime_quality = statistics.fmean([_clamp(metrics.get("positive_regime_ratio")), _clamp((float(metrics.get("worst_regime_expectancy_r") or 0.0) + target_expectancy) / max(2.0 * target_expectancy, 1e-9))])
@@ -379,7 +377,7 @@ def score_components(metrics: Mapping[str, Any], settings: Mapping[str, Any] | N
     drag_quality = 1.0 - _clamp(metrics.get("cost_drag_ratio")) if metrics.get("cost_drag_ratio") is not None else 0.5
     execution_quality = statistics.fmean([fill_quality, shortfall_quality, drag_quality])
     recency_quality = 0.0 if metrics.get("evidence_recency_days") is None else 1.0 - _clamp(float(metrics["evidence_recency_days"]) / max(float(cfg.get("evidence_stale_after_days", 90)), 1e-9))
-    evidence_quality = statistics.fmean([_clamp(float(metrics.get("sample_count") or 0) / max(float(cfg.get("minimum_completed_samples", 100)), 1.0)), recency_quality, _clamp(metrics.get("attribution_confidence")), _clamp(metrics.get("version_completeness"))])
+    evidence_quality = statistics.fmean([_clamp(float((metrics.get("trade_counts") or {}).get("shadow_oos", 0)) / max(float(cfg.get("minimum_shadow_oos_samples", 100)), 1.0)), recency_quality, _clamp(metrics.get("attribution_confidence")), _clamp(metrics.get("version_completeness"))])
 
     components = {
         "profitability": round(30.0 * profitability_quality, 10),
@@ -392,7 +390,8 @@ def score_components(metrics: Mapping[str, Any], settings: Mapping[str, Any] | N
     top_five = float(metrics.get("top_five_profit_contribution") or 0.0)
     largest = float(metrics.get("largest_symbol_profit_contribution") or 0.0)
     concentration = min(10.0, 5.0 * _clamp((top_five - 0.60) / 0.30) + 5.0 * _clamp((largest - 0.35) / 0.40))
-    divergence = min(10.0, 10.0 * _clamp(float(metrics.get("shadow_paper_expectancy_divergence_r") or 0.0) / max(target_divergence, 1e-9)))
+    actual_count = int((metrics.get("trade_counts") or {}).get("actual_paper", 0))
+    divergence = 0.0 if actual_count < int(cfg.get("minimum_actual_paper_for_divergence_penalty", 20)) else min(10.0, 10.0 * _clamp(float(metrics.get("shadow_paper_expectancy_divergence_r") or 0.0) / max(target_divergence, 1e-9)))
     penalties = {"concentration": round(concentration, 10), "divergence": round(divergence, 10)}
     return components, round(max(0.0, sum(components.values()) - sum(penalties.values())), 10), penalties
 
@@ -412,6 +411,9 @@ def calculate_metrics(
     shadow = [row for row in ordered if row.evidence_class == "shadow_oos"]
     actual = [row for row in ordered if row.evidence_class == "actual_paper"]
     regimes = regime_metrics(ordered)
+    minimum_regime_samples = int((settings or {}).get("minimum_samples_per_regime", 10))
+    mature_regimes = {name: item for name, item in regimes.items() if int(item["count"]) >= minimum_regime_samples}
+    immature_regimes = {name: item for name, item in regimes.items() if int(item["count"]) < minimum_regime_samples}
     latest = max((_text(row.exit_session) or _text(row.entry_session) or "" for row in ordered), default=None)
     now = _parse_datetime(as_of) if as_of is not None else datetime.now(UTC)
     recency_days = None
@@ -439,8 +441,10 @@ def calculate_metrics(
         "recent_20_trade_expectancy_r": recent_expectancy_r(values, PRIMARY_HORIZON_SESSIONS),
         "positive_rolling_20_window_ratio": positive_rolling_window_ratio(values, PRIMARY_HORIZON_SESSIONS),
         "regime_metrics": regimes,
-        "positive_regime_ratio": positive_regime_ratio(ordered),
-        "worst_regime_expectancy_r": worst_regime_expectancy(ordered),
+        "mature_regime_metrics": mature_regimes,
+        "immature_regime_metrics": immature_regimes,
+        "positive_regime_ratio": positive_regime_ratio(ordered, minimum_regime_samples),
+        "worst_regime_expectancy_r": worst_regime_expectancy(ordered, minimum_regime_samples),
         "submitted_order_fill_rate": fill_rate,
         "median_absolute_implementation_shortfall_bps": median_absolute_implementation_shortfall(execution_rows),
         "cost_drag_ratio": cost_drag_ratio(ordered),
@@ -457,6 +461,7 @@ def calculate_metrics(
         "shadow_r": _r_values(shadow),
         "actual_r": _r_values(actual),
         "regimes": regimes,
+        "minimum_samples_per_regime": minimum_regime_samples,
         "execution_rows": [dict(row) for row in execution_rows],
         "current_evidence_version": current_evidence_version,
         "current_formula_version": current_formula_version,
@@ -599,12 +604,13 @@ class StrategyPerformanceEngine:
         phase4 = self.config.get("phase4", {}) or {}
         promotion = phase3.get("promotion", {}) or {}
         return {
-            "minimum_completed_samples": int(self.cfg.get("minimum_completed_samples", phase4.get("minimum_oos_samples", promotion.get("minimum_completed_oos", 100)))),
+            "minimum_shadow_oos_samples": int(self.cfg.get("minimum_shadow_oos_samples", 100)),
+            "minimum_actual_paper_for_throttled": int(self.cfg.get("minimum_actual_paper_for_throttled", 20)),
+            "minimum_actual_paper_for_active": int(self.cfg.get("minimum_actual_paper_for_active", 50)),
+            "minimum_samples_per_regime": int(self.cfg.get("minimum_samples_per_regime", 10)),
+            "minimum_actual_paper_for_divergence_penalty": int(self.cfg.get("minimum_actual_paper_for_divergence_penalty", 20)),
             "minimum_regimes": int(self.cfg.get("minimum_regimes", phase4.get("minimum_regimes", promotion.get("minimum_regimes", 2)))),
             "evidence_stale_after_days": float(self.cfg.get("evidence_stale_after_days", phase4.get("evidence_stale_after_days", 90))),
-            "maturity_research_only_max": int(self.cfg.get("maturity_research_only_max", 19)),
-            "maturity_exploration_max": int(self.cfg.get("maturity_exploration_max", 49)),
-            "maturity_throttled_max": int(self.cfg.get("maturity_throttled_max", 99)),
             "score_exploration_threshold": float(self.cfg.get("score_exploration_threshold", 45.0)),
             "score_throttled_threshold": float(self.cfg.get("score_throttled_threshold", 60.0)),
             "score_active_threshold": float(self.cfg.get("score_active_threshold", 75.0)),
@@ -798,24 +804,28 @@ class StrategyPerformanceEngine:
         execution = self._execution_rows(strategy_version)
         metrics, raw_inputs = calculate_metrics(observations, execution_rows=execution, as_of=self.as_of, settings=settings)
         components, quality, penalties = score_components(metrics, settings)
-        minimum = settings["minimum_completed_samples"]
         sample_count = int(metrics["sample_count"])
-        regime_count = len(metrics["regime_metrics"])
+        shadow_count = int(metrics["trade_counts"]["shadow_oos"])
+        actual_count = int(metrics["trade_counts"]["actual_paper"])
+        regime_count = len(metrics["mature_regime_metrics"])
         recency = metrics.get("evidence_recency_days")
         gates = {
             "evidence_present": sample_count > 0,
-            "minimum_sample": sample_count >= minimum,
+            "minimum_shadow_oos_sample": shadow_count >= settings["minimum_shadow_oos_samples"],
             "minimum_regimes": regime_count >= settings["minimum_regimes"],
             "evidence_fresh": recency is not None and recency <= settings["evidence_stale_after_days"],
             "version_complete": metrics["version_completeness"] >= 1.0,
             "positive_expectancy": (metrics["expectancy_r"] or 0.0) > 0,
             "drawdown_within_hard_limit": (metrics["maximum_drawdown_r"] or 0.0) <= settings["hard_max_drawdown_r"],
             "losing_streak_within_hard_limit": int(metrics["worst_losing_streak"] or 0) <= settings["hard_max_losing_streak"],
-            "divergence_within_hard_limit": (metrics["shadow_paper_expectancy_divergence_r"] is None or metrics["shadow_paper_expectancy_divergence_r"] <= settings["hard_max_divergence_r"]),
+            "divergence_within_hard_limit": (actual_count < settings["minimum_actual_paper_for_divergence_penalty"] or metrics["shadow_paper_expectancy_divergence_r"] is None or metrics["shadow_paper_expectancy_divergence_r"] <= settings["hard_max_divergence_r"]),
         }
+        ceiling = "RESEARCH_ONLY" if shadow_count < settings["minimum_shadow_oos_samples"] else "EXPLORATION" if actual_count < settings["minimum_actual_paper_for_throttled"] else "THROTTLED" if actual_count < settings["minimum_actual_paper_for_active"] else "ACTIVE"
+        maturity_reason = f"shadow OOS {shadow_count}/{settings['minimum_shadow_oos_samples']}" if shadow_count < settings["minimum_shadow_oos_samples"] else f"actual paper {actual_count}/{settings['minimum_actual_paper_for_throttled']} for THROTTLED" if actual_count < settings["minimum_actual_paper_for_throttled"] else f"actual paper {actual_count}/{settings['minimum_actual_paper_for_active']} for ACTIVE" if actual_count < settings["minimum_actual_paper_for_active"] else "shadow and actual-paper maturity requirements met"
         maturity = {
-            "sample_count": sample_count, "minimum_completed_samples": minimum, "regime_count": regime_count,
-            "minimum_regimes": settings["minimum_regimes"], "ceiling": "RESEARCH_ONLY" if sample_count <= settings["maturity_research_only_max"] else "EXPLORATION" if sample_count <= settings["maturity_exploration_max"] else "THROTTLED" if sample_count <= settings["maturity_throttled_max"] else "ACTIVE",
+            "sample_count": sample_count, "shadow_oos_count": shadow_count, "actual_paper_count": actual_count,
+            "minimum_shadow_oos_samples": settings["minimum_shadow_oos_samples"], "minimum_actual_paper_for_throttled": settings["minimum_actual_paper_for_throttled"], "minimum_actual_paper_for_active": settings["minimum_actual_paper_for_active"],
+            "regime_count": regime_count, "minimum_regimes": settings["minimum_regimes"], "ceiling": ceiling, "binding_maturity_reason": maturity_reason,
         }
         if not gates["evidence_present"]:
             state, reason = "RESEARCH_ONLY", "no complete current-version evidence"
@@ -834,14 +844,12 @@ class StrategyPerformanceEngine:
                     candidate = "RESEARCH_ONLY"
                 ceiling = maturity["ceiling"]
                 state = candidate if _STATE_RANK[candidate] <= _STATE_RANK[ceiling] else ceiling
-                reason = "quality score and maturity ceiling" if state == candidate else f"maturity ceiling {ceiling}"
-                if state == "ACTIVE" and not gates["minimum_sample"]:
-                    state, reason = "THROTTLED", "minimum sample hard gate not met"
+                reason = "quality score and maturity requirements" if state == candidate else f"maturity ceiling {ceiling}: {maturity_reason}"
                 if state == "ACTIVE" and not gates["minimum_regimes"]:
                     state, reason = "THROTTLED", "minimum regime hard gate not met"
                 if state == "ACTIVE" and not gates["positive_expectancy"]:
                     state, reason = "SUSPENDED", "non-positive mature expectancy"
-        raw_inputs = {**raw_inputs, "penalties": penalties, "hard_gates": gates, "maturity": maturity, "settings": settings}
+        raw_inputs = {**raw_inputs, "score_inputs": dict(metrics), "score_components": components, "penalties": penalties, "hard_gates": gates, "maturity": maturity, "settings": settings}
         metrics = {**metrics, "quality_score": quality, "component_weights": {"profitability": 30, "downside": 20, "stability": 15, "regime": 15, "execution": 10, "evidence": 10}, "penalties": penalties}
         fingerprint = _fingerprint({"strategy_version": strategy_version, "observations": [asdict(row) for row in observations], "metrics": metrics, "components": components, "raw_inputs": raw_inputs, "performance_version": STRATEGY_PERFORMANCE_VERSION, "policy_version": STRATEGY_POLICY_VERSION})
         snapshot_id = fingerprint[:32]
@@ -1035,9 +1043,9 @@ class StrategyPerformanceEngine:
             latest.setdefault(row["strategy_version"], row)
         if not latest:
             enforcement = "enabled" if self.cfg.get("enforcement_enabled") is True else "disabled"
-            return f"Strategy performance: no persisted scorecard available.\nReport-only; enforcement {enforcement}."
+            return f"Strategy performance: no persisted scorecard available.\nEnforcement: {enforcement}."
         enforcement = "enabled" if self.cfg.get("enforcement_enabled") is True else "disabled"
-        lines = ["Strategy performance (persisted, report-only)", f"Enforcement: {enforcement}"]
+        lines = ["Strategy performance (persisted)", f"Enforcement: {enforcement}"]
         for version, row in latest.items():
             metrics = json.loads(row["metrics_json"] or "{}")
             lines.extend([

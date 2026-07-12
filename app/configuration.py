@@ -93,8 +93,9 @@ STRICT_SECTION_KEYS = {
     "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
-        "minimum_completed_samples", "minimum_regimes", "evidence_stale_after_days", "maturity_research_only_max",
-        "maturity_exploration_max", "maturity_throttled_max", "score_exploration_threshold", "score_throttled_threshold",
+        "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
+        "minimum_samples_per_regime", "minimum_actual_paper_for_divergence_penalty", "minimum_regimes", "evidence_stale_after_days",
+        "score_exploration_threshold", "score_throttled_threshold",
         "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
         "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
     },
@@ -236,6 +237,17 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(exploration_heat is not None and exploration_heat <= 0.25, "Phase 4 exploration heat exceeds the 0.25% bound")
         require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
         require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
+
+    profitability = config.get("profitability_engine", {}) or {}
+    required_profitability_settings = {
+        "minimum_shadow_oos_samples": 100,
+        "minimum_actual_paper_for_throttled": 20,
+        "minimum_actual_paper_for_active": 50,
+        "minimum_samples_per_regime": 10,
+        "minimum_actual_paper_for_divergence_penalty": 20,
+    }
+    for key, expected in required_profitability_settings.items():
+        require(profitability.get(key) == expected, f"profitability_engine.{key} must be {expected}")
 
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail
