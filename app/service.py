@@ -6648,6 +6648,9 @@ class TradingService:
         sizing_cfg = self.config.get("position_sizing", {}) or {}
         strategy_version = strategy_version or STRATEGY_VERSION
         mode = str(sizing_cfg.get("mode"))
+        resolved_policy: Any = None
+        resolved_strategy_risk_multiplier: float | None = None
+        resolved_permitted_stop_risk_pct: float | None = None
 
         def finite(value: Any, default: float | None = None) -> float | None:
             try:
@@ -6674,11 +6677,15 @@ class TradingService:
                 "caps_applied": "none", "binding_caps": [], "sizing_caps": {}, "blocked_reason": reason,
                 "atr_value": atr_value, "technical_stop_price": technical_stop_price,
                 "pending_exposure_unknown": False, "formula_version": RISK_DECISION_VERSION,
-                "strategy_version": strategy_version, "performance_snapshot_id": None, "policy_decision_id": None,
-                "strategy_quality_score": None, "strategy_state": "SUSPENDED" if "profitability_engine" in self.config else None,
-                "strategy_risk_multiplier": 0.0 if "profitability_engine" in self.config else None,
-                "permitted_stop_risk_pct": 0.0 if "profitability_engine" in self.config else None,
-                "strategy_policy_version": None, "binding_policy_reason": reason,
+                "strategy_version": strategy_version,
+                "performance_snapshot_id": resolved_policy.performance_snapshot_id if resolved_policy else None,
+                "policy_decision_id": resolved_policy.id if resolved_policy else None,
+                "strategy_quality_score": resolved_policy.quality_score if resolved_policy else None,
+                "strategy_state": resolved_policy.state if resolved_policy else ("SUSPENDED" if "profitability_engine" in self.config else None),
+                "strategy_risk_multiplier": resolved_strategy_risk_multiplier if resolved_policy else (0.0 if "profitability_engine" in self.config else None),
+                "permitted_stop_risk_pct": resolved_permitted_stop_risk_pct if resolved_policy else (0.0 if "profitability_engine" in self.config else None),
+                "strategy_policy_version": resolved_policy.policy_version if resolved_policy else None,
+                "binding_policy_reason": reason,
             }
 
         entry_price = finite(price)
@@ -6710,6 +6717,7 @@ class TradingService:
             persisted_policy = policy_override or self._cycle_strategy_policy(strategy_version)
             if "profitability_engine" in self.config and persisted_policy is None:
                 return empty("latest strategy performance policy unavailable or invalid; new entries and adds fail closed")
+            resolved_policy = persisted_policy
             states = {strategy_version: persisted_policy.state} if persisted_policy is not None else controller.refresh_strategy_states()
             allocation_mult = controller.allocation(strategy_version, states) if persisted_policy is None else 1.0
             regime_mult = phase3_regime_multiplier(volatility_regime)
@@ -6728,6 +6736,8 @@ class TradingService:
                     exploration_stop_risk_pct=float((self.config.get("phase4", {}) or {}).get("exploration_stop_risk_pct", 0.05)),
                     is_add=is_add,
                 )
+                resolved_strategy_risk_multiplier = strategy_risk_multiplier
+                resolved_permitted_stop_risk_pct = permitted_stop_risk_pct
                 if permitted_stop_risk_pct <= 0:
                     return empty(policy_reason)
                 base_risk_pct = permitted_stop_risk_pct
