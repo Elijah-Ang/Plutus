@@ -77,7 +77,7 @@ phase4:
   phase3_hard_limits_authoritative: true
 profitability_engine:
   enabled: true
-  enforcement_enabled: false
+  enforcement_enabled: true
   performance_version: strategy_performance_v1
   policy_version: strategy_policy_v1
   schema_version: strategy_profitability_engine_v1

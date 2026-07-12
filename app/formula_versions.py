@@ -15,6 +15,7 @@ EVIDENCE_VERSION = "phase1_outcome_v2_exit_session"
 STRATEGY_PERFORMANCE_VERSION = "strategy_performance_v1"
 STRATEGY_POLICY_VERSION = "strategy_policy_v1"
 STRATEGY_PERFORMANCE_SCHEMA_VERSION = "strategy_profitability_engine_v1"
+STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION = "strategy_policy_enforcement_v1"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -27,5 +28,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         "phase4_adaptive_paper_allocation_v1",
         "runtime_safety_accounting_v1",
         STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+        STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
     }
 )

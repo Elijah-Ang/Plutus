@@ -27,14 +27,16 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "reconciliation_attempts": {"intent_id", "outcome", "created_at"},
     "telegram_updates": {"update_id", "message_id", "message_timestamp", "received_at", "processing_state"},
     "research_outcomes": {"opportunity_id", "horizon_sessions", "status", "exit_session", "calculation_version", "outcome_class"},
-    "phase3_risk_decisions": {"run_id", "requested_notional", "binding_caps_json", "evidence_version", "formula_version"},
-    "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json"},
+    "phase3_risk_decisions": {"run_id", "requested_notional", "binding_caps_json", "evidence_version", "formula_version", "performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct"},
+    "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json", "strategy_policy_map_json", "strategy_policy_version"},
+    "trade_proposals": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
+    "position_sizing_decisions": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
     "cash_snapshots": {"equity", "realized_fifo_pnl", "account_equity_change", "unrealized_change", "external_cash_flow", "accounting_version"},
-    "position_lots": {"strategy_version", "entry_proposal_id", "entry_intent_id", "initial_risk_dollars", "evidence_version", "formula_version"},
+    "position_lots": {"strategy_version", "entry_proposal_id", "entry_intent_id", "entry_regime", "entry_score", "initial_risk_dollars", "config_hash", "evidence_version", "formula_version"},
     "lot_consumptions": {"broker_event_key", "sell_intent_id", "position_lifecycle_id", "lot_id", "allocated_proceeds", "allocated_cost_basis", "allocated_buy_fees", "allocated_sell_fees", "realized_pnl", "accounting_version"},
     "strategy_trade_records": {"source_key", "strategy_version", "evidence_class", "attribution_status", "r_multiple", "evidence_version", "formula_version"},
     "strategy_performance_snapshots": {"strategy_version", "performance_version", "policy_version", "quality_score", "metrics_json", "input_fingerprint"},
-    "strategy_policy_decisions": {"strategy_version", "state", "performance_snapshot_id", "enforcement_enabled", "policy_version", "input_fingerprint"},
+    "strategy_policy_decisions": {"strategy_version", "state", "performance_snapshot_id", "enforcement_enabled", "policy_version", "schema_version", "input_fingerprint"},
 }
 
 

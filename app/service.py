@@ -165,6 +165,7 @@ class TradingService:
         self._context_cache: tuple[float, dict[str, Any]] | None = None
         self._phase1_bar_cache: dict[str, Any] = {}
         self._phase4_allocation_cache: dict[str, Any] | None = None
+        self._strategy_policy_map: dict[str, Any] | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
@@ -2332,6 +2333,44 @@ class TradingService:
         elif not self.storage.writable():
             block_reason = "database is not writable"
 
+        # Entry/add approvals bind to both the policy captured with the
+        # proposal and the latest current policy.  The conservative merge can
+        # only reduce the permitted state/risk; protective exits do not enter
+        # this gate.
+        final_policy_override = None
+        policy_bound_proposal = bool(
+            proposal.get("strategy_version") or row.get("strategy_version")
+            or proposal.get("policy_decision_id") or row.get("policy_decision_id")
+        )
+        if block_reason is None and prop_side == "buy" and "profitability_engine" in self.config and policy_bound_proposal:
+            try:
+                from .strategy_performance import StrategyPerformanceEngine, more_conservative_state
+
+                strategy_version = str(proposal.get("strategy_version") or row.get("strategy_version") or STRATEGY_VERSION)
+                engine = StrategyPerformanceEngine(self.storage, self.config)
+                proposal_policy = engine.policy_by_id(proposal.get("policy_decision_id") or row.get("policy_decision_id"))
+                latest_policy = engine.latest_valid_policy(strategy_version)
+                if proposal_policy is None or latest_policy is None:
+                    block_reason = "strategy performance policy unavailable, stale, or invalid; entry/add fails closed"
+                else:
+                    merged_state = more_conservative_state(proposal_policy.state, latest_policy.state)
+                    final_policy_override = dataclasses.replace(
+                        latest_policy,
+                        state=merged_state,
+                        reason=(
+                            f"conservative final policy merge: proposal={proposal_policy.state}; "
+                            f"latest={latest_policy.state}; selected={merged_state}"
+                        ),
+                        quality_score=min(proposal_policy.quality_score, latest_policy.quality_score),
+                    )
+                    proposal["final_policy_state"] = merged_state
+                    proposal["final_policy_reason"] = final_policy_override.reason
+                    proposal["final_policy_proposal_decision_id"] = proposal_policy.id
+                    proposal["final_policy_current_decision_id"] = latest_policy.id
+            except Exception as exc:
+                logger.warning("Strategy policy final revalidation failed: %s", type(exc).__name__)
+                block_reason = "strategy performance policy final revalidation failed; entry/add fails closed"
+
         # Expiry check
         if block_reason is None and batch_row is not None:
             if self._proposal_or_candidate_expired(row, batch_row):
@@ -2465,17 +2504,18 @@ class TradingService:
                     refreshed_price_val,
                     bars_fresh,
                     snapshot_fresh,
-                    is_add=is_add
+                    is_add=is_add, strategy_version=str(proposal.get("strategy_version") or row.get("strategy_version") or STRATEGY_VERSION),
+                    policy_override=final_policy_override,
                 )
 
                 recalc_notional = size_dict["final_notional"]
                 
-                # Cap recalculated size at approved notional to satisfy approved-notional invariant
-                if approved_notional > 0.0 and recalc_notional > approved_notional:
-                    final_notional = approved_notional
+                # Final validation is a one-way ceiling: it may reduce to a
+                # stricter current-policy result, but can never expand the
+                # proposal-time approved notional (including a zero value).
+                final_notional = min(max(0.0, approved_notional), max(0.0, recalc_notional))
+                if recalc_notional > approved_notional:
                     proposal["notional_reduced_by_cap"] = True
-                else:
-                    final_notional = recalc_notional
                     
                 proposal["notional"] = final_notional
                 proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val > 0 else size_dict["suggested_shares"]
@@ -3703,9 +3743,20 @@ class TradingService:
                 phase4_mode = "disabled"
                 phase4_exploration_heat_cap_pct = None
                 phase4_exploration_gross_cap_pct = None
+                performance_snapshot_id = None
+                policy_decision_id = None
+                strategy_quality_score = None
+                strategy_state = None
+                strategy_risk_multiplier = None
+                permitted_stop_risk_pct = None
+                strategy_policy_version = None
+                binding_policy_reason = None
 
                 if signal.action == "ENTRY" and signal.side == "buy":
-                    size_dict = self._calculate_dynamic_size(symbol, score, volatility_regime, price, bars, snapshot, is_add=is_add)
+                    size_dict = self._calculate_dynamic_size(
+                        symbol, score, volatility_regime, price, bars, snapshot,
+                        is_add=is_add, strategy_version=signal.strategy_version,
+                    )
                     final_notional = size_dict["final_notional"]
                     suggested_shares = size_dict["suggested_shares"]
                     stop_price = size_dict["stop_price"]
@@ -3730,6 +3781,14 @@ class TradingService:
                     phase4_mode = size_dict.get("phase4_mode", "disabled")
                     phase4_exploration_heat_cap_pct = size_dict.get("phase4_exploration_heat_cap_pct")
                     phase4_exploration_gross_cap_pct = size_dict.get("phase4_exploration_gross_cap_pct")
+                    performance_snapshot_id = size_dict.get("performance_snapshot_id")
+                    policy_decision_id = size_dict.get("policy_decision_id")
+                    strategy_quality_score = size_dict.get("strategy_quality_score")
+                    strategy_state = size_dict.get("strategy_state")
+                    strategy_risk_multiplier = size_dict.get("strategy_risk_multiplier")
+                    permitted_stop_risk_pct = size_dict.get("permitted_stop_risk_pct")
+                    strategy_policy_version = size_dict.get("strategy_policy_version")
+                    binding_policy_reason = size_dict.get("binding_policy_reason")
 
                 # Log add-on opportunity
                 if is_add:
@@ -3909,6 +3968,14 @@ class TradingService:
                     "phase4_mode": phase4_mode,
                     "phase4_exploration_heat_cap_pct": phase4_exploration_heat_cap_pct,
                     "phase4_exploration_gross_cap_pct": phase4_exploration_gross_cap_pct,
+                    "performance_snapshot_id": performance_snapshot_id,
+                    "policy_decision_id": policy_decision_id,
+                    "strategy_quality_score": strategy_quality_score,
+                    "strategy_state": strategy_state,
+                    "strategy_risk_multiplier": strategy_risk_multiplier,
+                    "permitted_stop_risk_pct": permitted_stop_risk_pct,
+                    "strategy_policy_version": strategy_policy_version,
+                    "binding_policy_reason": binding_policy_reason,
                     "score_multiplier": score_mult,
                     "volatility_multiplier": vol_mult,
                     "stop_model_used": stop_method,
@@ -4741,6 +4808,19 @@ class TradingService:
                 else:
                     final_proposal_message_category = "suppressed"
 
+                if proposal is not None:
+                    proposal.update({
+                        "strategy_version": signal.strategy_version,
+                        "performance_snapshot_id": res.get("performance_snapshot_id"),
+                        "policy_decision_id": res.get("policy_decision_id"),
+                        "strategy_quality_score": res.get("strategy_quality_score"),
+                        "strategy_state": res.get("strategy_state"),
+                        "strategy_risk_multiplier": res.get("strategy_risk_multiplier"),
+                        "permitted_stop_risk_pct": res.get("permitted_stop_risk_pct"),
+                        "strategy_policy_version": res.get("strategy_policy_version"),
+                        "binding_policy_reason": res.get("binding_policy_reason"),
+                    })
+
                 res["proposal_allowed"] = proposal_allowed
                 res["proposal_generated"] = proposal_generated
                 res["proposal_id"] = proposal_id
@@ -4761,6 +4841,13 @@ class TradingService:
                 self.storage.execute(
                     "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, emergency_exit_hard_trigger, emergency_exit_mode, emergency_exit_wait_seconds, None, emergency_exit_auto_execute_due_at, None, emergency_exit_final_decision, emergency_exit_block_reason, price, atr_value, adverse_move_atr, minutes_to_close, 1 if sleep_mode_active else 0, suppressed_by_sleep_mode, sleep_mode_reason, sleep_mode_suppressed_candidate, sleep_mode_started_at, sleep_mode_ended_at)
+                )
+                self.storage.execute(
+                    """UPDATE trade_proposals SET performance_snapshot_id=?,policy_decision_id=?,strategy_quality_score=?,
+                       strategy_state=?,strategy_risk_multiplier=?,permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=? WHERE id=?""",
+                    (res.get("performance_snapshot_id"), res.get("policy_decision_id"), res.get("strategy_quality_score"),
+                     res.get("strategy_state"), res.get("strategy_risk_multiplier"), res.get("permitted_stop_risk_pct"),
+                     res.get("strategy_policy_version"), res.get("binding_policy_reason"), proposal_id),
                 )
 
                 logger.info(
@@ -4877,11 +4964,16 @@ class TradingService:
                     )
                     self.storage.execute(
                         """UPDATE position_sizing_decisions SET
-                           stop_policy_version=?,sizing_policy_version=?,formula_version=?,sizing_caps_json=?,binding_caps_json=?,evidence_version=?,config_hash=?
+                           stop_policy_version=?,sizing_policy_version=?,formula_version=?,sizing_caps_json=?,binding_caps_json=?,evidence_version=?,config_hash=?,
+                           performance_snapshot_id=?,policy_decision_id=?,strategy_quality_score=?,strategy_state=?,strategy_risk_multiplier=?,
+                           permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=?
                            WHERE id=?""",
                         (STOP_POLICY_VERSION, SIZING_POLICY_VERSION, RISK_DECISION_VERSION,
                          json_dumps(res.get("sizing_caps") or {}), json_dumps(res.get("binding_caps") or []),
-                         EVIDENCE_VERSION, self.config.get("effective_config_hash"), sizing_decision_id),
+                         EVIDENCE_VERSION, self.config.get("effective_config_hash"), res.get("performance_snapshot_id"),
+                         res.get("policy_decision_id"), res.get("strategy_quality_score"), res.get("strategy_state"),
+                         res.get("strategy_risk_multiplier"), res.get("permitted_stop_risk_pct"), res.get("strategy_policy_version"),
+                         res.get("binding_policy_reason"), sizing_decision_id),
                     )
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
@@ -5665,8 +5757,14 @@ class TradingService:
         return rows_by_tier
 
     def run_cycle(self, run_dynamic_universe: bool = True) -> None:
+        # One immutable policy view is used by all scanner candidates in this
+        # cycle. Final approval performs its own conservative current-policy
+        # revalidation immediately before execution.
+        self._strategy_policy_map = None
+        self._phase4_allocation_cache = None
         self.storage.audit(self.run_id, "scan_cycle_started", {"run_dynamic_universe": run_dynamic_universe})
         BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
+        self._refresh_strategy_performance()
         if self.config.get("phase3", {}).get("active"):
             from .phase3_risk import Phase3Controller
             controller = Phase3Controller(self.storage, self.config, self.run_id)
@@ -5694,7 +5792,8 @@ class TradingService:
                 "reserved_risk": float(reservations_phase4.get("active_reserved_stop_risk") or 0.0),
             }
             self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
-                regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot
+                regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot,
+                strategy_policy_map=self._strategy_policy_map or {},
             )
             self.storage.audit(self.run_id, "phase4_active_adaptive_allocation", {
                 "allocation_id": self._phase4_allocation_cache["allocation_id"],
@@ -5724,29 +5823,47 @@ class TradingService:
         self.check_and_send_digest()
         self.storage.audit(self.run_id, "scan_cycle_completed", {"run_dynamic_universe": run_dynamic_universe})
         self._update_forward_outcomes()
-        self._refresh_strategy_performance()
 
     def _refresh_strategy_performance(self) -> None:
-        """Refresh report-only scorecards after evidence work has completed."""
+        """Refresh and freeze the cycle's persisted strategy-policy map."""
         if not (self.config.get("profitability_engine", {}) or {}).get("enabled", True):
+            self._strategy_policy_map = {}
             return
         started_at = iso_now()
         try:
             from .strategy_performance import StrategyPerformanceEngine
 
-            snapshots = StrategyPerformanceEngine(self.storage, self.config).refresh_all()
+            engine = StrategyPerformanceEngine(self.storage, self.config)
+            snapshots = engine.refresh_all()
+            self._strategy_policy_map = engine.valid_policy_map()
             detail = {
                 "strategy_count": len(snapshots),
                 "states": {key: snapshot.recommendation_state for key, snapshot in snapshots.items()},
-                "enforcement_enabled": False,
-                "report_only": True,
+                "valid_policy_count": len(self._strategy_policy_map),
+                "enforcement_enabled": bool((self.config.get("profitability_engine", {}) or {}).get("enforcement_enabled")),
+                "report_only": False,
             }
             record_heartbeat(self.storage, "strategy_performance", "healthy", attempted_at=started_at, completed_at=iso_now(), successful_at=iso_now(), detail=detail)
             self.storage.audit(self.run_id, "strategy_performance_refresh_complete", detail)
         except Exception as exc:
-            detail = {"error_type": type(exc).__name__, "report_only": True, "enforcement_enabled": False}
+            self._strategy_policy_map = {}
+            detail = {"error_type": type(exc).__name__, "report_only": False, "enforcement_enabled": True}
             record_heartbeat(self.storage, "strategy_performance", "failed", attempted_at=started_at, completed_at=iso_now(), blocked_reason="scorecard refresh failed", detail=detail)
             self.storage.audit(self.run_id, "strategy_performance_refresh_failed", detail)
+
+    def _cycle_strategy_policy(self, strategy_version: str) -> Any:
+        """Return the frozen policy used by this cycle, or a read-only fallback.
+
+        The fallback supports direct unit-level sizing calls that do not run a
+        scanner cycle. A release config with enforcement enabled still fails
+        closed when no valid persisted policy exists.
+        """
+        if "profitability_engine" not in self.config:
+            return None
+        if self._strategy_policy_map is None:
+            from .strategy_performance import StrategyPerformanceEngine
+            self._strategy_policy_map = StrategyPerformanceEngine(self.storage, self.config).valid_policy_map()
+        return self._strategy_policy_map.get(strategy_version)
 
     def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
@@ -6516,7 +6633,12 @@ class TradingService:
             "unknown_reason": "; ".join(f"{row['proposal_id']}: {row['reason']}" for row in unknown_rows) if unknown_rows else None,
         }
 
-    def _calculate_dynamic_size(self, symbol: str, score: float, volatility_regime: str, price: float, bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False) -> dict[str, Any]:
+    def _calculate_dynamic_size(
+        self, symbol: str, score: float, volatility_regime: str, price: float,
+        bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False,
+        strategy_version: str | None = None,
+        policy_override: Any = None,
+    ) -> dict[str, Any]:
         """Calculate one conservative notional as the minimum of all ceilings.
 
         This method deliberately has no minimum clamp and no percentage-stop
@@ -6524,6 +6646,7 @@ class TradingService:
         Phase 3/4 risk input returns zero with an auditable blocker.
         """
         sizing_cfg = self.config.get("position_sizing", {}) or {}
+        strategy_version = strategy_version or STRATEGY_VERSION
         mode = str(sizing_cfg.get("mode"))
 
         def finite(value: Any, default: float | None = None) -> float | None:
@@ -6551,6 +6674,11 @@ class TradingService:
                 "caps_applied": "none", "binding_caps": [], "sizing_caps": {}, "blocked_reason": reason,
                 "atr_value": atr_value, "technical_stop_price": technical_stop_price,
                 "pending_exposure_unknown": False, "formula_version": RISK_DECISION_VERSION,
+                "strategy_version": strategy_version, "performance_snapshot_id": None, "policy_decision_id": None,
+                "strategy_quality_score": None, "strategy_state": "SUSPENDED" if "profitability_engine" in self.config else None,
+                "strategy_risk_multiplier": 0.0 if "profitability_engine" in self.config else None,
+                "permitted_stop_risk_pct": 0.0 if "profitability_engine" in self.config else None,
+                "strategy_policy_version": None, "binding_policy_reason": reason,
             }
 
         entry_price = finite(price)
@@ -6575,36 +6703,55 @@ class TradingService:
         base_risk_pct = risk_per_trade_pct
         if phase3_enabled:
             from .phase3_risk import Phase3Controller, drawdown_multiplier as phase3_drawdown_multiplier, regime_multiplier as phase3_regime_multiplier
+            from .strategy_performance import state_risk_policy
 
             controller = Phase3Controller(self.storage, self.config, self.run_id)
             drawdown_pct = controller.update_equity(equity)
-            states = controller.refresh_strategy_states()
-            allocation_mult = controller.allocation(STRATEGY_VERSION, states)
+            persisted_policy = policy_override or self._cycle_strategy_policy(strategy_version)
+            if "profitability_engine" in self.config and persisted_policy is None:
+                return empty("latest strategy performance policy unavailable or invalid; new entries and adds fail closed")
+            states = {strategy_version: persisted_policy.state} if persisted_policy is not None else controller.refresh_strategy_states()
+            allocation_mult = controller.allocation(strategy_version, states) if persisted_policy is None else 1.0
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
             phase4_mode = "disabled"
             exploration_gross_cap_pct = None
             exploration_heat_cap_pct = None
+            permitted_stop_risk_pct = base_risk_pct
+            strategy_risk_multiplier = None
+            policy_reason = "legacy Phase 3 state authority"
+            if persisted_policy is not None:
+                permitted_stop_risk_pct, strategy_risk_multiplier, policy_reason = state_risk_policy(
+                    persisted_policy.state,
+                    initial_stop_risk_pct=controller.profile.base_stop_risk_pct,
+                    add_stop_risk_pct=controller.profile.add_stop_risk_pct,
+                    exploration_stop_risk_pct=float((self.config.get("phase4", {}) or {}).get("exploration_stop_risk_pct", 0.05)),
+                    is_add=is_add,
+                )
+                if permitted_stop_risk_pct <= 0:
+                    return empty(policy_reason)
+                base_risk_pct = permitted_stop_risk_pct
             if self.config.get("phase4", {}).get("active"):
                 from .phase4_allocator import AdaptiveAllocator
                 if self._phase4_allocation_cache is None:
                     self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
-                        regime=volatility_regime, drawdown_pct=drawdown_pct
+                        regime=volatility_regime, drawdown_pct=drawdown_pct,
+                        strategy_policy_map=self._strategy_policy_map or {},
                     )
-                policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(STRATEGY_VERSION, {})
-                phase4_mode = str(policy.get("mode") or "blocked")
-                if phase4_mode == "exploration":
-                    base_risk_pct = min(float(policy.get("stop_risk_pct", 0.0)), float(policy.get("max_stop_risk_pct", 0.0)))
-                    exploration_gross_cap_pct = float(policy.get("gross_exposure_cap_pct", 7.5))
+                phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(strategy_version, {})
+                phase4_mode = str(phase4_policy.get("mode") or "blocked")
+                if persisted_policy is None and phase4_mode == "exploration":
+                    base_risk_pct = min(float(phase4_policy.get("stop_risk_pct", 0.0)), float(phase4_policy.get("max_stop_risk_pct", 0.0)))
+                    exploration_gross_cap_pct = float(phase4_policy.get("gross_exposure_cap_pct", 7.5))
                     exploration_heat_cap_pct = float(self.config["phase4"]["exploration_heat_pct"])
                     allocation_mult = base_risk_pct / controller.profile.base_stop_risk_pct if controller.profile.base_stop_risk_pct else 0.0
-                elif phase4_mode == "adaptive":
-                    allocation_mult = float(policy.get("allocation_weight", 0.0))
+                elif persisted_policy is None and phase4_mode == "adaptive":
+                    allocation_mult = float(phase4_policy.get("allocation_weight", 0.0))
                     base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-                else:
+                elif persisted_policy is None:
                     allocation_mult = 0.0
                     base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
-            else:
+            elif persisted_policy is None:
                 base_risk_pct = controller.profile.add_stop_risk_pct if is_add else controller.profile.base_stop_risk_pct
             risk_per_trade_pct = min(controller.profile.max_trade_stop_risk_pct, base_risk_pct * regime_mult * drawdown_mult * allocation_mult)
             phase3_context = {
@@ -6614,6 +6761,10 @@ class TradingService:
                 "base_risk_pct": base_risk_pct, "phase4_mode": phase4_mode,
                 "phase4_exploration_gross_cap_pct": exploration_gross_cap_pct,
                 "phase4_exploration_heat_cap_pct": exploration_heat_cap_pct,
+                "policy": persisted_policy, "strategy_version": strategy_version,
+                "strategy_risk_multiplier": strategy_risk_multiplier,
+                "permitted_stop_risk_pct": permitted_stop_risk_pct,
+                "binding_policy_reason": policy_reason,
             }
         risk_budget = equity * risk_per_trade_pct / 100.0
 
@@ -6831,6 +6982,15 @@ class TradingService:
                 "binding_caps": binding_caps, "pending_exposure_unknown": bool(pending.get("unknown")),
                 "manual_approval_required": True, "formula_version": PHASE3_DECISION_VERSION,
                 "evidence_version": EVIDENCE_VERSION, "config_hash": self.config.get("effective_config_hash"),
+                "strategy_version": strategy_version,
+                "performance_snapshot_id": phase3_context.get("policy").performance_snapshot_id if phase3_context.get("policy") else None,
+                "policy_decision_id": phase3_context.get("policy").id if phase3_context.get("policy") else None,
+                "quality_score": phase3_context.get("policy").quality_score if phase3_context.get("policy") else None,
+                "strategy_state": phase3_context.get("policy").state if phase3_context.get("policy") else None,
+                "strategy_risk_multiplier": phase3_context.get("strategy_risk_multiplier"),
+                "permitted_stop_risk_pct": phase3_context.get("permitted_stop_risk_pct"),
+                "strategy_policy_version": phase3_context.get("policy").policy_version if phase3_context.get("policy") else None,
+                "binding_policy_reason": phase3_context.get("binding_policy_reason"),
             }
             controller.storage.execute(
                 # Keep the audit insert named and count-checked as the schema
@@ -6843,12 +7003,19 @@ class TradingService:
                    portfolio_heat_before_pct,portfolio_heat_after_pct,gross_exposure_after_pct,symbol_exposure_after_pct,cluster_exposure_after_pct,
                    regime,regime_multiplier,drawdown_multiplier,allocation_multiplier,binding_caps_json,evidence_version,formula_version,config_hash,profile_version,payload)
                  VALUES({','.join('?' for _ in range(44))})""",
-                (decision_id,self.run_id,symbol,STRATEGY_VERSION,iso_now(),decision,blocked_reason or "within Phase 3 limits",equity,
+                (decision_id,self.run_id,symbol,strategy_version,iso_now(),decision,blocked_reason or "within Phase 3 limits",equity,
                  phase3_context["drawdown_pct"],phase3_context["base_risk_pct"],phase3_context["scaled_stop_risk_pct"],stop_price,stop_distance_dollars,risk_budget,final_notional,
                  sizing_caps.get("stop_risk"),sizing_caps.get("stage"),sizing_caps.get("equity"),sizing_caps.get("cash"),sizing_caps.get("buying_power"),sizing_caps.get("symbol"),sizing_caps.get("cluster"),sizing_caps.get("portfolio"),sizing_caps.get("allocation"),sizing_caps.get("exploration"),
                  pending_stop_risk,reserved_stop_risk,pending_stop_risk + final_notional / entry_price * stop_distance_dollars,reserved_stop_risk,
                  before_heat_pct,after_heat_pct,after_gross_pct,after_symbol_pct.get(symbol.upper(), 0.0),after_cluster_pct.get(cluster_name, 0.0) if cluster_name else None,
                  volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],phase3_context["allocation_multiplier"],json_dumps(binding_caps),EVIDENCE_VERSION,PHASE3_DECISION_VERSION,self.config.get("effective_config_hash"),"moderate_paper_risk_v1",json_dumps(payload)))
+            self.storage.execute(
+                """UPDATE phase3_risk_decisions SET performance_snapshot_id=?,policy_decision_id=?,strategy_quality_score=?,
+                   strategy_state=?,strategy_risk_multiplier=?,permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=? WHERE id=?""",
+                (payload["performance_snapshot_id"], payload["policy_decision_id"], payload["quality_score"], payload["strategy_state"],
+                 payload["strategy_risk_multiplier"], payload["permitted_stop_risk_pct"], payload["strategy_policy_version"],
+                 payload["binding_policy_reason"], decision_id),
+            )
 
         return {
             "final_notional": final_notional, "suggested_shares": suggested_shares, "stop_price": stop_price,
@@ -6872,6 +7039,15 @@ class TradingService:
             "binding_caps": binding_caps, "sizing_caps": sizing_caps, "blocked_reason": blocked_reason,
             "pending_exposure_unknown": False, "sizing_policy_version": SIZING_POLICY_VERSION,
             "formula_version": RISK_DECISION_VERSION,
+            "strategy_version": strategy_version,
+            "performance_snapshot_id": phase3_context.get("policy").performance_snapshot_id if phase3_context.get("policy") else None,
+            "policy_decision_id": phase3_context.get("policy").id if phase3_context.get("policy") else None,
+            "strategy_quality_score": phase3_context.get("policy").quality_score if phase3_context.get("policy") else None,
+            "strategy_state": phase3_context.get("policy").state if phase3_context.get("policy") else None,
+            "strategy_risk_multiplier": phase3_context.get("strategy_risk_multiplier"),
+            "permitted_stop_risk_pct": phase3_context.get("permitted_stop_risk_pct"),
+            "strategy_policy_version": phase3_context.get("policy").policy_version if phase3_context.get("policy") else None,
+            "binding_policy_reason": phase3_context.get("binding_policy_reason"),
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:

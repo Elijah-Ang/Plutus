@@ -102,7 +102,7 @@ def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
         "symbol_exposure_before_json": "TEXT", "symbol_exposure_after_json": "TEXT",
         "cluster_exposure_before_json": "TEXT", "cluster_exposure_after_json": "TEXT",
         "pending_risk": "REAL", "reserved_risk": "REAL", "binding_caps_json": "TEXT", "evidence_versions_json": "TEXT",
-        "formula_version": "TEXT", "config_hash": "TEXT",
+        "formula_version": "TEXT", "config_hash": "TEXT", "strategy_policy_map_json": "TEXT", "strategy_policy_version": "TEXT",
     }
     present = {row[1] for row in conn.execute("PRAGMA table_info(phase4_allocation_decisions)")}
     for name, definition in additions.items():
@@ -210,7 +210,14 @@ class AdaptiveAllocator:
         matrix=(1-shrink)*matrix+shrink*target
         return matrix,fallback,counts
 
-    def run(self, *, regime: str, drawdown_pct: float, portfolio_snapshot: Mapping[str, Any] | None = None) -> dict[str,Any]:
+    def run(
+        self,
+        *,
+        regime: str,
+        drawdown_pct: float,
+        portfolio_snapshot: Mapping[str, Any] | None = None,
+        strategy_policy_map: Mapping[str, Any] | None = None,
+    ) -> dict[str,Any]:
         healthy=not any(DurableExecutionStore(self.storage).integrity_report().values())
         estimates={}; evidence={}; fps=[]; now=iso_now()
         portfolio_snapshot = dict(portfolio_snapshot or {})
@@ -233,6 +240,37 @@ class AdaptiveAllocator:
                                                  "evidence_class":estimate.evidence_class,
                                                  "state_version":"phase4_strategy_state_v2"}),))
             self._persist_state(estimate,eid,now)
+        policy_authoritative = strategy_policy_map is not None
+
+        def policy_value(strategy: str, name: str, default: Any = None) -> Any:
+            policy = (strategy_policy_map or {}).get(strategy)
+            if policy is None:
+                return default
+            if isinstance(policy, Mapping):
+                return policy.get(name, default)
+            return getattr(policy, name, default)
+
+        operational_states: dict[str, str] = {}
+        operational_reasons: dict[str, str] = {}
+        for strategy in STRATEGIES:
+            if strategy not in EXECUTABLE_STRATEGIES:
+                operational_states[strategy] = "RESEARCH_ONLY"
+                operational_reasons[strategy] = "shadow/research strategy cannot receive executable allocation"
+            elif not policy_authoritative:
+                operational_states[strategy] = estimates[strategy].state
+                operational_reasons[strategy] = estimates[strategy].reason
+            elif policy_value(strategy, "state") in {"RESEARCH_ONLY", "EXPLORATION", "THROTTLED", "ACTIVE", "SUSPENDED"}:
+                operational_states[strategy] = str(policy_value(strategy, "state"))
+                operational_reasons[strategy] = str(policy_value(strategy, "reason", "persisted strategy policy"))
+            else:
+                operational_states[strategy] = "SUSPENDED"
+                operational_reasons[strategy] = "latest strategy performance policy unavailable or invalid"
+        try:
+            from .phase3_risk import Phase3RiskProfile
+            from .strategy_performance import state_risk_policy
+            phase3_profile = Phase3RiskProfile.from_config(self.config)
+        except (KeyError, TypeError, ValueError):
+            phase3_profile = None
         cov,fallback,counts=self.covariance(evidence); diag=np.sqrt(np.maximum(np.diag(cov),1e-12)); corr=cov/np.outer(diag,diag)
         cov_id=_fingerprint([self.run_id,counts,cov.tolist()])[:32]
         self.storage.execute("INSERT OR REPLACE INTO phase4_covariance_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -247,7 +285,7 @@ class AdaptiveAllocator:
             kelly_diagnostics[s] = min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
         # Kelly/covariance remain diagnostics.  Operational allocation is
         # deterministic and only executable strategies can receive it.
-        active_executable = [s for s in EXECUTABLE_STRATEGIES if estimates[s].state == "ACTIVE"]
+        active_executable = [s for s in EXECUTABLE_STRATEGIES if operational_states[s] == "ACTIVE"]
         if active_executable:
             equal_weight = min(max_weight, 1.0 / len(active_executable))
             for strategy in active_executable:
@@ -270,7 +308,7 @@ class AdaptiveAllocator:
         exploration_max_per_strategy=float(self.cfg.get("max_exploration_stop_risk_pct",0.10))
         exploration_heat=0.0; exploration_weights: dict[str,float] = {}
         for strategy in EXECUTABLE_STRATEGIES:
-            if estimates[strategy].state != "EXPLORATION" or not healthy:
+            if operational_states[strategy] != "EXPLORATION" or not healthy:
                 continue
             remaining=max(0.0, exploration_heat_cap-exploration_heat)
             risk=min(exploration_per_strategy, exploration_max_per_strategy, remaining)
@@ -289,22 +327,44 @@ class AdaptiveAllocator:
         for i, strategy in enumerate(STRATEGIES):
             estimate=estimates[strategy]
             if strategy in exploration_weights:
-                strategy_policies[strategy]={"mode":"exploration","state":estimate.state,"stop_risk_pct":exploration_weights[strategy],
+                strategy_policies[strategy]={"mode":"exploration","state":operational_states[strategy],"stop_risk_pct":exploration_weights[strategy],
                                              "max_stop_risk_pct":exploration_max_per_strategy,"gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
                                              "allocation_class":"exploration","evidence_version":EVIDENCE_VERSION}
-            elif strategy in EXECUTABLE_STRATEGIES and estimate.state=="ACTIVE" and weights[i]>0:
-                strategy_policies[strategy]={"mode":"adaptive","state":estimate.state,"allocation_weight":float(weights[i]),
+            elif strategy in EXECUTABLE_STRATEGIES and operational_states[strategy]=="ACTIVE" and weights[i]>0:
+                strategy_policies[strategy]={"mode":"adaptive","state":operational_states[strategy],"allocation_weight":float(weights[i]),
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
                                              "allocation_class":"adaptive","evidence_version":EVIDENCE_VERSION}
             elif strategy not in EXECUTABLE_STRATEGIES:
-                strategy_policies[strategy]={"mode":"research_only","state":estimate.state,"operationally_executable":False,
+                strategy_policies[strategy]={"mode":"research_only","state":"RESEARCH_ONLY","operationally_executable":False,
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":False,
                                              "allocation_class":"unallocated","evidence_version":EVIDENCE_VERSION,
                                              "reason":"shadow/research strategy cannot receive executable allocation"}
             else:
-                strategy_policies[strategy]={"mode":"blocked","state":estimate.state,"kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                strategy_policies[strategy]={"mode":"blocked","state":operational_states[strategy],"reason":operational_reasons[strategy],"kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
                                              "allocation_class":"unallocated","evidence_version":EVIDENCE_VERSION}
+            strategy_policies[strategy].update({
+                "performance_snapshot_id": policy_value(strategy, "performance_snapshot_id"),
+                "policy_decision_id": policy_value(strategy, "id"),
+                "quality_score": policy_value(strategy, "quality_score"),
+                "policy_version": policy_value(strategy, "policy_version"),
+                "binding_policy_reason": operational_reasons[strategy],
+                "policy_authoritative": policy_authoritative,
+            })
+            if phase3_profile is not None and strategy in EXECUTABLE_STRATEGIES:
+                permitted, multiplier, _risk_reason = state_risk_policy(
+                    operational_states[strategy],
+                    initial_stop_risk_pct=phase3_profile.base_stop_risk_pct,
+                    add_stop_risk_pct=phase3_profile.add_stop_risk_pct,
+                    exploration_stop_risk_pct=float(self.cfg.get("exploration_stop_risk_pct", 0.05)),
+                    is_add=False,
+                )
+                strategy_policies[strategy].update({
+                    "strategy_risk_multiplier": multiplier,
+                    "permitted_stop_risk_pct": permitted,
+                })
+            else:
+                strategy_policies[strategy].update({"strategy_risk_multiplier": 0.0, "permitted_stop_risk_pct": 0.0})
         fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
         allocation_class = "adaptive" if float(weights.sum()) > 0 else "exploration" if exploration_weights else "unallocated"
         unallocated_risk_pct = max(0.0, 1.0 - float(weights.sum()) - float(exploration_heat) / 100.0)
@@ -323,7 +383,9 @@ class AdaptiveAllocator:
                  "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies,
                  "allocation_class":allocation_class,"unallocated_risk_pct":unallocated_risk_pct,
                  "evidence_versions":{strategy:EVIDENCE_VERSION for strategy in STRATEGIES},"formula_version":PHASE4_ALLOCATION_VERSION,
-                 "config_hash":self.config.get("effective_config_hash")}
+                 "config_hash":self.config.get("effective_config_hash"), "strategy_policy_map":strategy_policies,
+                 "strategy_policy_version": next((policy_value(s, "policy_version") for s in STRATEGIES if policy_value(s, "policy_version")), None),
+                 "policy_authoritative": policy_authoritative}
         phase4_placeholders = ",".join("?" for _ in range(42))
         self.storage.execute(
             f"""INSERT OR REPLACE INTO phase4_allocation_decisions(
@@ -343,6 +405,10 @@ class AdaptiveAllocator:
              json_dumps(symbol_before),json_dumps(symbol_before),json_dumps(cluster_before),json_dumps(cluster_before),pending_risk,reserved_risk,
              json_dumps(binding_caps),json_dumps({strategy:EVIDENCE_VERSION for strategy in STRATEGIES}),fingerprint,PHASE4_ALLOCATION_VERSION,
              self.config.get("effective_config_hash"),json_dumps(payload)))
+        self.storage.execute(
+            "UPDATE phase4_allocation_decisions SET strategy_policy_map_json=?,strategy_policy_version=? WHERE id=?",
+            (json_dumps(strategy_policies), payload.get("strategy_policy_version"), aid),
+        )
         for scenario,loss in stress.items():
             sid=_fingerprint([aid,scenario])[:32]
             self.storage.execute("INSERT OR REPLACE INTO phase4_stress_results VALUES(?,?,?,?,?,?,?,?)",
@@ -354,7 +420,8 @@ class AdaptiveAllocator:
                 "allocation_class":allocation_class,"operational_kelly_used":False,
                 "unallocated_risk_pct":unallocated_risk_pct,"binding_caps":binding_caps,
                 "evidence_versions":{strategy:EVIDENCE_VERSION for strategy in STRATEGIES},
-                "formula_version":PHASE4_ALLOCATION_VERSION}
+                "formula_version":PHASE4_ALLOCATION_VERSION, "strategy_policy_map":strategy_policies,
+                "strategy_policy_version": payload.get("strategy_policy_version"), "policy_authoritative": policy_authoritative}
 
     def _persist_state(self,e:StrategyEstimate,eid:str,now:str)->None:
         old=self.storage.fetch_all("SELECT state FROM phase4_strategy_states WHERE strategy_version=?",(e.strategy_version,)); previous=old[0]["state"] if old else None

@@ -198,6 +198,7 @@ def test_additive_migration_is_idempotent_and_required_for_runtime(tmp_path):
     db.apply_explicit_migrations()
     versions = db.schema_versions()
     assert "strategy_profitability_engine_v1" in versions
+    assert "strategy_policy_enforcement_v1" in versions
     schema = db.fetch_all("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('lot_consumptions','strategy_trade_records','strategy_performance_snapshots','strategy_policy_decisions') ORDER BY name")
     db.apply_explicit_migrations()
     assert schema == db.fetch_all("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('lot_consumptions','strategy_trade_records','strategy_performance_snapshots','strategy_policy_decisions') ORDER BY name")

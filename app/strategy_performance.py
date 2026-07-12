@@ -2,9 +2,9 @@
 
 This module is deliberately downstream of proposal, sizing, approval, order,
 reconciliation, and FIFO accounting state.  It reads those records, creates a
-canonical strategy-trade projection, and persists a scorecard/policy for
-operator review.  The policy is not consulted by any execution or sizing path
-in Build 1.
+canonical strategy-trade projection, and persists a scorecard/policy.  Build 2
+consumers validate the persisted policy before new entries/adds; exits and all
+existing canonical portfolio ceilings remain independent and available.
 """
 
 from __future__ import annotations
@@ -23,9 +23,12 @@ from .formula_versions import (
     EVIDENCE_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
     STRATEGY_PERFORMANCE_VERSION,
+    STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
     STRATEGY_POLICY_VERSION,
 )
 from .utils import iso_now, json_dumps
+from .shadow_strategies import STRATEGY_VERSIONS
+from .strategy_rule_based import STRATEGY_VERSION
 
 
 PRIMARY_HORIZON_SESSIONS = 20
@@ -301,6 +304,47 @@ class StrategyRiskPolicy:
     fingerprint: str = ""
     decided_at: str | None = None
     id: str | None = None
+    schema_version: str = STRATEGY_PERFORMANCE_SCHEMA_VERSION
+    metrics: dict[str, Any] = field(default_factory=dict)
+    raw_inputs: dict[str, Any] = field(default_factory=dict)
+
+
+def state_rank(state: str) -> int:
+    """Return the operational permissiveness rank used for conservative merges."""
+    return _STATE_RANK.get(str(state), -1)
+
+
+def more_conservative_state(*states: str) -> str:
+    valid = [str(state) for state in states if str(state) in POLICY_STATES]
+    return min(valid, key=lambda state: state_rank(state)) if valid else "SUSPENDED"
+
+
+def state_risk_policy(
+    state: str,
+    *,
+    initial_stop_risk_pct: float,
+    add_stop_risk_pct: float,
+    exploration_stop_risk_pct: float = 0.05,
+    is_add: bool = False,
+) -> tuple[float, float, str]:
+    """Map a persisted state to its permitted pre-conversion stop-risk budget.
+
+    The returned tuple is (permitted percentage, multiplier, reason).  This
+    helper intentionally does not know about portfolio or notional ceilings;
+    those remain downstream canonical minimum-of-ceilings logic.
+    """
+    state = str(state)
+    base = float(add_stop_risk_pct if is_add else initial_stop_risk_pct)
+    if state == "ACTIVE":
+        return base, 1.0, "ACTIVE uses the current Phase 3 stop-risk budget"
+    if state == "THROTTLED":
+        return base * 0.50, 0.50, "THROTTLED applies the 0.50 strategy risk multiplier"
+    if state == "EXPLORATION":
+        if is_add:
+            return 0.0, 0.0, "EXPLORATION permits entries only; adds are blocked"
+        permitted = float(exploration_stop_risk_pct)
+        return permitted, permitted / base if base > 0 else 0.0, "EXPLORATION uses the existing Phase 4 exploration stop-risk budget"
+    return 0.0, 0.0, f"{state} has no executable allocation"
 
 
 def score_components(metrics: Mapping[str, Any], settings: Mapping[str, Any] | None = None) -> tuple[dict[str, float], float, dict[str, float]]:
@@ -457,6 +501,24 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
         "research_opportunities": {"strategy_performance_version": "TEXT"},
         "performance_setups": {"strategy_version": "TEXT", "evidence_version": "TEXT", "formula_version": "TEXT"},
         "trade_outcomes": {"strategy_version": "TEXT", "evidence_version": "TEXT", "formula_version": "TEXT"},
+        "trade_proposals": {
+            "performance_snapshot_id": "TEXT", "policy_decision_id": "TEXT", "strategy_quality_score": "REAL",
+            "strategy_state": "TEXT", "strategy_risk_multiplier": "REAL", "permitted_stop_risk_pct": "REAL",
+            "strategy_policy_version": "TEXT", "binding_policy_reason": "TEXT",
+        },
+        "position_sizing_decisions": {
+            "performance_snapshot_id": "TEXT", "policy_decision_id": "TEXT", "strategy_quality_score": "REAL",
+            "strategy_state": "TEXT", "strategy_risk_multiplier": "REAL", "permitted_stop_risk_pct": "REAL",
+            "strategy_policy_version": "TEXT", "binding_policy_reason": "TEXT",
+        },
+        "phase3_risk_decisions": {
+            "performance_snapshot_id": "TEXT", "policy_decision_id": "TEXT", "strategy_quality_score": "REAL",
+            "strategy_state": "TEXT", "strategy_risk_multiplier": "REAL", "permitted_stop_risk_pct": "REAL",
+            "strategy_policy_version": "TEXT", "binding_policy_reason": "TEXT",
+        },
+        "phase4_allocation_decisions": {
+            "strategy_policy_map_json": "TEXT", "strategy_policy_version": "TEXT",
+        },
     }
     for table, columns in additions.items():
         exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
@@ -516,6 +578,10 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
             (STRATEGY_PERFORMANCE_SCHEMA_VERSION, iso_now(), "additive deterministic strategy profitability and FIFO attribution schema"),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION, iso_now(), "additive persisted strategy policy enforcement provenance columns"),
         )
 
 
@@ -708,7 +774,12 @@ class StrategyPerformanceEngine:
         return result
 
     def _strategy_versions(self) -> list[str]:
-        versions = set(str(value) for value in (self.config.get("approved_strategy_versions") or []) if value)
+        # Known Build 2 sleeves are always materialized so a missing evidence
+        # population becomes an explicit RESEARCH_ONLY policy, not an absent
+        # operational record.
+        versions = set(str(value) for value in STRATEGY_VERSIONS.values())
+        versions.add(STRATEGY_VERSION)
+        versions.update(str(value) for value in (self.config.get("approved_strategy_versions") or []) if value)
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM research_opportunities WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM position_lots WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM order_intents WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
@@ -823,10 +894,136 @@ class StrategyPerformanceEngine:
                 performance_snapshot_id=row["performance_snapshot_id"], enforcement_enabled=bool(row["enforcement_enabled"]),
                 performance_version=row["performance_version"], policy_version=row["policy_version"], fingerprint=row["input_fingerprint"],
                 decided_at=row["decided_at"], id=row["id"],
+                schema_version=row.get("schema_version") or "",
             )
         if strategy_version is not None:
             return policies.get(strategy_version)
         return policies
+
+    def _policy_record(self, row: Mapping[str, Any], snapshot: Mapping[str, Any]) -> StrategyRiskPolicy:
+        return StrategyRiskPolicy(
+            strategy_version=str(row["strategy_version"]), state=str(row["state"]),
+            quality_score=float(row["quality_score"]), reason=str(row.get("reason") or ""),
+            hard_gates=json.loads(row.get("hard_gates_json") or "{}"),
+            maturity=json.loads(row.get("maturity_json") or "{}"),
+            performance_snapshot_id=str(row.get("performance_snapshot_id") or ""),
+            enforcement_enabled=bool(row.get("enforcement_enabled")),
+            performance_version=str(row.get("performance_version") or ""),
+            policy_version=str(row.get("policy_version") or ""),
+            fingerprint=str(row.get("input_fingerprint") or ""),
+            decided_at=row.get("decided_at"), id=str(row.get("id") or ""),
+            schema_version=str(row.get("schema_version") or ""),
+            metrics=json.loads(snapshot.get("metrics_json") or "{}"),
+            raw_inputs=json.loads(snapshot.get("raw_inputs_json") or "{}"),
+        )
+
+    def latest_valid_policy(self, strategy_version: str | None = None) -> StrategyRiskPolicy | dict[str, StrategyRiskPolicy] | None:
+        """Return only a current, internally linked, enforceable policy.
+
+        Invalid, stale, mixed-version and partially versioned evidence is
+        intentionally represented as unavailable so callers can fail closed.
+        This read-only validation never repairs or rewrites persisted rows.
+        """
+        latest = self.latest_policy(strategy_version)
+        if strategy_version is not None:
+            candidates = [latest] if isinstance(latest, StrategyRiskPolicy) else []
+        else:
+            candidates = list(latest.values()) if isinstance(latest, dict) else []
+        valid: dict[str, StrategyRiskPolicy] = {}
+        stale_after = float(self.cfg.get("evidence_stale_after_days", 90))
+        for candidate in candidates:
+            if candidate is None or not candidate.id or candidate.state not in POLICY_STATES:
+                continue
+            policy_rows = self.storage.fetch_all("SELECT * FROM strategy_policy_decisions WHERE id=?", (candidate.id,))
+            if not policy_rows:
+                continue
+            row = policy_rows[0]
+            snapshots = self.storage.fetch_all("SELECT * FROM strategy_performance_snapshots WHERE id=?", (candidate.performance_snapshot_id,))
+            if not snapshots:
+                continue
+            snapshot = snapshots[0]
+            try:
+                quality = float(row["quality_score"])
+                metrics = json.loads(snapshot.get("metrics_json") or "{}")
+                hard_gates = json.loads(row.get("hard_gates_json") or "{}")
+                maturity = json.loads(row.get("maturity_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                row.get("enforcement_enabled") != 1
+                or row.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
+                or row.get("policy_version") != STRATEGY_POLICY_VERSION
+                or row.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+                or snapshot.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
+                or snapshot.get("policy_version") != STRATEGY_POLICY_VERSION
+                or snapshot.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+                or row.get("input_fingerprint") != snapshot.get("input_fingerprint")
+                or row.get("performance_snapshot_id") != snapshot.get("id")
+                or snapshot.get("strategy_version") != row.get("strategy_version")
+                or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
+                or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
+                or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
+            ):
+                continue
+            recency = snapshot.get("evidence_recency_days")
+            evidence_present = bool(hard_gates.get("evidence_present"))
+            if evidence_present and (recency is None or float(recency) > stale_after or not hard_gates.get("evidence_fresh")):
+                continue
+            if snapshot.get("recommendation_state") != row.get("state"):
+                continue
+            valid[str(row["strategy_version"])] = self._policy_record(row, snapshot)
+        if strategy_version is not None:
+            return valid.get(strategy_version)
+        return valid
+
+    def valid_policy_map(self, strategy_versions: Iterable[str] | None = None) -> dict[str, StrategyRiskPolicy]:
+        policies = self.latest_valid_policy()
+        if not isinstance(policies, dict):
+            return {}
+        if strategy_versions is None:
+            return policies
+        allowed = {str(version) for version in strategy_versions}
+        return {version: policy for version, policy in policies.items() if version in allowed}
+
+    def policy_by_id(self, decision_id: str | None) -> StrategyRiskPolicy | None:
+        """Validate and load the exact proposal-time policy decision."""
+        if not decision_id:
+            return None
+        rows = self.storage.fetch_all("SELECT * FROM strategy_policy_decisions WHERE id=?", (decision_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        snapshots = self.storage.fetch_all("SELECT * FROM strategy_performance_snapshots WHERE id=?", (row.get("performance_snapshot_id"),))
+        if not snapshots:
+            return None
+        snapshot = snapshots[0]
+        try:
+            quality = float(row["quality_score"])
+            metrics = json.loads(snapshot.get("metrics_json") or "{}")
+            hard_gates = json.loads(row.get("hard_gates_json") or "{}")
+            maturity = json.loads(row.get("maturity_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        recency = snapshot.get("evidence_recency_days")
+        if (
+            row.get("enforcement_enabled") != 1
+            or row.get("state") not in POLICY_STATES
+            or row.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
+            or row.get("policy_version") != STRATEGY_POLICY_VERSION
+            or row.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+            or snapshot.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
+            or snapshot.get("policy_version") != STRATEGY_POLICY_VERSION
+            or snapshot.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+            or row.get("input_fingerprint") != snapshot.get("input_fingerprint")
+            or snapshot.get("strategy_version") != row.get("strategy_version")
+            or snapshot.get("recommendation_state") != row.get("state")
+            or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
+            or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
+            or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
+            or (bool(hard_gates.get("evidence_present")) and (recency is None or float(recency) > float(self.cfg.get("evidence_stale_after_days", 90)) or not hard_gates.get("evidence_fresh")))
+        ):
+            return None
+        return self._policy_record(row, snapshot)
 
     def format_report(self, strategy_version: str | None = None) -> str:
         """Format only persisted values; this method never refreshes or writes."""
@@ -837,8 +1034,10 @@ class StrategyPerformanceEngine:
         for row in rows:
             latest.setdefault(row["strategy_version"], row)
         if not latest:
-            return "Strategy performance: no persisted scorecard available.\nReport-only; enforcement disabled."
-        lines = ["Strategy performance (persisted, report-only)", "Enforcement: disabled"]
+            enforcement = "enabled" if self.cfg.get("enforcement_enabled") is True else "disabled"
+            return f"Strategy performance: no persisted scorecard available.\nReport-only; enforcement {enforcement}."
+        enforcement = "enabled" if self.cfg.get("enforcement_enabled") is True else "disabled"
+        lines = ["Strategy performance (persisted, report-only)", f"Enforcement: {enforcement}"]
         for version, row in latest.items():
             metrics = json.loads(row["metrics_json"] or "{}")
             lines.extend([
@@ -855,6 +1054,7 @@ class StrategyPerformanceEngine:
 __all__ = [
     "PerformanceObservation", "StrategyPerformanceSnapshot", "StrategyRiskPolicy", "StrategyPerformanceEngine",
     "STRATEGY_PERFORMANCE_VERSION", "STRATEGY_POLICY_VERSION", "STRATEGY_PERFORMANCE_SCHEMA_VERSION",
+    "STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION", "POLICY_STATES", "state_rank", "more_conservative_state", "state_risk_policy",
     "expectancy_r", "net_expectancy_r", "profit_factor", "win_rate", "average_win_r", "average_loss_r",
     "payoff_ratio", "maximum_drawdown_r", "max_drawdown_r", "worst_losing_streak", "rolling_window_means",
     "recent_expectancy_r", "positive_rolling_window_ratio", "regime_metrics", "positive_regime_ratio",

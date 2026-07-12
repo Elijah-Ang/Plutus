@@ -156,24 +156,42 @@ class Phase3Controller:
     def refresh_strategy_states(self) -> dict[str, str]:
         healthy, report = self.reconciliation_health()
         now = iso_now(); states: dict[str, str] = {}
-        for sleeve, version in STRATEGY_VERSIONS.items():
-            rows = self.storage.fetch_all("""SELECT ro.regime,ro.execution_type,ro.source_table,ro.provenance_json,
-              r.cost_adjusted_return,ro.split_label
-              FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
-              WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'
-                AND r.calculation_version=?""", (version, EVIDENCE_VERSION))
-            oos = [r for r in rows if r.get("split_label") == "out_of_sample" and r.get("cost_adjusted_return") is not None and classify_evidence_type(
-                r.get("execution_type"), r.get("source_table"), r.get("provenance_json")
-            ) == SHADOW_OUTCOME]
-            regimes = {str(r.get("regime")) for r in oos if r.get("regime")}
-            mean = sum(float(r["cost_adjusted_return"]) for r in oos) / len(oos) if oos else None
-            minimum = int(self.config.get("phase3", {}).get("promotion", {}).get("minimum_completed_oos", 100))
-            qualifies = healthy and len(oos) >= minimum and len(regimes) >= 2 and mean is not None and mean > 0
-            if not healthy: state, reason = "SUSPENDED", "reconciliation health failed"
-            elif qualifies: state, reason = "ACTIVE", "positive cost-aware OOS evidence across multiple regimes"
-            elif oos and mean is not None and mean <= 0: state, reason = "SUSPENDED", "non-positive cost-aware OOS expectancy"
-            else: state, reason = "THROTTLED", "promotion evidence incomplete"
+        from .strategy_performance import POLICY_STATES, StrategyPerformanceEngine
+
+        # Build 2 makes the persisted profitability decision authoritative.  A
+        # config without the Build 2 section is retained only for isolated
+        # pre-Build-2 fixtures; the release configuration always takes the
+        # fail-closed branch below.
+        build2 = "profitability_engine" in self.config
+        engine = StrategyPerformanceEngine(self.storage, self.config)
+        versions = [(sleeve, version) for sleeve, version in STRATEGY_VERSIONS.items()]
+        versions.append(("executable", STRATEGY_VERSION))
+        for sleeve, version in versions:
+            policy = engine.latest_valid_policy(version) if build2 else None
+            if not healthy:
+                state, reason = "SUSPENDED", "reconciliation health failed"
+            elif policy is None:
+                state = "SUSPENDED" if build2 else "THROTTLED"
+                reason = "latest strategy performance policy unavailable or invalid; new entries and adds fail closed" if build2 else "promotion evidence incomplete"
+                metrics: dict[str, Any] = {}
+            else:
+                state = policy.state if policy.state in POLICY_STATES else "SUSPENDED"
+                reason = policy.reason
+                metrics = policy.metrics
             states[version] = state
+            maturity = policy.maturity if policy is not None else {}
+            sample_count = int(maturity.get("sample_count", metrics.get("sample_count", 0)) or 0)
+            regime_count = int(maturity.get("regime_count", len(metrics.get("regime_metrics", {}))) or 0)
+            mean = metrics.get("expectancy_r")
+            payload = {
+                "integrity": report, "policy_authoritative": build2,
+                "performance_snapshot_id": policy.performance_snapshot_id if policy else None,
+                "policy_decision_id": policy.id if policy else None,
+                "quality_score": policy.quality_score if policy else None,
+                "policy_version": policy.policy_version if policy else None,
+                "hard_gates": policy.hard_gates if policy else {},
+                "binding_policy_reason": reason,
+            }
             self.storage.execute("""INSERT INTO phase3_strategy_states(strategy_version,sleeve,state,reason,completed_oos_n,
               qualifying_regimes,mean_cost_adjusted_return,health_status,state_version,evaluated_at,activated_at,suspended_at,payload)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version) DO UPDATE SET state=excluded.state,reason=excluded.reason,
@@ -181,39 +199,8 @@ class Phase3Controller:
               mean_cost_adjusted_return=excluded.mean_cost_adjusted_return,health_status=excluded.health_status,
               evaluated_at=excluded.evaluated_at,activated_at=CASE WHEN excluded.state='ACTIVE' THEN COALESCE(phase3_strategy_states.activated_at,excluded.evaluated_at) ELSE phase3_strategy_states.activated_at END,
               suspended_at=CASE WHEN excluded.state='SUSPENDED' THEN excluded.evaluated_at ELSE phase3_strategy_states.suspended_at END,payload=excluded.payload""",
-              (version,sleeve,state,reason,len(oos),len(regimes),mean,"healthy" if healthy else "unhealthy",
-               "phase3_evidence_health_state_v1",now,now if state=="ACTIVE" else None,now if state=="SUSPENDED" else None,json_dumps({"integrity":report})))
-        # The executable strategy uses the same evidence classification. This
-        # prevents Phase 3 from treating a missing executable return history as
-        # an implicit allocation while preserving all shadow sleeve states.
-        executable_rows = self.storage.fetch_all("""SELECT ro.regime,ro.execution_type,ro.source_table,ro.provenance_json,
-          ro.split_label,r.cost_adjusted_return
-          FROM research_opportunities ro JOIN research_outcomes r ON r.opportunity_id=ro.id
-          WHERE ro.strategy_version=? AND r.horizon_sessions=20 AND r.status='completed'
-            AND r.calculation_version=?""", (STRATEGY_VERSION, EVIDENCE_VERSION))
-        executable_oos = [r for r in executable_rows if r.get("split_label") == "out_of_sample" and r.get("cost_adjusted_return") is not None and is_operational_evidence(r)]
-        executable_regimes = {str(r.get("regime")) for r in executable_oos if r.get("regime")}
-        executable_mean = sum(float(r["cost_adjusted_return"]) for r in executable_oos) / len(executable_oos) if executable_oos else None
-        minimum = int(self.config.get("phase3", {}).get("promotion", {}).get("minimum_completed_oos", 100))
-        executable_qualifies = healthy and len(executable_oos) >= minimum and len(executable_regimes) >= 2 and executable_mean is not None and executable_mean > 0
-        if not healthy:
-            executable_state, executable_reason = "SUSPENDED", "reconciliation health failed"
-        elif executable_qualifies:
-            executable_state, executable_reason = "ACTIVE", "positive executable paper-return evidence across multiple regimes"
-        elif executable_oos and executable_mean is not None and executable_mean <= 0:
-            executable_state, executable_reason = "SUSPENDED", "non-positive executable paper-return expectancy"
-        else:
-            executable_state, executable_reason = "THROTTLED", "executable strategy evidence incomplete"
-        states[STRATEGY_VERSION] = executable_state
-        self.storage.execute("""INSERT INTO phase3_strategy_states(strategy_version,sleeve,state,reason,completed_oos_n,
-          qualifying_regimes,mean_cost_adjusted_return,health_status,state_version,evaluated_at,activated_at,suspended_at,payload)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version) DO UPDATE SET state=excluded.state,reason=excluded.reason,
-          completed_oos_n=excluded.completed_oos_n,qualifying_regimes=excluded.qualifying_regimes,
-          mean_cost_adjusted_return=excluded.mean_cost_adjusted_return,health_status=excluded.health_status,
-          evaluated_at=excluded.evaluated_at,payload=excluded.payload""",
-          (STRATEGY_VERSION,"executable",executable_state,executable_reason,len(executable_oos),len(executable_regimes),executable_mean,
-           "healthy" if healthy else "unhealthy","phase3_evidence_health_state_v2",now,now if executable_state=="ACTIVE" else None,
-           now if executable_state=="SUSPENDED" else None,json_dumps({"integrity":report,"evidence_type":"operational"})))
+              (version,sleeve,state,reason,sample_count,regime_count,mean,"healthy" if healthy else "unhealthy",
+               "phase3_strategy_policy_state_v1",now,now if state=="ACTIVE" else None,now if state=="SUSPENDED" else None,json_dumps(payload)))
         # Shadow strategy states are persisted for research and promotion
         # evidence, but never become executable Phase 3 allocations.
         eligible = [STRATEGY_VERSION] if states.get(STRATEGY_VERSION) == "ACTIVE" else []

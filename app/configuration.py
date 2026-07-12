@@ -182,7 +182,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     profitability = config.get("profitability_engine", {}) or {}
     require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")
-    require(profitability.get("enforcement_enabled") is False, "profitability_engine.enforcement_enabled must remain false in Build 1")
+    require(profitability.get("enforcement_enabled") is True, "profitability_engine.enforcement_enabled must be true in Build 2")
     require(profitability.get("performance_version") == STRATEGY_PERFORMANCE_VERSION, f"profitability_engine.performance_version must be {STRATEGY_PERFORMANCE_VERSION}")
     require(profitability.get("policy_version") == STRATEGY_POLICY_VERSION, f"profitability_engine.policy_version must be {STRATEGY_POLICY_VERSION}")
     require(profitability.get("schema_version") == STRATEGY_PERFORMANCE_SCHEMA_VERSION, f"profitability_engine.schema_version must be {STRATEGY_PERFORMANCE_SCHEMA_VERSION}")
