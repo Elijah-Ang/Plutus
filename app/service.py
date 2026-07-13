@@ -85,6 +85,13 @@ def _format_small_percent(value: float | int | None) -> str:
     return f"{numeric:.2f}%"
 
 
+def _proposal_action_for_signal(signal_action: str | None, signal_side: str | None, is_add: bool) -> str:
+    """Encode the final signal action without letting stale add metadata win."""
+    if str(signal_action or "").upper() == "EXIT" and str(signal_side or "").lower() == "sell":
+        return "exit"
+    return "add" if is_add else "entry"
+
+
 MARKET_PHASE_PRE = "pre_market"
 MARKET_PHASE_REGULAR = "regular_market"
 MARKET_PHASE_REGULAR_CATCH_UP = "regular_market_catch_up"
@@ -3864,6 +3871,10 @@ class TradingService:
                                 side="sell",
                                 reason=f"{position_management_decision.decision_type}: {decision_reason}",
                             )
+                            # Position management owns the final action. A prior
+                            # healthy-pullback check may have set is_add before
+                            # this sell decision was classified.
+                            is_add = False
                             exit_trigger_reason = decision_reason
                             score = max(score, float(self.config.get("ai", {}).get("ai_review_min_score", 65)))
                         elif position_management_decision.decision_type == "HEALTHY_PULLBACK_ADD":
@@ -4509,10 +4520,12 @@ class TradingService:
                             if volatility_multiplier is not None:
                                 paper_size_adjustment = volatility_multiplier
 
+                            proposal_action = _proposal_action_for_signal(signal.action, signal.side, bool(res.get("is_add")))
+                            proposal_is_add = proposal_action == "add"
                             port_context = self._portfolio_context({
                                 "symbol": symbol,
-                                "side": "buy",
-                                "action": "add" if res.get("is_add") else "entry",
+                                "side": signal.side,
+                                "action": proposal_action,
                                 "notional": notional
                             })
 
@@ -4530,8 +4543,8 @@ class TradingService:
                                 "approved_dynamic_paper_tradable": res.get("approved_dynamic_paper_tradable", False),
                                 "approved_market_profile": res.get("approved_market_profile"),
                                 "side": signal.side,
-                                "action": "add" if res.get("is_add") else ("entry" if signal.action == "ENTRY" else "exit"),
-                                "is_add": 1 if res.get("is_add") else 0,
+                                "action": proposal_action,
+                                "is_add": 1 if proposal_is_add else 0,
                                 "notional": notional,
                                 "qty": qty_val,
                                 "notional_adjustment_note": notional_adjustment_note,
@@ -4932,13 +4945,13 @@ class TradingService:
                         (proposal_id, self.run_id, symbol, pm_decision_type),
                     )
 
-                if is_buy or (is_add and proposal_generated):
+                if is_buy or (proposal_is_add and proposal_generated):
                     self.storage.execute(
                         "UPDATE trade_proposals SET sizing_caps_json=?,formula_versions_json=?,evidence_version=? WHERE id=?",
                         (json_dumps(proposal.get("sizing_caps") or {}), json_dumps({"stop_policy": STOP_POLICY_VERSION, "sizing_policy": SIZING_POLICY_VERSION, "risk_decision": RISK_DECISION_VERSION, "accounting": ACCOUNTING_VERSION, "evidence": EVIDENCE_VERSION}), EVIDENCE_VERSION, proposal_id),
                     )
 
-                if is_buy or (is_add and proposal_generated):
+                if is_buy or (proposal_is_add and proposal_generated):
                     sizing_decision_id = str(uuid.uuid4())
                     self.storage.execute(
                         """INSERT INTO position_sizing_decisions(
@@ -7288,6 +7301,9 @@ class TradingService:
         ):
             blocker_label = self._exit_blocker_label_from_reason(no_action_reason)
             return {"status": f"Watch — New buy blocked — {blocker_label}", "event": "exit_blocked", "high_score": True, "blocker": blocker_label}
+        if "suppressed due to exit priority" in no_act or "suppressed_due_to_exit_priority" in no_act:
+            blocker_label = "an actionable exit has priority"
+            return {"status": f"Watch — New buy blocked — {blocker_label}", "event": "exit_blocked", "high_score": True, "blocker": blocker_label}
         if "emergency exit score is" in no_act or "block_new_buy_if_emergency_exit_score_above" in no_act:
             return {"status": "Watch — new buy blocked due to emergency exit risk", "event": "emergency_risk", "high_score": True}
         if "pyramiding check failed" in no_act or "add_on_check_failed" in no_act or "position not sufficiently profitable" in no_act or "cannot average down" in no_act:
@@ -7330,6 +7346,9 @@ class TradingService:
             parts.append(f"{strongest['symbol']} scored highest, but it was blocked because total portfolio exposure would exceed the configured limit.")
         elif strongest_event == "observation_only":
             parts.append(f"{strongest['symbol']} crossed score threshold but is observation-only, so no proposal is allowed.")
+        elif strongest_event == "exit_blocked":
+            blocker = strongest.get("_blocker") or "an actionable exit has priority"
+            parts.append(f"{strongest['symbol']} scored highest, but the new buy was held back because {blocker}.")
         elif strongest_event == "no_entry":
             parts.append(f"{strongest['symbol']} crossed score threshold but had no ENTRY signal.")
         elif strongest_event == "pending_approval" and not parts:

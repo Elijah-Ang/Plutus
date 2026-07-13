@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from app.storage import Storage
-from app.service import TradingService
+from app.service import TradingService, _proposal_action_for_signal
 from app.utils import redact_sensitive_url
 from app.telegram_bot import TelegramBot
 from tests.test_sleep_and_emergency import MockBroker, temp_storage, base_config
@@ -36,6 +36,12 @@ class FakeTelegramBot:
         
     def is_available(self, *args, **kwargs):
         return True
+
+
+def test_actionable_exit_cannot_inherit_stale_add_action():
+    assert _proposal_action_for_signal("EXIT", "sell", True) == "exit"
+    assert _proposal_action_for_signal("ENTRY", "buy", True) == "add"
+    assert _proposal_action_for_signal("ENTRY", "buy", False) == "entry"
 
 def test_telegram_duplicate_and_fallback_routing(temp_storage, base_config):
     # Add DIA to watchlist so risk check approved_universe passes
@@ -234,9 +240,10 @@ def test_explicit_buy_guardrails(temp_storage, base_config):
     
     # 4. Sell/exit proposals remain allowed when holding a position
     broker.positions = [type("Pos", (), {"symbol": "DIA", "qty": 10, "avg_entry_price": 500.0, "current_price": 505.0})()]
-    mock_exit_prop = {**mock_prop, "action": "exit", "side": "sell"}
+    mock_exit_prop = {**mock_prop, "action": "exit", "side": "sell", "is_add": True, "qty": 10.0}
     port_ctx_exit = service._portfolio_context({"symbol": "DIA", "side": "sell"})
     decision_exit = service._risk_engine("test_exit_id", "proposal").evaluate(mock_exit_prop, port_ctx_exit)
+    assert decision_exit.passed, decision_exit.reasons
     # Ensure it's not blocked by the buy-specific checks
     assert not any("adding to existing position" in r for r in decision_exit.reasons)
     assert not any("new buys blocked" in r for r in decision_exit.reasons)
