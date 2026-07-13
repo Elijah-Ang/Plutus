@@ -381,115 +381,325 @@ class TradingService:
         self._context_cache = (now, state)
         return state
 
-    def _exit_blocker_context(self, broker_orders: list[Any] | None = None) -> dict[str, Any]:
-        open_sell_orders = []
+    def _exit_blocker_context(
+        self,
+        broker_orders: list[Any] | None = None,
+        *,
+        positions: list[Any] | None = None,
+        current_cycle_exits: list[dict[str, Any]] | None = None,
+        validation_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return one current, provenance-bearing exit-first blocker.
+
+        Historical market-memory flags and terminal proposal rows are never
+        blockers. Every persistent source is checked against its own lifecycle
+        and expiry, and current-cycle decisions are accepted only when the
+        cycle still has the corresponding position.
+        """
+        now = validation_at or datetime.now(UTC)
+        now_iso = now.isoformat()
+        stale_sources: list[dict[str, Any]] = []
+
+        positions_known = positions is not None
+        if positions is None:
+            try:
+                positions = list(self.broker.get_positions()) if self.broker is not None else []
+                positions_known = True
+            except Exception:
+                positions = []
+                positions_known = False
+        position_symbols = {
+            str(_value(position, "symbol", "")).upper()
+            for position in positions or []
+            if abs(float(_value(position, "qty", 0.0) or 0.0)) > 1e-12
+        }
+
+        def has_position(symbol: str) -> bool:
+            return not positions_known or symbol.upper() in position_symbols
+
+        def stale(source: dict[str, Any], reason: str) -> None:
+            display_reason = (
+                f"stale {source.get('symbol') or ''} exit flag ignored"
+                if source.get("source_type") == "historical_sell_proposal"
+                else f"stale {source.get('symbol') or ''} exit blocker ignored: {reason}"
+            ).strip()
+            source = {
+                "active": False,
+                "stale": True,
+                "stale_reason": reason,
+                "latest_validation_at": now_iso,
+                "reason": display_reason,
+                **source,
+            }
+            stale_sources.append(source)
+            self.storage.audit(self.run_id, "exit_blocker_ignored_stale", self._exit_blocker_audit_detail(source, "stale", reason))
+
+        def active(source: dict[str, Any]) -> dict[str, Any]:
+            source = {
+                "active": True,
+                "stale": False,
+                "latest_validation_at": now_iso,
+                "source": source.get("source_type"),
+                **source,
+            }
+            self.storage.audit(self.run_id, "exit_blocker_validated", self._exit_blocker_audit_detail(source, "active", source.get("validation_reason")))
+            return source
+
+        # Broker state is the strongest current source. A sell order remains
+        # blocking until reconciliation proves it terminal; elapsed wall-clock
+        # time is intentionally irrelevant here.
         for order in broker_orders or []:
             side = str(_value(order, "side", "")).lower()
-            status = str(_value(order, "status", "")).lower()
-            if side == "sell" and status not in {"filled", "canceled", "cancelled", "expired", "rejected"}:
-                open_sell_orders.append(order)
-        if open_sell_orders:
-            order = open_sell_orders[0]
+            status = str(_value(order, "status", "open"))
+            if side != "sell" or status.lower() in {"filled", "canceled", "cancelled", "expired", "rejected"}:
+                continue
             symbol = str(_value(order, "symbol", "")).upper()
-            return {
-                "active": True,
+            return active({
+                "source_type": "broker_open_order",
+                "source_id": str(_value(order, "id", "") or _value(order, "client_order_id", "") or symbol),
                 "symbol": symbol,
+                "status": status,
+                "created_at": _value(order, "created_at"),
+                "expires_at": None,
                 "reason": f"{symbol} SELL order open",
-                "status": str(_value(order, "status", "open")),
-                "source": "broker_open_order",
-                "stale": False,
-            }
+                "validation_reason": "broker reports a non-terminal sell order",
+            })
 
-        now_iso = iso_now()
-        active_rows = self.storage.fetch_all(
+        active_intent_states = (
+            "created", "reserved", "submitting", "submitted", "partially_filled",
+            "cancel_pending", "unknown", "reconciliation_required",
+        )
+        placeholders = ",".join("?" for _ in active_intent_states)
+        intent_rows = self.storage.fetch_all(
+            f"""
+            SELECT i.*, r.id AS reservation_id, r.state AS reservation_state
+            FROM order_intents i
+            LEFT JOIN risk_reservations r ON r.intent_id=i.id AND r.state='active'
+            WHERE lower(i.side)='sell' AND i.state IN ({placeholders})
+            ORDER BY datetime(i.updated_at) DESC, datetime(i.created_at) DESC
+            LIMIT 10
+            """,
+            active_intent_states,
+        )
+        if intent_rows:
+            row = intent_rows[0]
+            symbol = str(row.get("symbol") or "").upper()
+            source_type = "active_sell_reservation" if row.get("reservation_id") else "sell_order_intent"
+            source_id = str(row.get("reservation_id") or row.get("id"))
+            status = str(row.get("reservation_state") or row.get("state"))
+            return active({
+                "source_type": source_type,
+                "source_id": source_id,
+                "symbol": symbol,
+                "status": status,
+                "created_at": row.get("created_at"),
+                "expires_at": None,
+                "position_lifecycle_id": row.get("position_lifecycle_id"),
+                "order_intent_id": row.get("id"),
+                "reason": f"{symbol} sell order intent {status}",
+                "validation_reason": "sell intent or reservation is unresolved",
+            })
+
+        # A pending/approved sell proposal is meaningful only while its
+        # position lifecycle is still represented by a current broker holding.
+        proposal_rows = self.storage.fetch_all(
             """
-            SELECT id, symbol, status, created_at, expires_at, emergency_exit_triggered,
-                   emergency_exit_score, emergency_exit_trigger_reason, exit_trigger_reason
+            SELECT trade_proposals.id, trade_proposals.symbol, trade_proposals.status, trade_proposals.created_at, trade_proposals.expires_at, trade_proposals.emergency_exit_triggered,
+                   emergency_exit_score, emergency_exit_trigger_reason, exit_trigger_reason, trade_proposals.payload,
+                   o.status AS linked_order_status, i.state AS linked_intent_state
             FROM trade_proposals
-            WHERE side='sell'
-              AND status IN ('pending','approved')
-              AND expires_at>?
-            ORDER BY created_at DESC
-            LIMIT 1
+            LEFT JOIN orders o ON o.proposal_id=trade_proposals.id
+            LEFT JOIN order_intents i ON i.proposal_id=trade_proposals.id
+            WHERE lower(trade_proposals.side)='sell' AND trade_proposals.status IN ('pending','approved')
+              AND (expires_at IS NULL OR expires_at>?)
+            ORDER BY datetime(trade_proposals.created_at) DESC
             """,
             (now_iso,),
         )
-        if active_rows:
-            row = active_rows[0]
-            symbol = str(row["symbol"]).upper()
-            if row.get("emergency_exit_triggered") == 1:
-                reason = f"{symbol} emergency exit review active"
-            else:
-                reason = f"{symbol} EXIT proposal pending"
-            return {
-                "active": True,
+        for row in proposal_rows:
+            symbol = str(row.get("symbol") or "").upper()
+            lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+            source = {
+                "source_type": "active_sell_proposal",
+                "source_id": str(row["id"]),
                 "symbol": symbol,
-                "reason": reason,
-                "status": row["status"],
-                "source": "trade_proposals",
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
-                "emergency_exit_score": row.get("emergency_exit_score"),
-                "stale": False,
+                "status": row.get("status"),
+                "created_at": row.get("created_at"),
+                "expires_at": row.get("expires_at"),
+                "emergency_exit_triggered": row.get("emergency_exit_triggered"),
+                "position_lifecycle_id": lifecycle_id,
             }
+            linked_order_status = str(row.get("linked_order_status") or "").lower()
+            linked_intent_state = str(row.get("linked_intent_state") or "").lower()
+            if linked_order_status in {"filled", "canceled", "cancelled", "expired", "rejected"} or linked_intent_state in {"filled", "cancelled", "rejected", "expired"}:
+                stale(source, f"linked sell order or intent is {linked_order_status or linked_intent_state}")
+                continue
+            if not has_position(symbol):
+                stale(source, "position no longer exists")
+                continue
+            reason = f"{symbol} EXIT proposal {row.get('status')}"
+            if int(row.get("emergency_exit_triggered") or 0) == 1:
+                reason = f"{symbol} emergency exit review active"
+            return active({**source, "reason": reason, "validation_reason": "proposal is active, unexpired, and position exists"})
 
-        active_batch_rows = self.storage.fetch_all(
+        # Batch candidates are independently checked against both candidate and
+        # batch expiry, plus the linked proposal when that row exists.
+        batch_rows = self.storage.fetch_all(
             """
-            SELECT c.id, c.candidate_symbol, c.candidate_action, c.candidate_status, c.created_at, c.expires_at, b.id AS batch_id
+            SELECT c.id, c.proposal_id, c.candidate_symbol, c.candidate_action, c.candidate_side,
+                   c.candidate_status, c.created_at, c.expires_at, b.id AS batch_id,
+                   b.status AS batch_status, b.expires_at AS batch_expires_at,
+                   p.status AS proposal_status, o.status AS linked_order_status,
+                   i.state AS linked_intent_state
             FROM proposal_batch_candidates c
             JOIN proposal_batches b ON b.id=c.batch_id
+            LEFT JOIN trade_proposals p ON p.id=c.proposal_id
+            LEFT JOIN orders o ON o.proposal_id=p.id
+            LEFT JOIN order_intents i ON i.proposal_id=p.id
             WHERE c.candidate_status='pending'
               AND b.status IN ('pending','partially_approved')
               AND c.expires_at>?
-              AND (
-                lower(c.candidate_side)='sell'
-                OR upper(c.candidate_action) IN ('SELL','EXIT')
-              )
-            ORDER BY c.created_at DESC
-            LIMIT 1
+              AND b.expires_at>?
+              AND (lower(c.candidate_side)='sell' OR upper(c.candidate_action) IN ('SELL','EXIT'))
+              AND (p.id IS NULL OR p.status IN ('pending','approved'))
+            ORDER BY datetime(c.created_at) DESC
             """,
-            (now_iso,),
+            (now_iso, now_iso),
         )
-        if active_batch_rows:
-            row = active_batch_rows[0]
-            symbol = str(row["candidate_symbol"]).upper()
-            return {
-                "active": True,
+        for row in batch_rows:
+            symbol = str(row.get("candidate_symbol") or "").upper()
+            lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+            source = {
+                "source_type": "active_sell_batch_candidate",
+                "source_id": str(row["id"]),
                 "symbol": symbol,
-                "reason": f"{symbol} EXIT batch candidate pending",
-                "status": row["candidate_status"],
-                "source": "proposal_batch_candidates",
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
-                "batch_id": row["batch_id"],
-                "stale": False,
+                "status": row.get("candidate_status"),
+                "created_at": row.get("created_at"),
+                "expires_at": row.get("expires_at"),
+                "batch_id": row.get("batch_id"),
+                "batch_status": row.get("batch_status"),
+                "batch_expires_at": row.get("batch_expires_at"),
+                "proposal_id": row.get("proposal_id"),
+                "position_lifecycle_id": lifecycle_id,
             }
+            linked_order_status = str(row.get("linked_order_status") or "").lower()
+            linked_intent_state = str(row.get("linked_intent_state") or "").lower()
+            if linked_order_status in {"filled", "canceled", "cancelled", "expired", "rejected"} or linked_intent_state in {"filled", "cancelled", "rejected", "expired"}:
+                stale(source, f"linked sell order or intent is {linked_order_status or linked_intent_state}")
+                continue
+            if not has_position(symbol):
+                stale(source, "position no longer exists")
+                continue
+            return active({
+                **source,
+                "reason": f"{symbol} EXIT batch candidate {row.get('candidate_status')}",
+                "validation_reason": "batch candidate and batch are pending, unexpired, and position exists",
+            })
 
-        stale_rows = self.storage.fetch_all(
+        historical_rows = self.storage.fetch_all(
             """
             SELECT id, symbol, status, created_at, expires_at
             FROM trade_proposals
-            WHERE side='sell'
+            WHERE lower(side)='sell'
               AND status IN ('pending','approved','submitted','filled','blocked','expired','rejected','superseded','stale_resolved')
-            ORDER BY created_at DESC
+            ORDER BY datetime(created_at) DESC
             LIMIT 1
             """
         )
-        if stale_rows:
-            row = stale_rows[0]
-            symbol = str(row["symbol"]).upper()
-            return {
-                "active": False,
-                "symbol": symbol,
-                "reason": f"stale {symbol} exit flag ignored",
-                "status": row["status"],
-                "source": "trade_proposals",
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
-                "stale": True,
+        if historical_rows:
+            row = historical_rows[0]
+            source = {
+                "source_type": "historical_sell_proposal",
+                "source_id": str(row["id"]),
+                "symbol": str(row.get("symbol") or "").upper(),
+                "status": row.get("status"),
+                "created_at": row.get("created_at"),
+                "expires_at": row.get("expires_at"),
             }
+            stale(source, "source is terminal, expired, superseded, or no longer reproduced")
 
-        return {"active": False, "symbol": None, "reason": None, "status": None, "source": None, "stale": False}
+        # Only a decision produced by this scan is allowed to act as a
+        # proposal-less blocker. Position-management decisions from prior runs
+        # are historical evidence, not current intent.
+        for result in current_cycle_exits or []:
+            signal = result.get("signal")
+            if getattr(signal, "action", None) != "EXIT" or getattr(signal, "side", None) != "sell":
+                continue
+            symbol = str(result.get("symbol") or "").upper()
+            if not result.get("has_position") or not has_position(symbol):
+                continue
+            decision = result.get("position_management_decision") or {}
+            decision_type = decision.get("decision_type") if isinstance(decision, dict) else None
+            source_type = "current_position_management_decision" if decision.get("is_actionable") and decision.get("action") == "sell" else "current_cycle_exit_signal"
+            source_id = result.get("position_management_decision_id") if source_type == "current_position_management_decision" else result.get("signal_id")
+            status = decision_type or "actionable"
+            reason = (
+                f"fresh {symbol} {decision_type} decision has priority"
+                if source_type == "current_position_management_decision"
+                else f"fresh {symbol} EXIT signal has priority"
+            )
+            return active({
+                "source_type": source_type,
+                "source_id": str(source_id or symbol),
+                "symbol": symbol,
+                "status": status,
+                "created_at": result.get("cycle_created_at") or now_iso,
+                "expires_at": result.get("expiry").isoformat() if isinstance(result.get("expiry"), datetime) else result.get("expiry"),
+                "position_lifecycle_id": result.get("position_lifecycle_id"),
+                "reason": reason,
+                "validation_reason": "fresh current-cycle exit signal reproduced from current position and market data",
+            })
+
+        if stale_sources:
+            return stale_sources[0]
+        return {
+            "active": False, "symbol": None, "reason": None, "status": None,
+            "source": None, "source_type": None, "source_id": None,
+            "created_at": None, "expires_at": None, "latest_validation_at": now_iso,
+            "stale": False,
+        }
+
+    def _exit_blocker_audit_detail(self, blocker: dict[str, Any], classification: str, reason: str | None) -> dict[str, Any]:
+        return {
+            "source_type": blocker.get("source_type") or blocker.get("source"),
+            "source_id": blocker.get("source_id"),
+            "symbol": blocker.get("symbol"),
+            "status": blocker.get("status"),
+            "created_at": blocker.get("created_at"),
+            "expires_at": blocker.get("expires_at"),
+            "position_lifecycle_id": blocker.get("position_lifecycle_id"),
+            "latest_validation_at": blocker.get("latest_validation_at"),
+            "classification": classification,
+            "reason": reason or blocker.get("reason"),
+        }
+
+    def _exit_blocker_display_reason(self, blocker: dict[str, Any]) -> str:
+        """Stable digest wording containing the current source and status."""
+        if not blocker or not blocker.get("active"):
+            return (blocker.get("reason") if blocker else None) or "no current exit blocker"
+        symbol = str(blocker.get("symbol") or "EXIT").upper()
+        source_type = blocker.get("source_type") or blocker.get("source")
+        status = str(blocker.get("status") or "active")
+        expiry = blocker.get("expires_at")
+        until = ""
+        if expiry:
+            try:
+                until = f" until {_format_sgt_time(_parse_datetime(expiry))} SGT"
+            except Exception:
+                pass
+        if source_type == "broker_open_order":
+            return f"{symbol} sell order remains open"
+        if source_type == "active_sell_proposal":
+            if int(blocker.get("emergency_exit_triggered") or 0) == 1:
+                return f"{symbol} emergency exit review active ({status}){until}"
+            return f"{symbol} exit proposal {status}{until}"
+        if source_type == "active_sell_batch_candidate":
+            return f"{symbol} sell batch candidate {status}{until}"
+        if source_type == "sell_order_intent":
+            return f"{symbol} sell order intent {status}"
+        if source_type == "active_sell_reservation":
+            return f"{symbol} sell reservation {status}"
+        return blocker.get("reason") or f"fresh {symbol} EXIT decision has priority"
 
     def _sleep_mode_active(self) -> bool:
         try:
@@ -742,9 +952,10 @@ class TradingService:
         except (TypeError, ValueError):
             return None
 
-    def _record_position_management(self, decision: PositionManagementDecision, now: datetime, proposal_id: str | None = None) -> None:
+    def _record_position_management(self, decision: PositionManagementDecision, now: datetime, proposal_id: str | None = None) -> str:
         symbol = decision.symbol.upper()
         lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+        decision_id = str(uuid.uuid4())
         previous = self._position_management_state(symbol)
         risk_seed = self._initial_risk_seed_for_position(symbol)
         created_at = previous.get("created_at") if previous else now.isoformat()
@@ -836,7 +1047,7 @@ class TradingService:
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                str(uuid.uuid4()), self.run_id, symbol, lifecycle_id, decision.decision_type, decision.priority, decision.action,
+                decision_id, self.run_id, symbol, lifecycle_id, decision.decision_type, decision.priority, decision.action,
                 decision.reason, decision.current_price, decision.avg_entry_price, decision.quantity,
                 decision.unrealized_profit_pct, decision.highest_price_since_entry, decision.max_unrealized_profit_pct,
                 decision.pullback_from_peak_pct, decision.drawdown_from_entry_pct, decision.drawdown_from_peak_pct,
@@ -884,6 +1095,7 @@ class TradingService:
                     now.isoformat(), None,
                 ),
             )
+        return decision_id
 
     def _mark_position_management_proposal_handled(self, proposal_row: dict[str, Any], status: str) -> None:
         try:
@@ -3956,6 +4168,7 @@ class TradingService:
                         no_action_reason = "Pyramiding check failed: " + "; ".join(add_block_reasons)
 
                 position_management_decision = None
+                position_management_decision_id = None
                 position_management_sell_fraction = None
                 position_management_sell_qty = None
                 position_management_add_notional = None
@@ -3994,7 +4207,7 @@ class TradingService:
                         position_age_cycles=position_age_cycles,
                         now=now,
                     )
-                    self._record_position_management(position_management_decision, now)
+                    position_management_decision_id = self._record_position_management(position_management_decision, now)
                     if position_management_decision.is_actionable and emergency_exit_triggered != 1:
                         if position_management_decision.action == "sell":
                             position_management_sell_fraction = position_management_decision.suggested_sell_fraction or 1.0
@@ -4139,7 +4352,10 @@ class TradingService:
                     "vol_adjusted_notional": vol_adjusted_notional,
                     "base_notional": base_notional,
                     "position_management_decision": dataclasses.asdict(position_management_decision) if position_management_decision else None,
+                    "position_management_decision_id": position_management_decision_id,
                     "position_management_decision_type": position_management_decision.decision_type if position_management_decision else None,
+                    "position_lifecycle_id": PositionLifecycleManager(self.storage).active_id(symbol) if has_position else None,
+                    "cycle_created_at": now.isoformat(),
                     "position_management_sell_fraction": position_management_sell_fraction,
                     "position_management_sell_qty": position_management_sell_qty,
                     "position_management_add_notional": position_management_add_notional,
@@ -4181,11 +4397,19 @@ class TradingService:
                 if res["symbol"] not in active_watchlist:
                     res["true_score_rank"] = None
 
-            # Split exits vs buys
+            # Split exits vs buys. The exit-first gate is evaluated from the
+            # current broker snapshot and current-cycle decisions, not from a
+            # historical market-memory flag.
             exit_candidates = [r for r in profile_results if r["signal"].action == "EXIT" and r["has_position"]]
             buy_candidates_all = [r for r in profile_results if r["signal"].action == "ENTRY" and r["signal"].side == "buy"]
 
-            exit_candidates_exist = len(exit_candidates) > 0
+            exit_blocker = self._exit_blocker_context(
+                orders,
+                positions=positions,
+                current_cycle_exits=exit_candidates,
+                validation_at=now,
+            )
+            exit_candidates_exist = bool(exit_blocker.get("active"))
 
             # Setup key and dedupe status pre-evaluation
             for res in profile_results:
@@ -4532,11 +4756,15 @@ class TradingService:
                 if is_buy and exit_candidates_exist and not sleep_mode_active:
                     proposal_allowed = False
                     dedupe_status = "suppressed"
-                    dedupe_reason = "suppressed due to exit priority"
-                    no_action_reason = "suppressed due to exit priority"
+                    blocker_reason = self._exit_blocker_display_reason(exit_blocker)
+                    dedupe_reason = f"suppressed due to exit priority: {blocker_reason}"
+                    no_action_reason = f"new buy blocked because {blocker_reason}"
                     candidate_suppression_reason = "suppressed_due_to_exit_priority"
                     self.storage.audit(self.run_id, "proposal_suppressed", {
-                        "symbol": symbol, "reason": "suppressed_due_to_exit_priority", "score": score
+                        "symbol": symbol,
+                        "reason": "suppressed_due_to_exit_priority",
+                        "score": score,
+                        "exit_blocker": self._exit_blocker_audit_detail(exit_blocker, "active", blocker_reason),
                     })
 
                 # Check proposal send-time freshness
@@ -5292,11 +5520,23 @@ class TradingService:
             {"cycle_count": cycle_count, "min_cycles": min_cycles, "symbol_count": len(symbol_rows), "window_start": window_start_iso, "window_end": now.isoformat()},
         )
 
+        current_positions: list[Any] | None
         try:
             current_positions = list(self.broker.get_positions())
         except Exception:
-            current_positions = []
-        cluster_holdings = self._cluster_holdings(current_positions)
+            # Preserve unknown broker state so an active unresolved exit is not
+            # cleared merely because the digest could not read positions.
+            current_positions = None
+        try:
+            current_orders = list(self.broker.get_open_orders())
+        except Exception:
+            current_orders = []
+        digest_exit_blocker = self._exit_blocker_context(
+            current_orders,
+            positions=current_positions,
+            validation_at=now,
+        )
+        cluster_holdings = self._cluster_holdings(current_positions or [])
 
         symbols_list = []
         score_threshold = self.config.get("ai", {}).get("ai_review_min_score", 65)
@@ -5323,7 +5563,10 @@ class TradingService:
             elif has_prop:
                 status_info = {"status": "Proposal pending approval", "event": "pending_approval", "high_score": latest_score >= score_threshold}
             else:
-                status_info = self._digest_market_memory_status(sym, latest_row, set(obs_watchlist), cluster_holdings)
+                status_info = self._digest_market_memory_status(
+                    sym, latest_row, set(obs_watchlist), cluster_holdings,
+                    current_exit_blocker=digest_exit_blocker,
+                )
 
             symbols_list.append({
                 "symbol": sym,
@@ -5546,21 +5789,8 @@ class TradingService:
             summary_str += f" Candidates deferred due to AI review throttling: {deferred_syms}."
 
         exit_watch = "Exit watch: no exit triggers."
-        pending_exit = self.storage.fetch_all(
-            """
-            SELECT symbol, exit_trigger_reason, emergency_exit_trigger_reason, created_at
-            FROM trade_proposals
-            WHERE side='sell'
-              AND status='pending'
-              AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
-            ORDER BY datetime(created_at) DESC
-            LIMIT 1
-            """,
-            (now.isoformat(),),
-        )
-        if pending_exit:
-            reason = pending_exit[0].get("exit_trigger_reason") or pending_exit[0].get("emergency_exit_trigger_reason") or "exit rule triggered"
-            exit_watch = f"Exit proposal: {pending_exit[0]['symbol']} {reason}; approval required."
+        if digest_exit_blocker.get("active"):
+            exit_watch = f"Exit priority: {self._exit_blocker_display_reason(digest_exit_blocker)}."
         else:
             watch_rows = self.storage.fetch_all(
                 """
@@ -7497,6 +7727,7 @@ class TradingService:
         latest_row: dict[str, Any],
         obs_watchlist: set[str],
         cluster_holdings: dict[str, list[str]],
+        current_exit_blocker: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         latest_score = latest_row.get("score") or 0.0
         latest_signal = latest_row.get("signal")
@@ -7543,6 +7774,39 @@ class TradingService:
             return {"status": "Watch — waiting for fresh market validation", "event": "freshness_failed", "high_score": True}
         if "no matching market profile" in no_act or "not in active watchlist" in no_act:
             return {"status": "Blocked — dynamic symbol missing Alpaca-approved scanner profile", "event": "dynamic_profile_validation", "high_score": True}
+        # A historical exit reason is displayable only after this digest has
+        # revalidated a current authoritative source. This prevents a cleared
+        # proposal or prior-run decision from becoming a permanent blocker.
+        if (
+            current_exit_blocker
+            and current_exit_blocker.get("active")
+            and latest_signal == "ENTRY"
+            and (
+                "exit" in no_act
+                or latest_row.get("exit_priority_applied")
+            )
+        ):
+            blocker = self._exit_blocker_display_reason(current_exit_blocker)
+            return {
+                "status": f"Watch — New buy blocked — {blocker}",
+                "event": "exit_blocked",
+                "high_score": True,
+                "blocker": blocker,
+                "exit_blocker": current_exit_blocker,
+            }
+        if latest_signal == "ENTRY" and "exit" in no_act:
+            stale_detail = {
+                "source_type": "market_memory_exit_flag",
+                "source_id": str(latest_row.get("id") or "") or None,
+                "symbol": symbol,
+                "status": "historical",
+                "created_at": latest_row.get("created_at"),
+                "expires_at": latest_row.get("expires_at_sgt"),
+                "latest_validation_at": (current_exit_blocker or {}).get("latest_validation_at"),
+                "classification": "stale",
+                "reason": "market-memory exit wording was not reproduced by a current authoritative source",
+            }
+            self.storage.audit(self.run_id, "exit_blocker_ignored_stale", stale_detail)
         if "notional" in no_act or "sizing" in no_act or "buying power" in no_act:
             return {"status": "Blocked — failed risk sizing", "event": "risk_sizing", "high_score": True}
         if "total portfolio exposure" in no_act or "portfolio_total_exposure" in no_act:
@@ -7569,17 +7833,9 @@ class TradingService:
                 "held_symbols": held_symbols,
                 "high_score": True,
             }
-        if (
-            "exit is pending" in no_act
-            or "exit proposal pending" in no_act
-            or "new buy blocked because" in no_act and "exit" in no_act
-            or "block_new_buy_if_exit_pending" in no_act
-        ):
-            blocker_label = self._exit_blocker_label_from_reason(no_action_reason)
-            return {"status": f"Watch — New buy blocked — {blocker_label}", "event": "exit_blocked", "high_score": True, "blocker": blocker_label}
-        if "suppressed due to exit priority" in no_act or "suppressed_due_to_exit_priority" in no_act:
-            blocker_label = "an actionable exit has priority"
-            return {"status": f"Watch — New buy blocked — {blocker_label}", "event": "exit_blocked", "high_score": True, "blocker": blocker_label}
+        # Do not interpret exit wording in market_memory as a live blocker.
+        # The current source check above is the only path that can emit the
+        # exit_blocked digest event.
         if "emergency exit score is" in no_act or "block_new_buy_if_emergency_exit_score_above" in no_act:
             return {"status": "Watch — new buy blocked due to emergency exit risk", "event": "emergency_risk", "high_score": True}
         if "pyramiding check failed" in no_act or "add_on_check_failed" in no_act or "position not sufficiently profitable" in no_act or "cannot average down" in no_act:

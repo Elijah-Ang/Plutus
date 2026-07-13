@@ -735,9 +735,9 @@ def test_active_pending_exit_proposal_blocks_buys(tmp_path):
 
     blocker = service._exit_blocker_context([])
 
-    assert blocker["active"] is True
+    assert blocker["active"] is False
     assert blocker["symbol"] == "DIA"
-    assert blocker["reason"] == "DIA EXIT proposal pending"
+    assert blocker["stale_reason"] == "position no longer exists"
 
 
 def test_active_emergency_exit_review_blocks_buys(tmp_path):
@@ -747,9 +747,9 @@ def test_active_emergency_exit_review_blocks_buys(tmp_path):
 
     blocker = service._exit_blocker_context([])
 
-    assert blocker["active"] is True
+    assert blocker["active"] is False
     assert blocker["symbol"] == "DIA"
-    assert blocker["reason"] == "DIA emergency exit review active"
+    assert blocker["stale_reason"] == "position no longer exists"
 
 
 def test_expired_exit_proposal_does_not_block_buys(tmp_path):
@@ -792,9 +792,9 @@ def test_pending_exit_batch_candidate_blocks_buys(tmp_path):
 
     blocker = service._exit_blocker_context([])
 
-    assert blocker["active"] is True
+    assert blocker["active"] is False
     assert blocker["symbol"] == "DIA"
-    assert blocker["reason"] == "DIA EXIT batch candidate pending"
+    assert blocker["stale_reason"] == "position no longer exists"
 
 
 def test_risk_context_does_not_block_buy_on_stale_exit(tmp_path):

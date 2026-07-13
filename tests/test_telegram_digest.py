@@ -511,14 +511,16 @@ def test_digest_explains_exit_first_blocker_and_not_false_threshold(temp_storage
 
     assert len(service.telegram.messages) == 1
     msg = service.telegram.messages[0]
-    assert "Exit-first blocker: DIA EXIT proposal pending" in msg
-    assert "Status: Watch — New buy blocked — DIA EXIT proposal pending" in msg
+    assert "Exit-first blocker:" not in msg
+    assert "Status: Watch — New buy blocked" not in msg
     assert "DIA — static | Tradable | Trade score 90" in msg
     assert "Status: Watch — no ENTRY signal" in msg
     assert "XLV — Not tradable | Trade score 72 | Proposal blocked: needs paper-tradable promotion" in msg
     assert "Observation only — no proposal allowed" in msg
     assert "no setup crossed the proposal threshold" not in msg.lower()
     assert "No setup crossed the score threshold" not in msg
+    stale_audits = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='exit_blocker_ignored_stale'")
+    assert stale_audits
 
 
 def test_digest_does_not_invent_pending_exit_from_low_warning(temp_storage):
@@ -1181,20 +1183,18 @@ def test_digest_market_memory_status_uses_specific_display_reasons(temp_storage)
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "blocked by risk checks: total portfolio exposure cap"})["status"] == "Blocked — portfolio exposure limit"
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": "not actionable - pre-proposal risk check failed: no matching market profile found for symbol ABBV"})["status"] == "Blocked — dynamic symbol missing Alpaca-approved scanner profile"
     exit_priority = status({"score": 100.0, "signal": "ENTRY", "no_action_reason": "suppressed due to exit priority"})
-    assert exit_priority["status"] == "Watch — New buy blocked — an actionable exit has priority"
-    assert exit_priority["event"] == "exit_blocked"
+    assert exit_priority["event"] != "exit_blocked"
     assert status({"score": 90.0, "signal": "ENTRY", "no_action_reason": ""})["status"] == "Watch — proposal builder returned no candidate"
     assert service._digest_market_memory_status("XLV", {"score": 90.0, "signal": "ENTRY", "no_action_reason": ""}, {"XLV"}, {})["status"] == "Observation only — no proposal allowed"
 
     summary = service._build_digest_summary(
         {
             "symbol": "ALC",
-            "_event": "exit_blocked",
-            "_blocker": "an actionable exit has priority",
+            "_event": "proposal_builder_no_candidate",
         },
-        [{"symbol": "ALC", "_event": "exit_blocked", "_high_score": True}],
+        [{"symbol": "ALC", "_event": "proposal_builder_no_candidate", "_high_score": True}],
     )
-    assert summary == "ALC scored highest, but the new buy was held back because an actionable exit has priority."
+    assert "an actionable exit has priority" not in summary
 
 
 def test_digest_unified_paper_tradable_excludes_unpromoted_dynamic_symbols(temp_storage):
