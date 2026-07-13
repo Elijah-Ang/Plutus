@@ -25,24 +25,34 @@ def _db(tmp_path) -> Storage:
 
 
 def _observation(index: int, value: float = 0.5) -> PerformanceObservation:
+    exit_session = datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=index)
     return PerformanceObservation(
         observation_id=f"probe-{index}", source_id=f"probe-source-{index}",
         strategy_version="rule_based_v2", symbol="SPY", evidence_class="shadow_oos",
-        entry_session=f"2026-06-{(index % 20) + 1:02d}T14:00:00+00:00",
-        exit_session=f"2026-07-{(index % 9) + 1:02d}T14:00:00+00:00",
+        entry_session=(exit_session - timedelta(days=28)).isoformat(),
+        exit_session=exit_session.isoformat(),
         regime="normal" if index % 2 else "favorable", r_multiple=value, gross_r=value + 0.05,
         evidence_version=EVIDENCE_VERSION, formula_version=ACCOUNTING_VERSION,
         attribution_confidence="shadow_deterministic",
     )
 
 
-def _refresh_with(monkeypatch, storage, observations, quality=85.0, *, as_of="2026-07-13T00:00:00+00:00"):
+def _refresh_with(
+    monkeypatch,
+    storage,
+    observations,
+    quality=1.0,
+    *,
+    concentration=0.0,
+    actual_observations=None,
+    as_of="2026-07-13T00:00:00+00:00",
+):
     engine = StrategyPerformanceEngine(storage, load_config(), as_of=as_of)
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
-    monkeypatch.setattr(engine, "_actual_observations", lambda: [])
+    monkeypatch.setattr(engine, "_actual_observations", lambda: list(actual_observations or []))
     monkeypatch.setattr(
         "app.strategy_performance.score_components",
-        lambda metrics, settings: ({"profitability": quality}, quality, {"concentration": 0.0, "divergence": 0.0}),
+        lambda metrics, settings: ({"profitability": quality}, quality, {"concentration": concentration, "divergence": 0.0}),
     )
     return engine.refresh_strategy("rule_based_v2"), engine
 
@@ -53,7 +63,11 @@ def test_probe_evidence_rule_and_transition_to_exploration(monkeypatch, tmp_path
     assert probe.recommendation_state == "PROBE"
     policy = engine.latest_valid_policy("rule_based_v2")
     assert policy is not None
+    assert probe.quality_score == 1.0
     assert policy.hard_gates["probe_evidence_eligible"] is True
+    preliminary = probe.raw_inputs["probe_preliminary_evidence"]
+    assert preliminary["inputs"]["shadow_oos_count"] == 50
+    assert all(preliminary["results"].values())
     assert policy.maturity["probe"]["limits"] == {
         "stop_risk_pct": 0.03, "portfolio_heat_pct": 0.10, "gross_exposure_pct": 2.5,
         "max_active_count": 1, "minimum_setup_score": 85.0,
@@ -62,7 +76,7 @@ def test_probe_evidence_rule_and_transition_to_exploration(monkeypatch, tmp_path
     assert "rule_based_v2: PROBE" in report
     assert "new entries only; no adds" in report
 
-    exploration, _ = _refresh_with(monkeypatch, storage, [_observation(i) for i in range(100)])
+    exploration, _ = _refresh_with(monkeypatch, storage, [_observation(i) for i in range(100)], quality=50.0)
     assert exploration.recommendation_state == "EXPLORATION"
 
 
@@ -72,10 +86,24 @@ def test_incomplete_or_tampered_probe_policy_fails_closed(monkeypatch, tmp_path)
     policy = engine.latest_valid_policy("rule_based_v2")
     assert policy is not None and policy.state == "PROBE"
     gates = dict(policy.hard_gates)
-    gates["positive_expectancy"] = False
+    gates["probe_preliminary_expectancy"] = False
     storage.execute("UPDATE strategy_policy_decisions SET hard_gates_json=? WHERE id=?", (json.dumps(gates), policy.id))
     assert engine.latest_valid_policy("rule_based_v2") is None
     assert engine.policy_by_id(policy.id) is None
+    storage.execute("UPDATE strategy_policy_decisions SET hard_gates_json=? WHERE id=?", (json.dumps(policy.hard_gates), policy.id))
+    snapshot_row = storage.fetch_all("SELECT raw_inputs_json FROM strategy_performance_snapshots WHERE id=?", (policy.performance_snapshot_id,))[0]
+    raw_inputs = json.loads(snapshot_row["raw_inputs_json"])
+    original_raw_inputs = json.dumps(raw_inputs)
+    raw_inputs["probe_preliminary_evidence"]["inputs"]["expectancy_r"] = 999.0
+    storage.execute(
+        "UPDATE strategy_performance_snapshots SET raw_inputs_json=? WHERE id=?",
+        (json.dumps(raw_inputs), policy.performance_snapshot_id),
+    )
+    assert engine.latest_valid_policy("rule_based_v2") is None
+    storage.execute(
+        "UPDATE strategy_performance_snapshots SET raw_inputs_json=? WHERE id=?",
+        (original_raw_inputs, policy.performance_snapshot_id),
+    )
     storage.execute(
         "UPDATE strategy_policy_decisions SET hard_gates_json=?,policy_version='strategy_policy_v2_1' WHERE id=?",
         (json.dumps(policy.hard_gates), policy.id),
@@ -83,20 +111,118 @@ def test_incomplete_or_tampered_probe_policy_fails_closed(monkeypatch, tmp_path)
     assert engine.latest_valid_policy("rule_based_v2") is None
 
 
-@pytest.mark.parametrize("case", ["weak", "negative", "stale", "incomplete"])
-def test_probe_rejects_weak_negative_stale_or_incomplete_evidence(monkeypatch, tmp_path, case):
-    observations = [_observation(i) for i in range(50)]
-    quality = 84.999 if case == "weak" else 100.0
-    as_of = "2026-07-13T00:00:00+00:00"
-    if case == "negative":
-        observations = [_observation(i, -0.5) for i in range(50)]
-    elif case == "stale":
-        as_of = "2027-01-13T00:00:00+00:00"
-    elif case == "incomplete":
-        observations[0] = dataclasses.replace(observations[0], evidence_version="old_evidence")
-    snapshot, _ = _refresh_with(monkeypatch, _db(tmp_path), observations, quality, as_of=as_of)
+@pytest.mark.parametrize("count", [10, 99])
+def test_probe_preliminary_gate_passes_at_10_and_99_without_quality_dependency(monkeypatch, tmp_path, count):
+    snapshot, engine = _refresh_with(monkeypatch, _db(tmp_path), [_observation(i) for i in range(count)], quality=0.0)
+    assert snapshot.quality_score == 0.0
+    assert snapshot.recommendation_state == "PROBE"
+    assert snapshot.raw_inputs["hard_gates"]["probe_evidence_eligible"] is True
+    assert engine.latest_valid_policy("rule_based_v2") is not None
+
+
+def test_probe_uses_real_preliminary_math_while_persisting_sub_85_quality(monkeypatch, tmp_path):
+    storage = _db(tmp_path)
+    engine = StrategyPerformanceEngine(storage, load_config(), as_of="2026-07-13T00:00:00+00:00")
+    values = [0.65, -0.30, 0.65, 0.65, -0.30] * 2
+    observations = [dataclasses.replace(_observation(i, value), symbol=f"S{i}") for i, value in enumerate(values)]
+    monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
+    monkeypatch.setattr(engine, "_actual_observations", lambda: [])
+    snapshot = engine.refresh_strategy("rule_based_v2")
+    assert snapshot.quality_score < 85.0
+    assert snapshot.recommendation_state == "PROBE"
+    preliminary = snapshot.raw_inputs["probe_preliminary_evidence"]
+    assert preliminary["inputs"]["expectancy_r"] == pytest.approx(0.27)
+    assert preliminary["inputs"]["profit_factor"] == pytest.approx(3.25)
+    assert preliminary["inputs"]["concentration_penalty"] <= 5.0
+    assert all(preliminary["results"].values())
+    assert engine.latest_valid_policy("rule_based_v2") is not None
+
+
+def test_probe_preliminary_gate_rejects_count_9_with_explicit_reason(monkeypatch, tmp_path):
+    snapshot, _ = _refresh_with(monkeypatch, _db(tmp_path), [_observation(i) for i in range(9)], quality=100.0)
     assert snapshot.recommendation_state == "RESEARCH_ONLY"
-    assert snapshot.raw_inputs["hard_gates"]["probe_evidence_eligible"] is False
+    assert snapshot.raw_inputs["hard_gates"]["probe_preliminary_shadow_sample_range"] is False
+    assert "shadow_sample_range" in snapshot.raw_inputs["maturity"]["binding_maturity_reason"]
+
+
+def test_probe_preliminary_gate_exact_boundaries_pass():
+    from app.strategy_performance import _probe_preliminary_results
+
+    inputs = {
+        "strategy_version": "rule_based_v2",
+        "shadow_oos_count": 10,
+        "minimum_shadow_oos_count": 10,
+        "maximum_shadow_oos_count_exclusive": 100,
+        "version_completeness": 1.0,
+        "required_version_completeness": 1.0,
+        "evidence_recency_days": 90.0,
+        "maximum_evidence_recency_days": 90.0,
+        "expectancy_r": 0.25,
+        "minimum_expectancy_r": 0.25,
+        "profit_factor": 1.75,
+        "minimum_profit_factor": 1.75,
+        "concentration_penalty": 5.0,
+        "maximum_concentration_penalty": 5.0,
+        "maximum_drawdown_r": 6.0,
+        "maximum_allowed_drawdown_r": 6.0,
+        "worst_losing_streak": 8,
+        "maximum_allowed_losing_streak": 8,
+        "actual_paper_count": 20,
+        "divergence_gate_minimum_actual_paper_count": 20,
+        "shadow_paper_expectancy_divergence_r": 1.5,
+        "maximum_allowed_divergence_r": 1.5,
+    }
+    assert all(_probe_preliminary_results(inputs).values())
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_gate"),
+    [
+        ("expectancy", "expectancy"),
+        ("profit_factor", "profit_factor"),
+        ("concentration", "concentration"),
+        ("freshness", "evidence_fresh"),
+        ("completeness", "version_complete"),
+        ("drawdown", "drawdown"),
+        ("streak", "losing_streak"),
+        ("divergence", "divergence"),
+    ],
+)
+def test_probe_preliminary_gate_failures_are_persisted_and_explicit(monkeypatch, tmp_path, case, expected_gate):
+    count = 99 if case == "divergence" else 10
+    observations = [_observation(i) for i in range(count)]
+    actual = []
+    kwargs = {"quality": 100.0}
+    if case == "expectancy":
+        observations = [_observation(i, 0.20) for i in range(count)]
+    elif case == "profit_factor":
+        values = [2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0, 2.0]
+        observations = [_observation(i, value) for i, value in enumerate(values)]
+    elif case == "concentration":
+        kwargs["concentration"] = 5.01
+    elif case == "freshness":
+        kwargs["as_of"] = "2027-01-13T00:00:00+00:00"
+    elif case == "completeness":
+        observations[0] = dataclasses.replace(observations[0], evidence_version="old_evidence")
+    elif case == "drawdown":
+        values = [2.0] * 8 + [-4.0, -4.0]
+        observations = [_observation(i, value) for i, value in enumerate(values)]
+    elif case == "streak":
+        values = [4.0] + [-0.1] * 9
+        observations = [_observation(i, value) for i, value in enumerate(values)]
+    elif case == "divergence":
+        observations = [_observation(i, 2.0) for i in range(count)]
+        actual = [dataclasses.replace(_observation(100 + i, 0.0), evidence_class="actual_paper") for i in range(20)]
+        kwargs["actual_observations"] = actual
+    snapshot, engine = _refresh_with(monkeypatch, _db(tmp_path), observations, **kwargs)
+    results = snapshot.raw_inputs["probe_preliminary_evidence"]["results"]
+    assert results[expected_gate] is False
+    assert snapshot.raw_inputs["hard_gates"][f"probe_preliminary_{expected_gate}"] is False
+    assert snapshot.recommendation_state == "RESEARCH_ONLY"
+    assert expected_gate in snapshot.raw_inputs["maturity"]["binding_maturity_reason"]
+    persisted = engine.latest_policy("rule_based_v2")
+    assert persisted is not None
+    assert expected_gate in persisted.reason
 
 
 def test_probe_risk_mapping_is_entry_only_and_fixed():
@@ -166,8 +292,13 @@ def test_probe_sizing_respects_score_stage_risk_and_active_count(monkeypatch, tm
 def test_probe_configuration_is_strict():
     config = load_config()
     assert validate_config(config) == []
+    assert "score_probe_threshold" not in config["profitability_engine"]
     config["phase4"]["probe_stop_risk_pct"] = 0.031
     with pytest.raises(ConfigurationError, match="probe stop risk"):
+        validate_config(config)
+    config = load_config()
+    config["profitability_engine"]["probe_min_shadow_oos_samples"] = 9
+    with pytest.raises(ConfigurationError, match="probe_min_shadow_oos_samples"):
         validate_config(config)
 
 

@@ -96,7 +96,7 @@ STRICT_SECTION_KEYS = {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
         "minimum_samples_per_regime", "minimum_actual_paper_for_divergence_penalty", "minimum_regimes", "evidence_stale_after_days",
-        "score_exploration_threshold", "score_probe_threshold", "score_throttled_threshold",
+        "score_exploration_threshold", "probe_min_shadow_oos_samples", "probe_max_concentration_penalty", "score_throttled_threshold",
         "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
         "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
     },
@@ -257,7 +257,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     }
     for key, expected in required_profitability_settings.items():
         require(profitability.get(key) == expected, f"profitability_engine.{key} must be {expected}")
-    require(profitability.get("score_probe_threshold") == 85, "profitability_engine.score_probe_threshold must be 85")
+    require(profitability.get("probe_min_shadow_oos_samples") == 10, "profitability_engine.probe_min_shadow_oos_samples must be 10")
+    require(profitability.get("probe_max_concentration_penalty") == 5.0, "profitability_engine.probe_max_concentration_penalty must be 5.0")
 
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail

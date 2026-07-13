@@ -403,6 +403,71 @@ def score_components(metrics: Mapping[str, Any], settings: Mapping[str, Any] | N
     return components, round(max(0.0, sum(components.values()) - sum(penalties.values())), 10), penalties
 
 
+def _probe_preliminary_inputs(
+    strategy_version: str,
+    metrics: Mapping[str, Any],
+    penalties: Mapping[str, Any],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    profit_factor_value = metrics.get("profit_factor")
+    if profit_factor_value == float("inf") or (
+        profit_factor_value is None
+        and metrics.get("average_loss_r") is None
+        and float(metrics.get("expectancy_r") or 0.0) > 0
+    ):
+        profit_factor_value = "infinite"
+    elif _finite(profit_factor_value) is not None:
+        profit_factor_value = float(profit_factor_value)
+    else:
+        profit_factor_value = None
+    return {
+        "strategy_version": str(strategy_version),
+        "shadow_oos_count": int((metrics.get("trade_counts") or {}).get("shadow_oos") or 0),
+        "minimum_shadow_oos_count": int(settings["probe_min_shadow_oos_samples"]),
+        "maximum_shadow_oos_count_exclusive": int(settings["minimum_shadow_oos_samples"]),
+        "version_completeness": float(metrics.get("version_completeness") or 0.0),
+        "required_version_completeness": 1.0,
+        "evidence_recency_days": _finite(metrics.get("evidence_recency_days")),
+        "maximum_evidence_recency_days": float(settings["evidence_stale_after_days"]),
+        "expectancy_r": _finite(metrics.get("expectancy_r")),
+        "minimum_expectancy_r": float(settings["target_expectancy_r"]),
+        "profit_factor": profit_factor_value,
+        "minimum_profit_factor": float(settings["target_profit_factor"]),
+        "concentration_penalty": float(penalties.get("concentration") or 0.0),
+        "maximum_concentration_penalty": float(settings["probe_max_concentration_penalty"]),
+        "maximum_drawdown_r": _finite(metrics.get("maximum_drawdown_r")),
+        "maximum_allowed_drawdown_r": float(settings["hard_max_drawdown_r"]),
+        "worst_losing_streak": int(metrics.get("worst_losing_streak") or 0),
+        "maximum_allowed_losing_streak": int(settings["hard_max_losing_streak"]),
+        "actual_paper_count": int((metrics.get("trade_counts") or {}).get("actual_paper") or 0),
+        "divergence_gate_minimum_actual_paper_count": int(settings["minimum_actual_paper_for_divergence_penalty"]),
+        "shadow_paper_expectancy_divergence_r": _finite(metrics.get("shadow_paper_expectancy_divergence_r")),
+        "maximum_allowed_divergence_r": float(settings["hard_max_divergence_r"]),
+    }
+
+
+def _probe_preliminary_results(inputs: Mapping[str, Any]) -> dict[str, bool]:
+    profit_factor_value = inputs.get("profit_factor")
+    profit_factor_pass = profit_factor_value == "infinite" or (
+        _finite(profit_factor_value) is not None
+        and float(profit_factor_value) >= float(inputs["minimum_profit_factor"])
+    )
+    actual_count = int(inputs["actual_paper_count"])
+    divergence = inputs.get("shadow_paper_expectancy_divergence_r")
+    return {
+        "strategy_version": inputs.get("strategy_version") == STRATEGY_VERSION,
+        "shadow_sample_range": int(inputs["minimum_shadow_oos_count"]) <= int(inputs["shadow_oos_count"]) < int(inputs["maximum_shadow_oos_count_exclusive"]),
+        "version_complete": float(inputs["version_completeness"]) == float(inputs["required_version_completeness"]),
+        "evidence_fresh": inputs.get("evidence_recency_days") is not None and float(inputs["evidence_recency_days"]) <= float(inputs["maximum_evidence_recency_days"]),
+        "expectancy": inputs.get("expectancy_r") is not None and float(inputs["expectancy_r"]) >= float(inputs["minimum_expectancy_r"]),
+        "profit_factor": bool(profit_factor_pass),
+        "concentration": float(inputs["concentration_penalty"]) <= float(inputs["maximum_concentration_penalty"]),
+        "drawdown": inputs.get("maximum_drawdown_r") is not None and float(inputs["maximum_drawdown_r"]) <= float(inputs["maximum_allowed_drawdown_r"]),
+        "losing_streak": int(inputs["worst_losing_streak"]) <= int(inputs["maximum_allowed_losing_streak"]),
+        "divergence": actual_count < int(inputs["divergence_gate_minimum_actual_paper_count"]) or divergence is None or float(divergence) <= float(inputs["maximum_allowed_divergence_r"]),
+    }
+
+
 def calculate_metrics(
     observations: Sequence[PerformanceObservation],
     *,
@@ -623,7 +688,8 @@ class StrategyPerformanceEngine:
             "minimum_regimes": int(self.cfg.get("minimum_regimes", phase4.get("minimum_regimes", promotion.get("minimum_regimes", 2)))),
             "evidence_stale_after_days": float(self.cfg.get("evidence_stale_after_days", phase4.get("evidence_stale_after_days", 90))),
             "score_exploration_threshold": float(self.cfg.get("score_exploration_threshold", 45.0)),
-            "score_probe_threshold": float(self.cfg.get("score_probe_threshold", 85.0)),
+            "probe_min_shadow_oos_samples": int(self.cfg.get("probe_min_shadow_oos_samples", 10)),
+            "probe_max_concentration_penalty": float(self.cfg.get("probe_max_concentration_penalty", 5.0)),
             "score_throttled_threshold": float(self.cfg.get("score_throttled_threshold", 60.0)),
             "score_active_threshold": float(self.cfg.get("score_active_threshold", 75.0)),
             "hard_max_drawdown_r": float(self.cfg.get("hard_max_drawdown_r", 6.0)),
@@ -832,23 +898,19 @@ class StrategyPerformanceEngine:
             "losing_streak_within_hard_limit": int(metrics["worst_losing_streak"] or 0) <= settings["hard_max_losing_streak"],
             "divergence_within_hard_limit": (actual_count < settings["minimum_actual_paper_for_divergence_penalty"] or metrics["shadow_paper_expectancy_divergence_r"] is None or metrics["shadow_paper_expectancy_divergence_r"] <= settings["hard_max_divergence_r"]),
         }
-        probe_gate_names = (
-            "evidence_present", "evidence_fresh", "version_complete", "positive_expectancy",
-            "drawdown_within_hard_limit", "losing_streak_within_hard_limit", "divergence_within_hard_limit",
-        )
-        probe_evidence_eligible = (
-            strategy_version == STRATEGY_VERSION
-            and shadow_count < settings["minimum_shadow_oos_samples"]
-            and quality >= settings["score_probe_threshold"]
-            and all(gates[name] for name in probe_gate_names)
-        )
+        preliminary_inputs = _probe_preliminary_inputs(strategy_version, metrics, penalties, settings)
+        preliminary_results = _probe_preliminary_results(preliminary_inputs)
+        gates.update({f"probe_preliminary_{name}": passed for name, passed in preliminary_results.items()})
+        probe_gate_names = tuple(f"probe_preliminary_{name}" for name in preliminary_results)
+        probe_evidence_eligible = all(preliminary_results.values())
         gates["probe_evidence_eligible"] = probe_evidence_eligible
+        failed_preliminary_gates = [name for name, passed in preliminary_results.items() if not passed]
         if shadow_count < settings["minimum_shadow_oos_samples"]:
             ceiling = "PROBE" if probe_evidence_eligible else "RESEARCH_ONLY"
             maturity_reason = (
-                f"strong complete immature evidence qualifies for PROBE at quality {quality:.2f}"
+                "preliminary PROBE evidence gates passed"
                 if probe_evidence_eligible
-                else f"shadow OOS {shadow_count}/{settings['minimum_shadow_oos_samples']} and PROBE evidence gates not met"
+                else "preliminary PROBE gate failed: " + ", ".join(failed_preliminary_gates)
             )
         elif actual_count < settings["minimum_actual_paper_for_throttled"]:
             ceiling, maturity_reason = "EXPLORATION", f"actual paper {actual_count}/{settings['minimum_actual_paper_for_throttled']} for THROTTLED"
@@ -862,8 +924,9 @@ class StrategyPerformanceEngine:
             "regime_count": regime_count, "minimum_regimes": settings["minimum_regimes"], "ceiling": ceiling, "binding_maturity_reason": maturity_reason,
             "probe": {
                 "evidence_eligible": probe_evidence_eligible,
-                "quality_threshold": settings["score_probe_threshold"],
                 "required_gates": list(probe_gate_names),
+                "preliminary_inputs": preliminary_inputs,
+                "preliminary_results": preliminary_results,
                 "limits": {
                     "stop_risk_pct": float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
                     "portfolio_heat_pct": float((self.config.get("phase4", {}) or {}).get("probe_portfolio_heat_pct", 0.10)),
@@ -873,7 +936,10 @@ class StrategyPerformanceEngine:
                 },
             },
         }
-        if not gates["evidence_present"]:
+        if shadow_count < settings["minimum_shadow_oos_samples"]:
+            state = "PROBE" if probe_evidence_eligible else "RESEARCH_ONLY"
+            reason = maturity_reason
+        elif not gates["evidence_present"]:
             state, reason = "RESEARCH_ONLY", "no complete current-version evidence"
         else:
             failed_hard = [name for name in ("evidence_fresh", "version_complete", "drawdown_within_hard_limit", "losing_streak_within_hard_limit", "divergence_within_hard_limit") if not gates[name]]
@@ -895,7 +961,16 @@ class StrategyPerformanceEngine:
                     state, reason = "THROTTLED", "minimum regime hard gate not met"
                 if state == "ACTIVE" and not gates["positive_expectancy"]:
                     state, reason = "SUSPENDED", "non-positive mature expectancy"
-        raw_inputs = {**raw_inputs, "score_inputs": dict(metrics), "score_components": components, "penalties": penalties, "hard_gates": gates, "maturity": maturity, "settings": settings}
+        raw_inputs = {
+            **raw_inputs,
+            "score_inputs": dict(metrics),
+            "score_components": components,
+            "penalties": penalties,
+            "probe_preliminary_evidence": {"inputs": preliminary_inputs, "results": preliminary_results},
+            "hard_gates": gates,
+            "maturity": maturity,
+            "settings": settings,
+        }
         metrics = {**metrics, "quality_score": quality, "component_weights": {"profitability": 30, "downside": 20, "stability": 15, "regime": 15, "execution": 10, "evidence": 10}, "penalties": penalties}
         fingerprint = _fingerprint({"strategy_version": strategy_version, "observations": [asdict(row) for row in observations], "metrics": metrics, "components": components, "raw_inputs": raw_inputs, "performance_version": STRATEGY_PERFORMANCE_VERSION, "policy_version": STRATEGY_POLICY_VERSION})
         snapshot_id = fingerprint[:32]
@@ -975,19 +1050,23 @@ class StrategyPerformanceEngine:
         self,
         row: Mapping[str, Any],
         metrics: Mapping[str, Any],
+        raw_inputs: Mapping[str, Any],
         hard_gates: Mapping[str, Any],
         maturity: Mapping[str, Any],
-        quality: float,
     ) -> bool:
         if row.get("state") != "PROBE":
             return True
-        required = (
-            "evidence_present", "evidence_fresh", "version_complete", "positive_expectancy",
-            "drawdown_within_hard_limit", "losing_streak_within_hard_limit",
-            "divergence_within_hard_limit", "probe_evidence_eligible",
-        )
         probe = maturity.get("probe")
         limits = probe.get("limits") if isinstance(probe, Mapping) else None
+        persisted_preliminary = raw_inputs.get("probe_preliminary_evidence")
+        expected_inputs = _probe_preliminary_inputs(
+            str(row.get("strategy_version") or ""),
+            metrics,
+            metrics.get("penalties") if isinstance(metrics.get("penalties"), Mapping) else {},
+            self._settings(),
+        )
+        expected_results = _probe_preliminary_results(expected_inputs)
+        expected_hard_gates = {f"probe_preliminary_{name}": passed for name, passed in expected_results.items()}
         expected_limits = {
             "stop_risk_pct": float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
             "portfolio_heat_pct": float((self.config.get("phase4", {}) or {}).get("probe_portfolio_heat_pct", 0.10)),
@@ -995,15 +1074,20 @@ class StrategyPerformanceEngine:
             "max_active_count": int((self.config.get("phase4", {}) or {}).get("probe_max_active_count", 1)),
             "minimum_setup_score": float((self.config.get("phase4", {}) or {}).get("probe_min_setup_score", 85)),
         }
-        shadow_count = int((metrics.get("trade_counts") or {}).get("shadow_oos") or 0)
         return bool(
-            all(hard_gates.get(name) is True for name in required)
-            and isinstance(probe, Mapping)
+            isinstance(probe, Mapping)
+            and isinstance(persisted_preliminary, Mapping)
+            and persisted_preliminary.get("inputs") == expected_inputs
+            and persisted_preliminary.get("results") == expected_results
+            and probe.get("preliminary_inputs") == expected_inputs
+            and probe.get("preliminary_results") == expected_results
+            and probe.get("required_gates") == list(expected_hard_gates)
+            and all(expected_results.values())
+            and all(hard_gates.get(name) == passed for name, passed in expected_hard_gates.items())
+            and hard_gates.get("probe_evidence_eligible") is True
             and probe.get("evidence_eligible") is True
             and limits == expected_limits
-            and quality >= float(self.cfg.get("score_probe_threshold", 85))
-            and shadow_count < int(self.cfg.get("minimum_shadow_oos_samples", 100))
-            and (metrics.get("expectancy_r") is not None and float(metrics["expectancy_r"]) > 0)
+            and row.get("reason") == "preliminary PROBE evidence gates passed"
         )
 
     def latest_valid_policy(self, strategy_version: str | None = None) -> StrategyRiskPolicy | dict[str, StrategyRiskPolicy] | None:
@@ -1034,6 +1118,7 @@ class StrategyPerformanceEngine:
             try:
                 quality = float(row["quality_score"])
                 metrics = json.loads(snapshot.get("metrics_json") or "{}")
+                raw_inputs = json.loads(snapshot.get("raw_inputs_json") or "{}")
                 hard_gates = json.loads(row.get("hard_gates_json") or "{}")
                 maturity = json.loads(row.get("maturity_json") or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -1051,7 +1136,8 @@ class StrategyPerformanceEngine:
                 or snapshot.get("strategy_version") != row.get("strategy_version")
                 or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
                 or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
-                or not self._probe_policy_valid(row, metrics, hard_gates, maturity, quality)
+                or not isinstance(raw_inputs, dict)
+                or not self._probe_policy_valid(row, metrics, raw_inputs, hard_gates, maturity)
                 or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             ):
                 continue
@@ -1090,6 +1176,7 @@ class StrategyPerformanceEngine:
         try:
             quality = float(row["quality_score"])
             metrics = json.loads(snapshot.get("metrics_json") or "{}")
+            raw_inputs = json.loads(snapshot.get("raw_inputs_json") or "{}")
             hard_gates = json.loads(row.get("hard_gates_json") or "{}")
             maturity = json.loads(row.get("maturity_json") or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1109,7 +1196,8 @@ class StrategyPerformanceEngine:
             or snapshot.get("recommendation_state") != row.get("state")
             or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
             or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
-            or not self._probe_policy_valid(row, metrics, hard_gates, maturity, quality)
+            or not isinstance(raw_inputs, dict)
+            or not self._probe_policy_valid(row, metrics, raw_inputs, hard_gates, maturity)
             or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             or (bool(hard_gates.get("evidence_present")) and (recency is None or float(recency) > float(self.cfg.get("evidence_stale_after_days", 90)) or not hard_gates.get("evidence_fresh")))
         ):

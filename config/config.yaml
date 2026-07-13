@@ -95,7 +95,8 @@ profitability_engine:
   minimum_regimes: 2
   evidence_stale_after_days: 90
   score_exploration_threshold: 45
-  score_probe_threshold: 85
+  probe_min_shadow_oos_samples: 10
+  probe_max_concentration_penalty: 5.0
   score_throttled_threshold: 60
   score_active_threshold: 75
   hard_max_drawdown_r: 6.0
