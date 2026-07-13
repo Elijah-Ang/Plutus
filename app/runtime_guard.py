@@ -37,6 +37,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "strategy_trade_records": {"source_key", "strategy_version", "evidence_class", "attribution_status", "r_multiple", "evidence_version", "formula_version"},
     "strategy_performance_snapshots": {"strategy_version", "performance_version", "policy_version", "quality_score", "metrics_json", "input_fingerprint"},
     "strategy_policy_decisions": {"strategy_version", "state", "performance_snapshot_id", "enforcement_enabled", "policy_version", "schema_version", "input_fingerprint"},
+    "adaptive_conviction_decisions": {"proposal_id", "strategy_version", "deployment_mode", "opportunity_class", "recommended_stop_risk_pct", "operational_stop_risk_pct", "binding_cap", "raw_inputs_json", "formula_version", "configuration_schema_version", "config_hash", "decision_fingerprint", "report_only"},
 }
 
 

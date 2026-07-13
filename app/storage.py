@@ -221,12 +221,14 @@ class Storage:
             from .shadow_strategies import apply_phase2_schema
             from .phase3_risk import apply_phase3_schema
             from .phase4_allocator import apply_phase4_schema
+            from .adaptive_conviction import apply_adaptive_conviction_schema
             apply_p1_execution_schema(conn)
 
             apply_phase1_schema(conn)
             apply_phase2_schema(conn)
             apply_phase3_schema(conn)
             apply_phase4_schema(conn)
+            apply_adaptive_conviction_schema(conn)
             from .strategy_performance import apply_strategy_performance_schema
             apply_strategy_performance_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
@@ -274,6 +276,8 @@ class Storage:
                 apply_phase3_schema(conn, record_migration=False)
                 from .phase4_allocator import apply_phase4_schema
                 apply_phase4_schema(conn, record_migration=False)
+                from .adaptive_conviction import apply_adaptive_conviction_schema
+                apply_adaptive_conviction_schema(conn, record_migration=False)
                 apply_p1_execution_schema(conn, record_migration=False)
                 from .strategy_performance import apply_strategy_performance_schema
                 apply_strategy_performance_schema(conn, record_migration=False)

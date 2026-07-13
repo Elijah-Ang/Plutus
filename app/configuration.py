@@ -8,6 +8,8 @@ from typing import Any
 
 from .formula_versions import (
     ACCOUNTING_VERSION,
+    ADAPTIVE_CONVICTION_FORMULA_VERSION,
+    ADAPTIVE_CONVICTION_SCHEMA_VERSION,
     CONFIGURATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE3_DECISION_VERSION,
@@ -40,7 +42,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
-    "phase2_shadow_strategies", "phase3", "phase4", "profitability_engine", "execution_capabilities", "broker",
+    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "profitability_engine", "execution_capabilities", "broker",
     "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
     "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
@@ -87,11 +89,16 @@ STRICT_SECTION_KEYS = {
         "probe_stop_risk_pct", "probe_portfolio_heat_pct", "probe_gross_exposure_pct", "probe_max_active_count", "probe_min_setup_score",
         "require_manual_approval", "phase3_hard_limits_authoritative",
     },
+    "adaptive_conviction": {
+        "enabled", "report_only", "formula_version", "schema_version", "base_strategy_risk_pct",
+        "hard_trade_risk_ceiling_pct", "maximum_symbol_exposure_pct", "maximum_cluster_exposure_pct",
+        "minimum_liquidity_dollars", "maximum_quote_spread_bps", "kelly_operational", "covariance_operational",
+    },
     "risk_budget": {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "adaptive_conviction"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -178,9 +185,24 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "evidence": EVIDENCE_VERSION,
         "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
         "strategy_policy": STRATEGY_POLICY_VERSION,
+        "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
     }
     for key, expected in expected_formulas.items():
         require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")
+
+    conviction = config.get("adaptive_conviction", {}) or {}
+    require(conviction.get("enabled") is True, "adaptive_conviction.enabled must be true")
+    require(conviction.get("report_only") is True, "adaptive conviction must remain report-only")
+    require(conviction.get("formula_version") == ADAPTIVE_CONVICTION_FORMULA_VERSION, f"adaptive_conviction.formula_version must be {ADAPTIVE_CONVICTION_FORMULA_VERSION}")
+    require(conviction.get("schema_version") == ADAPTIVE_CONVICTION_SCHEMA_VERSION, f"adaptive_conviction.schema_version must be {ADAPTIVE_CONVICTION_SCHEMA_VERSION}")
+    require(conviction.get("base_strategy_risk_pct") == 0.20, "adaptive conviction base strategy risk must be 0.20%")
+    require(conviction.get("hard_trade_risk_ceiling_pct") == 0.35, "adaptive conviction hard trade ceiling must be 0.35%")
+    require(conviction.get("maximum_symbol_exposure_pct") == 6.0, "adaptive conviction symbol ceiling must remain 6.0%")
+    require(conviction.get("maximum_cluster_exposure_pct") == 15.0, "adaptive conviction cluster ceiling must remain 15.0%")
+    require(conviction.get("minimum_liquidity_dollars") == 10000000.0, "adaptive conviction liquidity floor must remain $10M")
+    require(conviction.get("maximum_quote_spread_bps") == 40.0, "adaptive conviction quote-spread ceiling must remain 40 bps")
+    require(conviction.get("kelly_operational") is False, "adaptive conviction Kelly must remain diagnostic only")
+    require(conviction.get("covariance_operational") is False, "adaptive conviction covariance must remain diagnostic only")
 
     profitability = config.get("profitability_engine", {}) or {}
     require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")
@@ -263,7 +285,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail
     # before a runtime object or database is opened.
-    for section_name in ("risk", "risk_budget", "phase3", "phase4", "profitability_engine", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
+    for section_name in ("risk", "risk_budget", "phase3", "phase4", "adaptive_conviction", "profitability_engine", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
         _validate_units(config.get(section_name), section_name, errors)
 
     try:

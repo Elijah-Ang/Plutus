@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .ai_review import AIReviewer, deterministic_review
+from .adaptive_conviction import AdaptiveConvictionEngine
 from .capabilities import AUTO_EXECUTION_SUPPORTED, require_protective_paper_exit_support
 from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active
 
@@ -1354,6 +1355,128 @@ class TradingService:
             ),
         }
 
+    def _adaptive_conviction_execution_evidence(self, strategy_version: str) -> dict[str, Any]:
+        rows = self.storage.fetch_all(
+            """SELECT o.status,COALESCE(
+                         (SELECT f.implementation_shortfall_bps FROM fills f
+                          WHERE f.order_id=o.id AND f.implementation_shortfall_bps IS NOT NULL
+                          ORDER BY f.filled_at DESC,f.id DESC LIMIT 1),
+                         o.implementation_shortfall_bps) AS shortfall_bps
+               FROM orders o JOIN trade_proposals p ON p.id=o.proposal_id
+               WHERE p.strategy_version=? AND lower(o.side)='buy'
+               ORDER BY o.created_at DESC LIMIT 50""",
+            (strategy_version,),
+        )
+        if not rows:
+            return {
+                "execution_fill_rate": None,
+                "execution_shortfall_bps": None,
+                "execution_evidence_count": 0,
+                "execution_evidence_calibrated": False,
+            }
+        completed = sum(str(row["status"] or "").lower() in {"filled", "partially_filled"} for row in rows)
+        shortfalls = sorted(float(row["shortfall_bps"]) for row in rows if row["shortfall_bps"] is not None)
+        middle = len(shortfalls) // 2
+        median_shortfall = None if not shortfalls else (
+            shortfalls[middle] if len(shortfalls) % 2 else (shortfalls[middle - 1] + shortfalls[middle]) / 2.0
+        )
+        return {
+            "execution_fill_rate": completed / len(rows),
+            "execution_shortfall_bps": median_shortfall,
+            "execution_evidence_count": len(rows),
+            "execution_evidence_calibrated": len(rows) >= 10 and median_shortfall is not None,
+        }
+
+    def _record_adaptive_conviction(
+        self,
+        proposal: dict[str, Any],
+        sizing: dict[str, Any],
+        portfolio: dict[str, Any],
+        *,
+        risk_checks_passed: bool,
+    ) -> dict[str, Any] | None:
+        """Gather diagnostic inputs; formula and classification stay in the engine."""
+        if proposal.get("action") != "entry" or str(proposal.get("side") or "").lower() != "buy":
+            return None
+        adaptive_config = self.config.get("adaptive_conviction")
+        if not isinstance(adaptive_config, dict) or adaptive_config.get("enabled") is not True:
+            return None
+        equity = float(portfolio.get("portfolio_equity") or 0.0)
+        proposal_pct = (float(proposal.get("notional") or 0.0) / equity * 100.0) if equity > 0 else None
+        current_gross = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_total_exposure_pct") or 0.0) - proposal_pct)
+        current_symbol = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_symbol_exposure_pct") or 0.0) - proposal_pct)
+        current_cluster = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_cluster_exposure_pct") or 0.0) - proposal_pct)
+        current_heat = None
+        if equity > 0:
+            current_heat = (
+                float(portfolio.get("held_open_stop_risk") or 0.0)
+                + float(portfolio.get("active_reserved_stop_risk") or 0.0)
+                + float(portfolio.get("pending_buy_stop_risk") or 0.0)
+            ) / equity * 100.0
+        integrity = DurableExecutionStore(self.storage).integrity_report()
+        integrity_ok = not any(integrity.values())
+        execution = self._adaptive_conviction_execution_evidence(str(proposal.get("strategy_version") or ""))
+        target_price = (proposal.get("indicators") or {}).get("target_price")
+        reward_to_risk = None
+        stop_price = proposal.get("stop_price")
+        entry_price = proposal.get("proposal_price")
+        try:
+            if target_price is not None and stop_price is not None and entry_price is not None and float(entry_price) > float(stop_price):
+                reward_to_risk = max(0.0, (float(target_price) - float(entry_price)) / (float(entry_price) - float(stop_price)))
+        except (TypeError, ValueError):
+            reward_to_risk = None
+        state = str(proposal.get("strategy_state") or "")
+        operational_risk = proposal.get("permitted_stop_risk_pct")
+        if operational_risk is None and equity > 0:
+            operational_risk = float(proposal.get("stop_risk_dollars") or 0.0) / equity * 100.0
+        inputs = {
+            "run_id": proposal.get("run_id"), "proposal_id": proposal.get("id"),
+            "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
+            "strategy_version": proposal.get("strategy_version"),
+            "policy_decision_id": proposal.get("policy_decision_id"),
+            "performance_snapshot_id": proposal.get("performance_snapshot_id"),
+            "action": proposal.get("action"), "side": proposal.get("side"),
+            "strategy_authorized": state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
+            "strategy_policy_state": state,
+            "evidence_quality": (float(proposal["strategy_quality_score"]) / 100.0) if proposal.get("strategy_quality_score") is not None else None,
+            "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"} and proposal.get("performance_snapshot_id") is not None,
+            "market_regime": proposal.get("volatility_regime"),
+            "account_drawdown_pct": sizing.get("phase3_account_drawdown_pct"),
+            "daily_realized_loss_pct": portfolio.get("daily_loss_pct"),
+            "weekly_realized_loss_pct": portfolio.get("weekly_loss_pct"),
+            "execution_integrity_ok": integrity_ok,
+            "reconciliation_ok": integrity_ok and not bool(portfolio.get("pending_buy_exposure_unknown")),
+            "integrity_counts": integrity,
+            "current_portfolio_heat_pct": current_heat,
+            "current_gross_exposure_pct": current_gross,
+            "symbol_exposure_pct": current_symbol,
+            "cluster_exposure_pct": current_cluster,
+            "correlation_score": None if current_cluster is None else min(1.0, current_cluster / float(adaptive_config["maximum_cluster_exposure_pct"])),
+            "setup_score": proposal.get("score"),
+            "stop_valid": proposal.get("stop_validation_status") == "validated",
+            "stop_distance_pct": proposal.get("stop_distance_pct"),
+            "reward_to_risk": reward_to_risk,
+            "average_dollar_volume": proposal.get("average_dollar_volume"),
+            "quote_spread_bps": proposal.get("quote_spread_bps"),
+            "market_data_fresh": proposal.get("proposal_price_age_seconds_at_send") is not None and float(proposal.get("proposal_price_age_seconds_at_send")) <= float(self.config.get("telegram", {}).get("proposal_price_freshness_threshold_seconds", 60.0)),
+            "risk_checks_passed": risk_checks_passed,
+            "deterioration_detected": state == "THROTTLED" or "deterior" in str(proposal.get("binding_policy_reason") or "").lower(),
+            "operational_stop_risk_pct": operational_risk,
+            **execution,
+        }
+        engine = AdaptiveConvictionEngine(self.config)
+        adaptive = engine.evaluate(inputs)
+        if adaptive is None:
+            return None
+        engine.persist(self.storage, adaptive)
+        summary = adaptive.summary()
+        self.storage.audit(self.run_id, "adaptive_conviction_report_only", summary)
+        return summary
+
+    def replay_adaptive_conviction(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        """Read-only engine replay; callers supply immutable historical inputs."""
+        return AdaptiveConvictionEngine(self.config).replay(records)
+
     def _process_sleep_mode_emergency_timeouts(self) -> None:
         timed_out = self.storage.fetch_all(
             """
@@ -1564,6 +1687,7 @@ class TradingService:
                     from .strategy_performance import StrategyPerformanceEngine
 
                     performance_text = StrategyPerformanceEngine(self.storage, self.config).format_report()
+                    performance_text += "\n\n" + AdaptiveConvictionEngine(self.config).format_report(self.storage)
                     self.storage.audit(self.run_id, "telegram_command", {"command": "/performance", "authorized": True, "report_only": True})
                     self.telegram.send_message(performance_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                     continue
@@ -4687,6 +4811,14 @@ class TradingService:
                                     no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                                     proposal_allowed = False
 
+                            if is_buy and proposal_action == "entry":
+                                proposal["adaptive_conviction"] = self._record_adaptive_conviction(
+                                    proposal,
+                                    res,
+                                    port_context,
+                                    risk_checks_passed=bool(decision is not None and decision.passed),
+                                )
+
                             if proposal_allowed:
                                 if is_buy:
                                     # AI is optional commentary only. It cannot
@@ -5457,6 +5589,19 @@ class TradingService:
                     strategy_policy_line += "; entry-only, no adds, manual approval, controlled probe limits"
         except Exception:
             strategy_policy_line = "unavailable or invalid; new entries fail closed"
+        adaptive_conviction_line = None
+        adaptive_rows = self.storage.fetch_all(
+            """SELECT deployment_mode,opportunity_class,recommended_stop_risk_pct,operational_stop_risk_pct,binding_cap
+               FROM adaptive_conviction_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (window_start_iso,),
+        )
+        if adaptive_rows:
+            adaptive = adaptive_rows[0]
+            adaptive_conviction_line = (
+                f"Adaptive Conviction report-only: {adaptive['deployment_mode']}/{adaptive['opportunity_class']}; "
+                f"future {float(adaptive['recommended_stop_risk_pct']):.4f}% vs operational {float(adaptive['operational_stop_risk_pct']):.4f}%; "
+                f"binding {adaptive['binding_cap']}"
+            )
         crypto_research_line = None
         if self.config.get("crypto", {}).get("enabled", False) and not crypto_quiet_hours_active(self.config, now):
             crypto_rows = self.storage.fetch_all(
@@ -5503,6 +5648,7 @@ class TradingService:
             "exit_watch": exit_watch,
             "proposal_capacity": proposal_capacity,
             "strategy_policy": strategy_policy_line,
+            "adaptive_conviction": adaptive_conviction_line,
             "crypto_research": crypto_research_line,
         }
 
@@ -7191,6 +7337,7 @@ class TradingService:
             "binding_caps": binding_caps, "sizing_caps": sizing_caps, "blocked_reason": blocked_reason,
             "pending_exposure_unknown": False, "sizing_policy_version": SIZING_POLICY_VERSION,
             "formula_version": RISK_DECISION_VERSION,
+            "phase3_account_drawdown_pct": phase3_context.get("drawdown_pct"),
             "strategy_version": strategy_version,
             "performance_snapshot_id": phase3_context.get("policy").performance_snapshot_id if phase3_context.get("policy") else None,
             "policy_decision_id": phase3_context.get("policy").id if phase3_context.get("policy") else None,

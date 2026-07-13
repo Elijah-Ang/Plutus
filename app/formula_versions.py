@@ -4,7 +4,7 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v3"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v4_adaptive_conviction"
 STOP_POLICY_VERSION = "validated_atr_or_technical_stop_v2"
 SIZING_POLICY_VERSION = "canonical_minimum_ceiling_notional_v3_probe"
 RISK_DECISION_VERSION = "risk_engine_ceiling_stop_probe_v3"
@@ -17,6 +17,8 @@ STRATEGY_POLICY_VERSION = "strategy_policy_v2_2_probe"
 STRATEGY_PERFORMANCE_SCHEMA_VERSION = "strategy_profitability_engine_v1"
 STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION = "strategy_policy_enforcement_v1"
 STRATEGY_PROBE_POLICY_SCHEMA_VERSION = "strategy_probe_policy_v1"
+ADAPTIVE_CONVICTION_FORMULA_VERSION = "adaptive_conviction_formula_v1"
+ADAPTIVE_CONVICTION_SCHEMA_VERSION = "adaptive_conviction_decisions_v1"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -31,5 +33,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         STRATEGY_PERFORMANCE_SCHEMA_VERSION,
         STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
         STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
+        ADAPTIVE_CONVICTION_SCHEMA_VERSION,
     }
 )

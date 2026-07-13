@@ -376,7 +376,18 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         if sizing_section:
             sizing_section = f"Sizing & Risk:\n{sizing_section}\n"
 
-        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}"
+        adaptive_section = ""
+        adaptive = proposal.get("adaptive_conviction") or {}
+        if adaptive:
+            adaptive_section = (
+                "Adaptive Conviction (report-only): "
+                f"{adaptive.get('deployment_mode')}/{adaptive.get('opportunity_class')}; "
+                f"future recommendation {float(adaptive.get('recommended_stop_risk_pct') or 0.0):.4f}% "
+                f"vs current operational {float(adaptive.get('operational_stop_risk_pct') or 0.0):.4f}%; "
+                f"binding {adaptive.get('binding_cap')}. This does not change this proposal's size.\n\n"
+            )
+
+        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}"
 
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
@@ -706,6 +717,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         strategy_policy = digest_data.get("strategy_policy")
         if strategy_policy:
             actions_sec += f"\n* Strategy policy: {strategy_policy}"
+        adaptive_conviction = digest_data.get("adaptive_conviction")
+        if adaptive_conviction:
+            actions_sec += f"\n* {adaptive_conviction}"
         sections.append(actions_sec)
         
         # 3-6. Tiers
@@ -847,6 +861,8 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             msg_parts.append(f"{digest_data['proposal_capacity']}\n")
         if digest_data.get("crypto_research"):
             msg_parts.append(f"{digest_data['crypto_research']}\n")
+        if digest_data.get("adaptive_conviction"):
+            msg_parts.append(f"{digest_data['adaptive_conviction']}\n")
 
         exit_first_blocker = digest_data.get("exit_first_blocker")
         if exit_first_blocker:
