@@ -24,6 +24,7 @@ from .formula_versions import (
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
     STRATEGY_PERFORMANCE_VERSION,
     STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
+    STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
     STRATEGY_POLICY_VERSION,
 )
 from .utils import iso_now, json_dumps
@@ -33,8 +34,8 @@ from .strategy_rule_based import STRATEGY_VERSION
 
 PRIMARY_HORIZON_SESSIONS = 20
 EVIDENCE_CLASSES = frozenset({"shadow_oos", "actual_paper"})
-QUALITY_SCORE_BOUNDARIES = (45.0, 60.0, 75.0)
-POLICY_STATES = ("RESEARCH_ONLY", "EXPLORATION", "THROTTLED", "ACTIVE", "SUSPENDED")
+QUALITY_SCORE_BOUNDARIES = (45.0, 60.0, 75.0, 85.0)
+POLICY_STATES = ("RESEARCH_ONLY", "PROBE", "EXPLORATION", "THROTTLED", "ACTIVE", "SUSPENDED")
 _STATE_RANK = {name: index for index, name in enumerate(POLICY_STATES[:-1])}
 
 
@@ -323,6 +324,7 @@ def state_risk_policy(
     initial_stop_risk_pct: float,
     add_stop_risk_pct: float,
     exploration_stop_risk_pct: float = 0.05,
+    probe_stop_risk_pct: float = 0.03,
     is_add: bool = False,
 ) -> tuple[float, float, str]:
     """Map a persisted state to its permitted pre-conversion stop-risk budget.
@@ -337,6 +339,11 @@ def state_risk_policy(
         return base, 1.0, "ACTIVE uses the current Phase 3 stop-risk budget"
     if state == "THROTTLED":
         return base * 0.50, 0.50, "THROTTLED applies the 0.50 strategy risk multiplier"
+    if state == "PROBE":
+        if is_add:
+            return 0.0, 0.0, "PROBE permits new entries only; adds are blocked"
+        permitted = float(probe_stop_risk_pct)
+        return permitted, permitted / base if base > 0 else 0.0, "PROBE uses the controlled Phase 4.2A stop-risk budget"
     if state == "EXPLORATION":
         if is_add:
             return 0.0, 0.0, "EXPLORATION permits entries only; adds are blocked"
@@ -588,6 +595,10 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
             (STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION, iso_now(), "additive persisted strategy policy enforcement provenance columns"),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (STRATEGY_PROBE_POLICY_SCHEMA_VERSION, iso_now(), "controlled probe state, limits, and policy provenance"),
+        )
 
 
 class StrategyPerformanceEngine:
@@ -612,6 +623,7 @@ class StrategyPerformanceEngine:
             "minimum_regimes": int(self.cfg.get("minimum_regimes", phase4.get("minimum_regimes", promotion.get("minimum_regimes", 2)))),
             "evidence_stale_after_days": float(self.cfg.get("evidence_stale_after_days", phase4.get("evidence_stale_after_days", 90))),
             "score_exploration_threshold": float(self.cfg.get("score_exploration_threshold", 45.0)),
+            "score_probe_threshold": float(self.cfg.get("score_probe_threshold", 85.0)),
             "score_throttled_threshold": float(self.cfg.get("score_throttled_threshold", 60.0)),
             "score_active_threshold": float(self.cfg.get("score_active_threshold", 75.0)),
             "hard_max_drawdown_r": float(self.cfg.get("hard_max_drawdown_r", 6.0)),
@@ -820,18 +832,52 @@ class StrategyPerformanceEngine:
             "losing_streak_within_hard_limit": int(metrics["worst_losing_streak"] or 0) <= settings["hard_max_losing_streak"],
             "divergence_within_hard_limit": (actual_count < settings["minimum_actual_paper_for_divergence_penalty"] or metrics["shadow_paper_expectancy_divergence_r"] is None or metrics["shadow_paper_expectancy_divergence_r"] <= settings["hard_max_divergence_r"]),
         }
-        ceiling = "RESEARCH_ONLY" if shadow_count < settings["minimum_shadow_oos_samples"] else "EXPLORATION" if actual_count < settings["minimum_actual_paper_for_throttled"] else "THROTTLED" if actual_count < settings["minimum_actual_paper_for_active"] else "ACTIVE"
-        maturity_reason = f"shadow OOS {shadow_count}/{settings['minimum_shadow_oos_samples']}" if shadow_count < settings["minimum_shadow_oos_samples"] else f"actual paper {actual_count}/{settings['minimum_actual_paper_for_throttled']} for THROTTLED" if actual_count < settings["minimum_actual_paper_for_throttled"] else f"actual paper {actual_count}/{settings['minimum_actual_paper_for_active']} for ACTIVE" if actual_count < settings["minimum_actual_paper_for_active"] else "shadow and actual-paper maturity requirements met"
+        probe_gate_names = (
+            "evidence_present", "evidence_fresh", "version_complete", "positive_expectancy",
+            "drawdown_within_hard_limit", "losing_streak_within_hard_limit", "divergence_within_hard_limit",
+        )
+        probe_evidence_eligible = (
+            strategy_version == STRATEGY_VERSION
+            and shadow_count < settings["minimum_shadow_oos_samples"]
+            and quality >= settings["score_probe_threshold"]
+            and all(gates[name] for name in probe_gate_names)
+        )
+        gates["probe_evidence_eligible"] = probe_evidence_eligible
+        if shadow_count < settings["minimum_shadow_oos_samples"]:
+            ceiling = "PROBE" if probe_evidence_eligible else "RESEARCH_ONLY"
+            maturity_reason = (
+                f"strong complete immature evidence qualifies for PROBE at quality {quality:.2f}"
+                if probe_evidence_eligible
+                else f"shadow OOS {shadow_count}/{settings['minimum_shadow_oos_samples']} and PROBE evidence gates not met"
+            )
+        elif actual_count < settings["minimum_actual_paper_for_throttled"]:
+            ceiling, maturity_reason = "EXPLORATION", f"actual paper {actual_count}/{settings['minimum_actual_paper_for_throttled']} for THROTTLED"
+        elif actual_count < settings["minimum_actual_paper_for_active"]:
+            ceiling, maturity_reason = "THROTTLED", f"actual paper {actual_count}/{settings['minimum_actual_paper_for_active']} for ACTIVE"
+        else:
+            ceiling, maturity_reason = "ACTIVE", "shadow and actual-paper maturity requirements met"
         maturity = {
             "sample_count": sample_count, "shadow_oos_count": shadow_count, "actual_paper_count": actual_count,
             "minimum_shadow_oos_samples": settings["minimum_shadow_oos_samples"], "minimum_actual_paper_for_throttled": settings["minimum_actual_paper_for_throttled"], "minimum_actual_paper_for_active": settings["minimum_actual_paper_for_active"],
             "regime_count": regime_count, "minimum_regimes": settings["minimum_regimes"], "ceiling": ceiling, "binding_maturity_reason": maturity_reason,
+            "probe": {
+                "evidence_eligible": probe_evidence_eligible,
+                "quality_threshold": settings["score_probe_threshold"],
+                "required_gates": list(probe_gate_names),
+                "limits": {
+                    "stop_risk_pct": float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
+                    "portfolio_heat_pct": float((self.config.get("phase4", {}) or {}).get("probe_portfolio_heat_pct", 0.10)),
+                    "gross_exposure_pct": float((self.config.get("phase4", {}) or {}).get("probe_gross_exposure_pct", 2.5)),
+                    "max_active_count": int((self.config.get("phase4", {}) or {}).get("probe_max_active_count", 1)),
+                    "minimum_setup_score": float((self.config.get("phase4", {}) or {}).get("probe_min_setup_score", 85)),
+                },
+            },
         }
         if not gates["evidence_present"]:
             state, reason = "RESEARCH_ONLY", "no complete current-version evidence"
         else:
             failed_hard = [name for name in ("evidence_fresh", "version_complete", "drawdown_within_hard_limit", "losing_streak_within_hard_limit", "divergence_within_hard_limit") if not gates[name]]
-            if failed_hard and sample_count >= settings["maturity_throttled_max"]:
+            if failed_hard and shadow_count >= settings["minimum_shadow_oos_samples"]:
                 state, reason = "SUSPENDED", "hard gate failed: " + ", ".join(failed_hard)
             else:
                 if quality >= settings["score_active_threshold"]:
@@ -925,6 +971,41 @@ class StrategyPerformanceEngine:
             raw_inputs=json.loads(snapshot.get("raw_inputs_json") or "{}"),
         )
 
+    def _probe_policy_valid(
+        self,
+        row: Mapping[str, Any],
+        metrics: Mapping[str, Any],
+        hard_gates: Mapping[str, Any],
+        maturity: Mapping[str, Any],
+        quality: float,
+    ) -> bool:
+        if row.get("state") != "PROBE":
+            return True
+        required = (
+            "evidence_present", "evidence_fresh", "version_complete", "positive_expectancy",
+            "drawdown_within_hard_limit", "losing_streak_within_hard_limit",
+            "divergence_within_hard_limit", "probe_evidence_eligible",
+        )
+        probe = maturity.get("probe")
+        limits = probe.get("limits") if isinstance(probe, Mapping) else None
+        expected_limits = {
+            "stop_risk_pct": float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
+            "portfolio_heat_pct": float((self.config.get("phase4", {}) or {}).get("probe_portfolio_heat_pct", 0.10)),
+            "gross_exposure_pct": float((self.config.get("phase4", {}) or {}).get("probe_gross_exposure_pct", 2.5)),
+            "max_active_count": int((self.config.get("phase4", {}) or {}).get("probe_max_active_count", 1)),
+            "minimum_setup_score": float((self.config.get("phase4", {}) or {}).get("probe_min_setup_score", 85)),
+        }
+        shadow_count = int((metrics.get("trade_counts") or {}).get("shadow_oos") or 0)
+        return bool(
+            all(hard_gates.get(name) is True for name in required)
+            and isinstance(probe, Mapping)
+            and probe.get("evidence_eligible") is True
+            and limits == expected_limits
+            and quality >= float(self.cfg.get("score_probe_threshold", 85))
+            and shadow_count < int(self.cfg.get("minimum_shadow_oos_samples", 100))
+            and (metrics.get("expectancy_r") is not None and float(metrics["expectancy_r"]) > 0)
+        )
+
     def latest_valid_policy(self, strategy_version: str | None = None) -> StrategyRiskPolicy | dict[str, StrategyRiskPolicy] | None:
         """Return only a current, internally linked, enforceable policy.
 
@@ -970,6 +1051,7 @@ class StrategyPerformanceEngine:
                 or snapshot.get("strategy_version") != row.get("strategy_version")
                 or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
                 or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
+                or not self._probe_policy_valid(row, metrics, hard_gates, maturity, quality)
                 or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             ):
                 continue
@@ -1027,6 +1109,7 @@ class StrategyPerformanceEngine:
             or snapshot.get("recommendation_state") != row.get("state")
             or not math.isfinite(quality) or not 0.0 <= quality <= 100.0
             or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
+            or not self._probe_policy_valid(row, metrics, hard_gates, maturity, quality)
             or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             or (bool(hard_gates.get("evidence_present")) and (recency is None or float(recency) > float(self.cfg.get("evidence_stale_after_days", 90)) or not hard_gates.get("evidence_fresh")))
         ):
@@ -1056,6 +1139,8 @@ class StrategyPerformanceEngine:
                 f"Max drawdown R: {metrics.get('maximum_drawdown_r') if metrics.get('maximum_drawdown_r') is not None else 'unavailable'} | Losing streak: {metrics.get('worst_losing_streak', 0)}",
                 f"Fingerprint: {row['input_fingerprint'][:16]}",
             ])
+            if row["recommendation_state"] == "PROBE":
+                lines.append("PROBE: new entries only; no adds; 0.03% stop risk; 0.10% probe heat; 2.5% probe gross; one active/reserved; Telegram approval required")
         return "\n".join(lines)
 
 

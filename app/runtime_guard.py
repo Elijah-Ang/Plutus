@@ -28,7 +28,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "telegram_updates": {"update_id", "message_id", "message_timestamp", "received_at", "processing_state"},
     "research_outcomes": {"opportunity_id", "horizon_sessions", "status", "exit_session", "calculation_version", "outcome_class"},
     "phase3_risk_decisions": {"run_id", "requested_notional", "binding_caps_json", "evidence_version", "formula_version", "performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct"},
-    "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json", "strategy_policy_map_json", "strategy_policy_version"},
+    "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json", "strategy_policy_map_json", "strategy_policy_version", "probe_allocation_json"},
     "trade_proposals": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
     "position_sizing_decisions": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
     "cash_snapshots": {"equity", "realized_fifo_pnl", "account_equity_change", "unrealized_change", "external_cash_flow", "accounting_version"},

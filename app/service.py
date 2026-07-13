@@ -1287,6 +1287,8 @@ class TradingService:
             weekly_confidence=realized.weekly_confidence,
             realized_provenance=realized.provenance,
         )
+        probe_commitments = self._probe_commitments(str(proposal.get("strategy_version") or STRATEGY_VERSION))
+        proposal_stop_risk = float(proposal.get("stop_risk_dollars") or proposal.get("initial_risk_dollars") or 0.0)
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -1338,6 +1340,10 @@ class TradingService:
             "pending_buy_exposure_unknown_rows": pending_execution.get("unknown_rows", []),
             "pending_buy_notional": float(pending_execution.get("total_notional") or 0.0),
             "pending_buy_stop_risk": float(pending_execution.get("total_stop_risk") or 0.0),
+            "probe_active_count": int(probe_commitments["active_count"]),
+            "probe_projected_count": int(probe_commitments["active_count"]) + (1 if proposal.get("phase4_mode") == "probe" and proposal.get("action", "entry") == "entry" else 0),
+            "probe_projected_gross_notional": float(probe_commitments["gross_notional"]) + (proposal_notional if proposal.get("phase4_mode") == "probe" else 0.0),
+            "probe_projected_stop_risk": float(probe_commitments["stop_risk"]) + (proposal_stop_risk if proposal.get("phase4_mode") == "probe" else 0.0),
             "held_open_stop_risk": canonical_risk.held_open_stop_risk,
             "unresolved_unknown_order_exposure": sum(
                 float(row.get("active_notional") or 0)
@@ -2526,6 +2532,13 @@ class TradingService:
                     
                 proposal["notional"] = final_notional
                 proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val > 0 else size_dict["suggested_shares"]
+                proposal["phase4_mode"] = size_dict.get("phase4_mode")
+                proposal["strategy_state"] = size_dict.get("strategy_state")
+                proposal["strategy_policy_version"] = size_dict.get("strategy_policy_version")
+                proposal["average_dollar_volume"] = size_dict.get("average_dollar_volume")
+                proposal["sizing_caps"] = size_dict.get("sizing_caps") or {}
+                proposal["binding_caps"] = size_dict.get("binding_caps") or []
+                proposal["stop_risk_dollars"] = size_dict.get("stop_risk_dollars")
             except Exception as e:
                 logger.warning("Recalculate dynamic size failed during revalidation: %s", type(e).__name__)
                 block_reason = "final validated sizing could not be recomputed"
@@ -4526,7 +4539,10 @@ class TradingService:
                                 "symbol": symbol,
                                 "side": signal.side,
                                 "action": proposal_action,
-                                "notional": notional
+                                "notional": notional,
+                                "strategy_version": signal.strategy_version,
+                                "phase4_mode": res.get("phase4_mode"),
+                                "stop_risk_dollars": res.get("stop_risk_dollars"),
                             })
 
                             notional_adjustment_note = ""
@@ -4565,6 +4581,19 @@ class TradingService:
                                 "asset_class": "equity",
                                 "indicators": signal.indicators,
                                 "score": score,
+                                "phase4_mode": res.get("phase4_mode", "disabled"),
+                                "phase4_probe_heat_cap_pct": res.get("phase4_probe_heat_cap_pct"),
+                                "phase4_probe_gross_cap_pct": res.get("phase4_probe_gross_cap_pct"),
+                                "phase4_probe_max_active_count": res.get("phase4_probe_max_active_count"),
+                                "average_dollar_volume": res.get("average_dollar_volume"),
+                                "performance_snapshot_id": res.get("performance_snapshot_id"),
+                                "policy_decision_id": res.get("policy_decision_id"),
+                                "strategy_quality_score": res.get("strategy_quality_score"),
+                                "strategy_state": res.get("strategy_state"),
+                                "strategy_risk_multiplier": res.get("strategy_risk_multiplier"),
+                                "permitted_stop_risk_pct": res.get("permitted_stop_risk_pct"),
+                                "strategy_policy_version": res.get("strategy_policy_version"),
+                                "binding_policy_reason": res.get("binding_policy_reason"),
                                 "classification": classification,
                                 "system_confidence": system_confidence,
                                 "expiry_minutes": expiry_minutes,
@@ -5418,6 +5447,16 @@ class TradingService:
                 exit_watch = f"Exit watch: {watch_rows[0]['symbol']} {reason}; no proposal yet."
 
         proposal_capacity = self._proposal_capacity_digest_line(window_start_iso, now.isoformat(), performance_lab)
+        strategy_policy_line = None
+        try:
+            from .strategy_performance import StrategyPerformanceEngine
+            policy = StrategyPerformanceEngine(self.storage, self.config).latest_valid_policy(STRATEGY_VERSION)
+            if policy is not None:
+                strategy_policy_line = f"{policy.state} (quality {policy.quality_score:.2f})"
+                if policy.state == "PROBE":
+                    strategy_policy_line += "; entry-only, no adds, manual approval, controlled probe limits"
+        except Exception:
+            strategy_policy_line = "unavailable or invalid; new entries fail closed"
         crypto_research_line = None
         if self.config.get("crypto", {}).get("enabled", False) and not crypto_quiet_hours_active(self.config, now):
             crypto_rows = self.storage.fetch_all(
@@ -5463,6 +5502,7 @@ class TradingService:
             "performance_lab": performance_lab,
             "exit_watch": exit_watch,
             "proposal_capacity": proposal_capacity,
+            "strategy_policy": strategy_policy_line,
             "crypto_research": crypto_research_line,
         }
 
@@ -5814,6 +5854,8 @@ class TradingService:
                 "cash_weight": self._phase4_allocation_cache["cash_weight"],
                 "exploration_heat_pct": self._phase4_allocation_cache.get("exploration_heat_pct", 0.0),
                 "exploration_weights": self._phase4_allocation_cache.get("exploration_weights", {}),
+                "probe_heat_pct": self._phase4_allocation_cache.get("probe_heat_pct", 0.0),
+                "probe_weights": self._phase4_allocation_cache.get("probe_weights", {}),
                 "allocation_class": self._phase4_allocation_cache.get("allocation_class", "unallocated"),
                 "operational_kelly_used": self._phase4_allocation_cache.get("operational_kelly_used", False),
                 "binding_caps": self._phase4_allocation_cache.get("binding_caps", {}),
@@ -6587,6 +6629,43 @@ class TradingService:
             "cluster_symbols": cluster_symbols,
         }
 
+    def _probe_commitments(self, strategy_version: str) -> dict[str, Any]:
+        """Return persisted probe slots, heat, and gross exposure.
+
+        A partially filled probe with a remaining reservation is one slot, not
+        two. Only proposals explicitly persisted as PROBE can consume a slot.
+        """
+        position_rows = self.storage.fetch_all(
+            """SELECT pl.entry_proposal_id,pl.position_lifecycle_id,pl.symbol,pl.original_quantity,
+                      pl.remaining_quantity,pl.unit_cost,pl.initial_risk_dollars
+               FROM position_lots pl JOIN trade_proposals p ON p.id=pl.entry_proposal_id
+               WHERE pl.strategy_version=? AND pl.remaining_quantity>0 AND p.strategy_state='PROBE'""",
+            (strategy_version,),
+        )
+        reservation_rows = self.storage.fetch_all(
+            """SELECT i.proposal_id,r.active_notional,r.active_stop_risk
+               FROM risk_reservations r JOIN order_intents i ON i.id=r.intent_id
+               JOIN trade_proposals p ON p.id=i.proposal_id
+               WHERE r.state='active' AND i.strategy_version=? AND p.strategy_state='PROBE'""",
+            (strategy_version,),
+        )
+        slots: set[str] = set()
+        gross = 0.0
+        heat = 0.0
+        for row in position_rows:
+            slot = str(row.get("entry_proposal_id") or row.get("position_lifecycle_id") or f"position:{row.get('symbol')}")
+            slots.add(slot)
+            original = float(row.get("original_quantity") or 0.0)
+            remaining = float(row.get("remaining_quantity") or 0.0)
+            gross += remaining * float(row.get("unit_cost") or 0.0)
+            if original > 0 and row.get("initial_risk_dollars") is not None:
+                heat += float(row["initial_risk_dollars"]) * remaining / original
+        for row in reservation_rows:
+            slots.add(str(row.get("proposal_id") or "reserved-probe"))
+            gross += float(row.get("active_notional") or 0.0)
+            heat += float(row.get("active_stop_risk") or 0.0)
+        return {"active_count": len(slots), "gross_notional": gross, "stop_risk": heat, "slot_ids": sorted(slots)}
+
     def _pending_execution_totals(self) -> dict[str, Any]:
         """Return unreserved pending BUY exposure, failing closed on unknowns."""
         rows = self.storage.fetch_all(
@@ -6687,6 +6766,7 @@ class TradingService:
                 "position_cap": 0.0, "portfolio_cap": 0.0, "cluster_cap": 0.0, "stage_cap": 0.0,
                 "equity_cap": 0.0, "absolute_cap": float("inf"), "stop_risk_cap": 0.0,
                 "allocation_cap": 0.0, "exploration_cap": 0.0, "minimum_executable_notional": 0.0,
+                "probe_cap": 0.0, "average_dollar_volume": None,
                 "caps_applied": "none", "binding_caps": [], "sizing_caps": {}, "blocked_reason": reason,
                 "atr_value": atr_value, "technical_stop_price": technical_stop_price,
                 "pending_exposure_unknown": False, "formula_version": RISK_DECISION_VERSION,
@@ -6738,6 +6818,9 @@ class TradingService:
             phase4_mode = "disabled"
             exploration_gross_cap_pct = None
             exploration_heat_cap_pct = None
+            probe_gross_cap_pct = None
+            probe_heat_cap_pct = None
+            probe_max_active_count = None
             permitted_stop_risk_pct = base_risk_pct
             strategy_risk_multiplier = None
             policy_reason = "legacy Phase 3 state authority"
@@ -6747,6 +6830,7 @@ class TradingService:
                     initial_stop_risk_pct=controller.profile.base_stop_risk_pct,
                     add_stop_risk_pct=controller.profile.add_stop_risk_pct,
                     exploration_stop_risk_pct=float((self.config.get("phase4", {}) or {}).get("exploration_stop_risk_pct", 0.05)),
+                    probe_stop_risk_pct=float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
                     is_add=is_add,
                 )
                 resolved_strategy_risk_multiplier = strategy_risk_multiplier
@@ -6763,6 +6847,15 @@ class TradingService:
                     )
                 phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(strategy_version, {})
                 phase4_mode = str(phase4_policy.get("mode") or "blocked")
+                if phase4_mode == "probe":
+                    if is_add:
+                        return empty("PROBE permits new entries only; adds are blocked")
+                    minimum_probe_score = float(self.config["phase4"]["probe_min_setup_score"])
+                    if float(score) < minimum_probe_score:
+                        return empty(f"PROBE setup trade score below threshold ({float(score):.2f} < {minimum_probe_score:.0f})")
+                    probe_gross_cap_pct = float(self.config["phase4"]["probe_gross_exposure_pct"])
+                    probe_heat_cap_pct = float(self.config["phase4"]["probe_portfolio_heat_pct"])
+                    probe_max_active_count = int(self.config["phase4"]["probe_max_active_count"])
                 if persisted_policy is None and phase4_mode == "exploration":
                     base_risk_pct = min(float(phase4_policy.get("stop_risk_pct", 0.0)), float(phase4_policy.get("max_stop_risk_pct", 0.0)))
                     exploration_gross_cap_pct = float(phase4_policy.get("gross_exposure_cap_pct", 7.5))
@@ -6784,6 +6877,9 @@ class TradingService:
                 "base_risk_pct": base_risk_pct, "phase4_mode": phase4_mode,
                 "phase4_exploration_gross_cap_pct": exploration_gross_cap_pct,
                 "phase4_exploration_heat_cap_pct": exploration_heat_cap_pct,
+                "phase4_probe_gross_cap_pct": probe_gross_cap_pct,
+                "phase4_probe_heat_cap_pct": probe_heat_cap_pct,
+                "phase4_probe_max_active_count": probe_max_active_count,
                 "policy": persisted_policy, "strategy_version": strategy_version,
                 "strategy_risk_multiplier": strategy_risk_multiplier,
                 "permitted_stop_risk_pct": permitted_stop_risk_pct,
@@ -6908,8 +7004,10 @@ class TradingService:
         stop_risk_cap = notional_from_stop_risk(stop_risk_ceiling, entry_price, stop_distance_dollars)
         allocation_cap = notional_from_stop_risk(risk_budget, entry_price, stop_distance_dollars) if phase3_enabled else float("inf")
         exploration_cap = float("inf")
+        probe_cap = float("inf")
         extra_caps: dict[str, float] = {}
         blocked_reason: str | None = None
+        average_dollar_volume: float | None = None
 
         if phase3_enabled:
             state = self._authoritative_runtime_state()
@@ -6957,12 +7055,33 @@ class TradingService:
                     extra_caps["exploration_heat_cap"] = notional_from_stop_risk(heat_remaining, entry_price, stop_distance_dollars)
                     extra_caps["exploration_strategy_cap"] = notional_from_stop_risk(strategy_remaining, entry_price, stop_distance_dollars)
                     extra_caps["exploration_gross_cap"] = extra_caps["gross_exposure_cap"]
+                if phase3_context.get("phase4_mode") == "probe":
+                    commitments = self._probe_commitments(strategy_version)
+                    if int(commitments["active_count"]) >= int(phase3_context.get("phase4_probe_max_active_count") or 1):
+                        blocked_reason = "PROBE active position or reserved-intent limit reached"
+                    probe_heat_remaining = max(
+                        0.0,
+                        equity * float(phase3_context.get("phase4_probe_heat_cap_pct") or 0.10) / 100.0
+                        - float(commitments["stop_risk"]),
+                    )
+                    probe_gross_remaining = max(
+                        0.0,
+                        equity * float(phase3_context.get("phase4_probe_gross_cap_pct") or 2.5) / 100.0
+                        - float(commitments["gross_notional"]),
+                    )
+                    probe_cap = min(
+                        notional_from_stop_risk(probe_heat_remaining, entry_price, stop_distance_dollars),
+                        probe_gross_remaining,
+                    )
+                    extra_caps["probe_heat_cap"] = notional_from_stop_risk(probe_heat_remaining, entry_price, stop_distance_dollars)
+                    extra_caps["probe_gross_cap"] = probe_gross_remaining
+                    extra_caps["probe_active_count_cap"] = 0.0 if blocked_reason else float("inf")
 
         caps: dict[str, float] = {
             "stage": stage_cap, "stop_risk": stop_risk_cap, "equity": equity_cap, "cash": cash_cap,
             "cash_available": cash_available_cap, "cash_usage": cash_usage_cap, "buying_power": buying_power_cap,
             "symbol": symbol_cap, "cluster": cluster_cap, "portfolio": portfolio_cap,
-            "allocation": allocation_cap, "exploration": exploration_cap, "absolute": absolute_cap,
+            "allocation": allocation_cap, "exploration": exploration_cap, "probe": probe_cap, "absolute": absolute_cap,
             **extra_caps,
         }
         finite_caps = {name: value for name, value in caps.items() if math.isfinite(value)}
@@ -7014,6 +7133,12 @@ class TradingService:
                 "permitted_stop_risk_pct": phase3_context.get("permitted_stop_risk_pct"),
                 "strategy_policy_version": phase3_context.get("policy").policy_version if phase3_context.get("policy") else None,
                 "binding_policy_reason": phase3_context.get("binding_policy_reason"),
+                "probe_limits": {
+                    "stop_risk_pct": float((self.config.get("phase4", {}) or {}).get("probe_stop_risk_pct", 0.03)),
+                    "portfolio_heat_pct": phase3_context.get("phase4_probe_heat_cap_pct"),
+                    "gross_exposure_pct": phase3_context.get("phase4_probe_gross_cap_pct"),
+                    "max_active_count": phase3_context.get("phase4_probe_max_active_count"),
+                } if phase3_context.get("phase4_mode") == "probe" else None,
             }
             controller.storage.execute(
                 # Keep the audit insert named and count-checked as the schema
@@ -7048,6 +7173,9 @@ class TradingService:
             "phase4_mode": phase3_context.get("phase4_mode", "disabled"),
             "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct"),
             "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct"),
+            "phase4_probe_heat_cap_pct": phase3_context.get("phase4_probe_heat_cap_pct"),
+            "phase4_probe_gross_cap_pct": phase3_context.get("phase4_probe_gross_cap_pct"),
+            "phase4_probe_max_active_count": phase3_context.get("phase4_probe_max_active_count"),
             "score_multiplier": score_mult, "volatility_multiplier": vol_mult, "stop_model_used": stop_model_used,
             "stop_validation_status": "validated", "stop_policy_version": STOP_POLICY_VERSION,
             "atr_value": atr_value, "technical_stop_price": technical_stop_price,
@@ -7057,7 +7185,8 @@ class TradingService:
             "cash_cap": cash_cap, "cash_available_cap": cash_available_cap, "cash_usage_cap": cash_usage_cap,
             "buying_power_cap": buying_power_cap, "position_cap": symbol_cap, "portfolio_cap": portfolio_cap,
             "cluster_cap": cluster_cap, "stage_cap": stage_cap, "equity_cap": equity_cap, "absolute_cap": absolute_cap,
-            "stop_risk_cap": stop_risk_cap, "allocation_cap": allocation_cap, "exploration_cap": exploration_cap,
+            "stop_risk_cap": stop_risk_cap, "allocation_cap": allocation_cap, "exploration_cap": exploration_cap, "probe_cap": probe_cap,
+            "average_dollar_volume": average_dollar_volume if phase3_enabled else None,
             "minimum_executable_notional": minimum_executable_notional, "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
             "binding_caps": binding_caps, "sizing_caps": sizing_caps, "blocked_reason": blocked_reason,
             "pending_exposure_unknown": False, "sizing_policy_version": SIZING_POLICY_VERSION,

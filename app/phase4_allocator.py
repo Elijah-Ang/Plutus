@@ -18,8 +18,8 @@ from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
 
-PHASE4_SCHEMA_VERSION = "phase4_adaptive_paper_allocation_v1"
-ALLOCATOR_VERSION = "adaptive_paper_allocator_v1"
+PHASE4_SCHEMA_VERSION = "phase4_adaptive_paper_allocation_v2_probe"
+ALLOCATOR_VERSION = "adaptive_paper_allocator_v2_probe"
 ESTIMATOR_VERSION = "shrunk_oos_estimator_v1"
 COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
 EXECUTABLE_STRATEGIES = (STRATEGY_VERSION,)
@@ -103,6 +103,7 @@ def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
         "cluster_exposure_before_json": "TEXT", "cluster_exposure_after_json": "TEXT",
         "pending_risk": "REAL", "reserved_risk": "REAL", "binding_caps_json": "TEXT", "evidence_versions_json": "TEXT",
         "formula_version": "TEXT", "config_hash": "TEXT", "strategy_policy_map_json": "TEXT", "strategy_policy_version": "TEXT",
+        "probe_allocation_json": "TEXT",
     }
     present = {row[1] for row in conn.execute("PRAGMA table_info(phase4_allocation_decisions)")}
     for name, definition in additions.items():
@@ -132,6 +133,8 @@ class AdaptiveAllocator:
         if self.cfg.get("operational_kelly_enabled") is not False: raise ValueError("operational Kelly must remain disabled")
         if self.cfg.get("operational_allocation_mode") != "deterministic_equal_risk":
             raise ValueError("operational allocation must be deterministic equal risk")
+        if self.cfg.get("allocator_version") != ALLOCATOR_VERSION:
+            raise ValueError(f"allocator version must be {ALLOCATOR_VERSION}")
 
     def _rows(self, strategy: str) -> list[dict[str, Any]]:
         rows = self.storage.fetch_all("""SELECT ro.id,ro.regime,ro.split_label,ro.execution_type,ro.source_table,
@@ -219,7 +222,7 @@ class AdaptiveAllocator:
         strategy_policy_map: Mapping[str, Any] | None = None,
     ) -> dict[str,Any]:
         healthy=not any(DurableExecutionStore(self.storage).integrity_report().values())
-        estimates={}; evidence={}; fps=[]; now=iso_now()
+        estimates={}; estimate_ids: dict[str, str] = {}; evidence={}; fps=[]; now=iso_now()
         portfolio_snapshot = dict(portfolio_snapshot or {})
         heat_before = portfolio_snapshot.get("heat_before_pct")
         gross_before = portfolio_snapshot.get("gross_exposure_before_pct")
@@ -232,13 +235,14 @@ class AdaptiveAllocator:
             if not healthy: estimate=StrategyEstimate(**{**asdict(estimate),"state":"SUSPENDED","reason":"durable integrity health failed"})
             estimates[strategy]=estimate
             eid=_fingerprint([self.run_id,strategy,fp])[:32]
+            estimate_ids[strategy] = eid
             self.storage.execute("INSERT OR REPLACE INTO phase4_strategy_estimates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (eid,self.run_id,strategy,now,estimate.sample_n,estimate.regime_n,estimate.mean_return,estimate.shrunk_mean_return,
                estimate.conservative_expected_return,estimate.calibrated_positive_probability,estimate.standard_error,
                estimate.uncertainty,estimate.data_quality,estimate.deterioration_score,estimate.state,estimate.reason,
                ESTIMATOR_VERSION,fp,json_dumps({"cost_adjusted":True,"score_sizing":False,
                                                  "evidence_class":estimate.evidence_class,
-                                                 "state_version":"phase4_strategy_state_v2"}),))
+                                                 "state_version":"phase4_strategy_state_v3_probe"}),))
             self._persist_state(estimate,eid,now)
         policy_authoritative = strategy_policy_map is not None
 
@@ -259,12 +263,19 @@ class AdaptiveAllocator:
             elif not policy_authoritative:
                 operational_states[strategy] = estimates[strategy].state
                 operational_reasons[strategy] = estimates[strategy].reason
-            elif policy_value(strategy, "state") in {"RESEARCH_ONLY", "EXPLORATION", "THROTTLED", "ACTIVE", "SUSPENDED"}:
+            elif policy_value(strategy, "state") in {"RESEARCH_ONLY", "PROBE", "EXPLORATION", "THROTTLED", "ACTIVE", "SUSPENDED"}:
                 operational_states[strategy] = str(policy_value(strategy, "state"))
                 operational_reasons[strategy] = str(policy_value(strategy, "reason", "persisted strategy policy"))
             else:
                 operational_states[strategy] = "SUSPENDED"
                 operational_reasons[strategy] = "latest strategy performance policy unavailable or invalid"
+        for strategy in EXECUTABLE_STRATEGIES:
+            if operational_states[strategy] != estimates[strategy].state or operational_reasons[strategy] != estimates[strategy].reason:
+                self._persist_state(
+                    StrategyEstimate(**{**asdict(estimates[strategy]), "state": operational_states[strategy], "reason": operational_reasons[strategy]}),
+                    estimate_ids[strategy],
+                    now,
+                )
         try:
             from .phase3_risk import Phase3RiskProfile
             from .strategy_performance import state_risk_policy
@@ -316,9 +327,22 @@ class AdaptiveAllocator:
                 continue
             exploration_weights[strategy]=risk
             exploration_heat += risk
+        probe_heat_cap=float(self.cfg.get("probe_portfolio_heat_pct",0.10))
+        probe_per_strategy=float(self.cfg.get("probe_stop_risk_pct",0.03))
+        probe_heat=0.0; probe_weights: dict[str,float] = {}
+        for strategy in EXECUTABLE_STRATEGIES:
+            if operational_states[strategy] != "PROBE" or not healthy:
+                continue
+            risk=min(probe_per_strategy, max(0.0, probe_heat_cap-probe_heat))
+            if risk <= 0:
+                continue
+            probe_weights[strategy]=risk
+            probe_heat += risk
         cash=max(0.0,1.0-float(weights.sum()))
         if float(weights.sum()) > 0:
             decision="ALLOCATE_ADAPTIVELY"; reason="qualified strategies sized below fractional Kelly and hard limits"
+        elif probe_weights:
+            decision="ALLOCATE_PROBE"; reason="strong complete immature evidence receives a controlled manual-approved paper probe"
         elif exploration_weights:
             decision="ALLOCATE_EXPLORATION"; reason="healthy immature strategies receive bounded manual-approved paper exploration"
         else:
@@ -326,7 +350,16 @@ class AdaptiveAllocator:
         strategy_policies: dict[str,dict[str,Any]] = {}
         for i, strategy in enumerate(STRATEGIES):
             estimate=estimates[strategy]
-            if strategy in exploration_weights:
+            if strategy in probe_weights:
+                strategy_policies[strategy]={"mode":"probe","state":"PROBE","stop_risk_pct":probe_weights[strategy],
+                                             "portfolio_heat_cap_pct":probe_heat_cap,
+                                             "gross_exposure_cap_pct":float(self.cfg.get("probe_gross_exposure_pct",2.5)),
+                                             "max_active_count":int(self.cfg.get("probe_max_active_count",1)),
+                                             "minimum_setup_score":float(self.cfg.get("probe_min_setup_score",85)),
+                                             "entries_only":True,"adds_allowed":False,"autonomous_execution_allowed":False,
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                                             "allocation_class":"probe","evidence_version":EVIDENCE_VERSION}
+            elif strategy in exploration_weights:
                 strategy_policies[strategy]={"mode":"exploration","state":operational_states[strategy],"stop_risk_pct":exploration_weights[strategy],
                                              "max_stop_risk_pct":exploration_max_per_strategy,"gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
@@ -357,6 +390,7 @@ class AdaptiveAllocator:
                     initial_stop_risk_pct=phase3_profile.base_stop_risk_pct,
                     add_stop_risk_pct=phase3_profile.add_stop_risk_pct,
                     exploration_stop_risk_pct=float(self.cfg.get("exploration_stop_risk_pct", 0.05)),
+                    probe_stop_risk_pct=float(self.cfg.get("probe_stop_risk_pct", 0.03)),
                     is_add=False,
                 )
                 strategy_policies[strategy].update({
@@ -366,8 +400,8 @@ class AdaptiveAllocator:
             else:
                 strategy_policies[strategy].update({"strategy_risk_multiplier": 0.0, "permitted_stop_risk_pct": 0.0})
         fingerprint=_fingerprint(fps); aid=_fingerprint([self.run_id,weights.tolist(),cash,fingerprint])[:32]
-        allocation_class = "adaptive" if float(weights.sum()) > 0 else "exploration" if exploration_weights else "unallocated"
-        unallocated_risk_pct = max(0.0, 1.0 - float(weights.sum()) - float(exploration_heat) / 100.0)
+        allocation_class = "adaptive" if float(weights.sum()) > 0 else "probe" if probe_weights else "exploration" if exploration_weights else "unallocated"
+        unallocated_risk_pct = max(0.0, 1.0 - float(weights.sum()) - float(exploration_heat + probe_heat) / 100.0)
         binding_caps = {
             "fractional_kelly_ceiling": fraction,
             "max_strategy_weight": max_weight,
@@ -375,11 +409,16 @@ class AdaptiveAllocator:
             "max_stress_loss": stress_cap,
             "exploration_heat_pct": exploration_heat_cap,
             "exploration_gross_exposure_pct": float(self.cfg.get("exploration_gross_exposure_pct", 7.5)),
+            "probe_stop_risk_pct": probe_per_strategy,
+            "probe_portfolio_heat_pct": probe_heat_cap,
+            "probe_gross_exposure_pct": float(self.cfg.get("probe_gross_exposure_pct", 2.5)),
+            "probe_max_active_count": int(self.cfg.get("probe_max_active_count", 1)),
         }
         payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback,
                  "operational_kelly_enabled":False,"operational_allocation_mode":"deterministic_equal_risk",
                  "kelly_diagnostics":kelly_diagnostics,
                  "exploration_heat_pct":exploration_heat,"exploration_heat_cap_pct":exploration_heat_cap,"exploration_weights":exploration_weights,
+                 "probe_heat_pct":probe_heat,"probe_heat_cap_pct":probe_heat_cap,"probe_weights":probe_weights,
                  "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies,
                  "allocation_class":allocation_class,"unallocated_risk_pct":unallocated_risk_pct,
                  "evidence_versions":{strategy:EVIDENCE_VERSION for strategy in STRATEGIES},"formula_version":PHASE4_ALLOCATION_VERSION,
@@ -406,14 +445,15 @@ class AdaptiveAllocator:
              json_dumps(binding_caps),json_dumps({strategy:EVIDENCE_VERSION for strategy in STRATEGIES}),fingerprint,PHASE4_ALLOCATION_VERSION,
              self.config.get("effective_config_hash"),json_dumps(payload)))
         self.storage.execute(
-            "UPDATE phase4_allocation_decisions SET strategy_policy_map_json=?,strategy_policy_version=? WHERE id=?",
-            (json_dumps(strategy_policies), payload.get("strategy_policy_version"), aid),
+            "UPDATE phase4_allocation_decisions SET strategy_policy_map_json=?,strategy_policy_version=?,probe_allocation_json=? WHERE id=?",
+            (json_dumps(strategy_policies), payload.get("strategy_policy_version"), json_dumps(probe_weights), aid),
         )
         for scenario,loss in stress.items():
             sid=_fingerprint([aid,scenario])[:32]
             self.storage.execute("INSERT OR REPLACE INTO phase4_stress_results VALUES(?,?,?,?,?,?,?,?)",
                                  (sid,aid,scenario,loss,loss,int(loss<=float(self.cfg.get("max_stress_loss",0.05))),"phase4_stress_v1",json_dumps({"deterministic":True})))
         return {"allocation_id":aid,"weights":dict(zip(STRATEGIES,weights.tolist())),"exploration_weights":exploration_weights,
+                "probe_weights":probe_weights,"probe_heat_pct":probe_heat,
                 "exploration_heat_pct":exploration_heat,"cash_weight":cash,"decision":decision,"reason":reason,"estimates":estimates,
                 "strategy_policies":strategy_policies,"kelly_diagnostics":kelly_diagnostics,
                 "operational_strategies":list(EXECUTABLE_STRATEGIES),"healthy":healthy,
@@ -430,9 +470,9 @@ class AdaptiveAllocator:
           ON CONFLICT(strategy_version) DO UPDATE SET state=excluded.state,reason=excluded.reason,estimate_id=excluded.estimate_id,
           evaluated_at=excluded.evaluated_at,activated_at=COALESCE(phase4_strategy_states.activated_at,excluded.activated_at),
           throttled_at=excluded.throttled_at,suspended_at=excluded.suspended_at,recovered_at=COALESCE(excluded.recovered_at,phase4_strategy_states.recovered_at),payload=excluded.payload""",
-          (e.strategy_version,e.state,e.reason,eid,"phase4_strategy_state_v2",now,now if e.state=="ACTIVE" else None,
+          (e.strategy_version,e.state,e.reason,eid,"phase4_strategy_state_v3_probe",now,now if e.state=="ACTIVE" else None,
            now if e.state=="THROTTLED" else None,now if e.state=="SUSPENDED" else None,recovered,
-           json_dumps({"deterministic":True,"evidence_class":e.evidence_class,"state_version":"phase4_strategy_state_v2"})))
+           json_dumps({"deterministic":True,"evidence_class":e.evidence_class,"state_version":"phase4_strategy_state_v3_probe"})))
 
     def _stress(self,w:np.ndarray)->dict[str,float]:
         invested=float(w.sum())

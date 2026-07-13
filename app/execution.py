@@ -202,6 +202,39 @@ class DurableExecutionStore:
                     "open_risk_ceiling",
                 )
                 enforce("paper buying power", float(totals["total"]) + reserved_notional, "buying_power_ceiling")
+                if proposal.get("phase4_mode") == "probe":
+                    probe_slots = conn.execute(
+                        """SELECT COUNT(DISTINCT proposal_id) n FROM (
+                               SELECT i.proposal_id proposal_id
+                               FROM risk_reservations rr JOIN order_intents i ON i.id=rr.intent_id
+                               JOIN trade_proposals p ON p.id=i.proposal_id
+                               WHERE rr.state='active' AND p.strategy_state='PROBE'
+                               UNION ALL
+                               SELECT pl.entry_proposal_id proposal_id
+                               FROM position_lots pl JOIN trade_proposals p ON p.id=pl.entry_proposal_id
+                               WHERE pl.remaining_quantity>0 AND p.strategy_state='PROBE'
+                           )"""
+                    ).fetchone()["n"]
+                    maximum = int(limits.get("probe_max_active_count", 1))
+                    if int(probe_slots or 0) >= maximum:
+                        raise RuntimeError("atomic reservation blocked by PROBE active-count ceiling")
+                    probe_totals = conn.execute(
+                        """SELECT
+                               COALESCE((SELECT SUM(rr.active_notional) FROM risk_reservations rr
+                                 JOIN order_intents i ON i.id=rr.intent_id JOIN trade_proposals p ON p.id=i.proposal_id
+                                 WHERE rr.state='active' AND p.strategy_state='PROBE'),0)
+                               + COALESCE((SELECT SUM(pl.remaining_quantity*pl.unit_cost) FROM position_lots pl
+                                 JOIN trade_proposals p ON p.id=pl.entry_proposal_id
+                                 WHERE pl.remaining_quantity>0 AND p.strategy_state='PROBE'),0) gross,
+                               COALESCE((SELECT SUM(rr.active_stop_risk) FROM risk_reservations rr
+                                 JOIN order_intents i ON i.id=rr.intent_id JOIN trade_proposals p ON p.id=i.proposal_id
+                                 WHERE rr.state='active' AND p.strategy_state='PROBE'),0)
+                               + COALESCE((SELECT SUM(pl.initial_risk_dollars*pl.remaining_quantity/pl.original_quantity) FROM position_lots pl
+                                 JOIN trade_proposals p ON p.id=pl.entry_proposal_id
+                                 WHERE pl.remaining_quantity>0 AND pl.initial_risk_dollars IS NOT NULL AND p.strategy_state='PROBE'),0) heat"""
+                    ).fetchone()
+                    enforce("PROBE gross-exposure ceiling", float(probe_totals["gross"] or 0) + reserved_notional, "probe_gross_notional_ceiling")
+                    enforce("PROBE portfolio-heat ceiling", float(probe_totals["heat"] or 0) + reserved_stop_risk, "probe_stop_risk_ceiling")
             conn.execute(
                 f"""INSERT INTO order_intents(
                        id,run_id,proposal_id,approval_id,source_id,source_type,logical_action_key,candidate_id,
@@ -751,6 +784,13 @@ class Executor:
                     "open_risk_ceiling": equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100,
                     "buying_power_ceiling": float(context["buying_power"]) + current_active if context.get("buying_power") is not None else None,
                 }
+                if candidate.get("phase4_mode") == "probe":
+                    phase4 = config.get("phase4", {}) or {}
+                    candidate["_reservation_limits"].update({
+                        "probe_max_active_count": int(phase4.get("probe_max_active_count", 1)),
+                        "probe_gross_notional_ceiling": equity * float(phase4.get("probe_gross_exposure_pct", 2.5)) / 100.0,
+                        "probe_stop_risk_ceiling": equity * float(phase4.get("probe_portfolio_heat_pct", 0.10)) / 100.0,
+                    })
 
         store = DurableExecutionStore(self.storage)
         try:

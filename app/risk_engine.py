@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
 
-from .formula_versions import EVIDENCE_VERSION, RISK_DECISION_VERSION
+from .formula_versions import EVIDENCE_VERSION, RISK_DECISION_VERSION, STRATEGY_POLICY_VERSION
 from .loss_controls import LOSS_METRICS_VERSION
 from .position_sizing import effective_notional_policy, validate_stop_evidence
 
@@ -370,6 +370,23 @@ class RiskEngine:
                   "Phase 4 exploration requires explicit manual approval")
             check("phase4_exploration_score_sizing", proposal.get("score_multiplier", 1.0) == 1.0,
                   "Phase 4 exploration cannot use score-based sizing")
+        if is_entry and (proposal.get("phase4_mode") == "probe" or proposal.get("strategy_state") == "PROBE"):
+            phase4 = self.config.get("phase4", {}) or {}
+            equity = context.get("portfolio_equity")
+            check("phase4_probe_state", proposal.get("strategy_state") == "PROBE", "PROBE requires an explicit persisted PROBE strategy state")
+            check("phase4_probe_policy_version", proposal.get("strategy_policy_version") == STRATEGY_POLICY_VERSION, "PROBE requires the current strategy policy version")
+            check("phase4_probe_entry_only", not is_add and str(proposal.get("action", "entry")) == "entry", "PROBE permits new entries only; adds are blocked")
+            score = proposal.get("score")
+            check("phase4_probe_setup_score", isinstance(score, (int, float)) and float(score) >= float(phase4.get("probe_min_setup_score", 85)), "PROBE setup trade score must be at least 85")
+            check("phase4_probe_score_sizing", proposal.get("score_multiplier", 1.0) == 1.0, "PROBE cannot use score-based sizing")
+            check("phase4_probe_manual_only", phase4.get("require_manual_approval") is True and self.config.get("auto_execution_enabled", False) is False, "PROBE requires manual Telegram approval and cannot execute autonomously")
+            check("phase4_probe_manual_approval", not final or context.get("approval_valid") is True, "PROBE requires explicit manual Telegram approval")
+            check("phase4_probe_active_count", isinstance(context.get("probe_projected_count"), int) and int(context["probe_projected_count"]) <= int(phase4.get("probe_max_active_count", 1)), "PROBE active position or reserved-intent limit")
+            check("phase4_probe_heat", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_stop_risk"), (int, float)) and float(context["probe_projected_stop_risk"]) <= float(equity) * float(phase4.get("probe_portfolio_heat_pct", 0.10)) / 100.0 + 1e-9, "PROBE portfolio heat cap")
+            check("phase4_probe_gross", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_gross_notional"), (int, float)) and float(context["probe_projected_gross_notional"]) <= float(equity) * float(phase4.get("probe_gross_exposure_pct", 2.5)) / 100.0 + 1e-9, "PROBE gross exposure cap")
+            adv = proposal.get("average_dollar_volume")
+            minimum_adv = float((self.config.get("phase3", {}).get("risk_profile", {}) or {}).get("minimum_average_dollar_volume", 10_000_000.0))
+            check("phase4_probe_liquidity", isinstance(adv, (int, float)) and float(adv) >= minimum_adv, "PROBE requires the existing Phase 3 liquidity floor")
         check("reason", not is_entry or bool(proposal.get("reason")), "entry strategy reason required")
         check("side", str(proposal.get("side", "")).lower() in {"buy", "sell"}, "side must be buy or sell")
         check("order_type", proposal.get("order_type", "market") in self.risk.get("allowed_order_types", ["market", "limit"]), "allowed order type required")

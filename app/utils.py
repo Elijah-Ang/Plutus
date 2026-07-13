@@ -294,6 +294,10 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
 
         confidence_line = f"Confidence: {system_confidence}\n"
         score_line = f"Trade score: {score_val:.0f}/100\n" if score_val is not None else ""
+        strategy_state = proposal.get("strategy_state")
+        policy_line = f"Strategy policy: {strategy_state}\n" if strategy_state else ""
+        if strategy_state == "PROBE":
+            policy_line += "PROBE controls: new entry only; no adds; manual Telegram approval; 0.03% stop risk; 0.10% heat; 2.5% gross; one active/reserved.\n"
 
         watchlist_order = proposal.get("watchlist_order")
         total_active = proposal.get("total_active_symbols")
@@ -372,7 +376,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         if sizing_section:
             sizing_section = f"Sizing & Risk:\n{sizing_section}\n"
 
-        scores_section = f"{confidence_line}{score_line}{rank_line}\n{account_section}{sizing_section}"
+        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}"
 
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
@@ -699,6 +703,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         crypto_research = digest_data.get("crypto_research")
         if crypto_research:
             actions_sec += f"\n* {crypto_research}"
+        strategy_policy = digest_data.get("strategy_policy")
+        if strategy_policy:
+            actions_sec += f"\n* Strategy policy: {strategy_policy}"
         sections.append(actions_sec)
         
         # 3-6. Tiers

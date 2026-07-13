@@ -84,6 +84,7 @@ STRICT_SECTION_KEYS = {
         "shrinkage_prior_samples", "confidence_z", "covariance_shrinkage", "fallback_annual_variance", "deterioration_suspend_z",
         "evidence_stale_after_days", "max_strategy_weight", "max_allocated_risk_fraction", "max_stress_loss", "exploration_heat_pct",
         "exploration_stop_risk_pct", "max_exploration_stop_risk_pct", "exploration_gross_exposure_pct", "preserve_cash_on_unreliable_evidence",
+        "probe_stop_risk_pct", "probe_portfolio_heat_pct", "probe_gross_exposure_pct", "probe_max_active_count", "probe_min_setup_score",
         "require_manual_approval", "phase3_hard_limits_authoritative",
     },
     "risk_budget": {
@@ -95,7 +96,7 @@ STRICT_SECTION_KEYS = {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
         "minimum_samples_per_regime", "minimum_actual_paper_for_divergence_penalty", "minimum_regimes", "evidence_stale_after_days",
-        "score_exploration_threshold", "score_throttled_threshold",
+        "score_exploration_threshold", "score_probe_threshold", "score_throttled_threshold",
         "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
         "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
     },
@@ -227,7 +228,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(phase4.get("full_kelly_allowed") is False, "full Kelly is forbidden")
         require(phase4.get("llm_trading_decisions") is False, "LLM trading decisions are forbidden")
         require(phase4.get("uncalibrated_score_sizing") is False, "uncalibrated score sizing is forbidden")
-        require(phase4.get("require_manual_approval") is True, "Phase 4 exploration requires manual approval")
+        require(phase4.get("require_manual_approval") is True, "Phase 4 exploration and probe entries require manual approval")
         kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)
         require(kelly is not None and kelly <= 0.25, "Phase 4 fractional Kelly cannot exceed one quarter")
         exploration_heat = _bounded(phase4.get("exploration_heat_pct"), "phase4.exploration_heat_pct", errors, 0, 0.25)
@@ -237,6 +238,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(exploration_heat is not None and exploration_heat <= 0.25, "Phase 4 exploration heat exceeds the 0.25% bound")
         require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
         require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
+        probe_risk = _bounded(phase4.get("probe_stop_risk_pct"), "phase4.probe_stop_risk_pct", errors, 0, 0.03)
+        probe_heat = _bounded(phase4.get("probe_portfolio_heat_pct"), "phase4.probe_portfolio_heat_pct", errors, 0, 0.10)
+        probe_gross = _bounded(phase4.get("probe_gross_exposure_pct"), "phase4.probe_gross_exposure_pct", errors, 0, 2.5)
+        require(probe_risk == 0.03, "Phase 4 probe stop risk must be exactly 0.03%")
+        require(probe_heat == 0.10, "Phase 4 probe portfolio heat must be exactly 0.10%")
+        require(probe_gross == 2.5, "Phase 4 probe gross exposure must be exactly 2.5%")
+        require(phase4.get("probe_max_active_count") == 1, "Phase 4 permits exactly one active probe position or reserved intent")
+        require(phase4.get("probe_min_setup_score") == 85, "Phase 4 probe setup score must be at least 85")
 
     profitability = config.get("profitability_engine", {}) or {}
     required_profitability_settings = {
@@ -248,6 +257,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     }
     for key, expected in required_profitability_settings.items():
         require(profitability.get(key) == expected, f"profitability_engine.{key} must be {expected}")
+    require(profitability.get("score_probe_threshold") == 85, "profitability_engine.score_probe_threshold must be 85")
 
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail

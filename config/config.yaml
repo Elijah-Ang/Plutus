@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v2
+configuration_schema_version: plutus_effective_config_v3
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -50,7 +50,7 @@ phase4:
   enabled: true
   active: true
   mode: ACTIVE_ADAPTIVE_PAPER
-  allocator_version: adaptive_paper_allocator_v1
+  allocator_version: adaptive_paper_allocator_v2_probe
   fractional_kelly: 0.20
   operational_kelly_enabled: false
   operational_allocation_mode: deterministic_equal_risk
@@ -72,14 +72,19 @@ phase4:
   exploration_stop_risk_pct: 0.05
   max_exploration_stop_risk_pct: 0.10
   exploration_gross_exposure_pct: 7.5
+  probe_stop_risk_pct: 0.03
+  probe_portfolio_heat_pct: 0.10
+  probe_gross_exposure_pct: 2.5
+  probe_max_active_count: 1
+  probe_min_setup_score: 85
   preserve_cash_on_unreliable_evidence: true
   require_manual_approval: true
   phase3_hard_limits_authoritative: true
 profitability_engine:
   enabled: true
   enforcement_enabled: true
-  performance_version: strategy_performance_v2_1
-  policy_version: strategy_policy_v2_1
+  performance_version: strategy_performance_v2_2_probe
+  policy_version: strategy_policy_v2_2_probe
   schema_version: strategy_profitability_engine_v1
   primary_horizon_sessions: 20
   minimum_shadow_oos_samples: 100
@@ -90,6 +95,7 @@ profitability_engine:
   minimum_regimes: 2
   evidence_stale_after_days: 90
   score_exploration_threshold: 45
+  score_probe_threshold: 85
   score_throttled_threshold: 60
   score_active_threshold: 75
   hard_max_drawdown_r: 6.0
@@ -131,12 +137,12 @@ strategies:
 
 formula_versions:
   stop_policy: validated_atr_or_technical_stop_v2
-  sizing_policy: canonical_minimum_ceiling_notional_v2
-  risk_decision: risk_engine_ceiling_and_stop_v2
+  sizing_policy: canonical_minimum_ceiling_notional_v3_probe
+  risk_decision: risk_engine_ceiling_stop_probe_v3
   accounting: fifo_equity_unrealized_cashflow_v1
   evidence: phase1_outcome_v2_exit_session
-  strategy_performance: strategy_performance_v2_1
-  strategy_policy: strategy_policy_v2_1
+  strategy_performance: strategy_performance_v2_2_probe
+  strategy_policy: strategy_policy_v2_2_probe
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.
