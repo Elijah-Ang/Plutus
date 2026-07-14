@@ -111,7 +111,7 @@ def test_concentration_uses_r_multiples_not_dollar_pnl():
 
 def test_immature_regimes_are_reported_but_excluded_from_mature_metrics():
     rows = [_obs(0.5, index=i, regime="mature") for i in range(10)] + [_obs(-10.0, index=20, regime="immature")]
-    metrics, _ = calculate_metrics(rows, settings={"minimum_samples_per_regime": 10})
+    metrics, _ = calculate_metrics(rows, as_of="2026-02-10T00:00:00+00:00", settings={"minimum_samples_per_regime": 10})
     assert set(metrics["mature_regime_metrics"]) == {"mature"}
     assert set(metrics["immature_regime_metrics"]) == {"immature"}
     assert metrics["positive_regime_ratio"] == 1.0

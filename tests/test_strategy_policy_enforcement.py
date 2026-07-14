@@ -64,7 +64,7 @@ def test_exact_state_to_risk_mapping_and_conservative_merge():
 def test_empty_current_scorecard_is_persisted_research_only_and_phase3_mirrors_it(tmp_path):
     db = _db(tmp_path)
     cfg = load_config()
-    engine = StrategyPerformanceEngine(db, cfg)
+    engine = StrategyPerformanceEngine(db, cfg, as_of="2026-07-14T08:00:00+00:00")
     engine.refresh_all()
     policy = engine.latest_valid_policy("rule_based_v2")
     assert policy is not None and policy.state == "RESEARCH_ONLY"
@@ -81,6 +81,8 @@ def test_phase4_operational_state_comes_from_persisted_policy_and_shadow_stays_r
     policy_map = {"rule_based_v2": policy}
     result = AdaptiveAllocator(db, cfg, "policy-run").run(
         regime="normal", drawdown_pct=0.0, strategy_policy_map=policy_map,
+        as_of="2026-07-14T08:00:00+00:00",
+        portfolio_snapshot={"portfolio_equity": 100.0, "as_of": "2026-07-14T08:00:00+00:00", "equity_as_of": "2026-07-14T08:00:00+00:00"},
     )
     assert result["weights"]["rule_based_v2"] > 0
     assert result["strategy_policies"]["rule_based_v2"]["state"] == "ACTIVE"

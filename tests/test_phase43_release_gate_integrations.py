@@ -18,6 +18,13 @@ def _storage(tmp_path) -> Storage:
     storage = Storage(tmp_path / "release-gates.sqlite3")
     storage.initialize()
     storage.apply_explicit_migrations()
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        """INSERT INTO position_lifecycles(
+             id,symbol,side,state,opened_at,opening_quantity,current_quantity,average_entry_price,
+             source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        ("lifecycle-old", "OLD", "long", "active", now, 1.0, 1.0, 100.0, "test", now, now),
+    )
     return storage
 
 
@@ -479,9 +486,10 @@ def test_phase4_strategy_consumption_includes_pending_nonrotation_claims(tmp_pat
 
 def _rotation(storage: Storage) -> tuple[RotationCoordinator, dict]:
     manager = RotationCoordinator(storage, config_hash="hash")
+    evaluated_at = datetime.now(UTC)
     group = manager.create_group(
-        run_id="run", expires_at=datetime.now(UTC) + timedelta(minutes=10),
-        exit_legs=[{"proposal_id": "exit-1", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
+        run_id="run", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
+        exit_legs=[{"proposal_id": "exit-1", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
         contingent_entries=[{"proposal_id": "buy-1", "candidate_key": "setup", "strategy_version": "rule_based_v2",
                              "symbol": "NEW", "side": "buy", "max_quantity": 1, "max_notional": 100,
                              "max_stop_risk": 5, "payload": {"action": "entry"}}],
@@ -492,10 +500,11 @@ def _rotation(storage: Storage) -> tuple[RotationCoordinator, dict]:
 def test_rotation_dedupes_logical_exit_and_enforces_group_ceiling_fingerprint(tmp_path) -> None:
     storage = _storage(tmp_path)
     manager, group = _rotation(storage)
-    with pytest.raises(RuntimeError, match="active logical rotation"):
+    with pytest.raises(RuntimeError, match="conflicting active rotation"):
+        evaluated_at = datetime.now(UTC)
         manager.create_group(
-            run_id="run-2", expires_at=datetime.now(UTC) + timedelta(minutes=10),
-            exit_legs=[{"proposal_id": "exit-2", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
+            run_id="run-2", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
+            exit_legs=[{"proposal_id": "exit-2", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
             contingent_entries=[{"proposal_id": "buy-2", "candidate_key": "other", "strategy_version": "rule_based_v2",
                                  "symbol": "NEW2", "side": "buy", "max_quantity": 1, "max_notional": 100,
                                  "max_stop_risk": 5, "payload": {}}],

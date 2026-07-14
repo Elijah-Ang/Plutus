@@ -29,8 +29,11 @@ def main()->int:
     if cash<0 or short_value<0 or long_value>equity+.01:raise SystemExit("no-leverage activation check failed")
     drawdown=Phase3Controller(s,cfg,"phase4-activation").update_equity(equity)
     if drawdown>=6:raise SystemExit("Phase 3 drawdown halt is active")
-    result=AdaptiveAllocator(s,cfg,"phase4-activation").run(regime="activation_uncertain",drawdown_pct=drawdown)
-    now=datetime.now(UTC).isoformat();s.execute("INSERT INTO phase4_activation_events VALUES(?,?,?,?,?,?,?,?,?)",(
+    now=datetime.now(UTC).isoformat()
+    result=AdaptiveAllocator(s,cfg,"phase4-activation").run(
+      regime="activation_uncertain",drawdown_pct=drawdown,as_of=now,
+      portfolio_snapshot={"portfolio_equity":equity,"as_of":now,"equity_as_of":now})
+    s.execute("INSERT INTO phase4_activation_events VALUES(?,?,?,?,?,?,?,?,?)",(
       str(uuid.uuid4()),manifest["release_commit"],now,"ACTIVE_ADAPTIVE_PAPER",result["allocation_id"],json.dumps(identity,sort_keys=True,default=str),
       json.dumps({"equity":equity,"cash":cash,"open_orders":0,"drawdown_pct":drawdown},sort_keys=True),json.dumps(report,sort_keys=True),ALLOCATOR_VERSION))
     print(json.dumps({"status":"ACTIVE_ADAPTIVE_PAPER","release_commit":manifest["release_commit"],"allocation_id":result["allocation_id"],"decision":result["decision"],"cash_weight":result["cash_weight"],"weights":result["weights"]},sort_keys=True))

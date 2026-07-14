@@ -94,7 +94,7 @@ def test_zero_authorized_strategies_preserves_cash_through_empty_vector_path(tmp
         regime="normal",
         drawdown_pct=0.0,
         strategy_policy_map={"alpha_v1": _policy(config, "alpha_v1", "SUSPENDED")},
-        portfolio_snapshot={"phase3_available_risk_pct": 1.0},
+        portfolio_snapshot={"phase3_available_risk_pct": 1.0, "portfolio_equity": 100.0, "as_of": AS_OF, "equity_as_of": AS_OF},
         as_of=AS_OF,
     )
 
@@ -120,7 +120,11 @@ def test_one_authorized_strategy_uses_valid_degenerate_covariance_and_exact_slee
         strategy_policy_map={"alpha_v1": _policy(config, "alpha_v1")},
         portfolio_snapshot={
             "phase3_available_risk_pct": 1.0,
+            "portfolio_equity": 100.0,
+            "as_of": AS_OF,
+            "equity_as_of": AS_OF,
             "reserved_risk_by_strategy": {"alpha_v1": 0.01},
+            "strategy_risk_unit": "stop_risk_dollars",
         },
         as_of=AS_OF,
     )
@@ -147,7 +151,7 @@ def test_multiple_authorized_strategies_have_deterministic_psd_order_and_replay_
 
     result = allocator.run(
         regime="normal", drawdown_pct=0.0, strategy_policy_map=policies,
-        portfolio_snapshot={"phase3_available_risk_pct": 1.0, "as_of": AS_OF},
+        portfolio_snapshot={"phase3_available_risk_pct": 1.0, "portfolio_equity": 100.0, "as_of": AS_OF, "equity_as_of": AS_OF},
         as_of=AS_OF,
     )
 
@@ -196,8 +200,8 @@ def test_covariance_persists_exact_aligned_inputs_and_repairs_invalid_rows(tmp_p
 
 def test_candidate_allocation_ranks_globally_but_cannot_cross_sleeves_and_exits_bypass() -> None:
     sleeves = {
-        "alpha_v1": {"remaining_risk": 0.30, "allocated_risk": 0.30, "state": "ACTIVE"},
-        "beta_v1": {"remaining_risk": 0.20, "allocated_risk": 0.20, "state": "ACTIVE"},
+        "alpha_v1": {"remaining_risk": 0.30, "risk_unit": "stop_risk_dollars", "allocated_risk": 0.30, "state": "ACTIVE"},
+        "beta_v1": {"remaining_risk": 0.20, "risk_unit": "stop_risk_dollars", "allocated_risk": 0.20, "state": "ACTIVE"},
     }
     base = {
         "symbol": "SPY", "action": "entry", "side": "buy", "evidence_quality": 90,
@@ -207,14 +211,16 @@ def test_candidate_allocation_ranks_globally_but_cannot_cross_sleeves_and_exits_
         "symbol_exposure_pct": 0, "cluster_exposure_pct": 0, "stop_risk_pct": 0.10,
     }
     candidates = [
-        {**base, "strategy_version": "alpha_v1", "setup_id": "strong", "setup_score": 98, "requested_stop_risk": 0.20},
-        {**base, "strategy_version": "beta_v1", "setup_id": "second", "setup_score": 90, "requested_stop_risk": 0.20},
-        {**base, "strategy_version": "alpha_v1", "setup_id": "weak", "setup_score": 45, "requested_stop_risk": 0.20, "uncertainty": 0.9},
+        {**base, "strategy_version": "alpha_v1", "setup_id": "strong", "setup_score": 98, "risk_value": 0.20, "risk_unit": "stop_risk_dollars"},
+        {**base, "strategy_version": "beta_v1", "setup_id": "second", "setup_score": 90, "risk_value": 0.20, "risk_unit": "stop_risk_dollars"},
+        {**base, "strategy_version": "alpha_v1", "setup_id": "weak", "setup_score": 45, "risk_value": 0.20, "risk_unit": "stop_risk_dollars", "uncertainty": 0.9},
         {"strategy_version": "suspended_v1", "symbol": "QQQ", "action": "exit", "side": "sell"},
     ]
 
-    first = allocate_candidates_to_sleeves(candidates, sleeves, global_available_risk=0.40)
-    second = allocate_candidates_to_sleeves(deepcopy(candidates), deepcopy(sleeves), global_available_risk=0.40)
+    first = allocate_candidates_to_sleeves(candidates, sleeves, global_available_risk=0.40,
+        global_risk_unit="stop_risk_dollars", conversion_equity=100.0, conversion_equity_as_of=AS_OF, evaluation_time=AS_OF)
+    second = allocate_candidates_to_sleeves(deepcopy(candidates), deepcopy(sleeves), global_available_risk=0.40,
+        global_risk_unit="stop_risk_dollars", conversion_equity=100.0, conversion_equity_as_of=AS_OF, evaluation_time=AS_OF)
     entries = [decision for decision in first["decisions"] if decision["decision"] != "EXIT_BYPASS"]
 
     assert first == second

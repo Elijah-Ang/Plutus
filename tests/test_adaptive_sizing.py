@@ -28,6 +28,7 @@ def _inputs(**overrides):
     ceilings = {name: 1_000_000.0 for name in CANONICAL_CEILING_ORDER}
     values = {
         "stage": "proposal", "run_id": "run-1", "proposal_id": "proposal-1", "candidate_id": "candidate-1",
+        "evaluation_time": "2026-07-14T08:00:00+00:00",
         "setup_id": "setup-1", "approval_id": None, "strategy_version": "rule_based_v2", "policy_id": "policy-1",
         "action": "entry", "side": "buy", "authoritative_equity": 100_000.0, "authoritative_cash": 50_000.0,
         "authoritative_buying_power": 50_000.0, "entry_price": 100.0, "stop_price": 95.0, "stop_distance_dollars": 5.0,

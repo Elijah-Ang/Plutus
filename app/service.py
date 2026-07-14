@@ -1117,88 +1117,97 @@ class TradingService:
         return rows[0] if rows else None
 
     def _initial_risk_seed_for_position(self, symbol: str) -> dict[str, Any]:
-        existing_state = self._position_management_state(symbol)
-        if existing_state and existing_state.get("initial_stop_price") is not None:
+        symbol = symbol.upper()
+        lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+
+        def unavailable(reason: str) -> dict[str, Any]:
             return {
-                "initial_stop_price": existing_state.get("initial_stop_price"),
-                "initial_risk_per_share": existing_state.get("initial_risk_per_share"),
-                "initial_risk_pct": existing_state.get("initial_risk_pct"),
-                "initial_risk_dollars": existing_state.get("initial_risk_dollars"),
-                "stop_model": existing_state.get("stop_model"),
-                "stop_source": existing_state.get("stop_source"),
-                "entry_price_for_r": existing_state.get("entry_price_for_r"),
-                "risk_model_version": existing_state.get("risk_model_version"),
-                "r_multiple_unavailable_reason": existing_state.get("r_multiple_unavailable_reason"),
+                "position_lifecycle_id": lifecycle_id,
+                "entry_fill_id": None,
+                "entry_order_intent_id": None,
+                "initial_stop_price": None,
+                "initial_risk_per_share": None,
+                "initial_risk_pct": None,
+                "initial_risk_dollars": None,
+                "stop_model": None,
+                "stop_source": None,
+                "entry_price_for_r": None,
+                "risk_model_version": "initial_r_lifecycle_provenance_v1",
+                "initial_risk_reconstruction_source": None,
+                "initial_risk_formula_version": "initial_r_lifecycle_provenance_v1",
+                "initial_risk_evidence_version": EVIDENCE_VERSION,
+                "r_multiple_unavailable_reason": reason,
             }
-        rows = self.storage.fetch_all(
-            "SELECT payload FROM trade_proposals WHERE symbol=? AND side='buy' AND status IN ('approved','submitted','filled') ORDER BY created_at ASC LIMIT 1",
-            (symbol.upper(),),
+
+        if not lifecycle_id:
+            return unavailable("r_multiple_unavailable_active_position_lifecycle_missing")
+        lifecycle_rows = self.storage.fetch_all(
+            "SELECT * FROM position_lifecycles WHERE id=? AND symbol=? AND state='active'",
+            (lifecycle_id, symbol),
         )
-        if not rows:
-            return {
-                "initial_stop_price": None,
-                "initial_risk_per_share": None,
-                "initial_risk_pct": None,
-                "initial_risk_dollars": None,
-                "stop_model": None,
-                "stop_source": None,
-                "entry_price_for_r": None,
-                "risk_model_version": None,
-                "r_multiple_unavailable_reason": "r_multiple_unavailable_initial_stop_missing",
-            }
+        if len(lifecycle_rows) != 1:
+            return unavailable("r_multiple_unavailable_active_position_lifecycle_invalid")
+        fill_rows = self.storage.fetch_all(
+            """SELECT f.id AS entry_fill_id,f.fill_price,f.occurred_at,
+                      i.id AS entry_order_intent_id,i.proposal_id,i.intended_stop_price,
+                      i.average_fill_price,p.payload
+               FROM order_intents i
+               JOIN broker_fill_events f ON f.intent_id=i.id AND f.delta_quantity>0
+               LEFT JOIN trade_proposals p ON p.id=i.proposal_id
+               WHERE i.position_lifecycle_id=? AND i.symbol=? AND i.side='buy'
+                 AND i.filled_quantity>0
+               ORDER BY f.occurred_at,f.id LIMIT 1""",
+            (lifecycle_id, symbol),
+        )
+        if not fill_rows:
+            return unavailable("r_multiple_unavailable_current_lifecycle_entry_fill_missing")
+        fill = fill_rows[0]
         try:
-            payload = json.loads(rows[0].get("payload") or "{}")
-            stop = payload.get("initial_stop_price", payload.get("stop_price"))
-            entry = payload.get("entry_price_for_r", payload.get("latest_price"))
-            stop_val = float(stop) if stop is not None else None
-            entry_val = float(entry) if entry is not None else None
-            if stop_val is None:
-                return {
-                    "initial_stop_price": None,
-                    "initial_risk_per_share": None,
-                    "initial_risk_pct": None,
-                    "initial_risk_dollars": None,
-                    "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
-                    "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
-                    "entry_price_for_r": entry_val,
-                    "risk_model_version": payload.get("risk_model_version"),
-                    "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason", "r_multiple_unavailable_initial_stop_missing"),
-                }
-            if entry_val is not None and stop_val >= entry_val:
-                return {
-                    "initial_stop_price": None,
-                    "initial_risk_per_share": None,
-                    "initial_risk_pct": None,
-                    "initial_risk_dollars": None,
-                    "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
-                    "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
-                    "entry_price_for_r": entry_val,
-                    "risk_model_version": payload.get("risk_model_version"),
-                    "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason", "r_multiple_unavailable_initial_stop_invalid"),
-                }
-            return {
-                "initial_stop_price": stop_val,
-                "initial_risk_per_share": payload.get("initial_risk_per_share"),
-                "initial_risk_pct": payload.get("initial_risk_pct", payload.get("stop_distance_pct")),
-                "initial_risk_dollars": payload.get("initial_risk_dollars"),
-                "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
-                "stop_source": payload.get("stop_source", payload.get("stop_model_used")),
-                "entry_price_for_r": entry_val,
-                "risk_model_version": payload.get("risk_model_version"),
-                "r_multiple_unavailable_reason": payload.get("r_multiple_unavailable_reason"),
-            }
+            entry_price = float(fill.get("fill_price") or fill.get("average_fill_price") or 0.0)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            return unavailable("r_multiple_unavailable_current_lifecycle_entry_price_invalid")
+        try:
+            payload = json.loads(fill.get("payload") or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
-            return {
-                "initial_stop_price": None,
-                "initial_risk_per_share": None,
-                "initial_risk_pct": None,
-                "initial_risk_dollars": None,
-                "stop_model": None,
-                "stop_source": None,
-                "entry_price_for_r": None,
-                "risk_model_version": None,
-                "r_multiple_unavailable_reason": "r_multiple_unavailable_initial_stop_missing",
-            }
+            payload = {}
+        stop = fill.get("intended_stop_price")
+        source = "linked_order_intent"
+        if stop is None:
+            stop = payload.get("initial_stop_price", payload.get("stop_price"))
+            source = "linked_filled_proposal"
+        existing = self._position_management_state(symbol)
+        if stop is None and existing and existing.get("position_lifecycle_id") == lifecycle_id:
+            stop = existing.get("initial_stop_price")
+            source = "lifecycle_initial_protective_stop"
+        try:
+            stop_price = float(stop) if stop is not None else None
+        except (TypeError, ValueError):
+            stop_price = None
+        if stop_price is None:
+            return unavailable("r_multiple_unavailable_current_lifecycle_initial_stop_missing")
+        if not math.isfinite(stop_price) or stop_price <= 0 or stop_price >= entry_price:
+            return unavailable("r_multiple_unavailable_current_lifecycle_initial_stop_invalid")
+        risk_per_share = entry_price - stop_price
+        opening_quantity = float(lifecycle_rows[0].get("opening_quantity") or 0.0)
+        return {
+            "position_lifecycle_id": lifecycle_id,
+            "entry_fill_id": fill.get("entry_fill_id"),
+            "entry_order_intent_id": fill.get("entry_order_intent_id"),
+            "initial_stop_price": stop_price,
+            "initial_risk_per_share": risk_per_share,
+            "initial_risk_pct": risk_per_share / entry_price * 100.0,
+            "initial_risk_dollars": risk_per_share * opening_quantity if opening_quantity > 0 else None,
+            "stop_model": payload.get("stop_model", payload.get("stop_model_used")),
+            "stop_source": payload.get("stop_source", source),
+            "entry_price_for_r": entry_price,
+            "risk_model_version": "initial_r_lifecycle_provenance_v1",
+            "initial_risk_reconstruction_source": source,
+            "initial_risk_formula_version": "initial_r_lifecycle_provenance_v1",
+            "initial_risk_evidence_version": EVIDENCE_VERSION,
+            "r_multiple_unavailable_reason": None,
+        }
 
     def _initial_stop_for_position(self, symbol: str) -> float | None:
         seed = self._initial_risk_seed_for_position(symbol)
@@ -1293,6 +1302,20 @@ class TradingService:
             ),
         )
         self.storage.execute(
+            """UPDATE position_management_state SET entry_fill_id=?,entry_order_intent_id=?,
+                 initial_risk_reconstruction_source=?,initial_risk_formula_version=?,
+                 initial_risk_evidence_version=? WHERE symbol=? AND position_lifecycle_id=?""",
+            (
+                risk_seed.get("entry_fill_id"),
+                risk_seed.get("entry_order_intent_id"),
+                risk_seed.get("initial_risk_reconstruction_source"),
+                risk_seed.get("initial_risk_formula_version"),
+                risk_seed.get("initial_risk_evidence_version"),
+                symbol,
+                lifecycle_id,
+            ),
+        )
+        self.storage.execute(
             """
             INSERT INTO position_management_decisions(
                 id,run_id,symbol,position_lifecycle_id,decision_type,priority,action,reason,current_price,avg_entry_price,quantity,
@@ -1365,23 +1388,87 @@ class TradingService:
         symbol = str(proposal.get("symbol", "")).upper()
         proposal_id = proposal.get("id")
         resolved_at = iso_now()
-        if pm_type == "TAKE_PROFIT_PARTIAL":
-            pm_decision = proposal.get("position_management_decision") or {}
-            try:
-                level = int(pm_decision.get("take_profit_level") or 0)
-            except (TypeError, ValueError):
-                level = 0
-            if level in {1, 2, 3}:
-                column = f"take_profit_level_{level}_hit"
-                self.storage.execute(
-                    f"UPDATE position_management_state SET {column}=1, updated_at=? WHERE symbol=?",
-                    (resolved_at, symbol),
-                )
+        # TAKE_PROFIT_PARTIAL progress is intentionally not changed here.
+        # Proposal status is not fill status; DurableExecutionStore.record_fill
+        # is the sole milestone advancement path.
         if pm_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
             self.storage.execute(
                 "UPDATE profit_exit_events SET status=?, resolved_at=? WHERE proposal_id=?",
                 (status, resolved_at, proposal_id),
             )
+
+    @staticmethod
+    def _buy_proposals_are_equivalent(current: dict[str, Any], other: dict[str, Any]) -> bool:
+        current_id = str(current.get("id") or current.get("proposal_id") or "")
+        other_id = str(other.get("id") or other.get("proposal_id") or "")
+        if not current_id or not other_id or current_id == other_id:
+            return False
+        if str(current.get("replaces_proposal_id") or "") == other_id:
+            return True
+        for key in ("logical_action_key", "pyramiding_milestone_id", "pyramiding_milestone_key"):
+            left, right = str(current.get(key) or ""), str(other.get(key) or "")
+            if left and left == right:
+                return True
+        current_symbol = str(current.get("symbol") or "").upper()
+        other_symbol = str(other.get("symbol") or "").upper()
+        current_action = str(current.get("action") or "entry").lower()
+        other_action = str(other.get("action") or "entry").lower()
+        current_lifecycle = str(current.get("position_lifecycle_id") or "")
+        other_lifecycle = str(other.get("position_lifecycle_id") or "")
+        if (
+            current_symbol
+            and current_symbol == other_symbol
+            and current_action == other_action
+            and current_lifecycle
+            and current_lifecycle == other_lifecycle
+        ):
+            return True
+        current_setup = str(current.get("setup_key") or "")
+        other_setup = str(other.get("setup_key") or "")
+        if (
+            current_setup
+            and current_setup == other_setup
+            and current_symbol == other_symbol
+            and current_action == other_action
+            and str(current.get("strategy_version") or "") == str(other.get("strategy_version") or "")
+        ):
+            return True
+        current_rotation = str(current.get("rotation_group_id") or current.get("relationship_group_id") or "")
+        other_rotation = str(other.get("rotation_group_id") or other.get("relationship_group_id") or "")
+        return bool(
+            current_rotation
+            and current_rotation == other_rotation
+            and str(current.get("relationship_type") or "") == "rotation_entry"
+            and str(other.get("relationship_type") or "") == "rotation_entry"
+        )
+
+    def _supersede_equivalent_pending_buys(self, submitted: dict[str, Any]) -> list[str]:
+        superseded: list[str] = []
+        rows = self.storage.fetch_all(
+            "SELECT * FROM trade_proposals WHERE side='buy' AND status='pending' AND id<>? ORDER BY created_at,id",
+            (submitted.get("id") or submitted.get("proposal_id"),),
+        )
+        for row in rows:
+            other = _hydrate_proposal_row(row)
+            if not self._buy_proposals_are_equivalent(submitted, other):
+                continue
+            changed = self.storage.execute(
+                "UPDATE trade_proposals SET status='superseded' WHERE id=? AND status='pending'",
+                (row["id"],),
+            )
+            if changed.rowcount == 1:
+                superseded.append(str(row["id"]))
+        if superseded:
+            self.storage.audit(
+                self.run_id,
+                "equivalent_buy_proposals_superseded",
+                {
+                    "submitted_proposal_id": submitted.get("id") or submitted.get("proposal_id"),
+                    "superseded_proposal_ids": superseded,
+                    "scope": "equivalent_or_mutually_exclusive_only",
+                },
+            )
+        return superseded
 
     def _parse_batch_approval_command(self, text: str) -> tuple[str, str] | None:
         normalized = text.strip()
@@ -1622,13 +1709,42 @@ class TradingService:
             sell_qty = float(proposal.get("qty") or 0.0)
             if sell_qty <= 0 or sell_qty > held_qty + 1e-9:
                 return "sell quantity is invalid or exceeds held quantity"
+            if pm_type == "TAKE_PROFIT_PARTIAL":
+                from .profit_milestones import remaining_take_profit_quantity
+
+                decision = proposal.get("position_management_decision") or {}
+                try:
+                    level = int(decision.get("take_profit_level") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    level = 0
+                lifecycle_id = str(
+                    proposal.get("position_lifecycle_id")
+                    or PositionLifecycleManager(self.storage).active_id(symbol)
+                    or ""
+                )
+                if level not in {1, 2, 3} or not lifecycle_id:
+                    return "take-profit milestone lifecycle provenance is unavailable"
+                remaining = remaining_take_profit_quantity(
+                    self.storage,
+                    position_lifecycle_id=lifecycle_id,
+                    take_profit_level=level,
+                )
+                if remaining is not None:
+                    if remaining <= 1e-12:
+                        return "take-profit milestone is already fully filled"
+                    proposal["qty"] = sell_qty = min(sell_qty, remaining)
+                    proposal["take_profit_remaining_quantity"] = remaining
             price = float(refreshed_price or proposal.get("latest_price") or 0.0)
             min_notional = float(self.config.get("position_management", {}).get("profit_taking", {}).get("minimum_notional_to_sell", 1.0))
             if sell_qty * price < min_notional:
                 return "position-management sell is below minimum notional"
             open_orders = self.broker.get_open_orders() if self.broker is not None else []
-            if any(str(_value(o, "symbol", "")).upper() == symbol for o in open_orders):
-                return "conflicting open order exists for symbol"
+            if any(
+                str(_value(o, "symbol", "")).upper() == symbol
+                and str(_value(o, "side", "")).lower() == "sell"
+                for o in open_orders
+            ):
+                return "conflicting open sell order exists for symbol"
         elif proposal.get("action") == "add":
             positions = self.broker.get_positions() if self.broker is not None else []
             pos = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
@@ -1696,9 +1812,20 @@ class TradingService:
         if not state_rows:
             raise ValueError("authoritative position-management state is absent")
         position_state = state_rows[0]
+        if (
+            not position_state.get("entry_fill_id")
+            or not position_state.get("entry_order_intent_id")
+            or not position_state.get("initial_risk_reconstruction_source")
+            or not position_state.get("initial_risk_formula_version")
+            or position_state.get("position_lifecycle_id") != lifecycle_id
+        ):
+            reason = position_state.get("r_multiple_unavailable_reason") or "current lifecycle entry-fill provenance is incomplete"
+            raise ValueError(f"initial R provenance unavailable: {reason}")
         winner_cfg = self.config.get("winner_expansion", {}) or {}
         current_stop, stop_current = _validated_authoritative_stop(position_state, winner_cfg)
-        initial_stop = float(position_state.get("initial_stop_price") or current_stop)
+        if position_state.get("initial_stop_price") is None:
+            raise ValueError("initial R provenance unavailable: current lifecycle initial stop missing")
+        initial_stop = float(position_state["initial_stop_price"])
         initial_risk_per_share = average_entry - initial_stop
         if initial_risk_per_share <= 0:
             raise ValueError("initial R geometry is unavailable or invalid")
@@ -2458,6 +2585,7 @@ class TradingService:
         if state != "ACTIVE":
             base_strategy_risk = float(operational_risk or 0.0)
         inputs = {
+            "evaluation_time": iso_now(),
             "run_id": proposal.get("run_id"), "proposal_id": proposal.get("id"),
             "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
             "decision_stage": stage, "approval_id": approval_id,
@@ -2558,6 +2686,7 @@ class TradingService:
         phase3_profile = (self.config.get("phase3", {}) or {}).get("risk_profile", {}) or {}
         engine = AdaptiveSizingEngine(self.config)
         decision = engine.evaluate({
+            "evaluation_time": iso_now(),
             "stage": stage, "run_id": proposal.get("run_id") or self.run_id,
             "proposal_id": proposal.get("id") or proposal.get("proposal_id"),
             "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
@@ -2729,6 +2858,7 @@ class TradingService:
             mark = float(proposal.get("latest_price") or 0.0)
             exits.append({
                 "proposal_id": proposal["id"],
+                "position_lifecycle_id": state.get("position_lifecycle_id") or proposal.get("position_lifecycle_id"),
                 "symbol": proposal["symbol"],
                 "side": "sell",
                 "quantity": quantity,
@@ -2751,6 +2881,7 @@ class TradingService:
             expires_at=expiry,
             registry_snapshot_id=self._ensure_strategy_registry_snapshot(),
             allocation_id=(self._phase4_allocation_cache or {}).get("allocation_id"),
+            evaluation_time=now,
         )
         for step in coordinator.steps(group["id"]):
             proposal_rows = self.storage.fetch_all("SELECT payload FROM trade_proposals WHERE id=?", (step["proposal_id"],))
@@ -4097,6 +4228,7 @@ class TradingService:
                     approval_id
                 )
             )
+            self._persist_approval_directional_validation(approval_id, proposal)
 
             if result.intent_id:
                 self.storage.link_executed_order_records(result.intent_id)
@@ -4130,10 +4262,9 @@ class TradingService:
                 self.telegram.send_message("✅ " + msg)
 
                 if prop_side == "buy":
-                    other_buys = self.storage.fetch_all("SELECT id FROM trade_proposals WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
-                    if other_buys:
-                        self.storage.execute("UPDATE trade_proposals SET status='superseded' WHERE side='buy' AND status='pending' AND id != ?", (parsed.proposal_id,))
-                        self.telegram.send_message("Other pending BUY proposals were cancelled because one paper position/trade is already active.")
+                    superseded = self._supersede_equivalent_pending_buys(proposal)
+                    if superseded:
+                        self.telegram.send_message("Equivalent older BUY proposal(s) were superseded; unrelated pending opportunities remain independently approvable.")
                 continue
             else:
                 decision_status = "unknown" if result.status == "unknown" else "blocked"
@@ -4158,7 +4289,7 @@ class TradingService:
                 # Format failure message
                 if "could not get a fresh Alpaca price" in result.reason:
                     self.telegram.send_message(result.reason)
-                elif "Price moved too much" in result.reason:
+                elif "price movement too large" in result.reason.lower() or "price moved too much" in result.reason.lower():
                     self.telegram.send_message(f"No order placed for {prop_symbol}. {result.reason}. A refreshed proposal is required.")
                 elif "no longer fresh" in result.reason:
                     self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
@@ -4364,6 +4495,27 @@ class TradingService:
         volatility_adjusted_bps = base_bps * (stop_distance_pct / 2.0)
         return min(max(base_bps, volatility_adjusted_bps), hard_cap_bps)
 
+    def _persist_approval_directional_validation(
+        self,
+        approval_id: str,
+        proposal: dict[str, Any],
+    ) -> None:
+        self.storage.execute(
+            """UPDATE approvals SET proposal_reference_price=?,refreshed_bid=?,refreshed_ask=?,
+                 directional_price_move_bps=?,movement_classification=?,final_limit_price=?,
+                 directional_validation_reason=? WHERE id=?""",
+            (
+                proposal.get("proposal_reference_price"),
+                proposal.get("quote_bid"),
+                proposal.get("quote_ask"),
+                proposal.get("directional_price_move_bps"),
+                proposal.get("movement_classification"),
+                proposal.get("final_limit_price", proposal.get("limit_price")),
+                proposal.get("directional_validation_reason"),
+                approval_id,
+            ),
+        )
+
     def _execute_final_revalidation(
         self,
         row: dict[str, Any],
@@ -4475,25 +4627,24 @@ class TradingService:
         # market-exit path.
         if block_reason is None and self.broker is not None:
             try:
-                if row.get("emergency_exit_triggered") == 1:
-                    trade = self.broker.get_latest_price(prop_symbol)
-                    refreshed_price_val = float(_value(trade, "price", 0) or 0)
-                    refreshed_price_at = _dt(_value(trade, "timestamp", now_dt))
-                else:
-                    quote_data = validated_quote(self.broker, prop_symbol, self.config, now=now_dt)
-                    refreshed_price_val = float(quote_data["ask"] if prop_side == "buy" else quote_data["bid"])
-                    refreshed_price_at = _dt(quote_data["timestamp"])
+                quote_data = validated_quote(self.broker, prop_symbol, self.config, now=now_dt)
+                refreshed_price_val = float(quote_data["ask"] if prop_side == "buy" else quote_data["bid"])
+                proposal["quote_bid"] = float(quote_data["bid"])
+                proposal["quote_ask"] = float(quote_data["ask"])
+                proposal["quote_timestamp"] = quote_data["timestamp"]
+                proposal["quote_spread_bps"] = float(quote_data["spread_bps"])
+                proposal["quote_source"] = quote_data["source"]
+                refreshed_price_at = _dt(quote_data["timestamp"])
                 if refreshed_price_at:
                     price_refreshed_at = refreshed_price_at.isoformat()
                     refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
             except Exception as e:
                 logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
-                if row.get("emergency_exit_triggered") != 1:
-                    block_reason = (
-                        "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
-                        if "stale" in str(e).lower() or "future" in str(e).lower()
-                        else "Price refresh failed or price is unavailable"
-                    )
+                block_reason = (
+                    "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
+                    if "stale" in str(e).lower() or "future" in str(e).lower()
+                    else "Price refresh failed or price is unavailable"
+                )
 
         # Check market open status
         market_open = False
@@ -4508,6 +4659,45 @@ class TradingService:
         if proposal_price is not None:
             proposal_price = float(proposal_price)
 
+        if block_reason is None and (proposal_price is None or proposal_price <= 0):
+            block_reason = "proposal reference price is unavailable"
+
+        if proposal_price is not None and proposal_price > 0 and refreshed_price_val is not None:
+            directional_move_bps = ((refreshed_price_val - proposal_price) / proposal_price) * 10000
+            price_move_bps_since_proposal = abs(directional_move_bps)
+            proposal["proposal_reference_price"] = proposal_price
+            proposal["directional_price_move_bps"] = directional_move_bps
+            proposal["movement_classification"] = (
+                ("adverse_upward" if directional_move_bps > 0 else "favourable_downward" if directional_move_bps < 0 else "unchanged")
+                if prop_side == "buy"
+                else ("adverse_downward_exit_urgent" if directional_move_bps < 0 else "favourable_upward_exit" if directional_move_bps > 0 else "unchanged")
+            )
+
+        if block_reason is None and prop_side == "sell":
+            try:
+                positions = self.broker.get_positions() if self.broker is not None else []
+                position = next(
+                    (item for item in positions if str(_value(item, "symbol", "")).upper() == prop_symbol.upper()),
+                    None,
+                )
+                held_quantity = float(_value(position, "qty", 0.0) or 0.0) if position is not None else 0.0
+                sell_quantity = float(proposal.get("qty") or 0.0)
+                if held_quantity <= 0:
+                    block_reason = "position no longer exists"
+                elif sell_quantity <= 0 or sell_quantity > held_quantity + 1e-9:
+                    block_reason = "sell quantity is invalid or exceeds held quantity"
+                else:
+                    proposal["held_quantity_at_revalidation"] = held_quantity
+                    open_orders = self.broker.get_open_orders() if self.broker is not None else []
+                    if any(
+                        str(_value(order, "symbol", "")).upper() == prop_symbol.upper()
+                        and str(_value(order, "side", "")).lower() == "sell"
+                        for order in open_orders
+                    ):
+                        block_reason = "conflicting open sell order exists"
+            except (AttributeError, TypeError, ValueError):
+                block_reason = "current sell holdings could not be validated"
+
         # Perform revalidation checks
         if block_reason is None:
             if refresh_required:
@@ -4518,7 +4708,7 @@ class TradingService:
                 elif not market_open:
                     block_reason = "Market is closed"
                 elif proposal_price is not None and proposal_price > 0:
-                    price_move_bps_since_proposal = (abs(refreshed_price_val - proposal_price) / proposal_price) * 10000
+                    directional_move_bps = float(proposal["directional_price_move_bps"])
                     # Make price movement limit volatility-aware
                     hard_cap_bps = float(telegram_cfg.get("approval_max_price_move_hard_cap_bps", 75.0))
                     volatility_aware_limit_bps = self._calculate_volatility_aware_bps_limit(proposal, float(max_price_move_bps), hard_cap_bps)
@@ -4526,13 +4716,31 @@ class TradingService:
                     # Store final limit used in proposal dict
                     proposal["approval_price_move_limit_bps"] = volatility_aware_limit_bps
                     
-                    if price_move_bps_since_proposal > volatility_aware_limit_bps:
-                        block_reason = f"Price moved too much ({price_move_bps_since_proposal:.1f} bps > limit {volatility_aware_limit_bps:.1f} bps)"
+                    if prop_side == "buy":
+                        proposal["movement_classification"] = (
+                            "adverse_upward" if directional_move_bps > 0
+                            else "favourable_downward" if directional_move_bps < 0
+                            else "unchanged"
+                        )
+                        if directional_move_bps > volatility_aware_limit_bps:
+                            block_reason = f"Price moved too much for BUY: adverse upward movement {directional_move_bps:.1f} bps exceeds limit {volatility_aware_limit_bps:.1f} bps"
+                            proposal["directional_validation_reason"] = block_reason
+                        else:
+                            proposal["directional_validation_reason"] = "directional BUY movement remained within approval protections"
+                    else:
+                        proposal["movement_classification"] = (
+                            "adverse_downward_exit_urgent" if directional_move_bps < 0
+                            else "favourable_upward_exit" if directional_move_bps > 0
+                            else "unchanged"
+                        )
+                        proposal["directional_validation_reason"] = (
+                            "risk-reducing SELL remains eligible after fresh holdings, quote, order-conflict, and expiry validation"
+                        )
             else:
                 if not market_open:
                     block_reason = "Market is closed"
 
-        if block_reason is None and row.get("emergency_exit_triggered") != 1:
+        if block_reason is None:
             try:
                 proposal["quote_bid"] = float(quote_data["bid"])
                 proposal["quote_ask"] = float(quote_data["ask"])
@@ -4540,8 +4748,13 @@ class TradingService:
                 proposal["quote_timestamp"] = quote_data["timestamp"]
                 proposal["quote_spread_bps"] = float(quote_data["spread_bps"])
                 proposal["quote_source"] = quote_data["source"]
-                proposal["order_type"] = "limit"
-                proposal["limit_price"] = bounded_marketable_limit(quote_data, prop_side, self.config)
+                if row.get("emergency_exit_triggered") == 1:
+                    proposal["final_limit_price"] = None
+                    proposal["protective_exit_mechanism"] = "protective_paper_exit"
+                else:
+                    proposal["order_type"] = "limit"
+                    proposal["limit_price"] = bounded_marketable_limit(quote_data, prop_side, self.config)
+                    proposal["final_limit_price"] = proposal["limit_price"]
             except (KeyError, TypeError, ValueError) as exc:
                 block_reason = f"bounded marketable-limit validation failed: {type(exc).__name__}"
 
@@ -4573,6 +4786,7 @@ class TradingService:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
 
         if block_reason:
+            proposal.setdefault("directional_validation_reason", block_reason)
             if prop_side == "buy" and proposal.get("action") in {"entry", "add"} and proposal.get("adaptive_sizing"):
                 try:
                     proposal["proposal_price_age_seconds_at_send"] = refreshed_price_age_seconds
@@ -4669,6 +4883,11 @@ class TradingService:
                 proposal["sleeve_stop_risk_ceiling"] = size_dict.get("sleeve_stop_risk_ceiling")
                 proposal["sleeve_notional_ceiling"] = size_dict.get("sleeve_notional_ceiling")
                 proposal["strategy_sleeve_payload"] = size_dict.get("strategy_sleeve_payload")
+                proposal["risk_value"] = size_dict.get("risk_value")
+                proposal["risk_unit"] = size_dict.get("risk_unit")
+                proposal["conversion_equity"] = size_dict.get("conversion_equity")
+                proposal["conversion_equity_as_of"] = size_dict.get("conversion_equity_as_of")
+                proposal["risk_formula_version"] = size_dict.get("risk_formula_version")
                 proposal["average_dollar_volume"] = size_dict.get("average_dollar_volume")
                 proposal["sizing_caps"] = size_dict.get("sizing_caps") or {}
                 proposal["binding_caps"] = size_dict.get("binding_caps") or []
@@ -4954,6 +5173,7 @@ class TradingService:
                 approval_id,
             ),
         )
+        self._persist_approval_directional_validation(approval_id, proposal)
         if result.intent_id:
             self.storage.link_executed_order_records(result.intent_id)
             self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
@@ -4966,6 +5186,8 @@ class TradingService:
             self.storage.execute("UPDATE approvals SET acknowledgement_status='submitted' WHERE id=?", (approval_id,))
             self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
             self._mark_position_management_proposal_handled(proposal, "submitted")
+            if prop_side == "buy":
+                self._supersede_equivalent_pending_buys(proposal)
             
             # Format success message
             price_used = refreshed_price_val or proposal.get("latest_price") or 0.0
@@ -5005,7 +5227,7 @@ class TradingService:
         # Format failure message
         if "could not get a fresh Alpaca price" in result.reason:
             self.telegram.send_message(result.reason)
-        elif "Price moved too much" in result.reason:
+        elif "price movement too large" in result.reason.lower() or "price moved too much" in result.reason.lower():
             self.telegram.send_message(f"No order placed for {prop_symbol}. {result.reason}. A refreshed proposal is required.")
         elif "no longer fresh" in result.reason:
             self.telegram.send_message(f"Approved, but no order was placed. {result.reason}")
@@ -7084,6 +7306,11 @@ class TradingService:
                                 "sleeve_stop_risk_ceiling": res.get("sleeve_stop_risk_ceiling"),
                                 "sleeve_notional_ceiling": res.get("sleeve_notional_ceiling"),
                                 "strategy_sleeve_payload": res.get("strategy_sleeve_payload"),
+                                "risk_value": res.get("risk_value"),
+                                "risk_unit": res.get("risk_unit"),
+                                "conversion_equity": res.get("conversion_equity"),
+                                "conversion_equity_as_of": res.get("conversion_equity_as_of"),
+                                "risk_formula_version": res.get("risk_formula_version"),
                                 "classification": classification,
                                 "system_confidence": system_confidence,
                                 "expiry_minutes": expiry_minutes,
@@ -7408,6 +7635,11 @@ class TradingService:
                         "strategy_sleeve": res.get("strategy_sleeve"),
                         "sleeve_allocation_id": res.get("sleeve_allocation_id"),
                         "sleeve_stop_risk_ceiling": res.get("sleeve_stop_risk_ceiling"),
+                        "risk_value": res.get("risk_value"),
+                        "risk_unit": res.get("risk_unit"),
+                        "conversion_equity": res.get("conversion_equity"),
+                        "conversion_equity_as_of": res.get("conversion_equity_as_of"),
+                        "risk_formula_version": res.get("risk_formula_version"),
                         "sleeve_notional_ceiling": res.get("sleeve_notional_ceiling"),
                     })
 
@@ -8497,15 +8729,19 @@ class TradingService:
                 list(runtime_state.get("positions") or []), equity
             )
             phase3_profile = Phase3Controller(self.storage, self.config, self.run_id).profile
+            allocation_as_of = iso_now()
             phase4_snapshot = {
                 "portfolio_equity": equity,
+                "as_of": allocation_as_of,
+                "equity_as_of": allocation_as_of,
                 "heat_before_pct": ((float(canonical_phase4.projected_total_open_risk or 0.0) + float(pending_phase4.get("total_stop_risk") or 0.0)) / equity * 100.0) if equity > 0 else None,
                 "gross_exposure_before_pct": ((float(canonical_phase4.projected_gross_exposure or 0.0) + float(pending_phase4.get("total_notional") or 0.0)) / equity * 100.0) if equity > 0 else None,
                 "symbol_exposure_before": canonical_phase4.symbol_exposure,
                 "cluster_exposure_before": canonical_phase4.cluster_exposure,
                 "pending_risk": float(pending_phase4.get("total_stop_risk") or 0.0),
                 "reserved_risk": float(reservations_phase4.get("active_reserved_stop_risk") or 0.0),
-                "strategy_risk_by_strategy": strategy_consumption["risk_pct"] if strategy_consumption["complete"] else {},
+                "strategy_risk_by_strategy": strategy_consumption["risk_dollars"] if strategy_consumption["complete"] else {},
+                "strategy_risk_unit": "stop_risk_dollars",
                 "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
                 "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
                 "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
@@ -8517,6 +8753,7 @@ class TradingService:
             self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                 regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot,
                 strategy_policy_map=self._strategy_policy_map or {},
+                as_of=allocation_as_of,
             )
             self.storage.audit(self.run_id, "phase4_active_adaptive_allocation", {
                 "allocation_id": self._phase4_allocation_cache["allocation_id"],
@@ -8558,7 +8795,7 @@ class TradingService:
         try:
             from .strategy_performance import StrategyPerformanceEngine
 
-            engine = StrategyPerformanceEngine(self.storage, self.config)
+            engine = StrategyPerformanceEngine(self.storage, self.config, as_of=started_at)
             snapshots = engine.refresh_all()
             self._strategy_policy_map = engine.valid_policy_map()
             from .phase3_risk import AVAILABLE_STRATEGY_IMPLEMENTATIONS
@@ -9633,6 +9870,7 @@ class TradingService:
         return {
             "complete": complete,
             "risk_pct": {strategy: value / portfolio_equity * 100.0 for strategy, value in risk_dollars.items()},
+            "risk_dollars": risk_dollars,
             "notional_dollars": notional_dollars,
             "active_reservation_ids_by_strategy": reservation_ids_by_strategy,
             "pending_proposal_claims_by_strategy": pending_claims_by_strategy,
@@ -9772,8 +10010,11 @@ class TradingService:
                     strategy_consumption = self._phase4_strategy_consumption(
                         list(phase4_state.get("positions") or []), equity
                     )
+                    allocation_as_of = iso_now()
                     phase4_snapshot = {
                         "portfolio_equity": equity,
+                        "as_of": allocation_as_of,
+                        "equity_as_of": allocation_as_of,
                         "heat_before_pct": (
                             (float(phase4_canonical.projected_total_open_risk or 0.0)
                              + float(phase4_pending.get("total_stop_risk") or 0.0))
@@ -9786,7 +10027,8 @@ class TradingService:
                         ),
                         "pending_risk": float(phase4_pending.get("total_stop_risk") or 0.0),
                         "reserved_risk": float(phase4_reservations.get("active_reserved_stop_risk") or 0.0),
-                        "strategy_risk_by_strategy": strategy_consumption["risk_pct"] if strategy_consumption["complete"] else {},
+                        "strategy_risk_by_strategy": strategy_consumption["risk_dollars"] if strategy_consumption["complete"] else {},
+                        "strategy_risk_unit": "stop_risk_dollars",
                         "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
                         "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
                         "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
@@ -9799,6 +10041,7 @@ class TradingService:
                         regime=volatility_regime, drawdown_pct=drawdown_pct,
                         portfolio_snapshot=phase4_snapshot,
                         strategy_policy_map=self._strategy_policy_map or {},
+                        as_of=allocation_as_of,
                     )
                 phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(strategy_version, {})
                 sleeve = self._phase4_allocation_cache.get("strategy_sleeves", {}).get(strategy_version) or {}
@@ -10193,6 +10436,11 @@ class TradingService:
             "sleeve_stop_risk_ceiling": phase3_context.get("sleeve_risk_remaining_dollars"),
             "sleeve_notional_ceiling": phase3_context.get("sleeve_notional_remaining"),
             "strategy_sleeve_payload": phase3_context.get("strategy_sleeve_payload"),
+            "risk_value": phase3_context.get("sleeve_risk_remaining_dollars"),
+            "risk_unit": "stop_risk_dollars",
+            "conversion_equity": (phase3_context.get("strategy_sleeve_payload") or {}).get("conversion_equity"),
+            "conversion_equity_as_of": (phase3_context.get("strategy_sleeve_payload") or {}).get("conversion_equity_as_of"),
+            "risk_formula_version": (phase3_context.get("strategy_sleeve_payload") or {}).get("risk_formula_version"),
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -10910,8 +11158,10 @@ class TradingService:
                             "symbol": symbol,
                             "action": "add" if candidate.get("is_add") else "entry",
                             "side": "buy",
-                            "requested_stop_risk": requested_risk,
-                            "minimum_stop_risk": cfg["min_notional"] * float(stop_distance_pct or 0.0) / 100.0,
+                            "risk_value": requested_risk,
+                            "risk_unit": "stop_risk_dollars",
+                            "minimum_risk_value": cfg["min_notional"] * float(stop_distance_pct or 0.0) / 100.0,
+                            "minimum_risk_unit": "stop_risk_dollars",
                             "setup_score": candidate.get("score"),
                             "evidence_quality": candidate.get("strategy_quality_score"),
                             "regime": candidate.get("volatility_regime"),
@@ -10920,6 +11170,10 @@ class TradingService:
                         }],
                         sleeve_inputs,
                         global_available_risk=global_sleeve_remaining,
+                        global_risk_unit="stop_risk_dollars",
+                        conversion_equity=equity,
+                        conversion_equity_as_of=allocation_as_of,
+                        evaluation_time=allocation_as_of,
                     )
                     sleeve_decision = sleeve_plan["decisions"][0]
                     if sleeve_decision.get("decision") not in {"ALLOCATE", "ALLOCATE_PARTIAL"}:

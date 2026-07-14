@@ -10,11 +10,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
+from .formula_versions import ROTATION_FORMULA_VERSION, ROTATION_SCHEMA_VERSION
 from .utils import iso_now, json_dumps
-
-
-ROTATION_SCHEMA_VERSION = "exit_first_rotation_v1"
-ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v1"
 
 
 class RotationState(StrEnum):
@@ -186,6 +183,21 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
     )
     for statement in statements:
         conn.execute(statement)
+    additions = {
+        "position_lifecycle_id": "TEXT",
+        "exit_proposal_fingerprint": "TEXT",
+        "contingent_candidate_fingerprint": "TEXT",
+        "displayed_approval_fingerprint": "TEXT",
+        "workflow_structure_fingerprint": "TEXT",
+    }
+    present = {row[1] for row in conn.execute("PRAGMA table_info(rotation_groups)")}
+    for name, kind in additions.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE rotation_groups ADD COLUMN {name} {kind}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rotation_active_lifecycle "
+        "ON rotation_groups(position_lifecycle_id,state,expires_at)"
+    )
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -207,81 +219,133 @@ class RotationCoordinator:
         expires_at: str | datetime,
         registry_snapshot_id: str | None = None,
         allocation_id: str | None = None,
+        evaluation_time: str | datetime,
     ) -> dict[str, Any]:
-        if not exit_legs or not contingent_entries:
-            raise ValueError("rotation requires at least one exit and one contingent entry")
+        if not exit_legs or len(contingent_entries) != 1:
+            raise ValueError("rotation requires valid exits and exactly one contingent entry")
+        evaluated_at = _utc(evaluation_time)
         expiry = _utc(expires_at)
-        if expiry <= datetime.now(UTC):
+        if expiry <= evaluated_at:
             raise ValueError("rotation expiry must be in the future")
         canonical_exits: list[dict[str, Any]] = []
         for leg in exit_legs:
             if str(leg.get("side") or "").lower() != "sell" or float(leg.get("quantity") or 0) <= 0:
                 raise ValueError("rotation exits must be genuine positive-quantity sells")
+            proposal_id = str(leg.get("proposal_id") or leg.get("id") or "")
+            lifecycle_id = str(leg.get("position_lifecycle_id") or "")
+            symbol = str(leg.get("symbol") or "").upper()
+            if not proposal_id or not lifecycle_id or not symbol:
+                raise ValueError("rotation exit requires proposal, symbol, and position lifecycle identity")
             canonical_exits.append({
-                "proposal_id": str(leg.get("proposal_id") or leg.get("id") or ""),
-                "symbol": str(leg.get("symbol") or "").upper(),
+                "proposal_id": proposal_id,
+                "position_lifecycle_id": lifecycle_id,
+                "symbol": symbol,
                 "quantity": float(leg.get("quantity") or 0),
                 "estimated_notional": max(0.0, float(leg.get("estimated_notional") or 0)),
                 "estimated_released_risk": max(0.0, float(leg.get("estimated_released_risk") or 0)),
                 "reason": str(leg.get("reason") or ""),
                 "position_state": str(leg.get("position_state") or ""),
             })
+        exit_proposal_ids = [row["proposal_id"] for row in canonical_exits]
+        if len(exit_proposal_ids) != len(set(exit_proposal_ids)):
+            raise ValueError("rotation exit proposal linkage must be unique")
+        lifecycle_ids = {row["position_lifecycle_id"] for row in canonical_exits}
+        if len(lifecycle_ids) != 1:
+            raise ValueError("one rotation cannot span position lifecycles")
+        lifecycle_id = next(iter(lifecycle_ids))
+        active_lifecycle = self.storage.fetch_all(
+            "SELECT id FROM position_lifecycles WHERE id=? AND state='active'", (lifecycle_id,)
+        )
+        if len(active_lifecycle) != 1:
+            raise ValueError("rotation position lifecycle is not active")
         canonical_entries: list[dict[str, Any]] = []
         for candidate in contingent_entries:
             if str(candidate.get("side") or "buy").lower() != "buy":
                 raise ValueError("rotation contingent entries must be buys")
             candidate_key = str(candidate.get("candidate_key") or "")
+            proposal_id = str(candidate.get("proposal_id") or "")
+            strategy_version = str(candidate.get("strategy_version") or "")
             quantity = float(candidate.get("max_quantity") or candidate.get("quantity") or 0)
             notional = float(candidate.get("max_notional") or candidate.get("notional") or 0)
             risk = float(candidate.get("max_stop_risk") or candidate.get("stop_risk") or 0)
-            if not candidate_key or quantity <= 0 or notional <= 0 or risk < 0:
+            if not candidate_key or not proposal_id or not strategy_version or quantity <= 0 or notional <= 0 or risk <= 0:
                 raise ValueError("rotation candidate requires stable identity and positive displayed ceilings")
             canonical_entries.append({
-                "proposal_id": str(candidate.get("proposal_id") or "") or None,
+                "proposal_id": proposal_id,
                 "candidate_key": candidate_key,
-                "strategy_version": str(candidate.get("strategy_version") or ""),
+                "strategy_version": strategy_version,
                 "symbol": str(candidate.get("symbol") or "").upper(),
                 "max_quantity": quantity,
                 "max_notional": notional,
                 "max_stop_risk": risk,
                 "payload": dict(candidate.get("payload") or {}),
             })
-        fingerprint = _fingerprint({
+        if canonical_entries[0]["proposal_id"] in set(exit_proposal_ids):
+            raise ValueError("rotation proposal cannot be linked as both exit and contingent entry")
+        exit_fingerprint = _fingerprint(exit_proposal_ids)
+        candidate_fingerprint = _fingerprint(canonical_entries[0]["candidate_key"])
+        displayed_fingerprint = _fingerprint({
+            "quantity": canonical_entries[0]["max_quantity"],
+            "notional": canonical_entries[0]["max_notional"],
+            "stop_risk": canonical_entries[0]["max_stop_risk"],
+        })
+        structure_fingerprint = _fingerprint({
+            "roles": ["rotation_exit" for _ in canonical_exits] + ["rotation_entry"],
+            "exit_count": len(canonical_exits),
+            "entry_count": 1,
+        })
+        workflow_identity = _fingerprint({
             "exits": canonical_exits,
             "entries": canonical_entries,
+            "position_lifecycle_id": lifecycle_id,
+            "exit_proposal_fingerprint": exit_fingerprint,
+            "contingent_candidate_fingerprint": candidate_fingerprint,
+            "displayed_approval_fingerprint": displayed_fingerprint,
+            "workflow_structure_fingerprint": structure_fingerprint,
             "registry_snapshot_id": registry_snapshot_id,
             "allocation_id": allocation_id,
             "formula": ROTATION_FORMULA_VERSION,
             "config_hash": self.config_hash,
         })
+        fingerprint = _fingerprint({
+            "workflow_identity": workflow_identity,
+            "run_id": run_id,
+            "expires_at": expiry.isoformat(),
+            "evaluation_time": evaluated_at.isoformat(),
+        })
         group_id = fingerprint[:32]
-        now = iso_now()
+        now = evaluated_at.isoformat()
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT * FROM rotation_groups WHERE decision_fingerprint=?", (fingerprint,)).fetchone()
-            if existing:
-                return dict(existing)
-            exit_symbols = sorted({row["symbol"] for row in canonical_exits})
-            if exit_symbols:
-                placeholders = ",".join("?" for _ in exit_symbols)
-                logical_existing = conn.execute(
-                    f"""SELECT DISTINCT g.* FROM rotation_groups g
-                        JOIN rotation_steps s ON s.group_id=g.id AND s.role='rotation_exit'
-                        WHERE s.symbol IN ({placeholders}) AND g.expires_at>?
-                          AND g.state NOT IN ({','.join('?' for _ in TERMINAL_STATES)})
-                        ORDER BY g.created_at LIMIT 1""",
-                    (*exit_symbols, now, *(state.value for state in TERMINAL_STATES)),
-                ).fetchone()
-                if logical_existing is not None:
-                    raise RuntimeError("an active logical rotation already owns this exit")
+            nonterminal = tuple(state.value for state in TERMINAL_STATES)
+            placeholders = ",".join("?" for _ in nonterminal)
+            existing = conn.execute(
+                f"""SELECT * FROM rotation_groups WHERE position_lifecycle_id=? AND expires_at>?
+                    AND state NOT IN ({placeholders}) ORDER BY created_at""",
+                (lifecycle_id, evaluated_at.isoformat(), *nonterminal),
+            ).fetchall()
+            for row in existing:
+                exact = (
+                    row["exit_proposal_fingerprint"] == exit_fingerprint
+                    and row["contingent_candidate_fingerprint"] == candidate_fingerprint
+                    and row["displayed_approval_fingerprint"] == displayed_fingerprint
+                    and row["workflow_structure_fingerprint"] == structure_fingerprint
+                )
+                if exact:
+                    return dict(row)
+                raise RuntimeError("a conflicting active rotation already owns this position lifecycle")
             conn.execute(
                 """INSERT INTO rotation_groups(
                      id,run_id,state,expires_at,estimated_release_notional,registry_snapshot_id,allocation_id,
-                     schema_version,formula_version,config_hash,decision_fingerprint,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     schema_version,formula_version,config_hash,decision_fingerprint,created_at,updated_at,
+                     position_lifecycle_id,exit_proposal_fingerprint,contingent_candidate_fingerprint,
+                     displayed_approval_fingerprint,workflow_structure_fingerprint)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (group_id, run_id, RotationState.PENDING_GROUP_APPROVAL.value, expiry.isoformat(),
                  sum(row["estimated_notional"] for row in canonical_exits), registry_snapshot_id, allocation_id,
-                 ROTATION_SCHEMA_VERSION, ROTATION_FORMULA_VERSION, self.config_hash, fingerprint, now, now),
+                 ROTATION_SCHEMA_VERSION, ROTATION_FORMULA_VERSION, self.config_hash, fingerprint, now, now,
+                 lifecycle_id, exit_fingerprint, candidate_fingerprint, displayed_fingerprint,
+                 structure_fingerprint),
             )
             for sequence, leg in enumerate(canonical_exits):
                 conn.execute(

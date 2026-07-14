@@ -404,7 +404,7 @@ def test_rule_only_warning_in_formatter(mock_config):
     msg = format_proposal_message(proposal, mock_config)
     assert "Rule-based only. AI review was not available. Treat with extra caution." in msg
 
-def test_proposal_conflict_supersedes_others(temp_storage, mock_config):
+def test_unrelated_buy_submission_does_not_supersede_others(temp_storage, mock_config):
     bot = MockTelegramBot()
     broker = MockBroker()
     service = TradingService(mock_config, temp_storage, broker, "run_id")
@@ -467,9 +467,8 @@ def test_proposal_conflict_supersedes_others(temp_storage, mock_config):
     spy_status = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id='prop-spy'")[0]["status"]
     assert spy_status == "submitted"
 
-    # Verify DIA is superseded
+    # Verify unrelated DIA remains independently approvable.
     dia_status = temp_storage.fetch_all("SELECT status FROM trade_proposals WHERE id='prop-dia'")[0]["status"]
-    assert dia_status == "superseded"
+    assert dia_status == "pending"
 
-    # Verify single notification is sent
-    assert any("Other pending BUY proposals were cancelled" in m for m in bot.messages)
+    assert not any("Other pending BUY proposals were cancelled" in m for m in bot.messages)

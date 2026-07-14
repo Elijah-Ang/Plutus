@@ -809,6 +809,9 @@ class WinnerExpansionStore:
         run_id: str | None,
         config_hash: str | None = None,
     ) -> str:
+        from .trend_management import validate_trend_decision_invariants
+
+        validate_trend_decision_invariants(decision)
         identifier = str(uuid.uuid4())
         self.storage.execute(
             """INSERT OR IGNORE INTO trend_management_decisions(

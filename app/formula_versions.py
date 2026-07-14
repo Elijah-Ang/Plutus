@@ -4,14 +4,14 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v8_phase43_operational_paper"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v9_audit_hardened_paper"
 STOP_POLICY_VERSION = "monotonic_trend_protective_stop_v3"
 SIZING_POLICY_VERSION = "adaptive_strategy_sleeve_winner_v5_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_position_risk_rotation_sleeve_v5"
 PHASE3_DECISION_VERSION = "phase3_registry_sleeves_v5_operational_paper"
-PHASE4_ALLOCATION_VERSION = "phase4_multi_strategy_allocation_v6_operational_paper"
-PHASE4_ALLOCATOR_VERSION = "multi_strategy_paper_allocator_v5"
-PHASE4_SCHEMA_VERSION = "phase4_multi_strategy_operational_paper_v4"
+PHASE4_ALLOCATION_VERSION = "phase4_multi_strategy_allocation_v7_stop_risk_dollars"
+PHASE4_ALLOCATOR_VERSION = "multi_strategy_paper_allocator_v6_explicit_units"
+PHASE4_SCHEMA_VERSION = "phase4_multi_strategy_operational_paper_v5_units"
 ACCOUNTING_VERSION = "fifo_equity_unrealized_cashflow_v1"
 EVIDENCE_VERSION = "phase1_outcome_v2_exit_session"
 STRATEGY_PERFORMANCE_VERSION = "strategy_performance_v2_2_probe"
@@ -26,11 +26,12 @@ ADAPTIVE_SIZING_SCHEMA_VERSION = "adaptive_sizing_operational_decisions_v2"
 STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION = "strategy_execution_registry_formula_v1"
 STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION = "strategy_execution_registry_v1"
 POSITION_RISK_FORMULA_VERSION = "position_open_risk_v1_operational_paper"
-TREND_MANAGEMENT_FORMULA_VERSION = "trend_management_v1_operational_paper"
+TREND_MANAGEMENT_FORMULA_VERSION = "trend_management_v2_final_mode_invariants"
 WINNER_EXPANSION_FORMULA_VERSION = "winner_expansion_v1_operational_paper"
 WINNER_EXPANSION_SCHEMA_VERSION = "phase4_2c_winner_expansion_v1"
-ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v1"
-ROTATION_SCHEMA_VERSION = "exit_first_rotation_v1"
+ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v2_lifecycle_bound"
+ROTATION_SCHEMA_VERSION = "exit_first_rotation_v2_lifecycle_bound"
+PLUTUS_AUDIT_SCHEMA_VERSION = "plutus_audit_hardening_v1"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -50,5 +51,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
         WINNER_EXPANSION_SCHEMA_VERSION,
         ROTATION_SCHEMA_VERSION,
+        PLUTUS_AUDIT_SCHEMA_VERSION,
     }
 )

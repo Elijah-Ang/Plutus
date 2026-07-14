@@ -236,6 +236,8 @@ def test_phase4_emits_distinct_probe_policy(monkeypatch, tmp_path):
     policy = engine.latest_valid_policy("rule_based_v2")
     result = AdaptiveAllocator(storage, load_config(), "probe-allocation").run(
         regime="normal", drawdown_pct=0.0, strategy_policy_map={"rule_based_v2": policy},
+        as_of="2026-07-14T08:00:00+00:00",
+        portfolio_snapshot={"portfolio_equity": 100.0, "as_of": "2026-07-14T08:00:00+00:00", "equity_as_of": "2026-07-14T08:00:00+00:00"},
     )
     assert result["decision"] == "ALLOCATE_PROBE"
     assert result["allocation_class"] == "probe"

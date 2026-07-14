@@ -307,7 +307,7 @@ def test_final_revalidation_blocks_profit_exit_if_position_gone(tmp_path):
     assert service._final_revalidate_position_management(proposal, 100.0) == "position no longer exists"
 
 
-def test_take_profit_handled_marks_level_state(tmp_path):
+def test_take_profit_proposal_status_does_not_mark_level_state(tmp_path):
     storage = Storage(tmp_path / "pm_handled.db")
     storage.initialize()
     service = TradingService(config(), storage, Broker([]), "run")
@@ -328,7 +328,7 @@ def test_take_profit_handled_marks_level_state(tmp_path):
     service._mark_position_management_proposal_handled(row, "rejected")
 
     state = storage.fetch_all("SELECT take_profit_level_1_hit FROM position_management_state WHERE symbol='SPY'")[0]
-    assert state["take_profit_level_1_hit"] == 1
+    assert state["take_profit_level_1_hit"] == 0
 
 
 def test_position_management_proposal_wording():

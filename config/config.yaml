@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v8_phase43_operational_paper
+configuration_schema_version: plutus_effective_config_v9_audit_hardened_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -50,7 +50,7 @@ phase4:
   enabled: true
   active: true
   mode: ACTIVE_ADAPTIVE_PAPER
-  allocator_version: multi_strategy_paper_allocator_v5
+  allocator_version: multi_strategy_paper_allocator_v6_explicit_units
   fractional_kelly: 0.20
   operational_kelly_enabled: false
   operational_allocation_mode: bounded_evidence_aware
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v8_phase43_operational_paper
+  required_configuration_version: plutus_effective_config_v9_audit_hardened_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_2_probe
   required_policy_version: strategy_policy_v2_2_probe
@@ -228,7 +228,7 @@ winner_expansion:
 trend_management:
   enabled: true
   mode: operational_paper
-  formula_version: trend_management_v1_operational_paper
+  formula_version: trend_management_v2_final_mode_invariants
   require_manual_approval_for_sells: true
   stop_never_moves_down: true
   mode_policies:
@@ -242,8 +242,8 @@ trend_management:
 rotation:
   enabled: true
   mode: operational_paper_exit_first
-  schema_version: exit_first_rotation_v1
-  formula_version: actual_fill_reconciled_capacity_v1
+  schema_version: exit_first_rotation_v2_lifecycle_bound
+  formula_version: actual_fill_reconciled_capacity_v2_lifecycle_bound
   require_explicit_group_approval: true
   approval_command_prefix: APPROVE ROTATION
   group_expiry_minutes: 15

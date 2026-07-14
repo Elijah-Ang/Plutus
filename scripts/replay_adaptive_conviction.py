@@ -123,7 +123,9 @@ def _research_records(conn: sqlite3.Connection, limit: int) -> list[dict[str, An
     return records
 
 
-def replay_database(database: str | Path, *, limit: int = 1000) -> dict[str, Any]:
+def replay_database(database: str | Path, *, as_of: str, limit: int = 1000) -> dict[str, Any]:
+    if not as_of:
+        raise ValueError("replay requires explicit as_of")
     uri = f"file:{Path(database).resolve()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
@@ -131,7 +133,7 @@ def replay_database(database: str | Path, *, limit: int = 1000) -> dict[str, Any
         before = _counts(conn)
         proposal_records = _proposal_records(conn, limit)
         research_records = _research_records(conn, limit)
-        records = [*proposal_records, *research_records]
+        records = [{**record, "evaluation_time": as_of} for record in [*proposal_records, *research_records]]
         result = AdaptiveConvictionEngine(load_config()).replay(records)
         after = _counts(conn)
         if before != after:
@@ -147,10 +149,11 @@ def replay_database(database: str | Path, *, limit: int = 1000) -> dict[str, Any
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
+    parser.add_argument("--as-of", required=True, help="ISO-8601 replay evaluation timestamp")
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--output")
     args = parser.parse_args()
-    result = replay_database(args.database, limit=args.limit)
+    result = replay_database(args.database, as_of=args.as_of, limit=args.limit)
     rendered = json.dumps(result, indent=2, sort_keys=True)
     if args.output:
         Path(args.output).write_text(rendered + "\n", encoding="utf-8")

@@ -127,6 +127,11 @@ RUNTIME_SAFETY_SCHEMA_VERSION = "runtime_safety_accounting_v1"
 
 
 RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "approvals": {
+        "proposal_reference_price": "REAL", "refreshed_bid": "REAL", "refreshed_ask": "REAL",
+        "directional_price_move_bps": "REAL", "movement_classification": "TEXT",
+        "final_limit_price": "REAL", "directional_validation_reason": "TEXT",
+    },
     "risk_checks": {
         "formula_version": "TEXT", "evidence_version": "TEXT", "config_hash": "TEXT",
     },
@@ -165,6 +170,8 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "strategy_version": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
         "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
         "incremental_risk": "REAL",
+        "risk_value": "REAL", "risk_unit": "TEXT", "conversion_equity": "REAL",
+        "conversion_equity_as_of": "TEXT", "risk_formula_version": "TEXT",
     },
     "position_management_state": {
         "authoritative_protective_stop": "REAL", "protective_stop_as_of": "TEXT",
@@ -172,6 +179,9 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "protective_stop_sequence": "INTEGER", "management_mode": "TEXT",
         "trend_management_formula_version": "TEXT", "peak_r_multiple": "REAL",
         "last_completed_pyramiding_milestone": "TEXT",
+        "entry_fill_id": "TEXT", "entry_order_intent_id": "TEXT",
+        "initial_risk_reconstruction_source": "TEXT",
+        "initial_risk_formula_version": "TEXT", "initial_risk_evidence_version": "TEXT",
     },
     "strategy_policy_decisions": {
         "evidence_version": "TEXT", "configuration_version": "TEXT", "config_hash": "TEXT",
@@ -271,6 +281,7 @@ class Storage:
             from .strategy_execution_registry import apply_strategy_registry_schema
             from .winner_expansion import apply_winner_expansion_schema
             from .rotation_coordinator import apply_rotation_schema
+            from .profit_milestones import apply_profit_milestone_schema
             apply_p1_execution_schema(conn)
 
             apply_phase1_schema(conn)
@@ -282,6 +293,7 @@ class Storage:
             apply_strategy_registry_schema(conn)
             apply_winner_expansion_schema(conn)
             apply_rotation_schema(conn)
+            apply_profit_milestone_schema(conn)
             from .strategy_performance import apply_strategy_performance_schema
             apply_strategy_performance_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
@@ -341,6 +353,8 @@ class Storage:
                 apply_winner_expansion_schema(conn, record_migration=False)
                 from .rotation_coordinator import apply_rotation_schema
                 apply_rotation_schema(conn, record_migration=False)
+                from .profit_milestones import apply_profit_milestone_schema
+                apply_profit_milestone_schema(conn, record_migration=False)
                 apply_p1_execution_schema(conn, record_migration=False)
                 from .strategy_performance import apply_strategy_performance_schema
                 apply_strategy_performance_schema(conn, record_migration=False)

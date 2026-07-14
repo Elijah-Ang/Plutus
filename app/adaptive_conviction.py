@@ -11,6 +11,7 @@ import json
 import math
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from .formula_versions import (
@@ -369,6 +370,13 @@ class AdaptiveConvictionEngine:
         raw = dict(inputs)
         if str(raw.get("action") or "entry").lower() not in {"entry", "add"} or str(raw.get("side") or "buy").lower() != "buy":
             return None
+        evaluation_time = str(raw.get("evaluation_time") or "")
+        if not evaluation_time:
+            raise ValueError("adaptive conviction requires explicit evaluation_time")
+        try:
+            datetime.fromisoformat(evaluation_time.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("adaptive conviction evaluation_time is invalid") from exc
         derived = self._derived(raw)
         opportunity_class, class_reasons = self._opportunity_class(derived)
         deployment_mode, mode_reasons = self._mode(opportunity_class, derived)
@@ -436,7 +444,7 @@ class AdaptiveConvictionEngine:
         }
         fingerprint = _fingerprint(fingerprint_payload)
         return AdaptiveConvictionDecision(
-            id=fingerprint[:32], created_at=iso_now(), run_id=raw.get("run_id"), proposal_id=raw.get("proposal_id"),
+            id=fingerprint[:32], created_at=evaluation_time, run_id=raw.get("run_id"), proposal_id=raw.get("proposal_id"),
             candidate_id=raw.get("candidate_id"), setup_id=raw.get("setup_id"),
             decision_stage=str(raw.get("decision_stage") or "proposal"), approval_id=raw.get("approval_id"),
             strategy_version=str(raw.get("strategy_version") or ""),

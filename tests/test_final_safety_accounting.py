@@ -219,7 +219,9 @@ def test_phase4_audit_records_truthful_operational_fields(tmp_path):
     config = load_config()
     result = AdaptiveAllocator(storage, config, "phase4-audit").run(
         regime="normal", drawdown_pct=0.0,
+        as_of="2026-07-14T08:00:00+00:00",
         portfolio_snapshot={
+            "portfolio_equity": 100_000.0, "as_of": "2026-07-14T08:00:00+00:00", "equity_as_of": "2026-07-14T08:00:00+00:00",
             "heat_before_pct": 0.20, "gross_exposure_before_pct": 3.0,
             "symbol_exposure_before": {"SPY": 1.0}, "cluster_exposure_before": {"us_broad_market": 1.5},
             "pending_risk": 12.0, "reserved_risk": 4.0,

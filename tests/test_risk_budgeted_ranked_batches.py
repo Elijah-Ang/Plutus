@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.service import TradingService
 from app.storage import Storage
 from app.risk_engine import RiskEngine
@@ -446,6 +448,40 @@ def test_batch_exit_approval_allowed_during_sleep_mode(tmp_path):
     assert service.broker.submitted and service.broker.submitted[0]["side"] == "sell"
     assert storage.fetch_all("SELECT status FROM trade_proposals WHERE id='p1'")[0]["status"] == "submitted"
     assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE proposal_id='p1'")[0]["candidate_status"] == "submitted"
+
+
+def test_adverse_downward_move_does_not_block_risk_reducing_sell(tmp_path):
+    service, storage = make_service(tmp_path)
+    service.config["telegram"].update({
+        "approval_price_refresh_required": True,
+        "approval_max_price_age_seconds": 120,
+        "approval_max_price_move_bps": 25,
+        "approval_max_price_move_hard_cap_bps": 75,
+    })
+    service.broker.get_positions = lambda: [
+        {"symbol": "SPY", "qty": 0.05, "avg_entry_price": 100.0, "market_value": 4.5}
+    ]
+    service.broker.get_latest_price = lambda symbol: {
+        "price": 90.0, "timestamp": datetime.now(UTC)
+    }
+    service.broker.get_latest_quote = lambda symbol: {
+        "bid_price": 89.99, "ask_price": 90.01, "timestamp": datetime.now(UTC)
+    }
+    insert_batch(storage, [("p1", "SPY", "sell", "exit")])
+
+    handled = service._handle_batch_approval_command("yes SPY", "7777", "yes", "spy", "4242")
+
+    assert handled is True
+    assert service.broker.submitted and service.broker.submitted[0]["side"] == "sell"
+    approval = storage.fetch_all(
+        "SELECT movement_classification,directional_price_move_bps,refreshed_bid,refreshed_ask,final_limit_price,final_order_decision FROM approvals"
+    )[0]
+    assert approval["movement_classification"] == "adverse_downward_exit_urgent"
+    assert approval["directional_price_move_bps"] < -900
+    assert approval["refreshed_bid"] == pytest.approx(89.99)
+    assert approval["refreshed_ask"] == pytest.approx(90.01)
+    assert approval["final_limit_price"] is not None
+    assert approval["final_order_decision"] == "submitted"
 
 
 def test_bad_symbol_gets_batch_aware_fallback_message(tmp_path):

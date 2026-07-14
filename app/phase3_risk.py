@@ -167,7 +167,7 @@ class Phase3Controller:
         # pre-Build-2 fixtures; the release configuration always takes the
         # fail-closed branch below.
         build2 = "profitability_engine" in self.config
-        engine = StrategyPerformanceEngine(self.storage, self.config)
+        engine = StrategyPerformanceEngine(self.storage, self.config, as_of=now)
         registry_entries = (self.config.get("strategy_execution_registry", {}) or {}).get("entries", {})
         if isinstance(registry_entries, Mapping) and registry_entries:
             versions = [

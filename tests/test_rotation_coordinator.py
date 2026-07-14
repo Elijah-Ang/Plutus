@@ -24,32 +24,45 @@ def coordinator(tmp_path):
     storage.initialize()
     with storage.connect() as conn:
         apply_rotation_schema(conn)
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        """INSERT INTO position_lifecycles(
+             id,symbol,side,state,opened_at,opening_quantity,current_quantity,average_entry_price,
+             source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        ("lifecycle-old", "OLD", "long", "active", now, 10.0, 10.0, 100.0, "test", now, now),
+    )
     return storage, RotationCoordinator(storage, config_hash="config-hash")
 
 
 def _create(coordinator, *, entries=None, exits=None, minutes=30):
     _storage, manager = coordinator
+    evaluated_at = datetime.now(UTC)
+    exit_rows = exits or [{
+        "proposal_id": "exit-proposal",
+        "symbol": "OLD",
+        "side": "sell",
+        "quantity": 10,
+        "estimated_notional": 1000,
+        "reason": "current exit required",
+    }]
+    exit_rows = [{**row, "position_lifecycle_id": row.get("position_lifecycle_id", "lifecycle-old")} for row in exit_rows]
+    entry_rows = entries or [{
+        "candidate_key": "rule_based_v2:NEW:entry:setup-1",
+        "strategy_version": "rule_based_v2",
+        "symbol": "NEW",
+        "side": "buy",
+        "max_quantity": 5,
+        "max_notional": 500,
+        "max_stop_risk": 25,
+        "payload": {"shown_to_operator": True},
+    }]
+    entry_rows = [{**row, "proposal_id": row.get("proposal_id", "entry-proposal")} for row in entry_rows]
     return manager.create_group(
         run_id="run-1",
-        exit_legs=exits or [{
-            "proposal_id": "exit-proposal",
-            "symbol": "OLD",
-            "side": "sell",
-            "quantity": 10,
-            "estimated_notional": 1000,
-            "reason": "current exit required",
-        }],
-        contingent_entries=entries or [{
-            "candidate_key": "rule_based_v2:NEW:entry:setup-1",
-            "strategy_version": "rule_based_v2",
-            "symbol": "NEW",
-            "side": "buy",
-            "max_quantity": 5,
-            "max_notional": 500,
-            "max_stop_risk": 25,
-            "payload": {"shown_to_operator": True},
-        }],
-        expires_at=datetime.now(UTC) + timedelta(minutes=minutes),
+        exit_legs=exit_rows,
+        contingent_entries=entry_rows,
+        expires_at=evaluated_at + timedelta(minutes=minutes),
+        evaluation_time=evaluated_at,
         registry_snapshot_id="registry-before",
         allocation_id="allocation-before",
     )
@@ -188,7 +201,7 @@ def test_partial_fill_recovery_can_link_every_approved_exit_leg(coordinator):
     _storage, manager = coordinator
     group = _create(coordinator, exits=[
         {"proposal_id": "exit-a", "symbol": "OLD", "side": "sell", "quantity": 5, "estimated_notional": 500},
-        {"proposal_id": "exit-b", "symbol": "OLDER", "side": "sell", "quantity": 5, "estimated_notional": 500},
+            {"proposal_id": "exit-b", "symbol": "OLD", "side": "sell", "quantity": 5, "estimated_notional": 500},
     ])
     manager.approve(group["id"], approval_id="approval", sender_id="owner", command="APPROVE ROTATION")
     first, second = manager.steps(group["id"])
@@ -427,6 +440,8 @@ def test_final_execution_boundary_rechecks_rotation_expiry(coordinator):
                 "bid_price": 100.0, "ask_price": 100.01, "timestamp": datetime.now(UTC),
             })()
         def is_market_open(self): return True
+        def get_positions(self): return [{"symbol": "OLD", "qty": 10.0}]
+        def get_open_orders(self): return []
 
     service = TradingService.__new__(TradingService)
     service.storage = storage
@@ -534,6 +549,7 @@ def test_invalid_rotation_inputs_fail_closed(coordinator):
         manager.create_group(
             run_id="run", exit_legs=[], contingent_entries=[],
             expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            evaluation_time=datetime.now(UTC),
         )
     with pytest.raises(ValueError):
         manager.create_group(
@@ -542,4 +558,5 @@ def test_invalid_rotation_inputs_fail_closed(coordinator):
             contingent_entries=[{"candidate_key": "c", "strategy_version": "s", "symbol": "N",
                                  "max_quantity": 1, "max_notional": 1, "max_stop_risk": 1}],
             expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            evaluation_time=datetime.now(UTC),
         )

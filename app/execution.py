@@ -528,8 +528,9 @@ class DurableExecutionStore:
                 """INSERT INTO risk_reservations(
                        id,intent_id,symbol,cluster_name,initial_notional,active_notional,initial_stop_risk,
                        active_stop_risk,state,created_at,updated_at,strategy_version,strategy_sleeve,
-                       sleeve_allocation_id,sleeve_notional_ceiling,sleeve_stop_risk_ceiling,incremental_risk)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       sleeve_allocation_id,sleeve_notional_ceiling,sleeve_stop_risk_ceiling,incremental_risk,
+                       risk_value,risk_unit,conversion_equity,conversion_equity_as_of,risk_formula_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     reservation_id,
                     intent_id,
@@ -548,6 +549,11 @@ class DurableExecutionStore:
                     proposal.get("sleeve_notional_ceiling"),
                     proposal.get("sleeve_stop_risk_ceiling"),
                     incremental_risk,
+                    reserved_stop_risk,
+                    "stop_risk_dollars",
+                    proposal.get("conversion_equity"),
+                    proposal.get("conversion_equity_as_of") or now,
+                    proposal.get("risk_formula_version") or "risk_unit_to_stop_risk_dollars_v1",
                 ),
             )
             conn.execute(
@@ -590,6 +596,17 @@ class DurableExecutionStore:
                     now,
                     now,
                 ),
+            )
+            from .profit_milestones import bind_take_profit_intent_in_transaction
+
+            bound_intent = dict(
+                conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
+            )
+            bind_take_profit_intent_in_transaction(
+                conn,
+                intent=bound_intent,
+                proposal=proposal,
+                now=now,
             )
             if approval_id:
                 changed = conn.execute(
@@ -680,6 +697,14 @@ class DurableExecutionStore:
                        WHERE intent_id=? AND state='active'""",
                     (now, destination.value, now, intent_id),
                 )
+                from .profit_milestones import apply_take_profit_terminal_state_in_transaction
+
+                apply_take_profit_terminal_state_in_transaction(
+                    conn,
+                    order_intent_id=intent_id,
+                    terminal_state=destination.value,
+                    now=now,
+                )
         return self.get_intent(intent_id)
 
     def record_fill(
@@ -752,10 +777,11 @@ class DurableExecutionStore:
             if current != target:
                 validate_transition(current, target)
             counter = int(intent["transition_counter"] or 0) + 1
+            fill_event_id = str(uuid.uuid4())
             conn.execute(
                 """INSERT INTO broker_fill_events(id,intent_id,broker_event_key,broker_order_id,cumulative_filled_quantity,
                        delta_quantity,fill_price,occurred_at,received_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative, delta, delta_fill_price, occurred_at or now, now, json_dumps({"aggregate": True, "reported_price": fill_price, "price_semantics": "cumulative_average" if price_is_cumulative_average else "delta_execution"})),
+                (fill_event_id, intent_id, broker_event_key, broker_order_id, cumulative, delta, delta_fill_price, occurred_at or now, now, json_dumps({"aggregate": True, "reported_price": fill_price, "price_semantics": "cumulative_average" if price_is_cumulative_average else "delta_execution"})),
             )
             # Lot/P&L accounting shares the fill transaction: a crash cannot
             # commit quantity while omitting its prospective accounting event.
@@ -771,6 +797,19 @@ class DurableExecutionStore:
                 fees=fees,
                 adjustments=adjustments,
                 source=source,
+            )
+            from .profit_milestones import apply_take_profit_fill_in_transaction
+
+            apply_take_profit_fill_in_transaction(
+                conn,
+                intent=dict(intent),
+                fill_event_id=fill_event_id,
+                broker_event_key=broker_event_key,
+                cumulative_quantity=cumulative,
+                delta_quantity=delta,
+                fill_price=delta_fill_price,
+                occurred_at=occurred_at or now,
+                now=now,
             )
             conn.execute(
                 """UPDATE order_intents SET filled_quantity=?,average_fill_price=?,state=?,broker_order_id=COALESCE(?,broker_order_id),

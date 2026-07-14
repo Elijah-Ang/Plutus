@@ -13,6 +13,7 @@ import math
 import statistics
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from .formula_versions import (
@@ -245,6 +246,13 @@ class AdaptiveSizingEngine:
         action = str(raw.get("action") or "").lower()
         if str(raw.get("side") or "").lower() != "buy" or action not in {"entry", "add"}:
             return None
+        evaluation_time = str(raw.get("evaluation_time") or "")
+        if not evaluation_time:
+            raise ValueError("adaptive sizing requires explicit evaluation_time")
+        try:
+            datetime.fromisoformat(evaluation_time.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("adaptive sizing evaluation_time is invalid") from exc
         stage = str(raw.get("stage") or "")
         if stage not in {"proposal", "final_revalidation"}:
             raise ValueError("adaptive sizing stage must be proposal or final_revalidation")
@@ -434,7 +442,7 @@ class AdaptiveSizingEngine:
         final_operational = constrained if stage == "proposal" else future_activation
         final_quantity = final_operational / entry_price if entry_price > 0 else 0.0
         return AdaptiveSizingDecision(
-            id=fingerprint[:32], stage=stage, created_at=iso_now(), run_id=raw.get("run_id"),
+            id=fingerprint[:32], stage=stage, created_at=evaluation_time, run_id=raw.get("run_id"),
             proposal_id=raw.get("proposal_id"), candidate_id=raw.get("candidate_id"), setup_id=raw.get("setup_id"),
             approval_id=raw.get("approval_id"), strategy_version=str(raw.get("strategy_version") or ""),
             policy_id=raw.get("policy_id"), adaptive_conviction_decision_id=conviction.get("decision_id"), action=action,

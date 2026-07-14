@@ -20,6 +20,7 @@ def _engine() -> AdaptiveConvictionEngine:
 def _inputs(**overrides):
     values = {
         "run_id": "run-1", "proposal_id": "proposal-1", "candidate_id": "candidate-1", "setup_id": "setup-1",
+        "evaluation_time": "2026-07-14T08:00:00+00:00",
         "strategy_version": "rule_based_v2", "policy_decision_id": "policy-1", "performance_snapshot_id": "snapshot-1",
         "action": "entry", "side": "buy", "strategy_authorized": True, "strategy_policy_state": "ACTIVE",
         "strategy_stop_risk_cap_pct": 0.35,
@@ -154,7 +155,7 @@ def test_read_only_database_replay_does_not_mutate_trading_state(tmp_path):
            strategy_state,permitted_stop_risk_pct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         ("p1", "r1", "s1", "SPY", "buy", 100.0, "pending", "2026-07-14T00:00:00+00:00", "2026-07-14T00:15:00+00:00", "rule_based_v2", json.dumps(payload), "PROBE", 0.03),
     )
-    result = replay_database(storage.path)
+    result = replay_database(storage.path, as_of="2026-07-14T08:00:00+00:00")
     assert result["source_records"]["production_paper_proposals"] == 1
     assert result["trading_state_counts_before"] == result["trading_state_counts_after"]
     assert result["trading_state_mutations"] == 0

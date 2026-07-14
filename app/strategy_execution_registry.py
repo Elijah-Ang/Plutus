@@ -295,7 +295,9 @@ class StrategyExecutionRegistry:
         *,
         as_of: datetime | str | None = None,
     ) -> StrategyRegistryEvaluation:
-        evaluated_at = _aware_datetime(as_of if as_of is not None else datetime.now(UTC))
+        if as_of is None:
+            raise ValueError("strategy registry evaluation requires explicit as_of")
+        evaluated_at = _aware_datetime(as_of)
         global_reasons = self._global_reasons(evaluated_at)
         as_of_text = _iso(evaluated_at) if evaluated_at is not None else str(as_of or "invalid")
         normalized_policies = {

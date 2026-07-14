@@ -27,6 +27,53 @@ COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
 # StrategyExecutionRegistry.  The alias remains because Phase 2/legacy reports
 # and tests import it as the complete research universe.
 STRATEGIES = (STRATEGY_VERSION, *tuple(sorted(STRATEGY_VERSIONS.values())))
+SUPPORTED_RISK_UNITS = frozenset({"stop_risk_dollars", "pct_equity"})
+RISK_CONVERSION_FORMULA_VERSION = "risk_unit_to_stop_risk_dollars_v1"
+
+
+def normalize_risk_to_dollars(
+    risk_value: Any,
+    risk_unit: str,
+    *,
+    conversion_equity: Any,
+    conversion_equity_as_of: str,
+    evaluation_time: str,
+    allow_zero: bool = False,
+    max_equity_age_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Validate a dimensional risk amount and return canonical stop-risk dollars."""
+    try:
+        value = float(risk_value)
+        equity = float(conversion_equity)
+        evaluated = datetime.fromisoformat(str(evaluation_time).replace("Z", "+00:00"))
+        equity_at = datetime.fromisoformat(str(conversion_equity_as_of).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("risk conversion requires finite value, equity, and timestamps") from exc
+    evaluated = evaluated.replace(tzinfo=UTC) if evaluated.tzinfo is None else evaluated.astimezone(UTC)
+    equity_at = equity_at.replace(tzinfo=UTC) if equity_at.tzinfo is None else equity_at.astimezone(UTC)
+    unit = str(risk_unit or "")
+    if unit not in SUPPORTED_RISK_UNITS:
+        raise ValueError("risk unit is missing or unsupported")
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        raise ValueError("risk value must be finite and positive")
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("authoritative conversion equity is missing or invalid")
+    age = (evaluated - equity_at).total_seconds()
+    if age < -5.0 or age > max_equity_age_seconds:
+        raise ValueError("authoritative conversion equity is stale")
+    dollars = value if unit == "stop_risk_dollars" else equity * value / 100.0
+    if not math.isfinite(dollars) or dollars < 0 or (dollars == 0 and not allow_zero):
+        raise ValueError("canonical stop-risk dollars are invalid")
+    return {
+        "risk_value": dollars,
+        "risk_unit": "stop_risk_dollars",
+        "source_risk_value": value,
+        "source_risk_unit": unit,
+        "conversion_equity": equity,
+        "conversion_equity_as_of": equity_at.isoformat(),
+        "evaluation_time": evaluated.isoformat(),
+        "formula_version": RISK_CONVERSION_FORMULA_VERSION,
+    }
 
 
 def operational_risk_budget_multiplier(allocation_weight: float, max_strategy_weight: float) -> float:
@@ -128,6 +175,10 @@ def allocate_candidates_to_sleeves(
     sleeves: Mapping[str, Mapping[str, Any]],
     *,
     global_available_risk: float | None = None,
+    global_risk_unit: str,
+    conversion_equity: float,
+    conversion_equity_as_of: str,
+    evaluation_time: str,
     precision: int = 8,
 ) -> dict[str, Any]:
     """Allocate ranked entry/add candidates inside pre-authorized sleeves.
@@ -137,21 +188,37 @@ def allocate_candidates_to_sleeves(
     strategy's remaining sleeve and the global remaining budget.  It returns
     exact replay inputs rather than an order quantity or execution decision.
     """
-    normalized_sleeves = {
-        str(strategy): {
-            **dict(sleeve),
-            "remaining_risk": round(
-                _finite_nonnegative(sleeve.get("remaining_risk"), 0.0) or 0.0,
-                precision,
-            ),
+    normalized_sleeves: dict[str, dict[str, Any]] = {}
+    for strategy, raw_sleeve in sorted(sleeves.items(), key=lambda item: str(item[0])):
+        sleeve = dict(raw_sleeve)
+        unit = str(sleeve.get("risk_unit") or "")
+        normalized = normalize_risk_to_dollars(
+            sleeve.get("remaining_risk"), unit,
+            conversion_equity=conversion_equity,
+            conversion_equity_as_of=conversion_equity_as_of,
+            evaluation_time=evaluation_time,
+            allow_zero=True,
+        )
+        normalized_sleeves[str(strategy)] = {
+            **sleeve,
+            **normalized,
+            "remaining_risk": round(float(normalized["risk_value"]), precision),
+            "risk_value": round(float(normalized["risk_value"]), precision),
+            "risk_unit": "stop_risk_dollars",
         }
-        for strategy, sleeve in sorted(sleeves.items(), key=lambda item: str(item[0]))
-    }
     sleeve_capacity = round(
         sum(float(sleeve["remaining_risk"]) for sleeve in normalized_sleeves.values()),
         precision,
     )
-    requested_global = _finite_nonnegative(global_available_risk, sleeve_capacity)
+    global_source = sleeve_capacity if global_available_risk is None else global_available_risk
+    global_normalized = normalize_risk_to_dollars(
+        global_source, global_risk_unit,
+        conversion_equity=conversion_equity,
+        conversion_equity_as_of=conversion_equity_as_of,
+        evaluation_time=evaluation_time,
+        allow_zero=True,
+    )
+    requested_global = float(global_normalized["risk_value"])
     global_remaining = round(min(sleeve_capacity, requested_global or 0.0), precision)
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, float]]] = []
@@ -178,6 +245,8 @@ def allocate_candidates_to_sleeves(
             "action": str(candidate.get("action") or "exit").lower(),
             "decision": "EXIT_BYPASS",
             "requested_risk": 0.0,
+            "risk_value": 0.0,
+            "risk_unit": "stop_risk_dollars",
             "allocated_risk": 0.0,
             "ranking_score": None,
             "reason": "exits do not compete for entry risk sleeves",
@@ -186,19 +255,18 @@ def allocate_candidates_to_sleeves(
     allocated_by_strategy = {strategy: 0.0 for strategy in normalized_sleeves}
     for _negative_score, identity, candidate, rank in ranked:
         strategy = str(candidate.get("strategy_version") or "")
-        requested = next(
-            (
-                _finite_nonnegative(candidate.get(name))
-                for name in (
-                    "requested_stop_risk",
-                    "requested_risk",
-                    "stop_risk_dollars",
-                    "stop_risk_pct",
-                )
-                if _finite_nonnegative(candidate.get(name)) is not None
-            ),
-            None,
-        )
+        requested = None
+        requested_conversion: dict[str, Any] | None = None
+        try:
+            requested_conversion = normalize_risk_to_dollars(
+                candidate.get("risk_value"), str(candidate.get("risk_unit") or ""),
+                conversion_equity=conversion_equity,
+                conversion_equity_as_of=conversion_equity_as_of,
+                evaluation_time=evaluation_time,
+            )
+            requested = float(requested_conversion["risk_value"])
+        except ValueError:
+            requested = None
         sleeve = normalized_sleeves.get(strategy)
         reason = "allocated within strategy sleeve and global risk budget"
         allocated = 0.0
@@ -216,7 +284,18 @@ def allocate_candidates_to_sleeves(
                 min(float(requested), float(sleeve["remaining_risk"]), global_remaining),
                 precision,
             )
-            minimum = _finite_nonnegative(candidate.get("minimum_stop_risk"), 0.0) or 0.0
+            minimum = 0.0
+            if candidate.get("minimum_risk_value") is not None or candidate.get("minimum_risk_unit") is not None:
+                try:
+                    minimum = float(normalize_risk_to_dollars(
+                        candidate.get("minimum_risk_value"), str(candidate.get("minimum_risk_unit") or ""),
+                        conversion_equity=conversion_equity,
+                        conversion_equity_as_of=conversion_equity_as_of,
+                        evaluation_time=evaluation_time,
+                    )["risk_value"])
+                except ValueError:
+                    allocated = 0.0
+                    reason = "candidate minimum risk unit or value is invalid"
             if allocated + 10 ** (-(precision + 1)) < minimum:
                 allocated = 0.0
                 reason = "remaining capacity is below the candidate minimum stop risk"
@@ -235,6 +314,9 @@ def allocate_candidates_to_sleeves(
             "decision": decision,
             "requested_risk": requested,
             "allocated_risk": allocated,
+            "risk_value": allocated,
+            "risk_unit": "stop_risk_dollars",
+            "risk_conversion": requested_conversion,
             "ranking_score": rank["ranking_score"],
             "rank_components": rank,
             "reason": reason,
@@ -246,6 +328,11 @@ def allocate_candidates_to_sleeves(
         "candidates": [dict(candidate) for candidate in candidates],
         "sleeves": {strategy: dict(sleeve) for strategy, sleeve in sorted(sleeves.items())},
         "global_available_risk": requested_global,
+        "global_risk_unit": "stop_risk_dollars",
+        "conversion_equity": conversion_equity,
+        "conversion_equity_as_of": conversion_equity_as_of,
+        "evaluation_time": evaluation_time,
+        "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
         "precision": precision,
     }
     return {
@@ -253,6 +340,8 @@ def allocate_candidates_to_sleeves(
         "allocated_by_strategy": allocated_by_strategy,
         "allocated_risk": allocated_total,
         "global_budget": starting_global,
+        "risk_value": allocated_total,
+        "risk_unit": "stop_risk_dollars",
         "global_remaining_risk": global_remaining,
         "sleeves_after": normalized_sleeves,
         "reconciliation_residual": round(starting_global - allocated_total - global_remaining, precision),
@@ -453,7 +542,7 @@ class AdaptiveAllocator:
             row.get("execution_type"), row.get("source_table"), row.get("provenance_json")
         ) in allowed]
 
-    def _is_stale(self, rows: Sequence[Mapping[str, Any]]) -> bool:
+    def _is_stale(self, rows: Sequence[Mapping[str, Any]], *, evaluation_time: str) -> bool:
         if not rows:
             return False
         latest = max((str(row.get("calculated_at") or "") for row in rows), default="")
@@ -462,12 +551,14 @@ class AdaptiveAllocator:
         try:
             timestamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
             timestamp = timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
-            age_days = (datetime.now(UTC) - timestamp).total_seconds() / 86400.0
+            evaluated = datetime.fromisoformat(str(evaluation_time).replace("Z", "+00:00"))
+            evaluated = evaluated.replace(tzinfo=UTC) if evaluated.tzinfo is None else evaluated.astimezone(UTC)
+            age_days = (evaluated - timestamp).total_seconds() / 86400.0
             return age_days > float(self.cfg.get("evidence_stale_after_days", 90))
         except (TypeError, ValueError, OverflowError):
             return True
 
-    def estimate(self, strategy: str) -> tuple[StrategyEstimate, list[dict[str, Any]], str]:
+    def estimate(self, strategy: str, *, evaluation_time: str) -> tuple[StrategyEstimate, list[dict[str, Any]], str]:
         rows = self._rows(strategy)
         values = [float(row["cost_adjusted_return"]) for row in rows if math.isfinite(float(row["cost_adjusted_return"]))]
         regimes = {str(row.get("regime")) for row in rows if row.get("regime")}
@@ -494,7 +585,7 @@ class AdaptiveAllocator:
         quality = min(1.0, len(values) / minimum) * min(1.0, len(regimes) / min_regimes)
         quality *= 1.0 if all(row.get("cost_bps") is not None for row in rows) else 0.5
         uncertainty = min(1.0, (se or 1.0) / (abs(shrunk) + 1e-9))
-        if self._is_stale(rows):
+        if self._is_stale(rows, evaluation_time=evaluation_time):
             state, reason, evidence_class = "SUSPENDED", "stale OOS evidence", "stale"
         elif deterioration >= float(self.cfg.get("deterioration_suspend_z", 2.0)):
             state, reason, evidence_class = "SUSPENDED", "statistically material recent deterioration", "deteriorating"
@@ -628,7 +719,7 @@ class AdaptiveAllocator:
         explicit = _finite_nonnegative(snapshot.get("phase3_available_risk"))
         explicit_pct = _finite_nonnegative(snapshot.get("phase3_available_risk_pct"))
         if explicit is not None:
-            return explicit, str(snapshot.get("phase3_available_risk_unit") or "stop_risk_dollars"), {"source": "phase3_available_risk"}
+            return explicit, str(snapshot.get("phase3_available_risk_unit") or ""), {"source": "phase3_available_risk"}
         if explicit_pct is not None:
             return explicit_pct, "pct_equity", {"source": "phase3_available_risk_pct"}
         maximum = float(getattr(phase3_profile, "max_portfolio_heat_pct", 0.0) or 0.0)
@@ -698,16 +789,28 @@ class AdaptiveAllocator:
         unallocated = round(max(0.0, budget - allocated_total), precision)
         residual = round(budget - allocated_total - unallocated, precision)
         consumption: dict[str, float] = {strategy: 0.0 for strategy in authorized}
+        consumption_unit = str(snapshot.get("strategy_risk_unit") or "")
+
+        def canonical_consumption(value: Any) -> float:
+            return float(normalize_risk_to_dollars(
+                value,
+                consumption_unit,
+                conversion_equity=snapshot.get("portfolio_equity"),
+                conversion_equity_as_of=str(snapshot.get("equity_as_of") or snapshot.get("as_of") or ""),
+                evaluation_time=str(snapshot.get("as_of") or ""),
+                allow_zero=True,
+            )["risk_value"])
+
         total_map = snapshot.get("strategy_risk_by_strategy")
-        if isinstance(total_map, Mapping):
+        if isinstance(total_map, Mapping) and total_map:
             for strategy in consumption:
-                consumption[strategy] = _finite_nonnegative(total_map.get(strategy), 0.0) or 0.0
+                consumption[strategy] = canonical_consumption(total_map.get(strategy, 0.0))
         else:
             for key in ("held_risk_by_strategy", "pending_risk_by_strategy", "reserved_risk_by_strategy"):
                 values = snapshot.get(key, {})
-                if isinstance(values, Mapping):
+                if isinstance(values, Mapping) and values:
                     for strategy in consumption:
-                        consumption[strategy] += _finite_nonnegative(values.get(strategy), 0.0) or 0.0
+                        consumption[strategy] += canonical_consumption(values.get(strategy, 0.0))
         sleeves: dict[str, dict[str, Any]] = {}
         notional_consumption = snapshot.get("strategy_notional_by_strategy", {})
         gross_capacity = 0.0
@@ -734,6 +837,10 @@ class AdaptiveAllocator:
                 "strategy_version": strategy,
                 "state": states[strategy],
                 "risk_unit": risk_unit,
+                "risk_value": assigned,
+                "conversion_equity": equity,
+                "conversion_equity_as_of": snapshot.get("equity_as_of") or snapshot.get("as_of"),
+                "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
                 "target_weight": target_share,
                 "state_cap_risk": round(caps[strategy], precision),
                 "allocated_risk": assigned,
@@ -758,10 +865,16 @@ class AdaptiveAllocator:
         strategy_policy_map: Mapping[str, Any] | None = None,
         as_of: str | None = None,
     ) -> dict[str, Any]:
+        if as_of is None:
+            raise ValueError("Phase 4 deterministic allocation requires explicit as_of")
         healthy = not any(DurableExecutionStore(self.storage).integrity_report().values())
-        now = iso_now()
         snapshot = dict(portfolio_snapshot or {})
-        evaluation_time = str(as_of or snapshot.get("as_of") or now)
+        evaluation_time = str(as_of)
+        evaluated_at = datetime.fromisoformat(evaluation_time.replace("Z", "+00:00"))
+        evaluated_at = evaluated_at.replace(tzinfo=UTC) if evaluated_at.tzinfo is None else evaluated_at.astimezone(UTC)
+        now = evaluated_at.isoformat()
+        snapshot["as_of"] = now
+        evaluation_time = now
         registry_eval, authorized_order, registry_rejections, registry_payload = self._registry_evaluation(
             strategy_policy_map, as_of=evaluation_time,
         )
@@ -791,7 +904,7 @@ class AdaptiveAllocator:
         estimate_ids: dict[str, str] = {}
         evidence_fingerprints: dict[str, str] = {}
         for strategy in strategy_order:
-            estimate, rows, evidence_fp = self.estimate(strategy)
+            estimate, rows, evidence_fp = self.estimate(strategy, evaluation_time=evaluation_time)
             evidence[strategy], evidence_fingerprints[strategy] = rows, evidence_fp
             if not healthy:
                 estimate = StrategyEstimate(**{**asdict(estimate), "state": "SUSPENDED", "reason": "durable integrity health failed"})
@@ -968,7 +1081,20 @@ class AdaptiveAllocator:
                     probe_weights[strategy] = risk
                     probe_heat += risk
 
-        available_risk, risk_unit, available_risk_inputs = self._phase3_available_risk(snapshot, drawdown_pct, phase3_profile)
+        source_available_risk, source_risk_unit, available_risk_inputs = self._phase3_available_risk(
+            snapshot, drawdown_pct, phase3_profile
+        )
+        conversion = normalize_risk_to_dollars(
+            source_available_risk,
+            source_risk_unit,
+            conversion_equity=snapshot.get("portfolio_equity"),
+            conversion_equity_as_of=str(snapshot.get("equity_as_of") or snapshot.get("as_of") or ""),
+            evaluation_time=evaluation_time,
+            allow_zero=True,
+        )
+        available_risk = float(conversion["risk_value"])
+        risk_unit = "stop_risk_dollars"
+        available_risk_inputs = {**available_risk_inputs, "conversion": conversion}
         sleeves, unallocated_available_risk, reconciliation_residual = self._build_sleeves(
             authorized_order, operational_states, allocation_weights, exploration_weights, probe_weights,
             snapshot, available_risk, risk_unit,
@@ -1029,13 +1155,8 @@ class AdaptiveAllocator:
             strategy_policies[strategy] = emitted
 
         unallocated_risk_pct = (
-            unallocated_available_risk
-            if risk_unit == "pct_equity"
-            else (
-                unallocated_available_risk / float(snapshot.get("portfolio_equity") or 0.0) * 100.0
-                if float(snapshot.get("portfolio_equity") or 0.0) > 0
-                else 0.0
-            )
+            unallocated_available_risk / float(snapshot.get("portfolio_equity") or 0.0) * 100.0
+            if float(snapshot.get("portfolio_equity") or 0.0) > 0 else 0.0
         )
         binding_caps = {
             "fractional_kelly_ceiling": fraction, "max_strategy_weight": max_weight,
@@ -1046,6 +1167,11 @@ class AdaptiveAllocator:
             "probe_gross_exposure_pct": float(self.cfg.get("probe_gross_exposure_pct", 2.5)),
             "probe_max_active_count": int(self.cfg.get("probe_max_active_count", 1)),
             "phase3_available_risk": available_risk, "phase3_available_risk_unit": risk_unit,
+            "phase3_source_risk_value": source_available_risk,
+            "phase3_source_risk_unit": source_risk_unit,
+            "conversion_equity": conversion["conversion_equity"],
+            "conversion_equity_as_of": conversion["conversion_equity_as_of"],
+            "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
         }
         raw_replay_inputs = {
             "as_of": evaluation_time, "regime": regime, "drawdown_pct": drawdown_pct,
@@ -1069,6 +1195,10 @@ class AdaptiveAllocator:
             "strategy_policies": strategy_policies, "allocation_class": allocation_class,
             "unallocated_risk_pct": unallocated_risk_pct, "phase3_available_risk": available_risk,
             "phase3_available_risk_unit": risk_unit, "strategy_sleeves": sleeves,
+            "risk_value": available_risk, "risk_unit": risk_unit,
+            "conversion_equity": conversion["conversion_equity"],
+            "conversion_equity_as_of": conversion["conversion_equity_as_of"],
+            "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
             "unallocated_available_risk": unallocated_available_risk, "risk_reconciliation_residual": reconciliation_residual,
             "risk_reconciliation": {
                 "capacity": available_risk,
@@ -1137,6 +1267,10 @@ class AdaptiveAllocator:
             "strategy_policy_version": payload.get("strategy_policy_version"), "policy_authoritative": policy_authoritative,
             "covariance": covariance_payload, "strategy_sleeves": sleeves, "phase3_available_risk": available_risk,
             "phase3_available_risk_unit": risk_unit, "unallocated_available_risk": unallocated_available_risk,
+            "risk_value": available_risk, "risk_unit": risk_unit,
+            "conversion_equity": conversion["conversion_equity"],
+            "conversion_equity_as_of": conversion["conversion_equity_as_of"],
+            "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
             "risk_reconciliation_residual": reconciliation_residual, "raw_replay_inputs": raw_replay_inputs,
             "evidence_fingerprint": fingerprint,
         }
@@ -1147,9 +1281,17 @@ class AdaptiveAllocator:
         sleeves: Mapping[str, Mapping[str, Any]],
         *,
         global_available_risk: float | None = None,
+        global_risk_unit: str,
+        conversion_equity: float,
+        conversion_equity_as_of: str,
+        evaluation_time: str,
     ) -> dict[str, Any]:
         return allocate_candidates_to_sleeves(
             candidates, sleeves, global_available_risk=global_available_risk,
+            global_risk_unit=global_risk_unit,
+            conversion_equity=conversion_equity,
+            conversion_equity_as_of=conversion_equity_as_of,
+            evaluation_time=evaluation_time,
         )
 
     def _persist_state(self, estimate: StrategyEstimate, estimate_id: str, now: str) -> None:

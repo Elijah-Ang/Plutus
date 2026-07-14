@@ -14,8 +14,7 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any, Mapping
 
-
-TREND_MANAGEMENT_FORMULA_VERSION = "trend_management_v1_operational_paper"
+from .formula_versions import TREND_MANAGEMENT_FORMULA_VERSION
 
 
 class PositionManagementMode(StrEnum):
@@ -196,6 +195,33 @@ class TrendManagementDecision:
         return self.mode == PositionManagementMode.EXIT_REQUIRED.value
 
 
+def validate_trend_decision_invariants(decision: TrendManagementDecision) -> None:
+    try:
+        mode = PositionManagementMode(decision.mode)
+    except ValueError as exc:
+        raise ValueError("trend decision has an invalid final mode") from exc
+    policy = MODE_POLICY[mode]
+    contradictions: list[str] = []
+    expected_pyramiding = mode is PositionManagementMode.TREND_PYRAMID and bool(policy["allow_pyramiding"])
+    if decision.allow_pyramiding != expected_pyramiding:
+        contradictions.append("pyramiding authority contradicts final mode")
+    if decision.defer_fixed_profit_target != bool(policy["defer_fixed_profit_target"]):
+        contradictions.append("fixed-target deferral contradicts final mode")
+    if abs(decision.recommended_partial_exit_fraction - float(policy["partial_exit_fraction"])) > 1e-12:
+        contradictions.append("partial-exit fraction contradicts final mode")
+    if abs(decision.retained_runner_fraction - float(policy["runner_fraction"])) > 1e-12:
+        contradictions.append("runner retention contradicts final mode")
+    if mode is PositionManagementMode.EXIT_REQUIRED and (
+        decision.allow_pyramiding
+        or decision.defer_fixed_profit_target
+        or decision.retained_runner_fraction != 0.0
+        or decision.recommended_partial_exit_fraction != 1.0
+    ):
+        contradictions.append("EXIT_REQUIRED must be a full non-runner exit with no ADD authority")
+    if contradictions:
+        raise ValueError("; ".join(contradictions))
+
+
 class TrendManagementEngine:
     """Classify mode and calculate a durable-candidate long stop."""
 
@@ -345,6 +371,14 @@ class TrendManagementEngine:
             transition_reason = "persisted stop is breached; stop cannot be loosened"
             classified_reason = transition_reason
 
+        # The persisted-stop check can change the final mode after the first
+        # policy lookup. Rebuild all mode-dependent values from the final mode.
+        policy = MODE_POLICY[mode]
+        if mode is PositionManagementMode.EXIT_REQUIRED:
+            effective_multiplier = 0.0
+            calculated = prior_stop
+            protective_stop = prior_stop
+
         raw_inputs = asdict(inputs)
         raw_inputs.update({
             "normalized_deployment_mode": deployment_mode,
@@ -368,7 +402,7 @@ class TrendManagementEngine:
             "formula_version": TREND_MANAGEMENT_FORMULA_VERSION,
         }
         fingerprint = _fingerprint(payload)
-        return TrendManagementDecision(
+        decision = TrendManagementDecision(
             symbol=symbol,
             position_lifecycle_id=lifecycle,
             previous_mode=previous.value if previous else None,
@@ -396,3 +430,15 @@ class TrendManagementEngine:
             formula_version=TREND_MANAGEMENT_FORMULA_VERSION,
             decision_fingerprint=fingerprint,
         )
+        validate_trend_decision_invariants(decision)
+        return decision
+
+
+__all__ = [
+    "PositionManagementMode",
+    "TrendManagementDecision",
+    "TrendManagementEngine",
+    "TrendManagementInput",
+    "TREND_MANAGEMENT_FORMULA_VERSION",
+    "validate_trend_decision_invariants",
+]

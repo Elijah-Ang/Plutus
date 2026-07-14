@@ -17,6 +17,10 @@ from app.storage import Storage
 from app.utils import load_config
 
 
+AS_OF = "2026-07-14T08:00:00+00:00"
+PORTFOLIO = {"portfolio_equity": 100_000.0, "as_of": AS_OF, "equity_as_of": AS_OF}
+
+
 def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=None, execution_type="actual_fill", source_table="performance_setups", provenance=None):
     now = datetime.now(UTC).isoformat()
     opportunity_id = f"op-{strategy}-{index}"
@@ -42,7 +46,7 @@ def _outcome(storage, strategy, value, regime="normal", index=0, calculated_at=N
 
 def test_healthy_immature_strategy_gets_bounded_exploration(tmp_path):
     storage=Storage(tmp_path/"p4.sqlite3"); storage.initialize(); cfg=load_config()
-    result=AdaptiveAllocator(storage,cfg,"run-cash").run(regime="mixed_uncertain",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-cash").run(regime="mixed_uncertain",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     assert result["decision"]=="ALLOCATE_EXPLORATION"
     assert result["cash_weight"]==1.0
     assert set(result["weights"])==set(STRATEGIES)
@@ -58,7 +62,7 @@ def test_healthy_immature_strategy_gets_bounded_exploration(tmp_path):
 def test_negative_immature_evidence_is_suspended_not_explored(tmp_path):
     storage=Storage(tmp_path/"p4-negative.sqlite3"); storage.initialize(); cfg=load_config()
     _outcome(storage, STRATEGIES[0], -.01, index=1)
-    result=AdaptiveAllocator(storage,cfg,"run-negative").run(regime="normal",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-negative").run(regime="normal",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     estimate=result["estimates"][STRATEGIES[0]]
     assert estimate.state == "SUSPENDED"
     assert estimate.evidence_class == "negative"
@@ -72,7 +76,7 @@ def test_qualified_strategy_uses_adaptive_allocation(tmp_path):
     storage=Storage(tmp_path/"p4-qualified.sqlite3"); storage.initialize(); cfg=load_config()
     for index in range(100):
         _outcome(storage, STRATEGIES[0], .02 + (index % 5) * .0001, regime="normal" if index % 2 else "favorable", index=index)
-    result=AdaptiveAllocator(storage,cfg,"run-qualified").run(regime="normal",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-qualified").run(regime="normal",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     estimate=result["estimates"][STRATEGIES[0]]
     assert estimate.state == "ACTIVE"
     assert estimate.evidence_class == "qualified"
@@ -89,7 +93,7 @@ def test_reliable_current_regime_performance_is_an_operational_weight_input(tmp_
     for index in range(100):
         _outcome(storage, STRATEGIES[0], .02 + (index % 3) * .0001,
                  regime="normal" if index < 20 else "favorable", index=index)
-    result=AdaptiveAllocator(storage,cfg,"run-regime").run(regime="normal",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-regime").run(regime="normal",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     regime_metric=result["strategy_policies"][STRATEGIES[0]]["current_regime_performance"]
     assert regime_metric["reliable"] is True
     assert regime_metric["sample_n"] == 20
@@ -169,7 +173,7 @@ def test_shadow_evidence_never_becomes_operational_allocation(tmp_path):
     for index in range(100):
         _outcome(storage, STRATEGIES[1], .02 + (index % 5) * .0001, regime="normal" if index % 2 else "favorable", index=index,
                  execution_type="shadow_hypothetical", source_table="shadow_insights", provenance={"shadow_id": f"shadow-{index}"})
-    result=AdaptiveAllocator(storage,cfg,"run-shadow").run(regime="normal",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-shadow").run(regime="normal",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     assert result["estimates"][STRATEGIES[1]].state == "ACTIVE"
     assert result["weights"][STRATEGIES[1]] == 0
     assert result["strategy_policies"][STRATEGIES[1]]["mode"] == "research_only"
@@ -181,7 +185,7 @@ def test_negative_shadow_evidence_keeps_auditable_state_without_allocation(tmp_p
     for index in range(100):
         _outcome(storage, STRATEGIES[1], -.02, regime="normal" if index % 2 else "favorable", index=index,
                  execution_type="shadow_hypothetical", source_table="shadow_insights", provenance={"shadow_id": f"shadow-{index}"})
-    result=AdaptiveAllocator(storage,cfg,"run-shadow-negative").run(regime="normal",drawdown_pct=0.0)
+    result=AdaptiveAllocator(storage,cfg,"run-shadow-negative").run(regime="normal",drawdown_pct=0.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     assert result["estimates"][STRATEGIES[1]].state == "SUSPENDED"
     assert result["estimates"][STRATEGIES[1]].evidence_class == "negative"
     assert result["weights"][STRATEGIES[1]] == 0
@@ -190,7 +194,7 @@ def test_negative_shadow_evidence_keeps_auditable_state_without_allocation(tmp_p
 
 def test_covariance_and_all_stress_scenarios_are_persisted(tmp_path):
     storage=Storage(tmp_path/"p4.sqlite3"); storage.initialize()
-    result=AdaptiveAllocator(storage,load_config(),"run-stress").run(regime="mixed_uncertain",drawdown_pct=1.0)
+    result=AdaptiveAllocator(storage,load_config(),"run-stress").run(regime="mixed_uncertain",drawdown_pct=1.0,as_of=AS_OF,portfolio_snapshot=PORTFOLIO)
     assert storage.fetch_all("SELECT * FROM phase4_covariance_snapshots")
     scenarios={r["scenario"] for r in storage.fetch_all("SELECT * FROM phase4_stress_results WHERE allocation_id=?",(result["allocation_id"],))}
     assert scenarios=={"spy_down_3","spy_down_5","sector_down_7","volatility_doubles","two_atr_gap","correlations_to_one","largest_position_down_15"}

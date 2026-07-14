@@ -490,7 +490,9 @@ def calculate_metrics(
     mature_regimes = {name: item for name, item in regimes.items() if int(item["count"]) >= minimum_regime_samples}
     immature_regimes = {name: item for name, item in regimes.items() if int(item["count"]) < minimum_regime_samples}
     latest = max((_text(row.exit_session) or _text(row.entry_session) or "" for row in ordered), default=None)
-    now = _parse_datetime(as_of) if as_of is not None else datetime.now(UTC)
+    if as_of is None:
+        raise ValueError("strategy performance evaluation requires explicit as_of")
+    now = _parse_datetime(as_of)
     recency_days = None
     if latest:
         latest_dt = _parse_datetime(latest)
@@ -680,7 +682,7 @@ class StrategyPerformanceEngine:
         self.storage = storage
         self.config = dict(config or {})
         self.cfg = dict(self.config.get("profitability_engine", {}) or {})
-        self.as_of = _parse_datetime(as_of or datetime.now(UTC)).isoformat()
+        self.as_of = _parse_datetime(as_of).isoformat() if as_of is not None else None
 
     def _settings(self) -> dict[str, Any]:
         phase3 = self.config.get("phase3", {}) or {}
@@ -879,6 +881,8 @@ class StrategyPerformanceEngine:
     def refresh_strategy(self, strategy_version: str) -> StrategyPerformanceSnapshot:
         if not strategy_version:
             raise ValueError("strategy_version is required")
+        if self.as_of is None:
+            raise ValueError("strategy performance refresh requires explicit as_of")
         shadow = [row for row in self._shadow_observations() if row.strategy_version == strategy_version]
         actual = [row for row in self._actual_observations() if row.strategy_version == strategy_version]
         observations = _ordered([*shadow, *actual])
@@ -983,7 +987,7 @@ class StrategyPerformanceEngine:
         metrics = {**metrics, "quality_score": quality, "component_weights": {"profitability": 30, "downside": 20, "stability": 15, "regime": 15, "execution": 10, "evidence": 10}, "penalties": penalties}
         fingerprint = _fingerprint({"strategy_version": strategy_version, "observations": [asdict(row) for row in observations], "metrics": metrics, "components": components, "raw_inputs": raw_inputs, "performance_version": STRATEGY_PERFORMANCE_VERSION, "policy_version": STRATEGY_POLICY_VERSION})
         snapshot_id = fingerprint[:32]
-        now = iso_now()
+        now = self.as_of
         self.storage.execute(
             """INSERT INTO strategy_performance_snapshots(
                  id,strategy_version,as_of,performance_version,policy_version,schema_version,quality_score,
