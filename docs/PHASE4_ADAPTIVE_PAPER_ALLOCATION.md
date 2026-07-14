@@ -36,5 +36,12 @@ expanded evidence-aware allocation. Only `rule_based_v2` is executable today;
 the architecture does not fabricate multi-strategy diversification.
 
 Schema: `phase4_evidence_aware_operational_paper_v3`. Allocator:
-`adaptive_paper_allocator_v3_evidence_aware`. Formula:
-`phase4_evidence_aware_allocation_v4_operational_paper`.
+`adaptive_paper_allocator_v4_dimensionally_normalized`. Formula:
+`phase4_evidence_aware_allocation_v5_dimensionally_normalized`.
+
+`max_strategy_weight`, the conservative `0.175` ACTIVE fallback ceiling,
+`max_allocated_risk_fraction`, and `max_stress_loss` are portfolio allocation
+fractions. The selected strategy weight is divided by `max_strategy_weight`
+before it becomes a unitless `0..1` strategy-risk multiplier. It is never read
+as a stop-risk percentage; only Adaptive Conviction can expand the resulting
+base, and Phase 3 still caps that expansion at `0.35%` of equity.

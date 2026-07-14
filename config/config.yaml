@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v6_adaptive_operational_paper
+configuration_schema_version: plutus_effective_config_v7_release_gate_operational_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -50,7 +50,7 @@ phase4:
   enabled: true
   active: true
   mode: ACTIVE_ADAPTIVE_PAPER
-  allocator_version: adaptive_paper_allocator_v3_evidence_aware
+  allocator_version: adaptive_paper_allocator_v4_dimensionally_normalized
   fractional_kelly: 0.20
   operational_kelly_enabled: false
   operational_allocation_mode: bounded_evidence_aware

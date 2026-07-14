@@ -3,7 +3,15 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from app.phase4_allocator import AdaptiveAllocator, STRATEGIES, apply_phase4_schema, candidate_allocation_rank
+import pytest
+
+from app.phase4_allocator import (
+    AdaptiveAllocator,
+    STRATEGIES,
+    apply_phase4_schema,
+    candidate_allocation_rank,
+    operational_risk_budget_multiplier,
+)
 from app.formula_versions import EVIDENCE_VERSION
 from app.storage import Storage
 from app.utils import load_config
@@ -107,6 +115,22 @@ def test_fractional_kelly_is_bounded_and_phase3_authoritative():
     assert cfg["uncalibrated_score_sizing"] is False
     assert cfg["operational_kelly_enabled"] is False
     assert cfg["operational_allocation_mode"] == "bounded_evidence_aware"
+
+
+def test_phase4_allocation_fractions_are_dimensionally_separate_from_stop_risk():
+    cfg = load_config()
+    phase4 = cfg["phase4"]
+    phase3 = cfg["phase3"]["risk_profile"]
+    assert operational_risk_budget_multiplier(0.35, 0.35) == 1.0
+    assert operational_risk_budget_multiplier(0.175, 0.35) == 0.5
+    assert operational_risk_budget_multiplier(0.0, 0.35) == 0.0
+    assert phase4["max_allocated_risk_fraction"] == 0.75
+    assert phase4["max_stress_loss"] == 0.05
+    assert phase3["max_trade_stop_risk_pct"] == 0.35
+    assert phase3["base_stop_risk_pct"] * operational_risk_budget_multiplier(0.35, 0.35) == 0.20
+    assert phase3["base_stop_risk_pct"] * operational_risk_budget_multiplier(0.175, 0.35) == 0.10
+    with pytest.raises(ValueError):
+        operational_risk_budget_multiplier(0.35, 35.0)
 
 
 def test_candidate_ranking_is_operationally_evidence_aware_and_deterministic():

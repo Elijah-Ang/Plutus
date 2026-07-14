@@ -396,6 +396,37 @@ def test_unknown_uses_lookup_only_and_cannot_call_submitter(tmp_path):
     assert store.get(workflow["id"])["state"] == "submitted"
 
 
+def test_submitted_terminal_intent_is_lookup_only_and_terminalised_after_restart(tmp_path):
+    storage = _storage(tmp_path)
+    proposal = _proposal()
+    workflow = _workflow(storage)
+    store = ApprovalWorkflowStore(storage)
+    intent = store.ensure_intent(workflow["id"], proposal, run_id="run-1")
+    store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+    store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+    store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
+    storage.execute("UPDATE order_intents SET state='filled',terminal_at=updated_at WHERE id=?", (intent["id"],))
+    lookups = []
+
+    def lookup(workflow_row, intent_row):
+        lookups.append((workflow_row["state"], intent_row["state"]))
+        return "terminal"
+
+    def forbidden_submit(*_args):  # pragma: no cover - must never execute
+        raise AssertionError("SUBMITTED recovery attempted a duplicate submission")
+
+    store.recover(
+        owner_token="terminal-lookup-worker",
+        proposal_loader=lambda _proposal_id: proposal,
+        submitter=forbidden_submit,
+        lookup_reconciler=lookup,
+        run_id="run-1",
+    )
+
+    assert lookups == [("submitted", "filled")]
+    assert store.get(workflow["id"])["state"] == "terminal"
+
+
 def test_blocked_workflow_cannot_be_reopened_by_intent_creation(tmp_path):
     storage = _storage(tmp_path)
     workflow = _workflow(storage, state=ApprovalWorkflowState.APPROVED_PENDING_INTENT)

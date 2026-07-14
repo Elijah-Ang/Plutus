@@ -684,6 +684,8 @@ class Executor:
                 require_protective_paper_exit_support()
             except PermissionError as exc:
                 return ExecutionResult(False, "blocked", None, reason=str(exc))
+            if not approval_id:
+                return ExecutionResult(False, "blocked", None, reason="manual approval is required for protective paper exits")
             if (
                 str(proposal.get("side", "")).lower() != "sell"
                 or int(proposal.get("emergency_exit_triggered") or 0) != 1

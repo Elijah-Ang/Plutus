@@ -270,6 +270,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(phase4.get("require_manual_approval") is True, "Phase 4 exploration and probe entries require manual approval")
         kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)
         require(kelly is not None and kelly <= 0.25, "Phase 4 fractional Kelly cannot exceed one quarter")
+        max_strategy_weight = _bounded(phase4.get("max_strategy_weight"), "phase4.max_strategy_weight", errors, 0.0, 1.0)
+        max_allocated = _bounded(phase4.get("max_allocated_risk_fraction"), "phase4.max_allocated_risk_fraction", errors, 0.0, 1.0)
+        max_stress_loss = _bounded(phase4.get("max_stress_loss"), "phase4.max_stress_loss", errors, 0.0, 1.0)
+        require(max_strategy_weight is not None and max_strategy_weight > 0, "Phase 4 maximum strategy weight must be a positive allocation fraction")
+        require(max_allocated is not None and max_strategy_weight is not None and max_strategy_weight <= max_allocated,
+                "Phase 4 strategy allocation cannot exceed the total allocated-risk fraction")
+        require(max_stress_loss is not None and max_stress_loss <= 0.05,
+                "Phase 4 stress-loss fraction cannot exceed 0.05")
         exploration_heat = _bounded(phase4.get("exploration_heat_pct"), "phase4.exploration_heat_pct", errors, 0, 0.25)
         exploration_risk = _bounded(phase4.get("exploration_stop_risk_pct"), "phase4.exploration_stop_risk_pct", errors, 0, 0.10)
         exploration_max = _bounded(phase4.get("max_exploration_stop_risk_pct"), "phase4.max_exploration_stop_risk_pct", errors, 0, 0.10)

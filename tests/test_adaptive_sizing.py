@@ -16,6 +16,7 @@ from app.execution import DurableExecutionStore
 from app.service import TradingService
 from app.storage import Storage
 from app.utils import format_proposal_message, load_config
+from scripts.trace_adaptive_operational_proposal import build_trace
 from scripts.adaptive_sizing_evidence import build_report
 
 
@@ -112,6 +113,18 @@ def test_active_conviction_can_expand_above_old_baseline_stop_risk_to_hard_envel
     assert decision.adaptive_constrained_notional == 7_000.0
     assert decision.adaptive_constrained_stop_risk_pct == 0.35
     assert decision.adaptive_constrained_notional > inputs["operational_sizing"]["sizing_caps"]["stop_risk"]
+
+
+def test_stop_risk_percentage_dollars_quantity_and_notional_units_at_extremes():
+    inputs = _inputs(strategy_policy_state="ACTIVE")
+    inputs["adaptive_conviction"]["recommended_stop_risk_pct"] = 0.35
+    inputs["operational_sizing"]["sizing_caps"] = {"cash": 1_000_000.0, "buying_power": 1_000_000.0}
+    decision = _engine().evaluate(inputs)
+    assert decision is not None
+    assert decision.conviction_stop_risk_dollars == 350.0
+    assert decision.adaptive_requested_notional == 7_000.0
+    assert decision.adaptive_quantity == 70.0
+    assert decision.adaptive_constrained_stop_risk_pct == 0.35
 
 
 @pytest.mark.parametrize(
@@ -331,13 +344,26 @@ def test_proposal_message_labels_operational_adaptive_size():
     proposal = {
         "symbol": "SPY", "side": "buy", "action": "entry", "notional": 80.0, "qty": 0.8,
         "latest_price": 100.0, "score": 90.0, "reason": "trend passed", "expires_at": "2026-07-14T01:00:00+00:00",
+        "strategy_state": "ACTIVE", "stop_price": 95.0, "stop_distance_pct": 5.0,
+        "stop_distance_dollars": 5.0, "stop_risk_dollars": 4.0,
+        "adaptive_conviction": {"deployment_mode": "OPPORTUNISTIC", "opportunity_class": "HIGH_CONVICTION",
+                                "recommended_stop_risk_pct": 0.30, "portfolio_heat_target_pct": 1.50,
+                                "gross_exposure_target_pct": 40.0, "binding_cap": "portfolio_heat"},
         "adaptive_sizing": {"operational_notional": 80.0, "operational_quantity": 0.8, "adaptive_notional": 100.0,
-                            "adaptive_quantity": 1.0, "comparison_direction": "INCREASE", "binding_adaptive_cap": "stage"},
+                            "adaptive_quantity": 1.0, "stop_risk_dollars": 4.0, "comparison_direction": "INCREASE",
+                            "binding_adaptive_cap": "portfolio", "reason": "strong evidence with remaining capacity"},
     }
     message = format_proposal_message(proposal, load_config())
+    assert "Strategy authorization: ACTIVE" in message
+    assert "OPPORTUNISTIC/HIGH_CONVICTION" in message
     assert "Adaptive Sizing (operational paper)" in message
     assert "actual proposed $80.00" in message
+    assert "stop risk 0.3000% ($4.00)" in message
+    assert "Stop price: $95.00" in message
+    assert "binding portfolio" in message
+    assert "Reason: strong evidence with remaining capacity" in message
     assert "maximum that approval can submit" in message
+    assert "report-only" not in message and "shadow" not in message and "future" not in message
 
 
 def test_evidence_report_uses_persisted_rows_only(tmp_path):
@@ -351,3 +377,12 @@ def test_evidence_report_uses_persisted_rows_only(tmp_path):
     assert report["complete_counts"] == {"proposal": 1}
     assert report["comparison_directions"] == {"INCREASE": 1}
     assert report["trading_state_mutations"] == 0
+
+
+def test_first_natural_proposal_trace_is_read_only_while_pending(tmp_path):
+    storage = Storage(tmp_path / "trace.sqlite3")
+    storage.initialize()
+    report = build_trace(storage.path, after="2026-07-14T00:00:00+00:00")
+    assert report["status"] == "pending_first_natural_operational_buy_or_add"
+    assert report["trading_state_mutations"] == 0
+    assert report["trading_state_counts_before"] == report["trading_state_counts_after"]

@@ -367,17 +367,17 @@ def test_crash_17_sequential_yes_all_exhausts_capacity(tmp_path):
     assert store.active_reservations()["active_reserved_notional"] == pytest.approx(100)
 
 
-def test_crash_18_emergency_ambiguous_timeout_matches_ordinary(tmp_path):
+def test_crash_18_emergency_cannot_create_ambiguous_submission_without_manual_approval(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker(submit_error=TimeoutError("synthetic"))
     emergency = {**_proposal("emergency", side="sell"), "emergency_exit_triggered": 1, "emergency_exit_trigger_reason": "synthetic protective trigger"}
     result = Executor(broker, PassingRisk(), storage, "run").execute(
         emergency, {"approval_valid": True}, source_type="emergency"
     )
-    replay = Executor(broker, PassingRisk(), Storage(storage.path), "restart").execute(
-        emergency, {"approval_valid": True}, source_type="emergency"
-    )
-    assert result.status == replay.status == "unknown"
-    assert result.client_order_id == replay.client_order_id and broker.submit_calls == 1
+    assert result.status == "blocked"
+    assert "manual approval" in result.reason
+    assert broker.submit_calls == 0
+    assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
+    storage.audit("run", "protective_exit_without_approval_blocked", {"paper_only": True})
 
 
 def test_crash_19_close_and_reopen_creates_new_lifecycle(tmp_path):

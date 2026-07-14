@@ -4,13 +4,13 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v6_adaptive_operational_paper"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v7_release_gate_operational_paper"
 STOP_POLICY_VERSION = "validated_atr_or_technical_stop_v2"
 SIZING_POLICY_VERSION = "adaptive_minimum_ceiling_notional_v4_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_adaptive_ceiling_stop_probe_v4"
 PHASE3_DECISION_VERSION = "phase3_adaptive_modes_v4_operational_paper"
-PHASE4_ALLOCATION_VERSION = "phase4_evidence_aware_allocation_v4_operational_paper"
-PHASE4_ALLOCATOR_VERSION = "adaptive_paper_allocator_v3_evidence_aware"
+PHASE4_ALLOCATION_VERSION = "phase4_evidence_aware_allocation_v5_dimensionally_normalized"
+PHASE4_ALLOCATOR_VERSION = "adaptive_paper_allocator_v4_dimensionally_normalized"
 PHASE4_SCHEMA_VERSION = "phase4_evidence_aware_operational_paper_v3"
 ACCOUNTING_VERSION = "fifo_equity_unrealized_cashflow_v1"
 EVIDENCE_VERSION = "phase1_outcome_v2_exit_session"

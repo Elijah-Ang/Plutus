@@ -373,7 +373,7 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         "ma_200": 105.0
     }])
 
-    # 1. Extreme Mode: drawdown <= -12% -> immediate paper submit after final validation
+    # 1. Extreme Mode: drawdown <= -12% -> urgent but still manually approved
     with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
         service.scan()
         
@@ -381,13 +381,13 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
         assert props[0]["emergency_exit_mode"] == "extreme"
-        assert props[0]["emergency_exit_wait_seconds"] == 0
-        assert props[0]["emergency_exit_auto_execute_due_at"] is not None
-        assert props[0]["emergency_exit_final_decision"] == "submitted"
-        assert props[0]["status"] == "approved"
+        assert props[0]["emergency_exit_wait_seconds"] is None
+        assert props[0]["emergency_exit_auto_execute_due_at"] is None
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
+        assert props[0]["status"] == "pending"
         
-        mock_exec.assert_called_once()
-        assert any("EXTREME EMERGENCY EXIT" in m[0] and "final validation" in m[0] for m in service.telegram.sent_messages)
+        mock_exec.assert_not_called()
+        assert any("Reply YES to approve" in m[0] for m in service.telegram.sent_messages)
 
     # Reset
     temp_storage.execute("DELETE FROM trade_proposals")
@@ -415,7 +415,7 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         assert props[0]["status"] == "pending"
         assert any("Final validation is still required" in m[0] for m in service.telegram.sent_messages)
 
-    # 3. Sleep Mode: sleep_mode_active = 1 -> timed automatic paper sell after final validation
+    # 3. Sleep Mode: sleep does not bypass manual approval
     temp_storage.execute("DELETE FROM trade_proposals")
     service.telegram.sent_messages.clear()
     temp_storage.set_control_state("sleep_mode_active", "1", "test", "test", "test", 1, 1, int(time.time()))
@@ -424,11 +424,11 @@ def test_emergency_exit_triggers_and_modes(temp_storage, base_config):
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
         assert props[0]["emergency_exit_mode"] == "sleep"
-        assert props[0]["emergency_exit_wait_seconds"] == 15
-        assert props[0]["emergency_exit_auto_execute_due_at"] is not None
-        assert props[0]["emergency_exit_final_decision"] == "auto_final_validation_pending"
+        assert props[0]["emergency_exit_wait_seconds"] is None
+        assert props[0]["emergency_exit_auto_execute_due_at"] is None
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
         assert props[0]["status"] == "pending"
-        assert any("Auto-submitting a paper sell in 15 seconds" in m[0] for m in service.telegram.sent_messages)
+        assert any("Reply YES to approve" in m[0] for m in service.telegram.sent_messages)
 
 def test_gpt_exit_explanation_timeout(temp_storage, base_config):
     broker = MockBroker()
@@ -450,7 +450,7 @@ def test_gpt_exit_explanation_timeout(temp_storage, base_config):
     assert res["telegram_message"] is None
 
 
-def test_sleep_mode_emergency_timeout_auto_submits_after_final_validation(temp_storage, base_config):
+def test_legacy_sleep_mode_emergency_timeout_is_suppressed_without_manual_approval(temp_storage, base_config):
     broker = MockBroker()
     service = TradingService(base_config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()
@@ -483,13 +483,13 @@ def test_sleep_mode_emergency_timeout_auto_submits_after_final_validation(temp_s
     with patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
         service.process_telegram()
 
-    mock_exec.assert_called_once()
-    row = temp_storage.fetch_all("SELECT status, emergency_exit_final_decision FROM trade_proposals WHERE id='sleep-emergency-prop'")[0]
-    assert row["status"] == "approved"
-    assert row["emergency_exit_final_decision"] == "submitted"
-    assert any("Sleep-mode emergency paper order submitted" in m[0] for m in service.telegram.sent_messages)
+    mock_exec.assert_not_called()
+    row = temp_storage.fetch_all("SELECT status,emergency_exit_auto_execute_due_at,emergency_exit_final_decision FROM trade_proposals WHERE id='sleep-emergency-prop'")[0]
+    assert row["status"] == "pending"
+    assert row["emergency_exit_auto_execute_due_at"] is None
+    assert row["emergency_exit_final_decision"] == "approval_required"
 
-def test_revalidate_and_execute_emergency_exit(temp_storage, base_config):
+def test_protective_exit_helper_cannot_bypass_manual_approval(temp_storage, base_config):
     broker = MockBroker()
     service = TradingService(base_config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()
@@ -508,13 +508,12 @@ def test_revalidate_and_execute_emergency_exit(temp_storage, base_config):
     broker.price = 100.0
     broker.price_time = datetime.now(UTC)
 
-    # 1. Revalidation passes -> executes successfully
+    # 1. Even valid protective evidence cannot execute without a consumed approval.
     success, desc = service.revalidate_and_execute_emergency_exit(proposal)
-    assert success is True, desc
-    assert desc == "submitted"
+    assert success is False
+    assert "manual approval" in desc
     orders = temp_storage.fetch_all("SELECT * FROM orders WHERE proposal_id='prop_emerg_123'")
-    assert len(orders) == 1
-    assert orders[0]["qty"] == 10.0
+    assert orders == []
 
     # 2. Blocked by live trading configuration
     temp_storage.execute("DELETE FROM orders")
@@ -586,15 +585,15 @@ def test_emergency_exit_missing_entry_price(temp_storage, base_config):
     with patch("app.service.evaluate_symbol", mock_eval), patch("app.features.build_features", return_value=mock_features), patch.object(service, "revalidate_and_execute_emergency_exit", return_value=(True, "submitted")) as mock_exec:
         service.scan()
         
-        # Since avg_entry_price fallback found (100.0) -> drawdown is calculated -> triggers extreme validated auto-exit
+        # Since avg_entry_price fallback found, an urgent manual proposal is created.
         props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY' AND emergency_exit_triggered=1")
         assert len(props) == 1
-        assert props[0]["status"] == "approved"
+        assert props[0]["status"] == "pending"
         assert props[0]["emergency_exit_mode"] == "extreme"
-        assert props[0]["emergency_exit_final_decision"] == "submitted"
+        assert props[0]["emergency_exit_final_decision"] == "approval_required"
         
-        mock_exec.assert_called_once()
-        assert any("EXTREME EMERGENCY EXIT" in m[0] and "final validation" in m[0] for m in service.telegram.sent_messages)
+        mock_exec.assert_not_called()
+        assert any("Reply YES to approve" in m[0] for m in service.telegram.sent_messages)
 
     # 3. Broker average entry price is preferred over fills fallback
     temp_storage.execute("DELETE FROM trade_proposals")

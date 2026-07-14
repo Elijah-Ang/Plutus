@@ -25,6 +25,25 @@ EXECUTABLE_STRATEGIES = (STRATEGY_VERSION,)
 STRATEGIES = (*EXECUTABLE_STRATEGIES, *tuple(sorted(STRATEGY_VERSIONS.values())))
 
 
+def operational_risk_budget_multiplier(allocation_weight: float, max_strategy_weight: float) -> float:
+    """Convert Phase 4 sleeve fractions into a unitless risk multiplier.
+
+    Both inputs are portfolio allocation fractions in ``[0, 1]``; neither is
+    a stop-risk percentage. Normalising by the configured strategy maximum
+    yields a multiplier in ``[0, 1]``. Adaptive Conviction is therefore the
+    only component that can expand the resulting strategy risk, and its Phase
+    3 hard ceiling remains 0.35% of equity.
+    """
+    try:
+        weight = float(allocation_weight)
+        maximum = float(max_strategy_weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Phase 4 allocation fractions must be finite numbers") from exc
+    if not math.isfinite(weight) or not math.isfinite(maximum) or maximum <= 0 or maximum > 1:
+        raise ValueError("Phase 4 allocation fractions must use the [0, 1] fraction scale")
+    return max(0.0, min(1.0, weight / maximum))
+
+
 def candidate_allocation_rank(inputs: Mapping[str, Any]) -> dict[str, float]:
     """Deterministic evidence-aware candidate rank; never an order quantity."""
     def unit(value: Any, *, scale: float = 1.0, default: float = 0.5) -> float:
@@ -464,8 +483,17 @@ class AdaptiveAllocator:
                                              "allocation_class":"exploration","evidence_version":EVIDENCE_VERSION}
             elif strategy in EXECUTABLE_STRATEGIES and operational_states[strategy]=="ACTIVE" and weights[i]>0:
                 strategy_policies[strategy]={"mode":"adaptive","state":operational_states[strategy],"allocation_weight":float(weights[i]),
+                                             "allocation_weight_unit":"fraction_of_phase4_risk_sleeve",
+                                             "risk_budget_multiplier":operational_risk_budget_multiplier(float(weights[i]), max_weight),
+                                             "risk_budget_multiplier_unit":"unitless_fraction_of_authorized_strategy_stop_risk",
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
                                              "allocation_class":"adaptive","evidence_version":EVIDENCE_VERSION}
+            elif strategy in EXECUTABLE_STRATEGIES and operational_states[strategy]=="THROTTLED":
+                strategy_policies[strategy]={"mode":"throttled","state":"THROTTLED","risk_budget_multiplier":1.0,
+                                             "risk_budget_multiplier_unit":"unitless_fraction_of_authorized_strategy_stop_risk",
+                                             "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":True,
+                                             "allocation_class":"throttled","evidence_version":EVIDENCE_VERSION,
+                                             "reason":"THROTTLED uses the profitability policy's reduced stop-risk base"}
             elif strategy not in EXECUTABLE_STRATEGIES:
                 strategy_policies[strategy]={"mode":"research_only","state":"RESEARCH_ONLY","operationally_executable":False,
                                              "kelly_used":False,"kelly_diagnostic_only":True,"score_sizing_used":False,"manual_approval_required":False,

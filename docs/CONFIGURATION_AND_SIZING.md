@@ -24,7 +24,7 @@ decisions and evidence:
   ceilings consumed by operational Adaptive Sizing.
 - `risk_engine_adaptive_ceiling_stop_probe_v4`: final hard validation.
 - `phase3_adaptive_modes_v4_operational_paper` and
-  `phase4_evidence_aware_allocation_v4_operational_paper`: operational mode and
+  `phase4_evidence_aware_allocation_v5_dimensionally_normalized`: operational mode and
   evidence-aware allocation boundaries.
 - `fifo_equity_unrealized_cashflow_v1`: realized FIFO P&L, account-equity
   change, unrealized change, and external cash-flow separation.

@@ -295,7 +295,16 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         confidence_line = f"Confidence: {system_confidence}\n"
         score_line = f"Trade score: {score_val:.0f}/100\n" if score_val is not None else ""
         strategy_state = proposal.get("strategy_state")
-        policy_line = f"Strategy policy: {strategy_state}\n" if strategy_state else ""
+        policy_line = (
+            f"Strategy authorization: {strategy_state} — authorised for operational paper entry risk\n"
+            f"Strategy policy: {strategy_state}\n"
+            if strategy_state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"}
+            else (
+                f"Strategy authorization: {strategy_state}\nStrategy policy: {strategy_state}\n"
+                if strategy_state
+                else ""
+            )
+        )
         if strategy_state == "PROBE":
             policy_line += "PROBE controls: new entry only; no adds; manual Telegram approval; 0.03% stop risk; 0.10% heat; 2.5% gross; one active/reserved.\n"
 
@@ -337,7 +346,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         if cash is not None:
             account_section += f"Available Cash: ${float(cash):,.2f}\n"
         if buying_power is not None:
-            account_section += f"Buying Power: ${float(buying_power):,.2f} (includes margin leverage)\n"
+            account_section += f"Buying Power: ${float(buying_power):,.2f} (authoritative broker capacity; margin use is forbidden)\n"
 
         if account_section:
             account_section = f"Account Context:\n{account_section}\n"
@@ -389,13 +398,17 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             )
         adaptive_sizing = proposal.get("adaptive_sizing") or {}
         if adaptive_sizing:
+            stop_risk_dollars = float(adaptive_sizing.get("stop_risk_dollars") or proposal.get("stop_risk_dollars") or 0.0)
+            stop_risk_pct = float(adaptive.get("recommended_stop_risk_pct") or proposal.get("permitted_stop_risk_pct") or 0.0)
+            sizing_reason = adaptive_sizing.get("reason") or adaptive.get("reason") or "bounded by conviction and authoritative ceilings"
             adaptive_section += (
                 "Adaptive Sizing (operational paper): "
                 f"actual proposed ${float(adaptive_sizing.get('operational_notional') or 0.0):,.2f} "
                 f"({float(adaptive_sizing.get('operational_quantity') or 0.0):.6f} shares); "
+                f"stop risk {stop_risk_pct:.4f}% (${stop_risk_dollars:,.2f}); "
                 f"canonical baseline ${float(proposal.get('baseline_operational_notional') or 0.0):,.2f}; "
                 f"{adaptive_sizing.get('comparison_direction')}, binding {adaptive_sizing.get('binding_adaptive_cap')}. "
-                "This displayed adaptive size is the maximum that approval can submit.\n\n"
+                f"Reason: {sizing_reason}. This displayed adaptive size is the maximum that approval can submit.\n\n"
             )
 
         scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}"

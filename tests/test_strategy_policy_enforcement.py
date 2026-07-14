@@ -84,6 +84,9 @@ def test_phase4_operational_state_comes_from_persisted_policy_and_shadow_stays_r
     )
     assert result["weights"]["rule_based_v2"] > 0
     assert result["strategy_policies"]["rule_based_v2"]["state"] == "ACTIVE"
+    active_policy = result["strategy_policies"]["rule_based_v2"]
+    assert active_policy["risk_budget_multiplier"] == active_policy["allocation_weight"] / cfg["phase4"]["max_strategy_weight"]
+    assert 0 < active_policy["allocation_weight"] <= 0.175
     assert result["strategy_policies"][STRATEGIES[1]]["state"] == "RESEARCH_ONLY"
     assert result["weights"][STRATEGIES[1]] == 0
     assert all(not value["kelly_used"] for value in result["strategy_policies"].values())
@@ -125,3 +128,21 @@ def test_policy_sizing_budget_is_not_score_scaled(tmp_path):
     assert initial["strategy_quality_score"] == 80
     assert initial["final_notional"] <= 100000 * .10 / 100 / (initial["stop_distance_dollars"] / 100)
     assert add["final_notional"] <= 100000 * .05 / 100 / (add["stop_distance_dollars"] / 100)
+
+
+def test_active_phase4_evidence_weight_reduces_actual_candidate_risk_budget(tmp_path):
+    db = _db(tmp_path)
+    cfg, _policy_row = _policy(db, "ACTIVE")
+    service = TradingService(cfg, db, None, "policy-run")
+    service._authoritative_runtime_state = lambda force=False: {
+        "positions": [], "account": {"equity": 100000, "cash": 90000, "buying_power": 360000},
+        "loss_metrics": {"daily_loss_dollars": 0, "weekly_loss_dollars": 0, "daily_loss_confidence": "verified", "weekly_loss_confidence": "verified"},
+    }
+    bars = pd.DataFrame({"high": [101.0] * 250, "low": [99.0] * 250, "close": [100.0] * 250, "volume": [200000.0] * 250})
+    snapshot = {"portfolio_equity": 100000, "cash": 90000, "buying_power": 360000, "total_exposure_dollars": 0, "single_exposures": {}, "cluster_exposures": {}}
+    result = service._calculate_dynamic_size("SPY", 90, "normal", 100, bars, snapshot, strategy_version="rule_based_v2")
+    assert result["phase4_mode"] == "adaptive"
+    phase4_policy = service._phase4_allocation_cache["strategy_policies"]["rule_based_v2"]
+    expected_risk_pct = 0.20 * phase4_policy["risk_budget_multiplier"]
+    assert result["risk_budget_dollars"] == 100000.0 * expected_risk_pct / 100.0
+    assert result["final_notional"] <= result["risk_budget_dollars"] / result["stop_distance_dollars"] * 100.0

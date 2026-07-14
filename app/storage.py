@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +11,13 @@ from typing import Any, Iterator
 from .utils import PROJECT_ROOT, iso_now, json_dumps
 from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
 from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION, REQUIRED_SCHEMA_VERSIONS, RISK_DECISION_VERSION
+
+
+# CPython 3.13 on macOS can deadlock two threads when one closes a WAL
+# connection while another opens the same database. Serialise only the native
+# open/close lifecycle; transactions and SQL execution remain concurrent and
+# continue to rely on SQLite's BEGIN IMMEDIATE/WAL guarantees.
+_SQLITE_CONNECTION_LIFECYCLE_LOCK = threading.RLock()
 
 TABLE_DEFINITIONS: dict[str, str] = {
     "runtime_metadata": "key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL",
@@ -255,7 +263,8 @@ class Storage:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=10)
+        with _SQLITE_CONNECTION_LIFECYCLE_LOCK:
+            conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -266,7 +275,8 @@ class Storage:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            with _SQLITE_CONNECTION_LIFECYCLE_LOCK:
+                conn.close()
 
     def initialize(self) -> None:
         with self.connect() as conn:

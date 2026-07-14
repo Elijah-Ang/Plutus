@@ -63,7 +63,11 @@ configuration hash, fingerprints and formula/schema/evidence versions.
 
 Configuration/schema/formula versions:
 
-- `plutus_effective_config_v6_adaptive_operational_paper`
+- `plutus_effective_config_v7_release_gate_operational_paper`
+
+Every ordinary or protective paper order requires manual approval. Extreme and
+sleep-mode exit detection can prioritise an urgent SELL proposal, but it cannot
+start a timer or submit through an approval-bypass path.
 - `adaptive_conviction_formula_v2_operational_paper`
 - `adaptive_conviction_operational_decisions_v2`
 - `adaptive_sizing_formula_v2_operational_paper`

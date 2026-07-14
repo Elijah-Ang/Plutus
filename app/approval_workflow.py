@@ -681,6 +681,41 @@ class ApprovalWorkflowStore:
                 elif state in {
                     ApprovalWorkflowState.SUBMISSION_STARTED,
                     ApprovalWorkflowState.SUBMITTED,
+                } and lookup_reconciler is not None:
+                    intent = intent_rows[0] if intent_rows else None
+                    # Broker-relevant workflows are lookup-only. In particular,
+                    # a filled/cancelled/rejected/expired intent must terminalise
+                    # its local workflow after restart instead of being claimed
+                    # forever. This path never calls the submission callback.
+                    outcome = str(lookup_reconciler(workflow, intent)).lower()
+                    if outcome == "terminal":
+                        self.transition(
+                            workflow_id,
+                            ApprovalWorkflowState.TERMINAL,
+                            owner_token=owner_token,
+                            safe_detail="lookup-only reconciliation terminalised broker-relevant workflow",
+                        )
+                    elif outcome == "unknown":
+                        self.transition(
+                            workflow_id,
+                            ApprovalWorkflowState.UNKNOWN,
+                            owner_token=owner_token,
+                            safe_detail="lookup-only reconciliation found unresolved broker state",
+                        )
+                        counts["external_ambiguity"] += 1
+                    elif outcome == "submitted":
+                        if state == ApprovalWorkflowState.SUBMISSION_STARTED:
+                            self.transition(
+                                workflow_id,
+                                ApprovalWorkflowState.SUBMITTED,
+                                owner_token=owner_token,
+                                safe_detail="lookup-only reconciliation confirmed submitted intent",
+                            )
+                    else:
+                        raise ValueError("lookup reconciler returned an unsupported recovery outcome")
+                elif state in {
+                    ApprovalWorkflowState.SUBMISSION_STARTED,
+                    ApprovalWorkflowState.SUBMITTED,
                     ApprovalWorkflowState.UNKNOWN,
                 }:
                     # Submission started without a conclusive durable result is external
