@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .ai_review import AIReviewer, deterministic_review
 from .adaptive_conviction import AdaptiveConvictionEngine
+from .adaptive_sizing import AdaptiveSizingEngine
 from .capabilities import AUTO_EXECUTION_SUPPORTED, require_protective_paper_exit_support
 from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active
 
@@ -1676,9 +1677,11 @@ class TradingService:
         portfolio: dict[str, Any],
         *,
         risk_checks_passed: bool,
+        stage: str = "proposal",
+        approval_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Gather diagnostic inputs; formula and classification stay in the engine."""
-        if proposal.get("action") != "entry" or str(proposal.get("side") or "").lower() != "buy":
+        if proposal.get("action") not in {"entry", "add"} or str(proposal.get("side") or "").lower() != "buy":
             return None
         adaptive_config = self.config.get("adaptive_conviction")
         if not isinstance(adaptive_config, dict) or adaptive_config.get("enabled") is not True:
@@ -1714,14 +1717,15 @@ class TradingService:
         inputs = {
             "run_id": proposal.get("run_id"), "proposal_id": proposal.get("id"),
             "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
+            "decision_stage": stage, "approval_id": approval_id,
             "strategy_version": proposal.get("strategy_version"),
-            "policy_decision_id": proposal.get("policy_decision_id"),
-            "performance_snapshot_id": proposal.get("performance_snapshot_id"),
+            "policy_decision_id": sizing.get("policy_decision_id") or proposal.get("policy_decision_id"),
+            "performance_snapshot_id": sizing.get("performance_snapshot_id") or proposal.get("performance_snapshot_id"),
             "action": proposal.get("action"), "side": proposal.get("side"),
             "strategy_authorized": state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
             "strategy_policy_state": state,
-            "evidence_quality": (float(proposal["strategy_quality_score"]) / 100.0) if proposal.get("strategy_quality_score") is not None else None,
-            "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"} and proposal.get("performance_snapshot_id") is not None,
+            "evidence_quality": (float(sizing.get("strategy_quality_score", proposal.get("strategy_quality_score"))) / 100.0) if sizing.get("strategy_quality_score", proposal.get("strategy_quality_score")) is not None else None,
+            "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"} and (sizing.get("performance_snapshot_id") or proposal.get("performance_snapshot_id")) is not None,
             "market_regime": proposal.get("volatility_regime"),
             "account_drawdown_pct": sizing.get("phase3_account_drawdown_pct"),
             "daily_realized_loss_pct": portfolio.get("daily_loss_pct"),
@@ -1753,6 +1757,85 @@ class TradingService:
         engine.persist(self.storage, adaptive)
         summary = adaptive.summary()
         self.storage.audit(self.run_id, "adaptive_conviction_report_only", summary)
+        return summary
+
+    def _record_adaptive_sizing(
+        self,
+        proposal: dict[str, Any],
+        sizing: dict[str, Any],
+        portfolio: dict[str, Any],
+        adaptive_conviction: dict[str, Any],
+        *,
+        stage: str,
+        approval_id: str | None = None,
+        displayed_adaptive_ceiling: float | None = None,
+        proposal_adaptive_notional: float | None = None,
+        final_revalidation_blocked: bool = False,
+        missing_inputs: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Gather authoritative inputs; all sizing formulae remain in the engine."""
+        if proposal.get("action") not in {"entry", "add"} or str(proposal.get("side") or "").lower() != "buy":
+            return None
+        equity = float(portfolio.get("portfolio_equity") or 0.0)
+        operational_notional = float(sizing.get("final_notional") or proposal.get("notional") or 0.0)
+        operational_pct = operational_notional / equity * 100.0 if equity > 0 else None
+        current_gross = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_total_exposure_pct") or 0.0) - operational_pct)
+        current_symbol = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_symbol_exposure_pct") or 0.0) - operational_pct)
+        current_cluster = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_cluster_exposure_pct") or 0.0) - operational_pct)
+        current_heat = None
+        if equity > 0:
+            current_heat = (
+                float(portfolio.get("held_open_stop_risk") or 0.0)
+                + float(portfolio.get("active_reserved_stop_risk") or 0.0)
+                + float(portfolio.get("pending_buy_stop_risk") or 0.0)
+            ) / equity * 100.0
+        phase3_profile = (self.config.get("phase3", {}) or {}).get("risk_profile", {}) or {}
+        engine = AdaptiveSizingEngine(self.config)
+        decision = engine.evaluate({
+            "stage": stage, "run_id": proposal.get("run_id") or self.run_id,
+            "proposal_id": proposal.get("id") or proposal.get("proposal_id"),
+            "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
+            "approval_id": approval_id, "strategy_version": proposal.get("strategy_version"),
+            "policy_id": proposal.get("policy_decision_id"), "action": proposal.get("action"), "side": proposal.get("side"),
+            "adaptive_conviction": adaptive_conviction, "operational_sizing": sizing,
+            "authoritative_equity": equity, "authoritative_cash": portfolio.get("cash"),
+            "authoritative_buying_power": portfolio.get("buying_power"),
+            "canonical_risk_snapshot": {
+                "held_open_stop_risk": portfolio.get("held_open_stop_risk"),
+                "pending_buy_stop_risk": portfolio.get("pending_buy_stop_risk"),
+                "pending_buy_notional": portfolio.get("pending_buy_notional"),
+            },
+            "active_reservations": {
+                "notional": portfolio.get("active_reserved_exposure"),
+                "stop_risk": portfolio.get("active_reserved_stop_risk"),
+            },
+            "entry_price": proposal.get("latest_price") or proposal.get("proposal_price"),
+            "stop_price": sizing.get("stop_price") or proposal.get("stop_price"),
+            "stop_distance_dollars": sizing.get("stop_distance_dollars") or proposal.get("stop_distance_dollars"),
+            "strategy_policy_state": sizing.get("strategy_state") or proposal.get("strategy_state"),
+            "strategy_policy_version": sizing.get("strategy_policy_version") or proposal.get("strategy_policy_version"),
+            "current_portfolio_heat_pct": current_heat, "current_gross_exposure_pct": current_gross,
+            "current_symbol_exposure_pct": current_symbol, "current_cluster_exposure_pct": current_cluster,
+            "hard_limits_pct": {
+                "portfolio_heat": phase3_profile.get("max_portfolio_heat_pct"),
+                "gross_exposure": phase3_profile.get("hard_gross_exposure_pct"),
+                "symbol_exposure": phase3_profile.get("max_symbol_exposure_pct"),
+                "cluster_exposure": phase3_profile.get("max_cluster_exposure_pct"),
+            },
+            "displayed_adaptive_ceiling": displayed_adaptive_ceiling,
+            "proposal_adaptive_notional": proposal_adaptive_notional,
+            "final_revalidation_blocked": final_revalidation_blocked,
+            "missing_inputs": list(missing_inputs or []),
+            "integrity": {
+                "pending_buy_exposure_unknown": portfolio.get("pending_buy_exposure_unknown"),
+                "reconciliation_checked": True,
+            },
+        })
+        if decision is None:
+            return None
+        engine.persist(self.storage, decision)
+        summary = decision.summary()
+        self.storage.audit(self.run_id, "adaptive_sizing_report_only", summary)
         return summary
 
     def replay_adaptive_conviction(self, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1970,6 +2053,7 @@ class TradingService:
 
                     performance_text = StrategyPerformanceEngine(self.storage, self.config).format_report()
                     performance_text += "\n\n" + AdaptiveConvictionEngine(self.config).format_report(self.storage)
+                    performance_text += "\n\n" + AdaptiveSizingEngine(self.config).format_report(self.storage)
                     self.storage.audit(self.run_id, "telegram_command", {"command": "/performance", "authorized": True, "report_only": True})
                     self.telegram.send_message(performance_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                     continue
@@ -2891,6 +2975,40 @@ class TradingService:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
 
         if block_reason:
+            if prop_side == "buy" and proposal.get("action") in {"entry", "add"} and proposal.get("adaptive_sizing"):
+                try:
+                    proposal["proposal_price_age_seconds_at_send"] = refreshed_price_age_seconds
+                    blocked_context = self._portfolio_context(proposal, approval_valid=True)
+                    blocked_sizing = {
+                        "score_adjusted_notional": float(row.get("notional") or 0.0),
+                        "final_notional": 0.0,
+                        "suggested_shares": 0.0,
+                        "stop_risk_dollars": 0.0,
+                        "minimum_executable_notional": (self.config.get("position_sizing", {}) or {}).get("minimum_executable_notional_usd"),
+                        "sizing_caps": proposal.get("sizing_caps") or {},
+                        "blocked_reason": block_reason,
+                        "strategy_state": proposal.get("final_policy_state") or proposal.get("strategy_state"),
+                        "strategy_policy_version": proposal.get("strategy_policy_version"),
+                        "policy_decision_id": proposal.get("final_policy_current_decision_id") or proposal.get("policy_decision_id"),
+                        "performance_snapshot_id": proposal.get("performance_snapshot_id"),
+                        "strategy_quality_score": proposal.get("strategy_quality_score"),
+                    }
+                    blocked_conviction = self._record_adaptive_conviction(
+                        proposal, blocked_sizing, blocked_context, risk_checks_passed=False,
+                        stage="final_revalidation", approval_id=approval_id,
+                    )
+                    if blocked_conviction is not None:
+                        proposal_shadow = proposal.get("adaptive_sizing") or {}
+                        self._record_adaptive_sizing(
+                            proposal, blocked_sizing, blocked_context, blocked_conviction,
+                            stage="final_revalidation", approval_id=approval_id,
+                            displayed_adaptive_ceiling=proposal_shadow.get("displayed_adaptive_ceiling"),
+                            proposal_adaptive_notional=proposal_shadow.get("adaptive_notional"),
+                            final_revalidation_blocked=True,
+                            missing_inputs=["complete_fresh_final_operational_sizing"],
+                        )
+                except Exception as exc:
+                    logger.warning("Blocked final adaptive evidence unavailable: %s", type(exc).__name__)
             result = ExecutionResult(False, "blocked", None, reason=block_reason)
             return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
@@ -2911,6 +3029,7 @@ class TradingService:
         proposal["approved_notional"] = approved_notional
         proposal["approved_notional_ceiling"] = approved_notional
         proposal["cluster_name"] = self._get_symbol_cluster(prop_symbol)
+        size_dict: dict[str, Any] | None = None
 
         # Recalculate dynamic size if sizing enabled and buy
         if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
@@ -2949,11 +3068,48 @@ class TradingService:
                 logger.warning("Recalculate dynamic size failed during revalidation: %s", type(e).__name__)
                 block_reason = "final validated sizing could not be recomputed"
 
+        # Recompute report-only Adaptive Conviction and sizing from the same
+        # fresh authoritative inputs. Shadow disagreement never blocks or
+        # changes the already-computed operational notional/quantity.
+        context = self._portfolio_context(proposal, approval_valid=True)
+        if prop_side == "buy" and proposal.get("action") in {"entry", "add"} and size_dict is not None:
+            operational_before_shadow = (proposal.get("notional"), proposal.get("qty"))
+            try:
+                proposal["proposal_price_age_seconds_at_send"] = refreshed_price_age_seconds
+                final_conviction = self._record_adaptive_conviction(
+                    proposal,
+                    size_dict,
+                    context,
+                    risk_checks_passed=block_reason is None and float(proposal.get("notional") or 0.0) > 0,
+                    stage="final_revalidation",
+                    approval_id=approval_id,
+                )
+                proposal_shadow = proposal.get("adaptive_sizing") or {}
+                if final_conviction is not None:
+                    proposal["adaptive_sizing_final"] = self._record_adaptive_sizing(
+                        proposal,
+                        size_dict,
+                        context,
+                        final_conviction,
+                        stage="final_revalidation",
+                        approval_id=approval_id,
+                        displayed_adaptive_ceiling=proposal_shadow.get("displayed_adaptive_ceiling"),
+                        proposal_adaptive_notional=proposal_shadow.get("adaptive_notional"),
+                        final_revalidation_blocked=bool(block_reason),
+                    )
+            except Exception as exc:
+                logger.warning("Report-only adaptive sizing final revalidation unavailable: %s", type(exc).__name__)
+                self.storage.audit(self.run_id, "adaptive_sizing_final_report_unavailable", {
+                    "proposal_id": row.get("id"), "approval_id": approval_id,
+                    "error_type": type(exc).__name__, "operational_sizing_unchanged": True,
+                })
+            if operational_before_shadow != (proposal.get("notional"), proposal.get("qty")):
+                raise RuntimeError("report-only adaptive sizing attempted to mutate operational size")
+
         # Execute
         proposal["status"] = "approved"
         if row.get("emergency_exit_triggered") == 1:
             proposal["execution_path"] = "protective_paper_exit"
-        context = self._portfolio_context(proposal, approval_valid=True)
         context["execution_path"] = proposal.get("execution_path")
         result = Executor(
             self.broker,
@@ -5115,13 +5271,22 @@ class TradingService:
                                     no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                                     proposal_allowed = False
 
-                            if is_buy and proposal_action == "entry":
+                            if is_buy and proposal_action in {"entry", "add"}:
                                 proposal["adaptive_conviction"] = self._record_adaptive_conviction(
                                     proposal,
                                     res,
                                     port_context,
                                     risk_checks_passed=bool(decision is not None and decision.passed),
+                                    stage="proposal",
                                 )
+                                if proposal["adaptive_conviction"] is not None:
+                                    proposal["adaptive_sizing"] = self._record_adaptive_sizing(
+                                        proposal,
+                                        res,
+                                        port_context,
+                                        proposal["adaptive_conviction"],
+                                        stage="proposal",
+                                    )
 
                             if proposal_allowed:
                                 if is_buy:
@@ -5908,6 +6073,19 @@ class TradingService:
                 f"future {float(adaptive['recommended_stop_risk_pct']):.4f}% vs operational {float(adaptive['operational_stop_risk_pct']):.4f}%; "
                 f"binding {adaptive['binding_cap']}"
             )
+        adaptive_sizing_rows = self.storage.fetch_all(
+            """SELECT operational_constrained_notional,adaptive_constrained_notional,comparison_direction,binding_adaptive_cap
+               FROM adaptive_sizing_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (window_start_iso,),
+        )
+        if adaptive_sizing_rows:
+            sizing_shadow = adaptive_sizing_rows[0]
+            sizing_line = (
+                f"Adaptive Sizing report-only: operational ${float(sizing_shadow['operational_constrained_notional']):,.2f}; "
+                f"shadow ${float(sizing_shadow['adaptive_constrained_notional']):,.2f}; "
+                f"{sizing_shadow['comparison_direction']}; binding {sizing_shadow['binding_adaptive_cap']}; operational unchanged"
+            )
+            adaptive_conviction_line = f"{adaptive_conviction_line}; {sizing_line}" if adaptive_conviction_line else sizing_line
         crypto_research_line = None
         if self.config.get("crypto", {}).get("enabled", False) and not crypto_quiet_hours_active(self.config, now):
             crypto_rows = self.storage.fetch_all(

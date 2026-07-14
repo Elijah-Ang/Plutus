@@ -10,6 +10,7 @@ from .formula_versions import (
     ACCOUNTING_VERSION,
     ADAPTIVE_CONVICTION_FORMULA_VERSION,
     ADAPTIVE_CONVICTION_SCHEMA_VERSION,
+    ADAPTIVE_SIZING_FORMULA_VERSION,
     CONFIGURATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE3_DECISION_VERSION,
@@ -42,7 +43,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
-    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "profitability_engine", "execution_capabilities", "broker",
+    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "execution_capabilities", "broker",
     "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
     "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
@@ -94,11 +95,12 @@ STRICT_SECTION_KEYS = {
         "hard_trade_risk_ceiling_pct", "maximum_symbol_exposure_pct", "maximum_cluster_exposure_pct",
         "minimum_liquidity_dollars", "maximum_quote_spread_bps", "kelly_operational", "covariance_operational",
     },
+    "adaptive_sizing": {"enabled", "mode", "operational_enforcement", "allow_order_size_change"},
     "risk_budget": {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "adaptive_conviction"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -186,6 +188,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
         "strategy_policy": STRATEGY_POLICY_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
+        "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
     for key, expected in expected_formulas.items():
         require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")
@@ -203,6 +206,12 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(conviction.get("maximum_quote_spread_bps") == 40.0, "adaptive conviction quote-spread ceiling must remain 40 bps")
     require(conviction.get("kelly_operational") is False, "adaptive conviction Kelly must remain diagnostic only")
     require(conviction.get("covariance_operational") is False, "adaptive conviction covariance must remain diagnostic only")
+
+    adaptive_sizing = config.get("adaptive_sizing", {}) or {}
+    require(adaptive_sizing.get("enabled") is True, "adaptive_sizing.enabled must be true")
+    require(adaptive_sizing.get("mode") == "shadow_only", "adaptive sizing mode must remain shadow_only")
+    require(adaptive_sizing.get("operational_enforcement") is False, "operational adaptive sizing is forbidden in this build")
+    require(adaptive_sizing.get("allow_order_size_change") is False, "adaptive sizing order-size changes are forbidden in this build")
 
     profitability = config.get("profitability_engine", {}) or {}
     require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")

@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v4_adaptive_conviction
+configuration_schema_version: plutus_effective_config_v5_adaptive_sizing_shadow
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -93,6 +93,11 @@ adaptive_conviction:
   maximum_quote_spread_bps: 40.0
   kelly_operational: false
   covariance_operational: false
+adaptive_sizing:
+  enabled: true
+  mode: shadow_only
+  operational_enforcement: false
+  allow_order_size_change: false
 profitability_engine:
   enabled: true
   enforcement_enabled: true
@@ -158,6 +163,7 @@ formula_versions:
   strategy_performance: strategy_performance_v2_2_probe
   strategy_policy: strategy_policy_v2_2_probe
   adaptive_conviction: adaptive_conviction_formula_v1
+  adaptive_sizing: adaptive_sizing_formula_v1
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.

@@ -65,6 +65,8 @@ class AdaptiveConvictionDecision:
     proposal_id: str | None
     candidate_id: str | None
     setup_id: str | None
+    decision_stage: str
+    approval_id: str | None
     strategy_version: str
     policy_decision_id: str | None
     performance_snapshot_id: str | None
@@ -101,6 +103,7 @@ class AdaptiveConvictionDecision:
     def summary(self) -> dict[str, Any]:
         return {
             "decision_id": self.id,
+            "decision_stage": self.decision_stage,
             "report_only": True,
             "deployment_mode": self.deployment_mode,
             "opportunity_class": self.opportunity_class,
@@ -108,6 +111,9 @@ class AdaptiveConvictionDecision:
             "operational_stop_risk_pct": self.operational_stop_risk_pct,
             "binding_cap": self.binding_cap,
             "confidence": self.confidence,
+            "missing_inputs": list(self.raw_inputs.get("derived", {}).get("missing", [])),
+            "formula_version": self.formula_version,
+            "evidence_version": self.evidence_version,
             "reason": self.reason,
         }
 
@@ -116,6 +122,7 @@ def apply_adaptive_conviction_schema(conn: Any, *, record_migration: bool = True
     conn.execute(
         """CREATE TABLE IF NOT EXISTS adaptive_conviction_decisions(
           id TEXT PRIMARY KEY,created_at TEXT NOT NULL,run_id TEXT,proposal_id TEXT,candidate_id TEXT,setup_id TEXT,
+          decision_stage TEXT NOT NULL DEFAULT 'proposal',approval_id TEXT,
           strategy_version TEXT NOT NULL,policy_decision_id TEXT,performance_snapshot_id TEXT,
           deployment_mode TEXT NOT NULL,opportunity_class TEXT NOT NULL,base_strategy_risk_pct REAL NOT NULL,
           opportunity_multiplier REAL NOT NULL,regime_multiplier REAL NOT NULL,account_health_multiplier REAL NOT NULL,
@@ -129,6 +136,11 @@ def apply_adaptive_conviction_schema(conn: Any, *, record_migration: bool = True
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_conviction_proposal ON adaptive_conviction_decisions(proposal_id,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_conviction_distribution ON adaptive_conviction_decisions(deployment_mode,opportunity_class,created_at)")
+    present = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_conviction_decisions)")}
+    if "decision_stage" not in present:
+        conn.execute("ALTER TABLE adaptive_conviction_decisions ADD COLUMN decision_stage TEXT NOT NULL DEFAULT 'proposal'")
+    if "approval_id" not in present:
+        conn.execute("ALTER TABLE adaptive_conviction_decisions ADD COLUMN approval_id TEXT")
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -323,7 +335,7 @@ class AdaptiveConvictionEngine:
 
     def evaluate(self, inputs: Mapping[str, Any]) -> AdaptiveConvictionDecision | None:
         raw = dict(inputs)
-        if str(raw.get("action") or "entry").lower() != "entry" or str(raw.get("side") or "buy").lower() != "buy":
+        if str(raw.get("action") or "entry").lower() not in {"entry", "add"} or str(raw.get("side") or "buy").lower() != "buy":
             return None
         derived = self._derived(raw)
         opportunity_class, class_reasons = self._opportunity_class(derived)
@@ -381,7 +393,7 @@ class AdaptiveConvictionEngine:
         if derived["missing"]:
             reason_parts.append("missing=" + ",".join(sorted(derived["missing"])))
         fingerprint_payload = {
-            "identifiers": {name: raw.get(name) for name in ("run_id", "proposal_id", "candidate_id", "setup_id", "strategy_version", "policy_decision_id", "performance_snapshot_id")},
+            "identifiers": {name: raw.get(name) for name in ("run_id", "proposal_id", "candidate_id", "setup_id", "decision_stage", "approval_id", "strategy_version", "policy_decision_id", "performance_snapshot_id")},
             "inputs": persisted_raw,
             "formula_version": ADAPTIVE_CONVICTION_FORMULA_VERSION,
             "config_hash": self.config.get("effective_config_hash"),
@@ -389,7 +401,9 @@ class AdaptiveConvictionEngine:
         fingerprint = _fingerprint(fingerprint_payload)
         return AdaptiveConvictionDecision(
             id=fingerprint[:32], created_at=iso_now(), run_id=raw.get("run_id"), proposal_id=raw.get("proposal_id"),
-            candidate_id=raw.get("candidate_id"), setup_id=raw.get("setup_id"), strategy_version=str(raw.get("strategy_version") or ""),
+            candidate_id=raw.get("candidate_id"), setup_id=raw.get("setup_id"),
+            decision_stage=str(raw.get("decision_stage") or "proposal"), approval_id=raw.get("approval_id"),
+            strategy_version=str(raw.get("strategy_version") or ""),
             policy_decision_id=raw.get("policy_decision_id"), performance_snapshot_id=raw.get("performance_snapshot_id"),
             deployment_mode=deployment_mode, opportunity_class=opportunity_class, base_strategy_risk_pct=round(base, 8),
             opportunity_multiplier=round(opportunity_multiplier, 8), regime_multiplier=round(regime_multiplier, 8),

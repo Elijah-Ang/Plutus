@@ -169,10 +169,11 @@ def test_schema_and_configuration_are_strict(tmp_path):
         validate_config(config)
 
 
-def test_operational_sizing_paths_do_not_reference_adaptive_conviction():
+def test_operational_sizing_formula_does_not_reference_adaptive_conviction():
     sizing_source = inspect.getsource(TradingService._calculate_dynamic_size)
     final_validation_source = inspect.getsource(TradingService._execute_final_revalidation)
     assert "AdaptiveConviction" not in sizing_source
     assert "adaptive_conviction" not in sizing_source
     assert "AdaptiveConviction" not in final_validation_source
-    assert "adaptive_conviction" not in final_validation_source
+    assert "_record_adaptive_conviction" in final_validation_source
+    assert "min(max(0.0, approved_notional), max(0.0, recalc_notional))" in final_validation_source
