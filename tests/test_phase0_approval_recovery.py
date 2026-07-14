@@ -215,6 +215,53 @@ def test_recovery_never_revives_expired_proposal(tmp_path):
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
 
 
+def test_recovery_action_authority_blocks_before_intent_creation(tmp_path):
+    storage = _storage(tmp_path)
+    workflow = _workflow(storage)
+    proposal = _proposal()
+
+    summary = ApprovalWorkflowStore(storage).recover(
+        owner_token="authority-worker",
+        proposal_loader=lambda _proposal_id: proposal,
+        action_validator=lambda _workflow, loaded: (
+            "blocked", loaded, "dependent group expired"
+        ),
+        run_id="run",
+    )
+
+    assert summary.blocked == 1
+    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "blocked"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
+
+
+def test_recovery_action_authority_rechecked_before_submission_and_releases_intent(tmp_path):
+    storage = _storage(tmp_path)
+    proposal = _proposal()
+    workflow = _workflow(storage)
+    store = ApprovalWorkflowStore(storage)
+    intent = store.ensure_intent(workflow["id"], proposal, run_id="run")
+    store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+    submitted = []
+
+    summary = store.recover(
+        owner_token="submission-authority-worker",
+        proposal_loader=lambda _proposal_id: proposal,
+        action_validator=lambda _workflow, loaded: (
+            "blocked", loaded, "dependent group expired"
+        ),
+        submitter=lambda *_args: submitted.append(True) or "submitted",
+        run_id="run",
+    )
+
+    assert summary.blocked == 1
+    assert submitted == []
+    assert store.get(workflow["id"])["state"] == "blocked"
+    assert DurableExecutionStore(storage).get_intent(intent["id"])["state"] == "expired"
+    assert storage.fetch_all(
+        "SELECT state FROM risk_reservations WHERE intent_id=?", (intent["id"],)
+    )[0]["state"] == "released"
+
+
 def test_update_cannot_be_processed_before_business_state_is_durable(tmp_path):
     storage = _storage(tmp_path)
     storage.ingest_telegram_update(

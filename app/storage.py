@@ -143,6 +143,38 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     },
     "trade_proposals": {
         "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
+        "strategy_registry_snapshot_id": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
+        "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
+        "winner_expansion_decision_id": "TEXT", "pyramiding_milestone_id": "TEXT",
+        "pyramiding_milestone_key": "TEXT", "management_mode": "TEXT",
+        "current_shares": "REAL", "add_shares": "REAL", "current_protective_stop": "REAL",
+        "proposed_protective_stop": "REAL", "pre_add_open_risk": "REAL",
+        "post_add_open_risk": "REAL", "incremental_risk": "REAL", "risk_released": "REAL",
+        "risk_operator_classification": "TEXT", "rotation_group_id": "TEXT",
+        "rotation_step_id": "TEXT", "relationship_type": "TEXT",
+    },
+    "order_intents": {
+        "strategy_registry_snapshot_id": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
+        "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
+        "winner_expansion_decision_id": "TEXT", "pyramiding_milestone_id": "TEXT",
+        "pyramiding_milestone_key": "TEXT", "management_mode": "TEXT",
+        "pre_add_open_risk": "REAL", "post_add_open_risk": "REAL", "incremental_risk": "REAL",
+        "rotation_step_id": "TEXT",
+    },
+    "risk_reservations": {
+        "strategy_version": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
+        "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
+        "incremental_risk": "REAL",
+    },
+    "position_management_state": {
+        "authoritative_protective_stop": "REAL", "protective_stop_as_of": "TEXT",
+        "protective_stop_source": "TEXT", "protective_stop_formula_version": "TEXT",
+        "protective_stop_sequence": "INTEGER", "management_mode": "TEXT",
+        "trend_management_formula_version": "TEXT", "peak_r_multiple": "REAL",
+        "last_completed_pyramiding_milestone": "TEXT",
+    },
+    "strategy_policy_decisions": {
+        "evidence_version": "TEXT", "configuration_version": "TEXT", "config_hash": "TEXT",
     },
     "telegram_updates": {
         "message_timestamp": "INTEGER",
@@ -153,6 +185,11 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
 def _ensure_columns(conn: sqlite3.Connection, additions: dict[str, dict[str, str]]) -> None:
     for table, columns in additions.items():
         present = {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        if not present:
+            # Some additive tables are created by their versioned migration
+            # later in initialize/apply_explicit_migrations. Never fabricate a
+            # partial table merely to add provenance columns.
+            continue
         for name, column_type in columns.items():
             if name not in present:
                 conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {column_type}')
@@ -231,6 +268,9 @@ class Storage:
             from .phase4_allocator import apply_phase4_schema
             from .adaptive_conviction import apply_adaptive_conviction_schema
             from .adaptive_sizing import apply_adaptive_sizing_schema
+            from .strategy_execution_registry import apply_strategy_registry_schema
+            from .winner_expansion import apply_winner_expansion_schema
+            from .rotation_coordinator import apply_rotation_schema
             apply_p1_execution_schema(conn)
 
             apply_phase1_schema(conn)
@@ -239,6 +279,9 @@ class Storage:
             apply_phase4_schema(conn)
             apply_adaptive_conviction_schema(conn)
             apply_adaptive_sizing_schema(conn)
+            apply_strategy_registry_schema(conn)
+            apply_winner_expansion_schema(conn)
+            apply_rotation_schema(conn)
             from .strategy_performance import apply_strategy_performance_schema
             apply_strategy_performance_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
@@ -292,9 +335,16 @@ class Storage:
                 apply_adaptive_conviction_schema(conn, record_migration=False)
                 from .adaptive_sizing import apply_adaptive_sizing_schema
                 apply_adaptive_sizing_schema(conn, record_migration=False)
+                from .strategy_execution_registry import apply_strategy_registry_schema
+                apply_strategy_registry_schema(conn)
+                from .winner_expansion import apply_winner_expansion_schema
+                apply_winner_expansion_schema(conn, record_migration=False)
+                from .rotation_coordinator import apply_rotation_schema
+                apply_rotation_schema(conn, record_migration=False)
                 apply_p1_execution_schema(conn, record_migration=False)
                 from .strategy_performance import apply_strategy_performance_schema
                 apply_strategy_performance_schema(conn, record_migration=False)
+                _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.
             now = iso_now()

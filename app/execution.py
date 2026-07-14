@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +27,26 @@ from .quotes import implementation_shortfall_bps, validate_quote_payload
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
     return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+
+def _winner_add_reservation_risk(
+    proposal: dict[str, Any], quantity: float, reference: float, stop_price: float | None
+) -> tuple[float, float]:
+    incremental_risk = proposal.get("incremental_risk")
+    if incremental_risk is None:
+        raise ValueError("winner ADD requires canonical incremental-risk provenance")
+    incremental_risk = float(incremental_risk)
+    if not math.isfinite(incremental_risk):
+        raise ValueError("winner ADD incremental risk must be finite")
+    canonical_add_leg_risk = quantity * max(reference - float(stop_price or reference), 0.0)
+    stated_add_leg_risk = proposal.get("pending_add_stop_risk")
+    if stated_add_leg_risk is not None:
+        stated_add_leg_risk = float(stated_add_leg_risk)
+        if not math.isfinite(stated_add_leg_risk) or stated_add_leg_risk < 0:
+            raise ValueError("winner ADD pending leg risk must be finite and nonnegative")
+        if abs(stated_add_leg_risk - canonical_add_leg_risk) > 1e-6:
+            raise ValueError("winner ADD pending leg risk does not match final quantity, price, and stop")
+    return incremental_risk, canonical_add_leg_risk
 
 
 @dataclass(frozen=True)
@@ -120,6 +142,35 @@ class DurableExecutionStore:
         client_order_id = stable_client_order_id(action_key)
         reserved_notional = quantity * reference if side == "buy" else 0.0
         reserved_stop_risk = quantity * max(reference - stop_price, 0.0) if side == "buy" and stop_price else 0.0
+        if side == "buy" and proposal.get("winner_expansion_decision_id"):
+            incremental_risk, reserved_stop_risk = _winner_add_reservation_risk(
+                proposal, quantity, reference, stop_price
+            )
+            if not proposal.get("pyramiding_milestone_id") or not proposal.get("pyramiding_milestone_key"):
+                raise ValueError("winner ADD requires a durable pyramiding milestone")
+            # The held-risk snapshot already reflects the final authoritative
+            # stop. Reserve the ADD leg's full post-stop risk; the net
+            # position delta remains separate audit provenance and may be
+            # negative for a genuinely risk-neutral ADD.
+        else:
+            incremental_risk = reserved_stop_risk
+        if side == "buy":
+            ceiling_checks = (
+                ("approved quantity", quantity, proposal.get("approved_quantity_ceiling")),
+                ("approved notional", reserved_notional, proposal.get("approved_notional_ceiling")),
+                ("approved stop-risk", reserved_stop_risk, proposal.get("approved_stop_risk_ceiling")),
+            )
+            for label, actual, raw_ceiling in ceiling_checks:
+                if raw_ceiling is None:
+                    continue
+                try:
+                    ceiling = float(raw_ceiling)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{label} ceiling must be numeric") from exc
+                if not math.isfinite(ceiling) or ceiling < 0:
+                    raise ValueError(f"{label} ceiling must be finite and nonnegative")
+                if actual > ceiling + 1e-9:
+                    raise RuntimeError(f"atomic reservation exceeds {label} ceiling")
         now = iso_now()
         intent_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
@@ -158,6 +209,32 @@ class DurableExecutionStore:
             ).fetchone()
             if conflict:
                 raise RuntimeError(f"conflicting active order intent exists: {conflict['state']}")
+            if side == "buy" and proposal.get("winner_expansion_decision_id"):
+                winner_authority = conn.execute(
+                    """SELECT 1 FROM add_risk_decisions
+                       WHERE id=? AND proposal_id=? AND decision_stage='final_revalidation'
+                         AND eligible=1 AND milestone_id=? AND milestone_key=?
+                         AND ABS(incremental_risk-?)<=0.000000001 LIMIT 1""",
+                    (
+                        proposal["winner_expansion_decision_id"],
+                        proposal.get("proposal_id") or proposal.get("id"),
+                        proposal["pyramiding_milestone_id"],
+                        proposal["pyramiding_milestone_key"],
+                        incremental_risk,
+                    ),
+                ).fetchone()
+                milestone_authority = conn.execute(
+                    """SELECT 1 FROM pyramiding_milestones
+                       WHERE id=? AND milestone_key=? AND active_proposal_id=?
+                         AND status='APPROVED' LIMIT 1""",
+                    (
+                        proposal["pyramiding_milestone_id"],
+                        proposal["pyramiding_milestone_key"],
+                        proposal.get("proposal_id") or proposal.get("id"),
+                    ),
+                ).fetchone()
+                if winner_authority is None or milestone_authority is None:
+                    raise RuntimeError("winner ADD lacks final canonical risk and milestone authority")
             limits = proposal.get("_reservation_limits") or {}
             if side == "buy" and limits:
                 totals = conn.execute(
@@ -235,6 +312,142 @@ class DurableExecutionStore:
                     ).fetchone()
                     enforce("PROBE gross-exposure ceiling", float(probe_totals["gross"] or 0) + reserved_notional, "probe_gross_notional_ceiling")
                     enforce("PROBE portfolio-heat ceiling", float(probe_totals["heat"] or 0) + reserved_stop_risk, "probe_stop_risk_ceiling")
+            sleeve_fields_present = any(
+                proposal.get(name) is not None
+                for name in (
+                    "strategy_registry_snapshot_id", "strategy_sleeve", "sleeve_allocation_id",
+                    "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling",
+                )
+            )
+            if side == "buy" and (sleeve_fields_present or limits.get("require_strategy_sleeve") is True):
+                required = {
+                    "strategy_registry_snapshot_id": proposal.get("strategy_registry_snapshot_id"),
+                    "strategy_sleeve": proposal.get("strategy_sleeve"),
+                    "sleeve_allocation_id": proposal.get("sleeve_allocation_id"),
+                    "sleeve_notional_ceiling": proposal.get("sleeve_notional_ceiling"),
+                    "sleeve_stop_risk_ceiling": proposal.get("sleeve_stop_risk_ceiling"),
+                    "strategy_version": proposal.get("strategy_version"),
+                }
+                missing = [name for name, value in required.items() if value in (None, "")]
+                if missing:
+                    raise RuntimeError("atomic strategy sleeve reservation missing " + ", ".join(sorted(missing)))
+                registry_authority = conn.execute(
+                    """SELECT 1 FROM strategy_registry_decisions
+                       WHERE snapshot_id=? AND strategy_version=? AND authorized=1 AND run_id=? LIMIT 1""",
+                    (proposal["strategy_registry_snapshot_id"], proposal["strategy_version"], run_id),
+                ).fetchone()
+                if registry_authority is None:
+                    raise RuntimeError("atomic strategy sleeve reservation lacks registry authority")
+                allocation = conn.execute(
+                    """SELECT run_id,decided_at,payload FROM phase4_allocation_decisions
+                       WHERE id=? AND run_id=? LIMIT 1""",
+                    (proposal["sleeve_allocation_id"], run_id),
+                ).fetchone()
+                if allocation is None:
+                    raise RuntimeError("atomic strategy sleeve reservation references an unknown current-run allocation")
+                try:
+                    allocation_payload = json.loads(allocation["payload"] or "{}")
+                    canonical_sleeves = allocation_payload["strategy_sleeves"]
+                    canonical_sleeve = canonical_sleeves[proposal["strategy_version"]]
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("atomic strategy sleeve allocation payload is invalid") from exc
+                if proposal["strategy_sleeve"] != proposal["strategy_version"]:
+                    raise RuntimeError("atomic strategy sleeve identity does not match the strategy")
+                if canonical_sleeve.get("strategy_version") != proposal["strategy_version"]:
+                    raise RuntimeError("canonical allocation does not contain the requested strategy sleeve")
+                if proposal["strategy_version"] not in set(allocation_payload.get("authorized_strategies") or []):
+                    raise RuntimeError("canonical allocation does not authorize the requested strategy")
+                if allocation_payload.get("registry_snapshot_id") != proposal["strategy_registry_snapshot_id"]:
+                    raise RuntimeError("canonical allocation is not bound to the supplied registry snapshot")
+                risk_unit = str(canonical_sleeve.get("risk_unit") or "")
+                canonical_risk = float(canonical_sleeve.get("remaining_risk"))
+                if risk_unit == "pct_equity":
+                    replay = allocation_payload.get("raw_replay_inputs") or {}
+                    portfolio_snapshot = replay.get("portfolio_snapshot") or {}
+                    equity = float(portfolio_snapshot.get("portfolio_equity") or 0.0)
+                    if not math.isfinite(equity) or equity <= 0:
+                        raise RuntimeError("canonical sleeve equity conversion is unavailable")
+                    canonical_risk = equity * canonical_risk / 100.0
+                elif risk_unit != "stop_risk_dollars":
+                    raise RuntimeError("canonical sleeve risk unit is unsupported")
+                canonical_notional = float(canonical_sleeve.get("remaining_notional"))
+                supplied_notional = float(proposal["sleeve_notional_ceiling"])
+                supplied_risk = float(proposal["sleeve_stop_risk_ceiling"])
+                if any(
+                    not math.isfinite(value) or value < 0
+                    for value in (canonical_risk, canonical_notional, supplied_notional, supplied_risk)
+                ):
+                    raise RuntimeError("canonical strategy sleeve ceilings must be finite and nonnegative")
+                if supplied_notional > canonical_notional + 1e-9 or supplied_risk > canonical_risk + 1e-9:
+                    raise RuntimeError("proposal-carried sleeve ceiling exceeds canonical persisted allocation")
+                effective_notional_ceiling = min(canonical_notional, supplied_notional)
+                effective_risk_ceiling = min(canonical_risk, supplied_risk)
+                # The allocation snapshot persists the exact active reservation
+                # IDs already deducted from canonical remaining capacity. Sum
+                # every currently active strategy reservation *not* in that
+                # immutable set. This coordinates overlapping allocations and
+                # closes the read-to-persist race without timestamp ordering or
+                # double-counting claims already present in the baseline.
+                try:
+                    snapshot = allocation_payload["raw_replay_inputs"]["portfolio_snapshot"]
+                    by_strategy = snapshot["active_reservation_ids_by_strategy"]
+                    pending_by_strategy = snapshot["pending_proposal_claims_by_strategy"]
+                    if not isinstance(by_strategy, dict) or not isinstance(pending_by_strategy, dict):
+                        raise TypeError("reservation and pending snapshots must be mappings")
+                    included_ids = by_strategy.get(proposal["strategy_version"], [])
+                    pending_claims = pending_by_strategy.get(proposal["strategy_version"], [])
+                    if not isinstance(included_ids, list) or not isinstance(pending_claims, list):
+                        raise TypeError("reservation snapshot IDs must be a mapping of lists")
+                    included_ids = [str(identifier) for identifier in included_ids]
+                    if any(not identifier for identifier in included_ids) or len(included_ids) != len(set(included_ids)):
+                        raise ValueError("reservation snapshot IDs must be unique and nonempty")
+                    pending_claim_map: dict[str, tuple[float, float]] = {}
+                    for claim in pending_claims:
+                        if not isinstance(claim, dict):
+                            raise TypeError("pending claim snapshot rows must be mappings")
+                        proposal_id = str(claim.get("proposal_id") or "")
+                        claim_notional = float(claim.get("notional"))
+                        claim_risk = float(claim.get("stop_risk"))
+                        if (
+                            not proposal_id or proposal_id in pending_claim_map
+                            or not math.isfinite(claim_notional) or claim_notional < 0
+                            or not math.isfinite(claim_risk) or claim_risk < 0
+                        ):
+                            raise ValueError("pending claim snapshot identity or amount is invalid")
+                        pending_claim_map[proposal_id] = (claim_notional, claim_risk)
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError("canonical strategy sleeve reservation snapshot is unavailable") from exc
+                current_rows = conn.execute(
+                    """SELECT rr.id,rr.active_notional,rr.active_stop_risk,i.proposal_id
+                       FROM risk_reservations rr
+                       LEFT JOIN order_intents i ON i.id=rr.intent_id
+                       WHERE rr.state='active' AND rr.strategy_version=?""",
+                    (proposal["strategy_version"],),
+                ).fetchall()
+                incremental_notional = 0.0
+                incremental_risk = 0.0
+                included_id_set = set(included_ids)
+                for current_row in current_rows:
+                    if str(current_row["id"]) in included_id_set:
+                        continue
+                    pending_notional, pending_risk = pending_claim_map.get(
+                        str(current_row["proposal_id"] or ""), (0.0, 0.0)
+                    )
+                    incremental_notional += max(
+                        0.0, float(current_row["active_notional"] or 0.0) - pending_notional
+                    )
+                    incremental_risk += max(
+                        0.0, float(current_row["active_stop_risk"] or 0.0) - pending_risk
+                    )
+                candidate_pending_notional, candidate_pending_risk = pending_claim_map.get(
+                    str(proposal.get("proposal_id") or proposal.get("id") or ""), (0.0, 0.0)
+                )
+                candidate_incremental_notional = max(0.0, reserved_notional - candidate_pending_notional)
+                candidate_incremental_risk = max(0.0, reserved_stop_risk - candidate_pending_risk)
+                if incremental_notional + candidate_incremental_notional > effective_notional_ceiling + 1e-9:
+                    raise RuntimeError("atomic reservation blocked by strategy sleeve notional ceiling")
+                if incremental_risk + candidate_incremental_risk > effective_risk_ceiling + 1e-9:
+                    raise RuntimeError("atomic reservation blocked by strategy sleeve stop-risk ceiling")
             conn.execute(
                 f"""INSERT INTO order_intents(
                        id,run_id,proposal_id,approval_id,source_id,source_type,logical_action_key,candidate_id,
@@ -243,8 +456,12 @@ class DurableExecutionStore:
                        reserved_stop_risk,quote_bid,quote_ask,quote_timestamp,quote_spread_bps,limit_price,implementation_shortfall_bps,
                        client_order_id,trading_mode,state,created_at,updated_at,replacement_enabled,
                        parent_intent_id,relationship_group_id,relationship_type,order_role,protection_confirmed,
-                       strategy_version,entry_regime,entry_score,initial_risk_dollars,config_hash,evidence_version,formula_version)
-                   VALUES({','.join('?' for _ in range(46))})""",
+                       strategy_version,entry_regime,entry_score,initial_risk_dollars,config_hash,evidence_version,formula_version,
+                       strategy_registry_snapshot_id,strategy_sleeve,sleeve_allocation_id,sleeve_notional_ceiling,
+                       sleeve_stop_risk_ceiling,winner_expansion_decision_id,pyramiding_milestone_id,
+                       pyramiding_milestone_key,management_mode,pre_add_open_risk,post_add_open_risk,
+                       incremental_risk,rotation_step_id)
+                   VALUES({','.join('?' for _ in range(59))})""",
                 (
                     intent_id,
                     run_id,
@@ -292,13 +509,27 @@ class DurableExecutionStore:
                     proposal.get("config_hash"),
                     proposal.get("evidence_version", EVIDENCE_VERSION),
                     proposal.get("formula_version", ACCOUNTING_VERSION),
+                    proposal.get("strategy_registry_snapshot_id"),
+                    proposal.get("strategy_sleeve"),
+                    proposal.get("sleeve_allocation_id"),
+                    proposal.get("sleeve_notional_ceiling"),
+                    proposal.get("sleeve_stop_risk_ceiling"),
+                    proposal.get("winner_expansion_decision_id"),
+                    proposal.get("pyramiding_milestone_id"),
+                    proposal.get("pyramiding_milestone_key"),
+                    proposal.get("management_mode"),
+                    proposal.get("pre_add_open_risk"),
+                    proposal.get("post_add_open_risk"),
+                    incremental_risk,
+                    proposal.get("rotation_step_id"),
                 ),
             )
             conn.execute(
                 """INSERT INTO risk_reservations(
                        id,intent_id,symbol,cluster_name,initial_notional,active_notional,initial_stop_risk,
-                       active_stop_risk,state,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       active_stop_risk,state,created_at,updated_at,strategy_version,strategy_sleeve,
+                       sleeve_allocation_id,sleeve_notional_ceiling,sleeve_stop_risk_ceiling,incremental_risk)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     reservation_id,
                     intent_id,
@@ -311,6 +542,12 @@ class DurableExecutionStore:
                     "active",
                     now,
                     now,
+                    proposal.get("strategy_version"),
+                    proposal.get("strategy_sleeve"),
+                    proposal.get("sleeve_allocation_id"),
+                    proposal.get("sleeve_notional_ceiling"),
+                    proposal.get("sleeve_stop_risk_ceiling"),
+                    incremental_risk,
                 ),
             )
             conn.execute(

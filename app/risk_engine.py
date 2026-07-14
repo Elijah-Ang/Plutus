@@ -364,11 +364,20 @@ class RiskEngine:
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))
         check("signal_time", not is_entry or (created is not None and created <= now and expires is not None and expires > now), "entry signal/proposal must be current")
-        # Explicit production config approves only the current version. A
-        # missing list is a legacy snapshot; retain compatibility for stored
-        # v1 proposals without changing the deployed config's explicit v2
-        # allowlist.
-        check("strategy", not is_entry or proposal.get("strategy_version") in self.config.get("approved_strategy_versions", ["rule_based_v1", "rule_based_v2"]), "approved entry strategy version required")
+        # Production injects the current persisted registry authorization on
+        # every evaluation.  The old configuration list remains only as a
+        # compatibility fallback for isolated historical fixtures.
+        runtime_authorized = self.config.get("runtime_authorized_strategy_versions")
+        approved = (
+            runtime_authorized
+            if runtime_authorized is not None
+            else self.config.get("approved_strategy_versions", ["rule_based_v1", "rule_based_v2"])
+        )
+        check(
+            "strategy",
+            not is_entry or proposal.get("strategy_version") in approved,
+            "current strategy execution registry authorization required",
+        )
         if is_entry and proposal.get("phase4_mode") == "exploration":
             check("phase4_exploration_manual_approval", not final or context.get("approval_valid") is True,
                   "Phase 4 exploration requires explicit manual approval")

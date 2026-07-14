@@ -306,6 +306,9 @@ class StrategyRiskPolicy:
     schema_version: str = STRATEGY_PERFORMANCE_SCHEMA_VERSION
     metrics: dict[str, Any] = field(default_factory=dict)
     raw_inputs: dict[str, Any] = field(default_factory=dict)
+    evidence_version: str = ""
+    configuration_version: str = ""
+    config_hash: str = ""
 
 
 def state_rank(state: str) -> int:
@@ -651,6 +654,10 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
         CREATE INDEX IF NOT EXISTS idx_strategy_policies_latest ON strategy_policy_decisions(strategy_version,decided_at);
         """
     )
+    present = {row[1] for row in conn.execute("PRAGMA table_info(strategy_policy_decisions)")}
+    for name in ("evidence_version", "configuration_version", "config_hash"):
+        if name not in present:
+            conn.execute(f"ALTER TABLE strategy_policy_decisions ADD COLUMN {name} TEXT")
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -863,7 +870,6 @@ class StrategyPerformanceEngine:
         # operational record.
         versions = set(str(value) for value in STRATEGY_VERSIONS.values())
         versions.add(STRATEGY_VERSION)
-        versions.update(str(value) for value in (self.config.get("approved_strategy_versions") or []) if value)
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM research_opportunities WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM position_lots WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM order_intents WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
@@ -963,6 +969,9 @@ class StrategyPerformanceEngine:
                     state, reason = "SUSPENDED", "non-positive mature expectancy"
         raw_inputs = {
             **raw_inputs,
+            "current_evidence_version": EVIDENCE_VERSION,
+            "configuration_version": self.config.get("configuration_schema_version"),
+            "effective_config_hash": self.config.get("effective_config_hash"),
             "score_inputs": dict(metrics),
             "score_components": components,
             "penalties": penalties,
@@ -993,14 +1002,17 @@ class StrategyPerformanceEngine:
             """INSERT INTO strategy_policy_decisions(
                  id,strategy_version,decided_at,performance_snapshot_id,state,quality_score,reason,
                  hard_gates_json,maturity_json,components_json,raw_inputs_json,enforcement_enabled,
-                 performance_version,policy_version,schema_version,input_fingerprint)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,performance_snapshot_id) DO UPDATE SET
+                 performance_version,policy_version,schema_version,input_fingerprint,evidence_version,
+                 configuration_version,config_hash)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,performance_snapshot_id) DO UPDATE SET
                  decided_at=excluded.decided_at,state=excluded.state,quality_score=excluded.quality_score,reason=excluded.reason,
                  hard_gates_json=excluded.hard_gates_json,maturity_json=excluded.maturity_json,components_json=excluded.components_json,
-                 raw_inputs_json=excluded.raw_inputs_json""",
+                 raw_inputs_json=excluded.raw_inputs_json,evidence_version=excluded.evidence_version,
+                 configuration_version=excluded.configuration_version,config_hash=excluded.config_hash""",
             (_fingerprint({"policy": fingerprint, "state": state})[:32], strategy_version, now, snapshot_id, state, quality, reason,
              json_dumps(gates), json_dumps(maturity), json_dumps(_json_safe({**components, "penalties": penalties})), json_dumps(_json_safe(raw_inputs)), int(bool(self.cfg.get("enforcement_enabled", False))),
-             STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION, fingerprint),
+             STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION, fingerprint,
+             EVIDENCE_VERSION, self.config.get("configuration_schema_version"), self.config.get("effective_config_hash")),
         )
         return StrategyPerformanceSnapshot(strategy_version, self.as_of, STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION, metrics, {**components, "concentration_penalty": penalties["concentration"], "divergence_penalty": penalties["divergence"]}, raw_inputs, quality, state, fingerprint, metrics["trade_counts"], metrics.get("evidence_recency_days"), metrics.get("attribution_confidence", 0.0), metrics.get("version_completeness", 0.0), snapshot_id)
 
@@ -1024,6 +1036,9 @@ class StrategyPerformanceEngine:
                 performance_version=row["performance_version"], policy_version=row["policy_version"], fingerprint=row["input_fingerprint"],
                 decided_at=row["decided_at"], id=row["id"],
                 schema_version=row.get("schema_version") or "",
+                evidence_version=row.get("evidence_version") or "",
+                configuration_version=row.get("configuration_version") or "",
+                config_hash=row.get("config_hash") or "",
             )
         if strategy_version is not None:
             return policies.get(strategy_version)
@@ -1044,6 +1059,9 @@ class StrategyPerformanceEngine:
             schema_version=str(row.get("schema_version") or ""),
             metrics=json.loads(snapshot.get("metrics_json") or "{}"),
             raw_inputs=json.loads(snapshot.get("raw_inputs_json") or "{}"),
+            evidence_version=str(row.get("evidence_version") or ""),
+            configuration_version=str(row.get("configuration_version") or ""),
+            config_hash=str(row.get("config_hash") or ""),
         )
 
     def _probe_policy_valid(
@@ -1128,6 +1146,9 @@ class StrategyPerformanceEngine:
                 or row.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
                 or row.get("policy_version") != STRATEGY_POLICY_VERSION
                 or row.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+                or row.get("evidence_version") != EVIDENCE_VERSION
+                or row.get("configuration_version") != self.config.get("configuration_schema_version")
+                or row.get("config_hash") != self.config.get("effective_config_hash")
                 or snapshot.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
                 or snapshot.get("policy_version") != STRATEGY_POLICY_VERSION
                 or snapshot.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
@@ -1188,6 +1209,9 @@ class StrategyPerformanceEngine:
             or row.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
             or row.get("policy_version") != STRATEGY_POLICY_VERSION
             or row.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION
+            or row.get("evidence_version") != EVIDENCE_VERSION
+            or row.get("configuration_version") != self.config.get("configuration_schema_version")
+            or row.get("config_hash") != self.config.get("effective_config_hash")
             or snapshot.get("performance_version") != STRATEGY_PERFORMANCE_VERSION
             or snapshot.get("policy_version") != STRATEGY_POLICY_VERSION
             or snapshot.get("schema_version") != STRATEGY_PERFORMANCE_SCHEMA_VERSION

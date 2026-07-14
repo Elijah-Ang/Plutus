@@ -307,6 +307,14 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         )
         if strategy_state == "PROBE":
             policy_line += "PROBE controls: new entry only; no adds; manual Telegram approval; 0.03% stop risk; 0.10% heat; 2.5% gross; one active/reserved.\n"
+        sleeve = proposal.get("strategy_sleeve_payload") or {}
+        if proposal.get("strategy_sleeve"):
+            policy_line += (
+                f"Strategy sleeve: {proposal.get('strategy_sleeve')} — "
+                f"allocated {float(sleeve.get('allocated_risk') or 0.0):.4f}, "
+                f"remaining {float(sleeve.get('remaining_risk') or 0.0):.4f} "
+                f"{sleeve.get('risk_unit') or 'risk units'}\n"
+            )
 
         watchlist_order = proposal.get("watchlist_order")
         total_active = proposal.get("total_active_symbols")
@@ -411,7 +419,27 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 f"Reason: {sizing_reason}. This displayed adaptive size is the maximum that approval can submit.\n\n"
             )
 
-        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}"
+        winner_section = ""
+        if is_add and proposal.get("winner_expansion_decision_id"):
+            binding_caps = proposal.get("binding_caps") or ["risk capacity"]
+            winner_section = (
+                "Winner expansion:\n"
+                f"Current shares: {float(proposal.get('current_shares') or 0.0):.6f}\n"
+                f"Proposed ADD shares: {float(proposal.get('add_shares') or qty or 0.0):.6f}\n"
+                f"Protective stop: ${float(proposal.get('current_protective_stop') or 0.0):.2f} → "
+                f"${float(proposal.get('proposed_protective_stop') or 0.0):.2f}\n"
+                f"Position risk: ${float(proposal.get('pre_add_open_risk') or 0.0):.2f} → "
+                f"${float(proposal.get('post_add_open_risk') or 0.0):.2f}; "
+                f"incremental ${float(proposal.get('incremental_risk') or 0.0):.2f}\n"
+                f"Current R: {float(proposal.get('current_r_multiple') or 0.0):.2f}R; "
+                f"milestone {proposal.get('management_mode') or 'validated'}\n"
+                f"Mode/class: {proposal.get('deployment_mode') or 'NORMAL'}/"
+                f"{proposal.get('opportunity_class') or 'winner expansion'}\n"
+                f"Binding cap: {proposal.get('binding_cap') or binding_caps[0]}\n"
+                f"Reason: {proposal.get('winner_expansion_reason') or 'risk-neutral or bounded after persisted stop tightening'}.\n\n"
+            )
+
+        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}{winner_section}"
 
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():
@@ -741,6 +769,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
         strategy_policy = digest_data.get("strategy_policy")
         if strategy_policy:
             actions_sec += f"\n* Strategy policy: {strategy_policy}"
+        strategy_allocation = digest_data.get("strategy_allocation")
+        if strategy_allocation:
+            actions_sec += f"\n* {strategy_allocation}"
         adaptive_conviction = digest_data.get("adaptive_conviction")
         if adaptive_conviction:
             actions_sec += f"\n* {adaptive_conviction}"
@@ -887,6 +918,8 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             msg_parts.append(f"{digest_data['crypto_research']}\n")
         if digest_data.get("adaptive_conviction"):
             msg_parts.append(f"{digest_data['adaptive_conviction']}\n")
+        if digest_data.get("strategy_allocation"):
+            msg_parts.append(f"{digest_data['strategy_allocation']}\n")
 
         exit_first_blocker = digest_data.get("exit_first_blocker")
         if exit_first_blocker:

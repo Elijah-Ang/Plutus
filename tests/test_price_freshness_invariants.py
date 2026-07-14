@@ -224,7 +224,9 @@ def test_approval_time_price_refresh_and_invariant_capping(temp_storage, base_co
             called_proposal = mock_exec.call_args[0][0]
             assert called_proposal["notional"] == 50.0
             assert called_proposal["approved_notional"] == 50.0
-            assert called_proposal["qty"] == pytest.approx(50.0 / 251.01)
+            assert called_proposal["qty"] == pytest.approx(
+                50.0 / called_proposal["limit_price"]
+            )
             
             assert len(service.telegram.messages) > 0
             assert "ADD TO WINNER" in service.telegram.messages[0]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -41,11 +42,20 @@ from .loss_controls import LOSS_METRICS_VERSION, build_loss_metrics
 from .market_data import normalize_bars
 from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
+from .position_risk import PositionRiskInput
 from .position_lifecycle import PositionLifecycleManager
 from .risk_engine import RiskCheck, RiskEngine, _dt
 from .risk_snapshot import RiskSnapshotBuilder
+from .trend_management import TrendManagementEngine, TrendManagementInput
+from .winner_expansion import (
+    MilestoneIdentity,
+    WinnerExpansionEngine,
+    WinnerExpansionInput,
+    WinnerExpansionStore,
+)
 from .position_sizing import effective_notional_policy, notional_from_stop_risk
 from .position_sizing import validate_stop_evidence
+from .order_state import logical_action_key, stable_client_order_id
 from .formula_versions import (
     ACCOUNTING_VERSION,
     EVIDENCE_VERSION,
@@ -54,7 +64,12 @@ from .formula_versions import (
     SIZING_POLICY_VERSION,
     STOP_POLICY_VERSION,
 )
-from .quotes import bounded_marketable_limit, implementation_shortfall_bps, validated_quote
+from .quotes import (
+    bounded_marketable_limit,
+    implementation_shortfall_bps,
+    validate_quote_payload,
+    validated_quote,
+)
 from .reconciliation import BrokerReconciler
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
@@ -67,9 +82,58 @@ def _value(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default) if not isinstance(obj, dict) else obj.get(name, default)
 
 
+def _hydrate_proposal_row(row: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    """Hydrate a proposal without letting nullable additive columns erase payload provenance."""
+    try:
+        payload = json.loads(row.get("payload") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    authoritative = {key: value for key, value in row.items() if value is not None}
+    return {**payload, **authoritative, **overrides}
+
+
 def _parse_datetime(value: str | datetime) -> datetime:
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _validated_authoritative_stop(
+    position_state: dict[str, Any],
+    winner_config: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[float, bool]:
+    authoritative_stop = position_state.get("authoritative_protective_stop")
+    stop_as_of_value = position_state.get("protective_stop_as_of")
+    if bool(winner_config.get("require_authoritative_current_stop", True)):
+        if authoritative_stop is None or float(authoritative_stop) <= 0:
+            raise ValueError("authoritative protective stop is absent")
+        if not stop_as_of_value:
+            raise ValueError("authoritative protective stop timestamp is absent")
+        try:
+            stop_age = ((now or datetime.now(UTC)) - _parse_datetime(str(stop_as_of_value))).total_seconds()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("authoritative protective stop timestamp is invalid") from exc
+        freshness_seconds = float(winner_config.get("stop_freshness_seconds", 300.0))
+        if stop_age < -60.0 or stop_age > freshness_seconds:
+            raise ValueError("authoritative protective stop is stale")
+        if not position_state.get("protective_stop_source") or not position_state.get("protective_stop_formula_version"):
+            raise ValueError("authoritative protective stop provenance is incomplete")
+        if int(position_state.get("protective_stop_sequence") or 0) < 1:
+            raise ValueError("authoritative protective stop sequence is absent")
+        return float(authoritative_stop), True
+    stops = [
+        float(value)
+        for value in (
+            position_state.get("initial_stop_price"),
+            position_state.get("trailing_stop_price"),
+            authoritative_stop,
+        )
+        if value is not None and float(value) > 0
+    ]
+    if not stops:
+        raise ValueError("protective stop is absent")
+    return max(stops), bool(stop_as_of_value)
 
 
 def _format_sgt_time(value: datetime) -> str:
@@ -175,6 +239,7 @@ class TradingService:
         self._phase1_bar_cache: dict[str, Any] = {}
         self._phase4_allocation_cache: dict[str, Any] | None = None
         self._strategy_policy_map: dict[str, Any] | None = None
+        self._strategy_registry_snapshot_id: str | None = None
         self._current_cycle_exit_blocker: dict[str, Any] | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
@@ -194,7 +259,9 @@ class TradingService:
                 payload = json.loads(row.get("payload") or "{}")
             except (TypeError, ValueError):
                 payload = {}
-            return {**payload, **row, "proposal_id": proposal_id, "source_id": proposal_id, "trading_mode": "paper"}
+            return _hydrate_proposal_row(
+                row, proposal_id=proposal_id, source_id=proposal_id, trading_mode="paper"
+            )
 
         def recover_validation(workflow: dict[str, Any], proposal: dict[str, Any] | None):
             if proposal is None:
@@ -202,16 +269,89 @@ class TradingService:
             expires = _dt(proposal.get("expires_at"))
             if str(proposal.get("status")) in {"expired", "rejected", "superseded"} or (expires and expires <= datetime.now(UTC)):
                 return "blocked", None, "proposal expired or became ineligible before recovery"
+            if proposal.get("relationship_type") in {"rotation_exit", "rotation_entry"}:
+                # The rotation coordinator owns fresh group/dependency
+                # revalidation and resumes the already-consumed derived
+                # approval.  Generic recovery must neither submit it nor turn
+                # the grouped approval into an unrecoverable manual-review row.
+                return "retry", None, "rotation coordinator owns grouped recovery"
             # A crash before final validation lacks a fresh broker/account proof.
             # Surface it explicitly instead of silently reviving or stranding it.
             return "manual_review", None, "fresh final broker validation cannot be reconstructed automatically"
 
-        def recover_submission(workflow: dict[str, Any], intent: dict[str, Any]) -> str:
+        def recover_action_authority(
+            workflow: dict[str, Any], proposal: dict[str, Any] | None
+        ) -> tuple[str, dict[str, Any] | None, str | None]:
+            if proposal is None:
+                return "blocked", None, "proposal record unavailable during recovery action"
+            relationship = str(proposal.get("relationship_type") or "")
+            if relationship not in {"rotation_exit", "rotation_entry"}:
+                return "approved", proposal, "ordinary workflow retains its existing recovery authority"
+            from .rotation_coordinator import RotationCoordinator, RotationState, TERMINAL_STATES
+
+            group_id = str(
+                proposal.get("rotation_group_id")
+                or proposal.get("relationship_group_id")
+                or ""
+            )
+            coordinator = RotationCoordinator(
+                self.storage, config_hash=self.config.get("effective_config_hash")
+            )
+            try:
+                group = coordinator.get_group(group_id)
+            except KeyError:
+                return "blocked", proposal, "rotation group disappeared before recovery action"
+            now = datetime.now(UTC)
+            if RotationState(group["state"]) in TERMINAL_STATES:
+                return "blocked", proposal, "rotation group is terminal"
+            if _parse_datetime(group["expires_at"]) <= now or self._proposal_or_candidate_expired(proposal):
+                return "blocked", proposal, "rotation group or proposal expired before recovery action"
+            if relationship == "rotation_entry":
+                if RotationState(group["state"]) not in {
+                    RotationState.ENTRY_REVALIDATING, RotationState.ENTRY_RESERVED,
+                } or not coordinator.approval_is_current(group_id):
+                    return "blocked", proposal, "rotation entry dependency or grouped approval is no longer current"
+            else:
+                if RotationState(group["state"]) not in {
+                    RotationState.APPROVED_EXIT_PENDING,
+                    RotationState.EXIT_SUBMITTED,
+                    RotationState.EXIT_PARTIALLY_FILLED,
+                }:
+                    return "blocked", proposal, "rotation exit group is no longer eligible for first submission"
+                approvals = self.storage.fetch_all(
+                    """SELECT approval_id,status FROM rotation_group_approvals
+                       WHERE group_id=? ORDER BY created_at DESC LIMIT 1""",
+                    (group_id,),
+                )
+                if (
+                    not approvals
+                    or approvals[0].get("approval_id") != group.get("approval_id")
+                    or approvals[0].get("status") not in {"active", "exit_submitted"}
+                ):
+                    return "blocked", proposal, "rotation exit grouped approval is no longer current"
             if self.broker is None:
-                return "unknown"
+                return "retry", proposal, "rotation recovery is deferred until the broker client is available"
+            return "approved", proposal, "current rotation dependency and expiry revalidated"
+
+        def recover_submission(workflow: dict[str, Any], intent: dict[str, Any]) -> str:
             proposal = load_local_proposal(workflow["proposal_id"])
             if proposal is None:
                 return "terminal"
+            authority, proposal, _reason = recover_action_authority(workflow, proposal)
+            if authority != "approved" or proposal is None:
+                current_intent = DurableExecutionStore(self.storage).get_intent(str(intent["id"]))
+                if str(current_intent.get("state")) in {"created", "reserved"}:
+                    from .order_state import OrderState
+
+                    DurableExecutionStore(self.storage).transition(
+                        str(intent["id"]), OrderState.EXPIRED,
+                        event_type="rotation_recovery_authority_expired",
+                        safe_summary="rotation dependency failed the immediate pre-submission check",
+                        expected_state=OrderState(str(current_intent["state"])),
+                    )
+                return "terminal"
+            if self.broker is None:
+                return "unknown"
             executable = {
                 **proposal,
                 "status": "approved",
@@ -251,6 +391,7 @@ class TradingService:
             proposal_loader=load_local_proposal,
             run_id=self.run_id,
             validator=recover_validation,
+            action_validator=recover_action_authority,
             submitter=recover_submission,
             lookup_reconciler=recover_lookup,
             max_items=100,
@@ -306,8 +447,30 @@ class TradingService:
         return detail
 
     def _risk_engine(self, proposal_id: str, stage: str) -> RiskEngine:
+        risk_config = self.config
+        if self.config.get("strategy_execution_registry") and (
+            self._strategy_registry_snapshot_id is not None
+            or self._strategy_policy_map is not None
+            or stage == "final"
+        ):
+            snapshot_id = self._ensure_strategy_registry_snapshot()
+            authorized_rows = self.storage.fetch_all(
+                """SELECT strategy_version FROM strategy_registry_decisions
+                   WHERE snapshot_id=? AND authorized=1 ORDER BY strategy_version""",
+                (snapshot_id,),
+            ) if snapshot_id else []
+            # A per-call config view prevents the legacy compatibility list
+            # from granting production execution authority.  An empty current
+            # registry result is intentionally fail closed.
+            risk_config = {
+                **self.config,
+                "runtime_authorized_strategy_versions": [
+                    str(row["strategy_version"]) for row in authorized_rows
+                ],
+                "runtime_strategy_registry_snapshot_id": snapshot_id,
+            }
         return RiskEngine(
-            self.config,
+            risk_config,
             lambda c: self.storage.record_check(
                 self.run_id, c.name, c.passed, c.reason, proposal_id, stage,
                 config_hash=self.config.get("effective_config_hash"),
@@ -390,6 +553,7 @@ class TradingService:
         positions: list[Any] | None = None,
         current_cycle_exits: list[dict[str, Any]] | None = None,
         validation_at: datetime | None = None,
+        exclude_reconciled_rotation_group_id: str | None = None,
     ) -> dict[str, Any]:
         """Return one current, provenance-bearing exit-first blocker.
 
@@ -401,6 +565,20 @@ class TradingService:
         now = validation_at or datetime.now(UTC)
         now_iso = now.isoformat()
         stale_sources: list[dict[str, Any]] = []
+        excluded_client_order_ids: set[str] = set()
+        excluded_broker_order_ids: set[str] = set()
+        if exclude_reconciled_rotation_group_id:
+            excluded_rows = self.storage.fetch_all(
+                """SELECT client_order_id,broker_order_id FROM order_intents
+                   WHERE relationship_group_id=? AND relationship_type='rotation_exit'""",
+                (exclude_reconciled_rotation_group_id,),
+            )
+            excluded_client_order_ids = {
+                str(row.get("client_order_id")) for row in excluded_rows if row.get("client_order_id")
+            }
+            excluded_broker_order_ids = {
+                str(row.get("broker_order_id")) for row in excluded_rows if row.get("broker_order_id")
+            }
 
         positions_known = positions is not None
         if positions is None:
@@ -455,6 +633,11 @@ class TradingService:
             status = str(_value(order, "status", "open"))
             if side != "sell" or status.lower() in {"filled", "canceled", "cancelled", "expired", "rejected"}:
                 continue
+            if (
+                str(_value(order, "client_order_id", "")) in excluded_client_order_ids
+                or str(_value(order, "id", "")) in excluded_broker_order_ids
+            ):
+                continue
             symbol = str(_value(order, "symbol", "")).upper()
             return active({
                 "source_type": "broker_open_order",
@@ -478,10 +661,11 @@ class TradingService:
             FROM order_intents i
             LEFT JOIN risk_reservations r ON r.intent_id=i.id AND r.state='active'
             WHERE lower(i.side)='sell' AND i.state IN ({placeholders})
+              AND (? IS NULL OR COALESCE(i.relationship_group_id,'')<>?)
             ORDER BY datetime(i.updated_at) DESC, datetime(i.created_at) DESC
             LIMIT 10
             """,
-            active_intent_states,
+            (*active_intent_states, exclude_reconciled_rotation_group_id, exclude_reconciled_rotation_group_id),
         )
         if intent_rows:
             row = intent_rows[0]
@@ -514,9 +698,10 @@ class TradingService:
             LEFT JOIN order_intents i ON i.proposal_id=trade_proposals.id
             WHERE lower(trade_proposals.side)='sell' AND trade_proposals.status IN ('pending','approved')
               AND (expires_at IS NULL OR expires_at>?)
+              AND (? IS NULL OR COALESCE(trade_proposals.rotation_group_id,'')<>?)
             ORDER BY datetime(trade_proposals.created_at) DESC
             """,
-            (now_iso,),
+            (now_iso, exclude_reconciled_rotation_group_id, exclude_reconciled_rotation_group_id),
         )
         for row in proposal_rows:
             symbol = str(row.get("symbol") or "").upper()
@@ -1465,6 +1650,500 @@ class TradingService:
                     return f"healthy-pullback add requires complete {key.upper()} trend evidence"
         return None
 
+    def _evaluate_winner_expansion(
+        self,
+        proposal: dict[str, Any],
+        *,
+        decision_stage: str,
+        approval_id: str | None = None,
+    ) -> tuple[Any, str, str]:
+        """Run and persist the one canonical operational winner-ADD decision.
+
+        This method is intentionally used at both proposal and final approval.
+        The latter can only preserve or reduce the displayed action because the
+        caller has already applied the displayed quantity/notional ceilings.
+        """
+        if proposal.get("action") != "add" or str(proposal.get("side", "")).lower() != "buy":
+            raise ValueError("winner expansion applies only to long ADD proposals")
+        symbol = str(proposal.get("symbol") or "").upper()
+        lifecycle_id = str(
+            proposal.get("position_lifecycle_id")
+            or PositionLifecycleManager(self.storage).active_id(symbol)
+            or ""
+        )
+        if not symbol or not lifecycle_id:
+            raise ValueError("active position lifecycle is required for winner expansion")
+
+        runtime_state = self._authoritative_runtime_state(force=True)
+        positions = list(runtime_state.get("positions") or [])
+        account = runtime_state.get("account")
+        position = next(
+            (item for item in positions if str(_value(item, "symbol", "")).upper() == symbol),
+            None,
+        )
+        if position is None:
+            raise ValueError("authoritative broker position is unavailable")
+        current_shares = float(_value(position, "qty", 0.0) or 0.0)
+        average_entry = float(_value(position, "avg_entry_price", 0.0) or 0.0)
+        current_price = float(proposal.get("latest_price") or _value(position, "current_price", 0.0) or 0.0)
+        if current_shares <= 0 or average_entry <= 0 or current_price <= 0:
+            raise ValueError("positive long-position shares, entry, and current price are required")
+
+        state_rows = self.storage.fetch_all(
+            "SELECT * FROM position_management_state WHERE symbol=? AND position_lifecycle_id=?",
+            (symbol, lifecycle_id),
+        )
+        if not state_rows:
+            raise ValueError("authoritative position-management state is absent")
+        position_state = state_rows[0]
+        winner_cfg = self.config.get("winner_expansion", {}) or {}
+        current_stop, stop_current = _validated_authoritative_stop(position_state, winner_cfg)
+        initial_stop = float(position_state.get("initial_stop_price") or current_stop)
+        initial_risk_per_share = average_entry - initial_stop
+        if initial_risk_per_share <= 0:
+            raise ValueError("initial R geometry is unavailable or invalid")
+
+        try:
+            # Final approval has already fetched, validated, and bound its
+            # marketable limit to one authoritative quote. Revalidate that
+            # persisted envelope locally instead of fetching a second quote
+            # which could desynchronise quantity, limit, and ADD-risk proof.
+            quote = (
+                validate_quote_payload(
+                    proposal, "buy", self.config, now=datetime.now(UTC)
+                )
+                if decision_stage == "final_revalidation"
+                else validated_quote(
+                    self.broker, symbol, self.config, now=datetime.now(UTC)
+                )
+            )
+            proposal["quote_bid"] = float(quote["bid"])
+            proposal["quote_ask"] = float(quote["ask"])
+            proposal["quote_midpoint"] = float(quote["midpoint"])
+            proposal["quote_timestamp"] = quote["timestamp"]
+            proposal["quote_spread_bps"] = float(quote["spread_bps"])
+            # Winner risk and its pending reservation use the worst executable
+            # local price, not merely the ask.  Final paper orders use a
+            # bounded marketable BUY limit which can sit above the ask.
+            add_price = max(
+                float(quote["ask"]),
+                float(proposal.get("limit_price") or 0.0),
+                float(bounded_marketable_limit(quote, "buy", self.config)),
+            )
+            proposal["winner_risk_reference_price"] = add_price
+        except Exception as exc:
+            raise ValueError("fresh validated ADD quote is unavailable") from exc
+        add_shares = float(proposal.get("qty") or 0.0)
+        if add_shares <= 0:
+            raise ValueError("positive adaptive ADD quantity is required")
+
+        current_r = max(0.0, (current_price - average_entry) / initial_risk_per_share)
+        highest_price = max(
+            current_price,
+            float(position_state.get("highest_price_since_entry") or current_price),
+        )
+        peak_r = max(current_r, (highest_price - average_entry) / initial_risk_per_share)
+        atr = float(proposal.get("atr_value") or 0.0)
+        if atr <= 0:
+            raise ValueError("current ATR is required for trend management")
+        trend_evidence = proposal.get("trend_evidence") or {}
+        ma50 = float(trend_evidence.get("ma_50") or 0.0)
+        ma200 = float(trend_evidence.get("ma_200") or 0.0)
+        deployment_mode = str(proposal.get("deployment_mode") or "NORMAL").upper()
+        if deployment_mode not in {"DEFENSIVE", "NORMAL", "OPPORTUNISTIC", "AGGRESSIVE"}:
+            raise ValueError("operational Adaptive Conviction deployment mode is unavailable")
+        drawdown_rows = self.storage.fetch_all(
+            "SELECT drawdown_pct FROM account_equity_watermarks ORDER BY updated_at DESC LIMIT 1"
+        )
+        account_drawdown = float(drawdown_rows[0]["drawdown_pct"] or 0.0) if drawdown_rows else 0.0
+        max_spread = float((self.config.get("quotes", {}) or {}).get("max_spread_bps", 50.0))
+        execution_quality = max(0.0, min(1.0, 1.0 - float(proposal["quote_spread_bps"]) / max(max_spread, 1.0)))
+        integrity_report = DurableExecutionStore(self.storage).integrity_report()
+        critical_integrity = {
+            "terminal_intents_with_active_reservations", "active_intents_missing_reservations",
+            "fills_exceeding_quantity", "stale_unknown_intents", "stale_partial_fills",
+            "broker_relevant_missing_identity",
+        }
+        integrity_ok = not any(int(integrity_report.get(key, 0)) for key in critical_integrity)
+        prior_mode = position_state.get("management_mode")
+        market_regime = "favorable" if float(proposal.get("score") or 0.0) >= 80 and deployment_mode in {"OPPORTUNISTIC", "AGGRESSIVE"} else "normal"
+        trend = TrendManagementEngine().evaluate(
+            TrendManagementInput(
+                symbol=symbol,
+                position_lifecycle_id=lifecycle_id,
+                current_price=current_price,
+                average_entry_price=average_entry,
+                highest_price_since_entry=highest_price,
+                current_protective_stop=current_stop,
+                atr=atr,
+                current_r_multiple=current_r,
+                peak_r_multiple=peak_r,
+                trend_strength=max(0.0, min(100.0, float(proposal.get("score") or 0.0))),
+                price_above_ma50=ma50 > 0 and current_price > ma50,
+                ma50_above_ma200=ma50 > 0 and ma200 > 0 and ma50 > ma200,
+                higher_highs_and_lows=bool(proposal.get("higher_highs_and_lows", True)),
+                market_regime=market_regime,
+                volatility_regime=str(proposal.get("volatility_regime") or "normal"),
+                deployment_mode=deployment_mode,
+                execution_quality=execution_quality,
+                account_health=max(0.0, min(1.0, 1.0 - account_drawdown / 6.0)),
+                account_drawdown_pct=max(0.0, account_drawdown),
+                position_age_days=float((proposal.get("position_management_decision") or {}).get("position_age_days") or 1.0),
+                previous_mode=str(prior_mode) if prior_mode else None,
+                deterioration_detected=bool(proposal.get("exit_trigger_reason")),
+                profit_protection_triggered=bool(position_state.get("profit_protection_active")),
+                emergency_exit=bool(proposal.get("emergency_exit_triggered")),
+                normal_exit_signal=False,
+                integrity_warning=not integrity_ok,
+                reconciliation_warning=not integrity_ok,
+                as_of=iso_now(),
+                minimum_price_increment=float((self.config.get("quotes", {}) or {}).get("price_increment_usd", 0.01)),
+            )
+        )
+        winner_store = WinnerExpansionStore(self.storage)
+        winner_store.persist_trend_decision(
+            trend, run_id=self.run_id, config_hash=self.config.get("effective_config_hash")
+        )
+        stop_as_of = iso_now()
+
+        canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(positions, account)
+        equity = float(canonical.portfolio_equity or 0.0)
+        if equity <= 0 or canonical.held_open_stop_risk is None or canonical.projected_gross_exposure is None:
+            raise ValueError("canonical portfolio risk snapshot is incomplete")
+        reservations = DurableExecutionStore(self.storage).active_reservations()
+        same_symbol_reservations = self.storage.fetch_all(
+            """SELECT COALESCE(SUM(active_notional),0) notional,
+                      COALESCE(SUM(active_stop_risk),0) stop_risk
+               FROM risk_reservations WHERE state='active' AND symbol=?""",
+            (symbol,),
+        )[0]
+        cluster = self._get_symbol_cluster(symbol)
+        cluster_reserved_rows = self.storage.fetch_all(
+            "SELECT COALESCE(SUM(active_notional),0) notional FROM risk_reservations WHERE state='active' AND cluster_name=?",
+            (cluster,),
+        ) if cluster else []
+        current_position_open_risk = current_shares * max(current_price - current_stop, 0.0)
+        current_position_notional = current_shares * current_price
+        risk_profile = (self.config.get("phase3", {}) or {}).get("risk_profile", {})
+        mode_allowances = (self.config.get("winner_expansion", {}) or {}).get("mode_incremental_risk_allowance_pct", {})
+        risk_input = PositionRiskInput(
+            symbol=symbol,
+            position_lifecycle_id=lifecycle_id,
+            deployment_mode=deployment_mode,
+            current_shares=current_shares,
+            proposed_add_shares=add_shares,
+            current_market_price=current_price,
+            proposed_add_price=add_price,
+            current_protective_stop=current_stop,
+            proposed_tightened_stop=trend.protective_stop,
+            portfolio_equity=equity,
+            same_symbol_reserved_stop_risk_dollars=float(same_symbol_reservations.get("stop_risk") or 0.0),
+            active_reserved_stop_risk_dollars=float(reservations.get("active_reserved_stop_risk") or 0.0),
+            portfolio_open_risk_excluding_position_dollars=max(0.0, float(canonical.held_open_stop_risk) - current_position_open_risk),
+            active_reserved_exposure_dollars=float(reservations.get("active_reserved_notional") or 0.0),
+            same_symbol_reserved_exposure_dollars=float(same_symbol_reservations.get("notional") or 0.0),
+            cluster_reserved_exposure_dollars=float(cluster_reserved_rows[0]["notional"] or 0.0) if cluster_reserved_rows else 0.0,
+            portfolio_gross_exposure_excluding_position_dollars=max(0.0, float(canonical.filled_gross_exposure or 0.0) - current_position_notional),
+            cluster_exposure_excluding_position_dollars=max(0.0, float(canonical.cluster_exposure.get(cluster, 0.0)) - current_position_notional) if cluster else 0.0,
+            adaptive_conviction_position_risk_cap_pct={"DEFENSIVE": 0.15, "NORMAL": 0.20, "OPPORTUNISTIC": 0.30, "AGGRESSIVE": 0.35}[deployment_mode],
+            phase3_position_risk_cap_pct=float(risk_profile.get("max_trade_stop_risk_pct", 0.35)),
+            portfolio_heat_cap_pct=float(risk_profile.get("max_portfolio_heat_pct", 1.75)),
+            symbol_exposure_cap_pct=float(risk_profile.get("max_symbol_exposure_pct", 6.0)),
+            cluster_exposure_cap_pct=float(risk_profile.get("max_cluster_exposure_pct", 15.0)),
+            portfolio_gross_exposure_cap_pct=float(risk_profile.get("hard_gross_exposure_pct", 50.0)),
+            mode_incremental_risk_allowance_pct=float(mode_allowances.get(deployment_mode, 0.0)),
+            rounding_tolerance_dollars=float((self.config.get("winner_expansion", {}) or {}).get("rounding_tolerance_dollars", 0.01)),
+            as_of=stop_as_of,
+            config_hash=self.config.get("effective_config_hash"),
+        )
+        milestone_cfg = (self.config.get("winner_expansion", {}) or {}).get("milestones", {})
+        prior_filled_adds = int(self.storage.fetch_all(
+            "SELECT COUNT(*) count FROM pyramiding_milestones WHERE position_lifecycle_id=? AND status='FILLED'",
+            (lifecycle_id,),
+        )[0]["count"])
+        milestone = MilestoneIdentity.build(
+            symbol=symbol,
+            position_lifecycle_id=lifecycle_id,
+            current_r_multiple=current_r,
+            price_advance_since_prior_entry_pct=max(0.0, (current_price / average_entry - 1.0) * 100.0),
+            stop_advance_r=max(0.0, (trend.protective_stop - initial_stop) / initial_risk_per_share),
+            prior_filled_adds=prior_filled_adds,
+            trend_mode=trend.mode,
+            r_step=float(milestone_cfg.get("r_multiple_step", 0.5)),
+            price_advance_step_pct=float(milestone_cfg.get("price_advance_atr_step", 0.75)),
+            stop_advance_step_r=float(milestone_cfg.get("stop_advance_atr_step", 0.5)),
+        )
+        existing_milestone = winner_store.get_milestone(lifecycle_id, milestone.milestone_key)
+        proposal_id = str(proposal.get("proposal_id") or proposal.get("id") or "")
+        if decision_stage == "proposal":
+            milestone_available = existing_milestone is None
+        else:
+            milestone_available = bool(
+                existing_milestone
+                and existing_milestone.get("active_proposal_id") == proposal_id
+                and existing_milestone.get("status") in {"PROPOSED", "APPROVED"}
+                and proposal.get("pyramiding_milestone_key") == milestone.milestone_key
+            )
+        policy_state = str(proposal.get("strategy_state") or "SUSPENDED").upper()
+        adaptive_record = proposal.get("adaptive_sizing_final") if decision_stage == "final_revalidation" else proposal.get("adaptive_sizing")
+        winner_input = WinnerExpansionInput(
+                risk_input=risk_input,
+                trend_decision=trend,
+                milestone=milestone,
+                average_entry_price=average_entry,
+                strategy_state=policy_state,
+                policy_adds_allowed=policy_state in {"THROTTLED", "ACTIVE"},
+                regime_supports_add=str(proposal.get("volatility_regime") or "normal").lower() not in {"extreme", "dislocated", "high"},
+                setup_score=float(proposal.get("score") or 0.0),
+                minimum_setup_score=float((self.config.get("add_to_position", {}) or {}).get("min_trade_score", 85.0)),
+                score_improvement=float(proposal.get("score_improvement") or 0.0),
+                minimum_score_improvement=(
+                    0.0
+                    if abs(float(proposal.get("score_improvement") or 0.0)) <= 1e-9
+                    else float((self.config.get("add_to_position", {}) or {}).get("min_score_improvement", 5.0))
+                ),
+                exit_or_deterioration_warning=bool(proposal.get("exit_trigger_reason") or proposal.get("emergency_exit_triggered")),
+                reconciliation_ok=integrity_ok,
+                integrity_ok=integrity_ok,
+                quote_current=True,
+                spread_ok=float(proposal["quote_spread_bps"]) <= max_spread,
+                liquidity_ok=float(proposal.get("average_dollar_volume") or 0.0) >= float(risk_profile.get("minimum_average_dollar_volume", 10_000_000.0)),
+                stop_current=stop_current,
+                milestone_available=milestone_available,
+                adaptive_conviction_authorized=bool(proposal.get("adaptive_conviction")),
+                adaptive_sizing_authorized=bool(adaptive_record and float(adaptive_record.get("operational_notional") or 0.0) > 0),
+                phase3_validation_passed=False,
+                phase3_validation_stage="pending",
+                decision_stage=decision_stage,
+            )
+        decision = WinnerExpansionEngine().evaluate(winner_input)
+        required_phase3_stage = "final" if decision_stage == "final_revalidation" else "proposal"
+        phase3_blocker = f"Phase 3 {required_phase3_stage} validation has not passed"
+        non_phase3_blockers = tuple(
+            reason for reason in decision.blocking_reasons if reason != phase3_blocker
+        )
+        if non_phase3_blockers:
+            raise ValueError(non_phase3_blockers[0])
+        phase3_candidate = {
+            **proposal,
+            "stop_price": decision.required_protective_stop,
+            "stop_distance_dollars": max(
+                float(proposal.get("latest_price") or 0.0) - decision.required_protective_stop,
+                0.0,
+            ),
+            "stop_risk_dollars": decision.risk_decision.consumed_risk,
+            "risk_budget": decision.risk_decision.consumed_risk,
+            "risk_budget_dollars": decision.risk_decision.consumed_risk,
+            "pending_add_stop_risk": decision.proposed_add_shares
+            * max(decision.risk_decision.proposed_add_price - decision.required_protective_stop, 0.0),
+        }
+        if decision_stage == "final_revalidation":
+            phase3_candidate["client_order_id"] = stable_client_order_id(
+                logical_action_key(phase3_candidate, "proposal")
+            )
+        phase3_context = self._portfolio_context(
+            phase3_candidate, approval_valid=decision_stage == "final_revalidation"
+        )
+        if decision_stage == "final_revalidation":
+            phase3_context["final_revalidation"] = True
+        phase3_decision = self._risk_engine(
+            proposal_id or "winner_add", f"winner_phase3_{required_phase3_stage}_preflight"
+        ).evaluate(
+            phase3_candidate,
+            phase3_context,
+            final=decision_stage == "final_revalidation",
+        )
+        if not phase3_decision.passed:
+            raise ValueError(
+                f"Phase 3 {required_phase3_stage} validation blocked: "
+                + "; ".join(phase3_decision.reasons)
+            )
+        decision = WinnerExpansionEngine().evaluate(
+            dataclasses.replace(
+                winner_input,
+                phase3_validation_passed=True,
+                phase3_validation_stage=required_phase3_stage,
+            )
+        )
+        if not decision.eligible:
+            raise ValueError(decision.reason)
+        if decision_stage == "final_revalidation":
+            displayed_post_risk = float(proposal.get("approved_post_add_open_risk_ceiling") or 0.0)
+            displayed_incremental = float(proposal.get("approved_incremental_risk_ceiling") or 0.0)
+            displayed_stop_floor = float(proposal.get("approved_protective_stop_floor") or 0.0)
+            if displayed_post_risk <= 0 or decision.post_add_open_risk > displayed_post_risk + 1e-9:
+                raise ValueError("final ADD total position risk exceeds the displayed ceiling")
+            if decision.risk_decision.consumed_risk > displayed_incremental + 1e-9:
+                raise ValueError("final ADD incremental risk exceeds the displayed ceiling")
+            if decision.required_protective_stop + 1e-9 < displayed_stop_floor:
+                raise ValueError("final protective stop would loosen the displayed stop floor")
+            winner_store.persist_authoritative_stop(
+                trend,
+                run_id=self.run_id,
+                source="winner_expansion_final_revalidation",
+                stop_as_of=stop_as_of,
+                config_hash=self.config.get("effective_config_hash"),
+                peak_r_multiple=peak_r,
+            )
+        if decision_stage == "proposal":
+            claim = winner_store.claim_milestone(
+                milestone,
+                run_id=self.run_id,
+                proposal_id=proposal_id,
+                max_retries=int(milestone_cfg.get("max_retries", 0)),
+            )
+            if not claim.accepted:
+                raise ValueError(claim.reason)
+            milestone_id = claim.milestone_id
+        else:
+            milestone_id = str(existing_milestone["id"])
+            winner_store.transition_milestone(
+                lifecycle_id,
+                milestone.milestone_key,
+                "APPROVED",
+                approval_id=approval_id,
+            )
+        decision_id = winner_store.persist_add_risk_decision(
+            decision,
+            run_id=self.run_id,
+            proposal_id=proposal_id,
+            approval_id=approval_id,
+            milestone_id=milestone_id,
+            config_hash=self.config.get("effective_config_hash"),
+        )
+        proposal.update({
+            "winner_expansion_decision_id": decision_id,
+            "pyramiding_milestone_id": milestone_id,
+            "pyramiding_milestone_key": milestone.milestone_key,
+            "management_mode": trend.mode,
+            "current_shares": current_shares,
+            "add_shares": decision.proposed_add_shares,
+            "current_protective_stop": current_stop,
+            "proposed_protective_stop": decision.required_protective_stop,
+            "stop_price": decision.required_protective_stop,
+            "stop_distance_dollars": max(
+                float(proposal.get("latest_price") or 0.0) - decision.required_protective_stop,
+                0.0,
+            ),
+            "pre_add_open_risk": decision.pre_add_open_risk,
+            "post_add_open_risk": decision.post_add_open_risk,
+            "incremental_risk": decision.incremental_risk,
+            "pending_add_stop_risk": decision.proposed_add_shares
+            * max(decision.risk_decision.proposed_add_price - decision.required_protective_stop, 0.0),
+            "risk_released": decision.released_risk,
+            "risk_operator_classification": "risk_neutral" if decision.incremental_risk <= risk_input.rounding_tolerance_dollars else "bounded",
+            "binding_cap": decision.binding_cap,
+            "winner_expansion_reason": decision.reason,
+            "current_r_multiple": current_r,
+            "position_lifecycle_id": lifecycle_id,
+        })
+        if decision_stage == "proposal":
+            proposal.update({
+                "approved_post_add_open_risk_ceiling": decision.post_add_open_risk,
+                "approved_incremental_risk_ceiling": decision.risk_decision.consumed_risk,
+                "approved_protective_stop_floor": decision.required_protective_stop,
+            })
+        return decision, decision_id, milestone_id
+
+    def _evaluate_held_position_trend(
+        self,
+        *,
+        symbol: str,
+        current_price: float,
+        average_entry_price: float,
+        bars: pd.DataFrame,
+        score: float,
+        volatility_regime: str,
+        strategy_version: str,
+        position_age_days: float | None,
+        normal_exit_signal: bool,
+        emergency_exit: bool,
+        deterioration_detected: bool,
+        now: datetime,
+    ) -> Any:
+        """Persist the operational trend mode and monotonic protective stop."""
+        lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
+        state = self._position_management_state(symbol)
+        if not lifecycle_id or not state:
+            raise ValueError("active lifecycle and durable position-management state are required")
+        stops = [
+            float(value)
+            for value in (
+                state.get("initial_stop_price"), state.get("trailing_stop_price"),
+                state.get("authoritative_protective_stop"),
+            )
+            if value is not None and float(value) > 0
+        ]
+        if not stops:
+            raise ValueError("durable protective stop is required")
+        current_stop = max(stops)
+        initial_stop = float(state.get("initial_stop_price") or current_stop)
+        initial_risk = average_entry_price - initial_stop
+        if initial_risk <= 0 or bars.empty or len(bars) < 50:
+            raise ValueError("valid initial R geometry and trend history are required")
+        close = pd.to_numeric(bars["close"], errors="coerce")
+        high = pd.to_numeric(bars["high"], errors="coerce")
+        low = pd.to_numeric(bars["low"], errors="coerce")
+        ma50 = float(close.tail(50).mean())
+        ma200 = float(close.tail(min(200, len(close))).mean())
+        prior_close = close.shift(1)
+        atr = float(pd.concat(
+            [(high - low).abs(), (high - prior_close).abs(), (low - prior_close).abs()], axis=1
+        ).max(axis=1).tail(14).mean())
+        if not all(math.isfinite(value) and value > 0 for value in (ma50, ma200, atr)):
+            raise ValueError("trend moving-average or ATR evidence is unavailable")
+        highest = max(
+            current_price, float(state.get("highest_price_since_entry") or current_price),
+            float(high.tail(min(200, len(high))).max()),
+        )
+        current_r = (current_price - average_entry_price) / initial_risk
+        peak_r = max(float(state.get("peak_r_multiple") or current_r), (highest - average_entry_price) / initial_risk)
+        drawdown_rows = self.storage.fetch_all(
+            "SELECT drawdown_pct FROM account_equity_watermarks ORDER BY updated_at DESC LIMIT 1"
+        )
+        account_drawdown = max(0.0, float(drawdown_rows[0]["drawdown_pct"] or 0.0)) if drawdown_rows else 0.0
+        execution = self._adaptive_conviction_execution_evidence(strategy_version)
+        fill_rate = execution.get("execution_fill_rate")
+        shortfall = execution.get("execution_shortfall_bps")
+        execution_quality = 0.70 if fill_rate is None else max(0.0, min(1.0, float(fill_rate)))
+        if shortfall is not None:
+            execution_quality = min(execution_quality, max(0.0, 1.0 - float(shortfall) / 100.0))
+        deployment_mode = "DEFENSIVE" if account_drawdown >= 4.0 or volatility_regime == "extreme" else "NORMAL"
+        market_regime = "favorable" if score >= 80 and current_price > ma50 > ma200 else "normal"
+        higher_highs_lows = bool(
+            len(high) >= 20
+            and float(high.tail(10).mean()) >= float(high.iloc[-20:-10].mean())
+            and float(low.tail(10).mean()) >= float(low.iloc[-20:-10].mean())
+        )
+        decision = TrendManagementEngine().evaluate(TrendManagementInput(
+            symbol=symbol, position_lifecycle_id=lifecycle_id, current_price=current_price,
+            average_entry_price=average_entry_price, highest_price_since_entry=highest,
+            current_protective_stop=current_stop, atr=atr, current_r_multiple=current_r,
+            peak_r_multiple=peak_r, trend_strength=max(0.0, min(100.0, score)),
+            price_above_ma50=current_price > ma50, ma50_above_ma200=ma50 > ma200,
+            higher_highs_and_lows=higher_highs_lows, market_regime=market_regime,
+            volatility_regime=volatility_regime, deployment_mode=deployment_mode,
+            execution_quality=execution_quality,
+            account_health=max(0.0, min(1.0, 1.0 - account_drawdown / 6.0)),
+            account_drawdown_pct=account_drawdown,
+            position_age_days=max(0.0, float(position_age_days or 0.0)),
+            previous_mode=str(state.get("management_mode")) if state.get("management_mode") else None,
+            deterioration_detected=deterioration_detected,
+            profit_protection_triggered=bool(state.get("profit_protection_active")),
+            emergency_exit=emergency_exit, normal_exit_signal=normal_exit_signal,
+            as_of=now.isoformat(),
+            minimum_price_increment=float((self.config.get("quotes", {}) or {}).get("price_increment_usd", 0.01)),
+        ))
+        store = WinnerExpansionStore(self.storage)
+        store.persist_trend_decision(decision, run_id=self.run_id, config_hash=self.config.get("effective_config_hash"))
+        stop_as_of = now.isoformat()
+        store.persist_authoritative_stop(
+            decision, run_id=self.run_id, source="position_trend_management",
+            stop_as_of=stop_as_of, config_hash=self.config.get("effective_config_hash"),
+            peak_r_multiple=peak_r,
+        )
+        return decision
+
     def _exit_blocker_label_from_reason(self, no_action_reason: str) -> str:
         no_act = no_action_reason or ""
         lower = no_act.lower()
@@ -1525,7 +2204,30 @@ class TradingService:
             proposed_cluster_positions_count = current_cluster_count + (0 if has_symbol_pos else 1)
             proposed_cluster_exposure_pct = current_cluster_exposure + proposal_notional_pct
 
-        exit_blocker = self._exit_blocker_context(orders)
+        excluded_rotation_group_id = None
+        relationship_group_id = str(
+            proposal.get("rotation_group_id") or proposal.get("relationship_group_id") or ""
+        )
+        if proposal.get("relationship_type") == "rotation_entry" and relationship_group_id:
+            rotation_rows = self.storage.fetch_all(
+                """SELECT state,actual_released_notional,reconciliation_fingerprint
+                   FROM rotation_groups WHERE id=?""",
+                (relationship_group_id,),
+            )
+            reconciled_states = {
+                "reconciled", "entry_revalidating", "entry_reserved",
+                "entry_submitted", "completed", "entry_blocked",
+            }
+            if (
+                len(rotation_rows) == 1
+                and str(rotation_rows[0].get("state")) in reconciled_states
+                and float(rotation_rows[0].get("actual_released_notional") or 0.0) > 0
+                and rotation_rows[0].get("reconciliation_fingerprint")
+            ):
+                excluded_rotation_group_id = relationship_group_id
+        exit_blocker = self._exit_blocker_context(
+            orders, exclude_reconciled_rotation_group_id=excluded_rotation_group_id
+        )
         exit_pending = bool(exit_blocker.get("active"))
 
         # max_emergency_exit_score
@@ -1958,6 +2660,780 @@ class TradingService:
             )
             self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {"symbol": row["symbol"], "proposal_id": row["id"], "reason": "non_sleep_mode"})
 
+    def _create_rotation_group(
+        self,
+        exit_proposals: list[dict[str, Any]],
+        contingent_candidates: list[dict[str, Any]],
+        now: datetime,
+    ) -> dict[str, Any]:
+        from .rotation_coordinator import RotationCoordinator
+
+        maximum = int((self.config.get("rotation", {}) or {}).get("maximum_contingent_entries", 1))
+        if maximum != 1:
+            raise ValueError("operational rotation supports exactly one contingent entry")
+        candidates: list[dict[str, Any]] = []
+        for row in contingent_candidates[:maximum]:
+            notional = max(0.0, float(row.get("final_notional") or 0.0))
+            price = max(0.0, float(row.get("price") or 0.0))
+            quantity = max(0.0, float(row.get("suggested_shares") or 0.0))
+            stop_distance = max(0.0, float(row.get("stop_distance_dollars") or 0.0))
+            if notional <= 0 or price <= 0 or quantity <= 0 or stop_distance <= 0:
+                continue
+            signal = row["signal"]
+            strategy = str(signal.strategy_version)
+            candidate_key = f"{row.get('setup_key')}:{strategy}:{signal.action}:{signal.side}"
+            displayed_proposal = dict(row.get("performance_proposal_payload") or {})
+            proposal_id = str(row.get("proposal_id") or displayed_proposal.get("id") or "")
+            if not proposal_id or not displayed_proposal:
+                continue
+            candidates.append({
+                "proposal_id": proposal_id,
+                "candidate_key": candidate_key,
+                "strategy_version": strategy,
+                "symbol": row["symbol"],
+                "side": "buy",
+                "max_quantity": quantity,
+                "max_notional": notional,
+                "max_stop_risk": quantity * stop_distance,
+                "payload": {
+                    **displayed_proposal,
+                    "candidate_key": candidate_key,
+                    "score": row.get("score"),
+                    "volatility_regime": row.get("volatility_regime"),
+                    "price": price,
+                    "stop_price": row.get("stop_price"),
+                    "stop_distance_dollars": stop_distance,
+                    "setup_key": row.get("setup_key"),
+                    "strategy_version": strategy,
+                    "strategy_registry_snapshot_id": displayed_proposal.get("strategy_registry_snapshot_id"),
+                    "sleeve_allocation_id": displayed_proposal.get("sleeve_allocation_id"),
+                    "strategy_sleeve": displayed_proposal.get("strategy_sleeve"),
+                    "rank": row.get("final_candidate_rank"),
+                    "displayed_at": now.isoformat(),
+                },
+            })
+        if not candidates:
+            raise ValueError("no current risk-qualified contingent entry is available")
+        exits: list[dict[str, Any]] = []
+        for proposal in exit_proposals:
+            quantity = float(proposal.get("qty") or 0.0)
+            if quantity <= 0:
+                continue
+            state = self._position_management_state(str(proposal["symbol"])) or {}
+            stops = [
+                float(value) for value in (
+                    state.get("initial_stop_price"), state.get("trailing_stop_price"),
+                    state.get("authoritative_protective_stop"),
+                ) if value is not None and float(value) > 0
+            ]
+            mark = float(proposal.get("latest_price") or 0.0)
+            exits.append({
+                "proposal_id": proposal["id"],
+                "symbol": proposal["symbol"],
+                "side": "sell",
+                "quantity": quantity,
+                "estimated_notional": float(proposal.get("notional") or 0.0),
+                "estimated_released_risk": quantity * max(0.0, mark - max(stops)) if stops else 0.0,
+                "reason": proposal.get("reason"),
+                "position_state": state.get("management_mode") or state.get("last_decision_type"),
+            })
+        expiry = now + timedelta(minutes=float((self.config.get("rotation", {}) or {}).get("group_expiry_minutes", 15)))
+        for proposal in exit_proposals:
+            try:
+                expiry = min(expiry, _parse_datetime(proposal["expires_at"]))
+            except Exception:
+                pass
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        group = coordinator.create_group(
+            run_id=self.run_id,
+            exit_legs=exits,
+            contingent_entries=candidates,
+            expires_at=expiry,
+            registry_snapshot_id=self._ensure_strategy_registry_snapshot(),
+            allocation_id=(self._phase4_allocation_cache or {}).get("allocation_id"),
+        )
+        for step in coordinator.steps(group["id"]):
+            proposal_rows = self.storage.fetch_all("SELECT payload FROM trade_proposals WHERE id=?", (step["proposal_id"],))
+            payload = json.loads(proposal_rows[0]["payload"] or "{}") if proposal_rows else {}
+            payload.update({
+                "rotation_group_id": group["id"], "rotation_step_id": step["id"],
+                "relationship_type": "rotation_exit", "order_role": "rotation_exit",
+            })
+            self.storage.execute(
+                """UPDATE trade_proposals SET rotation_group_id=?,rotation_step_id=?,relationship_type=?,payload=?
+                   WHERE id=? AND status='pending'""",
+                (group["id"], step["id"], "rotation_exit", json_dumps(payload), step["proposal_id"]),
+            )
+        for entry in coordinator.entries(group["id"]):
+            if not entry.get("proposal_id"):
+                continue
+            proposal_rows = self.storage.fetch_all(
+                "SELECT payload FROM trade_proposals WHERE id=?", (entry["proposal_id"],)
+            )
+            payload = json.loads(proposal_rows[0]["payload"] or "{}") if proposal_rows else {}
+            payload.update({
+                "rotation_group_id": group["id"], "rotation_step_id": entry["id"],
+                "relationship_type": "rotation_entry", "order_role": "rotation_entry",
+            })
+            self.storage.execute(
+                """UPDATE trade_proposals SET rotation_group_id=?,rotation_step_id=?,relationship_type=?,payload=?
+                   WHERE id=? AND status='pending'""",
+                (group["id"], entry["id"], "rotation_entry", json_dumps(payload), entry["proposal_id"]),
+            )
+        return group
+
+    def _format_rotation_group_message(self, group: dict[str, Any]) -> str:
+        from .rotation_coordinator import RotationCoordinator
+
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        exits = coordinator.steps(group["id"])
+        entries = coordinator.entries(group["id"])
+        exit_lines = []
+        estimated_risk = 0.0
+        for row in exits:
+            payload = json.loads(row.get("payload") or "{}")
+            estimated_risk += float(payload.get("estimated_released_risk") or 0.0)
+            exit_lines.append(
+                f"Exit first: {row['symbol']} {float(row.get('requested_quantity') or 0):.4f} shares"
+                f" — {payload.get('reason') or 'risk reduction'}"
+                f" (state: {payload.get('position_state') or 'current held position'})"
+            )
+        entry_lines = [
+            f"Contingent entry: {row['symbol']} up to {float(row['displayed_max_quantity']):.4f} shares / ${float(row['displayed_max_notional']):.2f} / ${float(row['displayed_max_stop_risk']):.2f} stop risk"
+            for row in entries
+        ]
+        code = str(group["id"])[:8]
+        return "\n".join([
+            "🔄 Paper exit-first rotation proposal",
+            *exit_lines,
+            *entry_lines,
+            f"Estimated release: ${float(group.get('estimated_release_notional') or 0.0):.2f}; this is not available capacity yet.",
+            f"Estimated stop risk released: ${estimated_risk:.2f}; actual fill and current stop will replace this estimate.",
+            "Sequence: exit submission → authoritative fill → reconciliation → fresh entry validation.",
+            "A partial fill can only reduce or block the contingent entry. No pre-fill BUY capital is reserved.",
+            f"Expires: {format_sgt(_parse_datetime(group['expires_at']))}.",
+            f"Reply exactly: APPROVE ROTATION {code}",
+            f"To reject: REJECT ROTATION {code}",
+        ])
+
+    def _prepare_rotation_proposal_approval(
+        self,
+        *,
+        row: dict[str, Any],
+        sender: str,
+        raw_text: str,
+        targeting_method: str,
+        safe_detail: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Create or resume the one durable derived approval for a group leg."""
+        workflow_store = ApprovalWorkflowStore(self.storage)
+        existing = self.storage.fetch_all(
+            """SELECT w.*,a.consumed_at,a.sender_id,a.raw_message
+               FROM approval_workflows w JOIN approvals a ON a.id=w.approval_id
+               WHERE w.proposal_id=? AND a.proposal_targeting_method=?
+               ORDER BY w.created_at DESC LIMIT 1""",
+            (row["id"], targeting_method),
+        )
+        if existing:
+            workflow = existing[0]
+            approval_id = str(workflow["approval_id"])
+        else:
+            if str(row.get("status")) != "pending":
+                raise ValueError("rotation proposal has no recoverable grouped approval")
+            approval_id = str(uuid.uuid4())
+            workflow = workflow_store.accept_approval(
+                approval_id=approval_id,
+                run_id=self.run_id,
+                proposal_id=str(row["id"]),
+                sender_id=sender,
+                raw_message=raw_text,
+                parsed_action="approve",
+                telegram_update_id=None,
+                reply_to_message_id=None,
+                targeting_method=targeting_method,
+                acknowledgement_status="received",
+                approval_received_at=iso_now(),
+            )
+        state = ApprovalWorkflowState(workflow["state"])
+        if state == ApprovalWorkflowState.TARGET_RESOLVED:
+            workflow = workflow_store.transition(
+                workflow["id"], ApprovalWorkflowState.VALIDATING,
+                expected_state=ApprovalWorkflowState.TARGET_RESOLVED,
+                safe_detail=safe_detail,
+            )
+            state = ApprovalWorkflowState.VALIDATING
+        if state not in {
+            ApprovalWorkflowState.VALIDATING,
+            ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+        }:
+            raise ValueError(f"rotation approval workflow is not resumable from {state.value}")
+        if self._check_stale_listener_block(str(row.get("symbol") or ""), approval_id):
+            if state == ApprovalWorkflowState.VALIDATING:
+                workflow_store.transition(
+                    workflow["id"], ApprovalWorkflowState.BLOCKED,
+                    safe_detail="listener freshness blocked rotation approval",
+                )
+            raise ValueError("listener is running stale code")
+        if str(row.get("status")) == "pending":
+            if not self.storage.consume_approval(str(row["id"]), approval_id):
+                raise ValueError("rotation approval could not be consumed")
+        else:
+            approval_rows = self.storage.fetch_all(
+                "SELECT consumed_at FROM approvals WHERE id=?", (approval_id,)
+            )
+            if str(row.get("status")) != "approved" or not approval_rows or not approval_rows[0].get("consumed_at"):
+                raise ValueError("rotation proposal approval state is inconsistent")
+        return approval_id, workflow_store.get(str(workflow["id"]))
+
+    def _approve_rotation_exit_step(
+        self,
+        *,
+        group_id: str,
+        step: dict[str, Any],
+        sender: str,
+        raw_text: str,
+    ) -> tuple[bool, str | None]:
+        from .rotation_coordinator import RotationCoordinator, RotationState, TERMINAL_STATES
+
+        coordinator = RotationCoordinator(
+            self.storage, config_hash=self.config.get("effective_config_hash")
+        )
+        try:
+            group = coordinator.get_group(group_id)
+        except KeyError:
+            return False, "rotation group is unavailable"
+        if (
+            RotationState(group["state"]) in TERMINAL_STATES
+            or _parse_datetime(group["expires_at"]) <= datetime.now(UTC)
+        ):
+            return False, "rotation group expired or became terminal before exit submission"
+
+        rows = self.storage.fetch_all(
+            "SELECT * FROM trade_proposals WHERE id=? AND status IN ('pending','approved')", (step["proposal_id"],)
+        )
+        if not rows:
+            return False, "rotation exit proposal is no longer recoverable"
+        row = rows[0]
+        workflow_store = ApprovalWorkflowStore(self.storage)
+        linked = self.storage.fetch_all(
+            """SELECT id FROM order_intents WHERE proposal_id=? AND relationship_group_id=?
+               AND relationship_type='rotation_exit' ORDER BY created_at DESC LIMIT 1""",
+            (row["id"], group_id),
+        )
+        if linked:
+            coordinator.record_exit_submitted(
+                group_id, step_id=step["id"], intent_id=str(linked[0]["id"])
+            )
+            return True, str(linked[0]["id"])
+        try:
+            approval_id, workflow = self._prepare_rotation_proposal_approval(
+                row=row, sender=sender, raw_text=raw_text,
+                targeting_method="rotation_group",
+                safe_detail="explicit rotation group approval validating exit leg",
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        proposal = _hydrate_proposal_row(row)
+        proposal.update({
+            "rotation_group_id": group_id, "relationship_group_id": group_id,
+            "rotation_step_id": step["id"], "relationship_type": "rotation_exit",
+            "order_role": "rotation_exit",
+        })
+        result, *_ = self._execute_final_revalidation(
+            row, proposal, str(row["symbol"]), "sell", False, approval_id
+        )
+        if not result.submitted or not result.intent_id:
+            workflow_now = workflow_store.get(workflow["id"])
+            if workflow_now["state"] == ApprovalWorkflowState.VALIDATING.value:
+                workflow_store.transition(workflow["id"], ApprovalWorkflowState.BLOCKED, safe_detail=result.reason)
+            self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (row["id"],))
+            return False, result.reason
+        workflow_now = workflow_store.get(workflow["id"])
+        if workflow_now["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+            workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+            workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+            workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
+        self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (row["id"],))
+        coordinator.record_exit_submitted(
+            group_id, step_id=step["id"], intent_id=result.intent_id
+        )
+        return True, result.intent_id
+
+    def _handle_rotation_command(self, text: str, sender: str) -> bool:
+        from .rotation_coordinator import RotationCoordinator, parse_rotation_approval
+
+        normalized = " ".join(text.strip().lower().split())
+        if not re.fullmatch(r"(approve|reject) rotation [a-f0-9]{6,64}", normalized):
+            return False
+        if not self.telegram.is_authorized(sender):
+            self.storage.audit(self.run_id, "rotation_command_ignored_unauthorized", {"sender_id": sender})
+            return True
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        pending = self.storage.fetch_all(
+            "SELECT * FROM rotation_groups WHERE state='pending_group_approval' ORDER BY created_at"
+        )
+        parsed = parse_rotation_approval(text, pending)
+        if not parsed.accepted or not parsed.group_id:
+            self.telegram.send_message(f"Rotation command not accepted: {parsed.reason}.")
+            return True
+        if parsed.action == "reject":
+            coordinator.reject(parsed.group_id, reason="explicit grouped rejection")
+            for step in coordinator.steps(parsed.group_id):
+                self.storage.execute("UPDATE trade_proposals SET status='rejected' WHERE id=? AND status='pending'", (step["proposal_id"],))
+            self.telegram.send_message("Rotation rejected. No exit or contingent entry was submitted.")
+            return True
+        approval_id = str(uuid.uuid4())
+        coordinator.approve(parsed.group_id, approval_id=approval_id, sender_id=sender, command=text)
+        self.telegram.send_message("Rotation approval received. Running final checks and submitting exit legs first; no contingent BUY is reserved yet.")
+        for step in coordinator.steps(parsed.group_id):
+            submitted, reason = self._approve_rotation_exit_step(
+                group_id=parsed.group_id, step=step, sender=sender, raw_text=text
+            )
+            if not submitted:
+                coordinator.fail_exit(parsed.group_id, reason=reason or "rotation exit validation failed")
+                self.telegram.send_message(f"Rotation terminated before entry. Exit leg was blocked: {reason or 'final validation failed'}.")
+                return True
+        self.storage.execute(
+            "UPDATE rotation_group_approvals SET consumed_at=?,status='exit_submitted' WHERE group_id=? AND approval_id=?",
+            (iso_now(), parsed.group_id, approval_id),
+        )
+        self.telegram.send_message("Rotation exit submitted in paper mode. The contingent entry remains zero-capital until an authoritative fill and reconciliation.")
+        return True
+
+    def _send_rotation_lifecycle_events(self) -> None:
+        from .rotation_coordinator import RotationCoordinator
+
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        rows = self.storage.fetch_all(
+            """SELECT group_id,event_key,event_type,safe_detail FROM rotation_events
+               WHERE notification_sent_at IS NULL ORDER BY created_at,id"""
+        )
+        labels = {
+            "exit_submitted": "Rotation exit submitted in paper mode. The contingent entry remains zero-capital until authoritative fill reconciliation.",
+            "exit_partially_filled": "Rotation exit partially filled. Only actual released capacity will be considered.",
+            "exit_filled": "Rotation exit filled. Authoritative account and position reconciliation is now required.",
+            "reconciliation_complete": "Rotation reconciliation complete. The contingent entry is being revalidated from fresh data.",
+            "contingent_entry_revalidated": "Rotation contingent entry revalidated without enlarging its displayed ceiling.",
+            "entry_reduced": "Rotation contingent entry was reduced by fresh post-fill limits; it was not enlarged.",
+            "entry_reserved": "Rotation contingent entry passed atomic post-fill reservation.",
+            "entry_submitted": "Rotation contingent entry submitted in paper mode.",
+            "completed": "Rotation group completed.",
+            "entry_blocked": "Rotation contingent entry was blocked or stopped before a complete fill. No additional BUY will be submitted; any partial fill remains in the linked intent ledger.",
+            "late_exit_fill_reconciled": "A later rotation exit fill was reconciled. Its additional capacity was not reused by the completed dependency decision.",
+            "exit_failed": "Rotation terminated because the exit failed. No contingent BUY was submitted.",
+            "expired": "Rotation expired. No further action is authorized.",
+            "cancelled": "Rotation cancelled. No further dependent action is authorized.",
+        }
+        for row in rows:
+            message = labels.get(str(row["event_type"]))
+            if not message or not coordinator.claim_notification(row["group_id"], row["event_key"]):
+                continue
+            try:
+                self.telegram.send_message(message)
+                coordinator.mark_notification_sent(row["group_id"], row["event_key"])
+            except Exception:
+                coordinator.release_notification_claim(row["group_id"], row["event_key"])
+                continue
+
+    def _submit_revalidated_rotation_entry(self, group: dict[str, Any]) -> None:
+        """Freshly size and submit the one displayed contingent entry."""
+        from .rotation_coordinator import RotationCoordinator, RotationState
+
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        entries = [row for row in coordinator.entries(group["id"]) if row["state"] == "contingent"]
+        if len(entries) != 1 or not coordinator.approval_is_current(group["id"]):
+            coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason="current grouped approval or contingent entry is unavailable")
+            return
+        entry = entries[0]
+        payload = json.loads(entry.get("payload") or "{}")
+        symbol = str(entry["symbol"]).upper()
+        strategy = str(entry["strategy_version"])
+        action = str(payload.get("action") or "entry").lower()
+        is_add = bool(payload.get("is_add")) or action == "add"
+        try:
+            runtime = self._authoritative_runtime_state(force=True)
+            quote = validated_quote(self.broker, symbol, self.config, now=datetime.now(UTC))
+            price = float(quote["ask"])
+            bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
+            clock = self.broker.get_clock()
+            strategy_config = {
+                "maximum_volatility_20d": 0.45,
+                "stop_drawdown_pct": 0.08,
+                **((self.config.get("strategies", {}) or {}).get(strategy, {}) or {}),
+            }
+            fresh_signal = evaluate_symbol(
+                symbol, bars, False, False, bool(_value(clock, "is_open", False)),
+                float(strategy_config["maximum_volatility_20d"]),
+                float(strategy_config["stop_drawdown_pct"]),
+                position_drawdown_pct=0.0,
+            )
+            if fresh_signal.action != "ENTRY" or fresh_signal.side != "buy" or fresh_signal.strategy_version != strategy:
+                raise ValueError("fresh strategy no longer emits the displayed BUY setup")
+            fresh_now = datetime.now(UTC)
+            fresh_price_at = _parse_datetime(quote["timestamp"])
+            spy_return = None
+            try:
+                spy_bars = normalize_bars(self.broker.get_historical_bars("SPY", "1Day", 50), "SPY")
+                if len(spy_bars) >= 20:
+                    spy_return = float(spy_bars["close"].iloc[-1] / spy_bars["close"].iloc[-20]) - 1.0
+            except Exception:
+                pass
+            asset_score = self._calculate_asset_selection_score(
+                symbol, bars, fresh_price_at, fresh_signal, fresh_now, spy_return
+            )
+            score_components = self._canonical_trade_score_components(
+                symbol=symbol, signal=fresh_signal, price=price, price_at=fresh_price_at,
+                bars=bars, asset_score=asset_score, now=fresh_now,
+            )
+            fresh_regime = str(score_components["volatility_regime"])
+            fresh_score = float(score_components["score"])
+            fresh_setup_key = self._compute_setup_key(
+                symbol, "buy", "ENTRY", fresh_signal.indicators, fresh_score
+            )
+            fresh_candidate_key = f"{fresh_setup_key}:{strategy}:ENTRY:buy"
+            if fresh_candidate_key != str(entry["candidate_key"]):
+                raise ValueError("contingent candidate changed materially; a new approval is required")
+            snapshot = self._get_exposure_snapshot(runtime.get("positions", []), runtime.get("account"))
+            self._phase4_allocation_cache = None
+            size = self._calculate_dynamic_size(
+                symbol, fresh_score, fresh_regime, price, bars, snapshot,
+                is_add=is_add, strategy_version=strategy,
+            )
+            requested_notional = min(
+                float(entry["displayed_max_notional"]), float(size.get("final_notional") or 0.0)
+            )
+            requested_quantity = min(
+                float(entry["displayed_max_quantity"]), requested_notional / price if price > 0 else 0.0
+            )
+            stop_distance = float(size.get("stop_distance_dollars") or 0.0)
+            registry_snapshot_id = str(size.get("strategy_registry_snapshot_id") or "")
+            allocation_id = str(size.get("sleeve_allocation_id") or "")
+            revalidated = coordinator.revalidate_entry(
+                group["id"], entry["id"], candidate_key=fresh_candidate_key,
+                price=price, requested_quantity=requested_quantity,
+                stop_risk_per_share=stop_distance,
+                allocation_notional_cap=float(size.get("sleeve_notional_ceiling") or 0.0),
+                allocation_risk_cap=float(size.get("sleeve_stop_risk_ceiling") or 0.0),
+                other_available_cash=min(
+                    float(_value(runtime.get("account"), "cash", 0.0) or 0.0),
+                    float(_value(runtime.get("account"), "buying_power", 0.0) or 0.0),
+                ),
+                minimum_notional=float((self.config.get("position_sizing", {}) or {}).get("minimum_executable_notional_usd", 1.0)),
+                registry_snapshot_id=registry_snapshot_id, allocation_id=allocation_id,
+            )
+        except Exception as exc:
+            coordinator.transition(
+                group["id"], RotationState.ENTRY_BLOCKED,
+                reason=f"fresh contingent entry validation unavailable ({type(exc).__name__})",
+            )
+            return
+        if not revalidated.allowed:
+            return
+        proposal_id = str(entry.get("proposal_id") or "")
+        proposal_rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
+        if len(proposal_rows) != 1:
+            coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason="displayed contingent proposal is unavailable")
+            return
+        row = proposal_rows[0]
+        proposal = _hydrate_proposal_row(row)
+        proposal.update({
+            "id": proposal_id, "proposal_id": proposal_id,
+            "symbol": symbol, "side": "buy", "action": action, "is_add": is_add,
+            "notional": revalidated.final_notional, "qty": revalidated.final_quantity,
+            "approved_notional_ceiling": revalidated.final_notional,
+            "approved_quantity_ceiling": revalidated.final_quantity,
+            "approved_stop_risk_ceiling": revalidated.final_stop_risk,
+            "latest_price": price, "price_at": quote["timestamp"],
+            "score": fresh_score, "volatility_regime": fresh_regime,
+            "stop_price": size.get("stop_price"), "stop_distance_dollars": stop_distance,
+            "stop_validation_status": size.get("stop_validation_status"),
+            "stop_model_used": size.get("stop_model_used"), "atr_value": size.get("atr_value"),
+            "technical_stop_price": size.get("technical_stop_price"),
+            "stop_risk_dollars": revalidated.final_stop_risk,
+            "strategy_registry_snapshot_id": registry_snapshot_id,
+            "strategy_sleeve": size.get("strategy_sleeve"), "sleeve_allocation_id": allocation_id,
+            "sleeve_stop_risk_ceiling": size.get("sleeve_stop_risk_ceiling"),
+            "sleeve_notional_ceiling": size.get("sleeve_notional_ceiling"),
+            "rotation_group_id": group["id"], "relationship_group_id": group["id"],
+            "rotation_step_id": entry["id"], "relationship_type": "rotation_entry",
+            "order_role": "rotation_entry", "cluster_name": self._get_symbol_cluster(symbol),
+        })
+        self.storage.execute(
+            """UPDATE trade_proposals SET notional=?,payload=?,rotation_group_id=?,rotation_step_id=?,relationship_type=?
+               WHERE id=? AND status IN ('pending','approved')""",
+            (proposal["notional"], json_dumps(proposal), group["id"], entry["id"], "rotation_entry", proposal_id),
+        )
+        row = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))[0]
+        approval_rows = self.storage.fetch_all(
+            """SELECT * FROM rotation_group_approvals WHERE group_id=?
+               AND status='exit_submitted' AND consumed_at IS NOT NULL ORDER BY created_at DESC LIMIT 1""",
+            (group["id"],),
+        )
+        if not approval_rows:
+            coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason="durable consumed group approval is missing")
+            return
+        linked_intents = self.storage.fetch_all(
+            """SELECT id,state FROM order_intents WHERE proposal_id=? AND relationship_group_id=?
+               AND relationship_type='rotation_entry' ORDER BY created_at DESC LIMIT 1""",
+            (proposal_id, group["id"]),
+        )
+        if linked_intents:
+            intent_id = str(linked_intents[0]["id"])
+            coordinator.record_entry_reserved(group["id"], entry["id"], intent_id=intent_id)
+            if str(linked_intents[0]["state"]) in {"submitted", "partially_filled", "filled", "cancel_pending"}:
+                coordinator.record_entry_submitted(group["id"], entry["id"], intent_id=intent_id)
+            return
+        try:
+            approval_id, _workflow = self._prepare_rotation_proposal_approval(
+                row=row,
+                sender=str(approval_rows[0]["sender_id"]),
+                raw_text=str(approval_rows[0]["command"]),
+                targeting_method="rotation_group_contingent",
+                safe_detail="approved rotation contingent entry final validation",
+            )
+        except ValueError as exc:
+            coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason=str(exc))
+            return
+        result, *_ = self._execute_final_revalidation(
+            row, proposal, symbol, "buy", is_add, approval_id,
+            rotation_dependency_authorized=True,
+        )
+        if not result.submitted or not result.intent_id:
+            coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason=result.reason or "contingent entry blocked")
+            self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=?", (proposal_id,))
+            return
+        coordinator.record_entry_reserved(group["id"], entry["id"], intent_id=result.intent_id)
+        coordinator.record_entry_submitted(group["id"], entry["id"], intent_id=result.intent_id)
+        self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
+
+    def _advance_rotation_workflows(self) -> None:
+        from .rotation_coordinator import RotationCoordinator, RotationState
+
+        coordinator = RotationCoordinator(self.storage, config_hash=self.config.get("effective_config_hash"))
+        coordinator.expire_stale()
+        for action in coordinator.recovery_actions():
+            group = coordinator.get_group(action["group_id"])
+            state = RotationState(group["state"])
+            if state == RotationState.APPROVED_EXIT_PENDING:
+                approvals = self.storage.fetch_all(
+                    """SELECT * FROM rotation_group_approvals WHERE group_id=?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (group["id"],),
+                )
+                if not approvals:
+                    coordinator.fail_exit(group["id"], reason="durable grouped approval disappeared")
+                    continue
+                approval = approvals[0]
+                recovery_failed = False
+                for step in coordinator.steps(group["id"]):
+                    linked = self.storage.fetch_all(
+                        """SELECT id,state FROM order_intents WHERE proposal_id=?
+                           AND relationship_group_id=? AND relationship_type='rotation_exit'
+                           ORDER BY created_at DESC LIMIT 1""",
+                        (step["proposal_id"], group["id"]),
+                    )
+                    if linked:
+                        coordinator.record_exit_submitted(
+                            group["id"], step_id=step["id"], intent_id=str(linked[0]["id"])
+                        )
+                        continue
+                    submitted, reason = self._approve_rotation_exit_step(
+                        group_id=group["id"], step=step,
+                        sender=str(approval["sender_id"]), raw_text=str(approval["command"]),
+                    )
+                    if not submitted:
+                        coordinator.fail_exit(group["id"], reason=reason or "recovered exit validation failed")
+                        recovery_failed = True
+                        break
+                if recovery_failed:
+                    continue
+                self.storage.execute(
+                    """UPDATE rotation_group_approvals SET consumed_at=COALESCE(consumed_at,?),status='exit_submitted'
+                       WHERE group_id=? AND approval_id=?""",
+                    (iso_now(), group["id"], approval["approval_id"]),
+                )
+                group = coordinator.get_group(group["id"])
+                state = RotationState(group["state"])
+            if state in {RotationState.EXIT_SUBMITTED, RotationState.EXIT_PARTIALLY_FILLED}:
+                self.storage.execute(
+                    """UPDATE rotation_group_approvals SET consumed_at=COALESCE(consumed_at,?),status='exit_submitted'
+                       WHERE group_id=? AND status='active'""",
+                    (iso_now(), group["id"]),
+                )
+                missing_steps = [step for step in coordinator.steps(group["id"]) if not step.get("intent_id")]
+                if missing_steps:
+                    approval_rows = self.storage.fetch_all(
+                        """SELECT * FROM rotation_group_approvals WHERE group_id=?
+                           AND status IN ('active','exit_submitted') ORDER BY created_at DESC LIMIT 1""",
+                        (group["id"],),
+                    )
+                    if not approval_rows:
+                        coordinator.fail_exit(group["id"], reason="approved exit leg recovery lost grouped approval")
+                        continue
+                    missing_failed = False
+                    for missing_step in missing_steps:
+                        submitted, reason = self._approve_rotation_exit_step(
+                            group_id=group["id"], step=missing_step,
+                            sender=str(approval_rows[0]["sender_id"]),
+                            raw_text=str(approval_rows[0]["command"]),
+                        )
+                        if not submitted:
+                            coordinator.fail_exit(group["id"], reason=reason or "approved exit leg recovery failed")
+                            missing_failed = True
+                            break
+                    if missing_failed:
+                        continue
+                    group = coordinator.get_group(group["id"])
+                    state = RotationState(group["state"])
+
+            exit_tracking_states = {
+                RotationState.EXIT_SUBMITTED, RotationState.EXIT_PARTIALLY_FILLED,
+                RotationState.EXIT_FILLED, RotationState.RECONCILIATION_PENDING,
+                RotationState.RECONCILED, RotationState.ENTRY_REVALIDATING,
+                RotationState.ENTRY_RESERVED, RotationState.ENTRY_SUBMITTED,
+                RotationState.COMPLETED, RotationState.ENTRY_BLOCKED,
+                RotationState.EXIT_FAILED, RotationState.EXPIRED,
+                RotationState.CANCELLED,
+            }
+            if state in exit_tracking_states:
+                terminal_without_fill: str | None = None
+                allow_partial = bool((self.config.get("rotation", {}) or {}).get("allow_partial_fill_reallocation"))
+                for step in coordinator.steps(group["id"]):
+                    if not step.get("intent_id"):
+                        continue
+                    rows = self.storage.fetch_all(
+                        """SELECT state,requested_quantity,filled_quantity,reference_price,average_fill_price
+                           FROM order_intents WHERE id=?""", (step["intent_id"],)
+                    )
+                    if not rows:
+                        coordinator.fail_exit(group["id"], reason="rotation exit intent linkage disappeared")
+                        break
+                    intent = rows[0]
+                    intent_state = str(intent["state"])
+                    filled = float(intent.get("filled_quantity") or 0.0)
+                    if filled > float(step.get("filled_quantity") or 0.0) + 1e-12:
+                        fill_price = float(intent.get("average_fill_price") or intent.get("reference_price") or 0.0)
+                        pm_state = self._position_management_state(step["symbol"]) or {}
+                        stops = [float(value) for value in (
+                            pm_state.get("initial_stop_price"), pm_state.get("trailing_stop_price"),
+                            pm_state.get("authoritative_protective_stop"),
+                        ) if value is not None and float(value) > 0]
+                        released_risk = filled * max(0.0, fill_price - max(stops)) if stops else 0.0
+                        complete = intent_state == "filled" or filled + 1e-12 >= float(intent.get("requested_quantity") or 0.0)
+                        coordinator.record_exit_fill(
+                            group["id"], intent_id=step["intent_id"], cumulative_quantity=filled,
+                            cumulative_notional=filled * fill_price, released_risk=released_risk,
+                            exit_complete=complete,
+                        )
+                    if intent_state in {"rejected", "cancelled", "expired"} and filled <= 0:
+                        terminal_without_fill = intent_state
+                        break
+                    if (
+                        intent_state in {"rejected", "cancelled", "expired"}
+                        and filled > 0
+                        and filled + 1e-12 < float(intent.get("requested_quantity") or 0.0)
+                    ):
+                        coordinator.record_exit_terminal(
+                            group["id"], intent_id=step["intent_id"], terminal_state=intent_state
+                        )
+                        if state not in {
+                            RotationState.COMPLETED, RotationState.ENTRY_BLOCKED,
+                            RotationState.EXIT_FAILED, RotationState.EXPIRED,
+                            RotationState.CANCELLED,
+                        } and not allow_partial:
+                            terminal_without_fill = f"partially filled then {intent_state}"
+                            break
+                if terminal_without_fill:
+                    if state not in {
+                        RotationState.COMPLETED, RotationState.ENTRY_BLOCKED,
+                        RotationState.EXIT_FAILED, RotationState.EXPIRED,
+                        RotationState.CANCELLED,
+                    }:
+                        coordinator.fail_exit(group["id"], reason=f"rotation exit {terminal_without_fill} without a fill")
+                    continue
+                group = coordinator.get_group(group["id"])
+                if group["state"] == RotationState.EXIT_FILLED.value or (
+                    allow_partial and group["state"] == RotationState.EXIT_PARTIALLY_FILLED.value
+                ):
+                    coordinator.begin_reconciliation(group["id"])
+                    group = coordinator.get_group(group["id"])
+                    state = RotationState(group["state"])
+            if state == RotationState.EXIT_FILLED:
+                coordinator.begin_reconciliation(group["id"])
+                group = coordinator.get_group(group["id"])
+                state = RotationState(group["state"])
+            if state == RotationState.RECONCILIATION_PENDING:
+                runtime = self._authoritative_runtime_state(force=True)
+                account = runtime.get("account")
+                cash = float(_value(account, "cash", -1.0) or -1.0)
+                buying_power = float(_value(account, "buying_power", -1.0) or -1.0)
+                fingerprint = hashlib.sha256(json_dumps({
+                    "cash": cash, "buying_power": buying_power,
+                    "positions": sorted((str(_value(p, "symbol", "")), float(_value(p, "qty", 0.0) or 0.0)) for p in runtime.get("positions", [])),
+                    "as_of": iso_now(),
+                }).encode()).hexdigest()
+                coordinator.record_reconciliation(
+                    group["id"], cash=cash, buying_power=buying_power,
+                    snapshot_fingerprint=fingerprint,
+                )
+                group = coordinator.get_group(group["id"])
+                state = RotationState(group["state"])
+            if state == RotationState.RECONCILED:
+                self._phase4_allocation_cache = None
+                self._submit_revalidated_rotation_entry(group)
+                group = coordinator.get_group(group["id"])
+                state = RotationState(group["state"])
+            if state in {
+                RotationState.ENTRY_REVALIDATING,
+                RotationState.ENTRY_RESERVED,
+                RotationState.ENTRY_SUBMITTED,
+            }:
+                entries = coordinator.entries(group["id"])
+                if len(entries) != 1:
+                    coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason="rotation entry linkage is ambiguous")
+                    continue
+                entry = entries[0]
+                intent_rows = self.storage.fetch_all(
+                    """SELECT id,state FROM order_intents WHERE rotation_step_id=?
+                       OR (proposal_id=? AND relationship_group_id=?)
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (entry["id"], entry.get("proposal_id"), group["id"]),
+                )
+                if state == RotationState.ENTRY_REVALIDATING and not intent_rows:
+                    coordinator.reset_entry_for_revalidation(group["id"])
+                    self._phase4_allocation_cache = None
+                    self._submit_revalidated_rotation_entry(coordinator.get_group(group["id"]))
+                    continue
+                if not intent_rows:
+                    coordinator.transition(group["id"], RotationState.ENTRY_BLOCKED, reason="rotation entry intent linkage disappeared")
+                    continue
+                intent = intent_rows[0]
+                intent_id = str(intent["id"])
+                intent_state = str(intent["state"])
+                if state == RotationState.ENTRY_REVALIDATING:
+                    coordinator.record_entry_reserved(group["id"], entry["id"], intent_id=intent_id)
+                    state = RotationState.ENTRY_RESERVED
+                if state == RotationState.ENTRY_RESERVED and intent_state in {
+                    "submitted", "partially_filled", "filled", "cancel_pending"
+                }:
+                    coordinator.record_entry_submitted(group["id"], entry["id"], intent_id=intent_id)
+                    state = RotationState.ENTRY_SUBMITTED
+                elif state == RotationState.ENTRY_RESERVED and intent_state in {"rejected", "cancelled", "expired"}:
+                    coordinator.transition(
+                        group["id"], RotationState.ENTRY_BLOCKED,
+                        reason=f"rotation entry {intent_state} before submission reconciliation",
+                    )
+                    continue
+                if state == RotationState.ENTRY_SUBMITTED:
+                    if intent_state == "filled":
+                        coordinator.complete(group["id"])
+                    elif intent_state in {"rejected", "cancelled", "expired"}:
+                        coordinator.transition(
+                            group["id"], RotationState.ENTRY_BLOCKED,
+                            reason=f"rotation entry {intent_state} before a complete fill",
+                        )
+        self._send_rotation_lifecycle_events()
+
     def process_telegram(self) -> None:
         self._recover_local_workflows()
         self.storage.expire_proposals()
@@ -2113,6 +3589,7 @@ class TradingService:
                     performance_text = StrategyPerformanceEngine(self.storage, self.config).format_report()
                     performance_text += "\n\n" + AdaptiveConvictionEngine(self.config).format_report(self.storage)
                     performance_text += "\n\n" + AdaptiveSizingEngine(self.config).format_report(self.storage)
+                    performance_text += "\n\n" + self._format_strategy_allocation_report()
                     self.storage.audit(self.run_id, "telegram_command", {"command": "/performance", "authorized": True, "report_only": True})
                     self.telegram.send_message(performance_text, str((message.get("chat") or {}).get("id", self.telegram.chat_id)))
                     continue
@@ -2144,6 +3621,11 @@ class TradingService:
             # Live safety check before processing approvals
             if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
                 self.telegram.send_message("Blocked for safety: live trading is disabled.")
+                continue
+
+            # Rotation commands are explicit group-targeted approvals and must
+            # never fall through to the generic YES/single-proposal parser.
+            if self._handle_rotation_command(text, sender):
                 continue
 
             reply_to = message.get("reply_to_message") or {}
@@ -2452,6 +3934,20 @@ class TradingService:
                 raise RuntimeError("accepted approval is missing its durable workflow")
             prop_symbol = row.get("symbol", "")
             prop_side = row.get("side", "").lower()
+            if row.get("relationship_type") == "rotation_entry":
+                workflow_store.transition(
+                    approval_workflow["id"], ApprovalWorkflowState.BLOCKED,
+                    safe_detail="generic approval cannot authorize a contingent rotation entry",
+                )
+                self.storage.execute(
+                    """UPDATE approvals SET status='blocked',final_order_decision='blocked',
+                       final_block_reason='rotation group command required' WHERE id=?""",
+                    (approval_id,),
+                )
+                self.telegram.send_message(
+                    "This is a contingent rotation entry. Only its exact APPROVE ROTATION command can authorize the dependency; no order was placed."
+                )
+                continue
             if parsed.action == "approve":
                 approval_workflow = workflow_store.transition(
                     approval_workflow["id"],
@@ -2460,7 +3956,7 @@ class TradingService:
                     safe_detail="final local validation started",
                 )
             if parsed.action == "approve" and row.get("emergency_exit_triggered") != 1:
-                proposal_for_sleep_check = {**json.loads(row.get("payload") or "{}"), **row}
+                proposal_for_sleep_check = _hydrate_proposal_row(row)
                 if self._sleep_mode_blocks_approval(proposal_for_sleep_check):
                     msg = "Sleep mode is ON, so I did not process this BUY/ADD approval. Send awake first, then approve again if the proposal is still valid."
                     self.telegram.send_message(msg)
@@ -2527,7 +4023,7 @@ class TradingService:
 
                 self.storage.audit(self.run_id, "emergency_exit_approved_by_user", {"symbol": prop_symbol, "proposal_id": parsed.proposal_id})
 
-                proposal = {**json.loads(row.get("payload") or "{}"), **row}
+                proposal = _hydrate_proposal_row(row)
                 success, err_reason = self.revalidate_and_execute_emergency_exit(proposal)
                 if success:
                     workflow = workflow_store.get(approval_workflow["id"])
@@ -2574,7 +4070,7 @@ class TradingService:
                 continue
 
             final_revalidation_started_at = iso_now()
-            proposal = {**json.loads(row.get("payload") or "{}"), **row}
+            proposal = _hydrate_proposal_row(row)
             is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
 
             result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal = self._execute_final_revalidation(
@@ -2876,7 +4372,9 @@ class TradingService:
         prop_side: str,
         is_add: bool,
         approval_id: str,
-        batch_row: dict[str, Any] = None
+        batch_row: dict[str, Any] = None,
+        *,
+        rotation_dependency_authorized: bool = False,
     ) -> tuple[Any, float | None, Any, str | None, float | None, float | None]:
         refreshed_price_val = None
         refreshed_price_at = None
@@ -2894,6 +4392,35 @@ class TradingService:
             block_reason = "kill switch active"
         elif not self.storage.writable():
             block_reason = "database is not writable"
+        elif (
+            str(proposal.get("relationship_type") or row.get("relationship_type") or "")
+            == "rotation_entry"
+            and not rotation_dependency_authorized
+        ):
+            block_reason = "rotation contingent entry requires its current grouped dependency approval"
+        elif (
+            str(proposal.get("relationship_type") or row.get("relationship_type") or "")
+            == "rotation_entry"
+            and rotation_dependency_authorized
+        ):
+            from .rotation_coordinator import RotationCoordinator, RotationState
+
+            rotation_group_id = str(
+                proposal.get("rotation_group_id") or proposal.get("relationship_group_id") or ""
+            )
+            rotation = RotationCoordinator(
+                self.storage, config_hash=self.config.get("effective_config_hash")
+            )
+            try:
+                current_group = rotation.get_group(rotation_group_id)
+            except KeyError:
+                current_group = None
+            if (
+                current_group is None
+                or current_group.get("state") != RotationState.ENTRY_REVALIDATING.value
+                or not rotation.approval_is_current(rotation_group_id)
+            ):
+                block_reason = "rotation dependency or grouped approval is no longer current"
 
         # Entry/add approvals bind to both the policy captured with the
         # proposal and the latest current policy.  The conservative merge can
@@ -2934,9 +4461,8 @@ class TradingService:
                 block_reason = "strategy performance policy final revalidation failed; entry/add fails closed"
 
         # Expiry check
-        if block_reason is None and batch_row is not None:
-            if self._proposal_or_candidate_expired(row, batch_row):
-                block_reason = "Proposal expired"
+        if block_reason is None and self._proposal_or_candidate_expired(row, batch_row):
+            block_reason = "Proposal expired"
 
         # Retrieve parameters from config
         telegram_cfg = self.config.get("telegram", {})
@@ -3019,14 +4545,27 @@ class TradingService:
             except (KeyError, TypeError, ValueError) as exc:
                 block_reason = f"bounded marketable-limit validation failed: {type(exc).__name__}"
 
+        execution_reference_price = refreshed_price_val
+        if block_reason is None and prop_side == "buy" and row.get("emergency_exit_triggered") != 1:
+            try:
+                execution_reference_price = max(
+                    float(refreshed_price_val or 0.0),
+                    float(proposal.get("limit_price") or 0.0),
+                )
+                if execution_reference_price <= 0:
+                    raise ValueError("nonpositive execution reference")
+                proposal["execution_reference_price"] = execution_reference_price
+            except (TypeError, ValueError):
+                block_reason = "conservative BUY execution reference is unavailable"
+
         # The stop is persisted as an absolute price. Recompute its dollar
         # distance against the freshly validated entry quote before the final
         # risk check so stale proposal geometry cannot be misclassified.
-        if block_reason is None and row.get("emergency_exit_triggered") != 1 and refreshed_price_val is not None:
+        if block_reason is None and row.get("emergency_exit_triggered") != 1 and execution_reference_price is not None:
             try:
                 persisted_stop = float(proposal.get("stop_price"))
-                if prop_side == "buy" and persisted_stop > 0 and refreshed_price_val > persisted_stop:
-                    proposal["stop_distance_dollars"] = refreshed_price_val - persisted_stop
+                if prop_side == "buy" and persisted_stop > 0 and execution_reference_price > persisted_stop:
+                    proposal["stop_distance_dollars"] = execution_reference_price - persisted_stop
             except (TypeError, ValueError):
                 pass
 
@@ -3080,7 +4619,11 @@ class TradingService:
             snapshot_fresh = None
 
         if refreshed_price_val is not None:
-            proposal["latest_price"] = refreshed_price_val
+            proposal["latest_price"] = (
+                execution_reference_price
+                if prop_side == "buy" and execution_reference_price is not None
+                else refreshed_price_val
+            )
         if refreshed_price_at is not None:
             proposal["price_at"] = refreshed_price_at.isoformat()
 
@@ -3093,12 +4636,17 @@ class TradingService:
         # Recalculate dynamic size if sizing enabled and buy
         if snapshot_fresh and self.config.get("position_sizing", {}).get("enabled", True) and prop_side == "buy":
             try:
+                # Final approval must never reuse a proposal-cycle sleeve.
+                # Rebuild from current held positions and reservations so a
+                # fill/release between Telegram polls cannot leave stale room.
+                if self.config.get("phase4", {}).get("active"):
+                    self._phase4_allocation_cache = None
                 bars_fresh = normalize_bars(self.broker.get_historical_bars(prop_symbol, "1Day", 250), prop_symbol)
                 size_dict = self._calculate_dynamic_size(
                     prop_symbol,
                     float(proposal.get("score", 70.0) or 70.0),
                     proposal.get("volatility_regime", "normal"),
-                    refreshed_price_val,
+                    execution_reference_price,
                     bars_fresh,
                     snapshot_fresh,
                     is_add=is_add, strategy_version=str(proposal.get("strategy_version") or row.get("strategy_version") or STRATEGY_VERSION),
@@ -3111,10 +4659,16 @@ class TradingService:
                 if not self._operational_adaptive_enabled():
                     final_notional = min(max(0.0, approved_notional), max(0.0, float(size_dict["final_notional"] or 0.0)))
                     proposal["notional"] = final_notional
-                    proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val and refreshed_price_val > 0 else 0.0
+                    proposal["qty"] = final_notional / execution_reference_price if execution_reference_price and execution_reference_price > 0 else 0.0
                 proposal["phase4_mode"] = size_dict.get("phase4_mode")
                 proposal["strategy_state"] = size_dict.get("strategy_state")
                 proposal["strategy_policy_version"] = size_dict.get("strategy_policy_version")
+                proposal["strategy_registry_snapshot_id"] = size_dict.get("strategy_registry_snapshot_id")
+                proposal["strategy_sleeve"] = size_dict.get("strategy_sleeve")
+                proposal["sleeve_allocation_id"] = size_dict.get("sleeve_allocation_id")
+                proposal["sleeve_stop_risk_ceiling"] = size_dict.get("sleeve_stop_risk_ceiling")
+                proposal["sleeve_notional_ceiling"] = size_dict.get("sleeve_notional_ceiling")
+                proposal["strategy_sleeve_payload"] = size_dict.get("strategy_sleeve_payload")
                 proposal["average_dollar_volume"] = size_dict.get("average_dollar_volume")
                 proposal["sizing_caps"] = size_dict.get("sizing_caps") or {}
                 proposal["binding_caps"] = size_dict.get("binding_caps") or []
@@ -3127,6 +4681,7 @@ class TradingService:
         # fresh authoritative inputs. Approval may preserve, reduce, or block;
         # the displayed approved ceiling can never be enlarged.
         context = self._portfolio_context(proposal, approval_valid=True)
+        final_conviction = None
         if self._operational_adaptive_enabled() and prop_side == "buy" and proposal.get("action") in {"entry", "add"} and size_dict is not None:
             try:
                 proposal["proposal_price_age_seconds_at_send"] = refreshed_price_age_seconds
@@ -3175,11 +4730,11 @@ class TradingService:
             else:
                 displayed_quantity = float(row.get("qty") or proposal.get("approved_quantity_ceiling") or proposal.get("qty") or 0.0)
                 displayed_stop_risk = float(proposal.get("approved_stop_risk_ceiling") or proposal.get("stop_risk_dollars") or 0.0)
-                recomputed_quantity = final_notional / refreshed_price_val if refreshed_price_val and refreshed_price_val > 0 else 0.0
+                recomputed_quantity = final_notional / execution_reference_price if execution_reference_price and execution_reference_price > 0 else 0.0
                 stop_distance = float(proposal.get("stop_distance_dollars") or 0.0)
                 risk_quantity_ceiling = displayed_stop_risk / stop_distance if displayed_stop_risk > 0 and stop_distance > 0 else recomputed_quantity
                 final_quantity = min(recomputed_quantity, displayed_quantity, risk_quantity_ceiling)
-                final_notional = min(final_notional, final_quantity * float(refreshed_price_val or 0.0))
+                final_notional = min(final_notional, final_quantity * float(execution_reference_price or 0.0))
                 proposal["notional_reduced_by_cap"] = final_notional < approved_notional - 1e-9
                 proposal["notional"] = final_notional
                 proposal["qty"] = final_quantity
@@ -3195,8 +4750,88 @@ class TradingService:
                 if final_notional <= 0 or final_quantity <= 0:
                     block_reason = "displayed quantity or stop-risk ceiling leaves no executable final size"
 
+        if (
+            block_reason is None and prop_side == "buy" and proposal.get("action") == "add"
+            and (self.config.get("winner_expansion", {}) or {}).get("enabled") is True
+            and (self.config.get("phase3", {}) or {}).get("active") is True
+            and (self.config.get("phase4", {}) or {}).get("active") is True
+        ):
+            try:
+                if final_conviction is not None:
+                    proposal["adaptive_conviction_final"] = final_conviction
+                    proposal["deployment_mode"] = final_conviction.get("deployment_mode")
+                winner_decision, _, _ = self._evaluate_winner_expansion(
+                    proposal,
+                    decision_stage="final_revalidation",
+                    approval_id=approval_id,
+                )
+                proposal["stop_risk_dollars"] = winner_decision.risk_decision.consumed_risk
+                proposal["risk_budget"] = winner_decision.risk_decision.consumed_risk
+                proposal["risk_budget_dollars"] = winner_decision.risk_decision.consumed_risk
+                context = self._portfolio_context(proposal, approval_valid=True)
+            except Exception as exc:
+                block_reason = f"final winner-expansion validation blocked: {str(exc)}"
+
         if block_reason:
             return ExecutionResult(False, "blocked", None, reason=block_reason), refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
+
+        # This check is deliberately adjacent to Executor. Quote refresh,
+        # sizing, and multi-leg recovery may take long enough to cross the
+        # grouped approval expiry after the earlier preflight. No dependent
+        # rotation action may reach broker submission on stale authority.
+        relationship = str(
+            proposal.get("relationship_type") or row.get("relationship_type") or ""
+        )
+        if relationship in {"rotation_exit", "rotation_entry"}:
+            from .rotation_coordinator import RotationCoordinator, RotationState, TERMINAL_STATES
+
+            group_id = str(
+                proposal.get("rotation_group_id")
+                or proposal.get("relationship_group_id")
+                or row.get("rotation_group_id")
+                or row.get("relationship_group_id")
+                or ""
+            )
+            coordinator = RotationCoordinator(
+                self.storage, config_hash=self.config.get("effective_config_hash")
+            )
+            try:
+                group = coordinator.get_group(group_id)
+            except KeyError:
+                group = None
+            rotation_block = None
+            if (
+                group is None
+                or RotationState(group["state"]) in TERMINAL_STATES
+                or _parse_datetime(group["expires_at"]) <= datetime.now(UTC)
+            ):
+                rotation_block = "rotation group expired or became terminal before broker submission"
+            elif relationship == "rotation_entry":
+                if (
+                    RotationState(group["state"]) != RotationState.ENTRY_REVALIDATING
+                    or not rotation_dependency_authorized
+                    or not coordinator.approval_is_current(group_id)
+                ):
+                    rotation_block = "rotation entry dependency or grouped approval changed before broker submission"
+            else:
+                approvals = self.storage.fetch_all(
+                    """SELECT approval_id,status FROM rotation_group_approvals
+                       WHERE group_id=? ORDER BY created_at DESC LIMIT 1""",
+                    (group_id,),
+                )
+                if (
+                    RotationState(group["state"]) not in {
+                        RotationState.APPROVED_EXIT_PENDING,
+                        RotationState.EXIT_SUBMITTED,
+                        RotationState.EXIT_PARTIALLY_FILLED,
+                    }
+                    or not approvals
+                    or approvals[0].get("approval_id") != group.get("approval_id")
+                    or approvals[0].get("status") not in {"active", "exit_submitted"}
+                ):
+                    rotation_block = "rotation exit grouped approval changed before broker submission"
+            if rotation_block:
+                return ExecutionResult(False, "blocked", None, reason=rotation_block), refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
         # Execute
         proposal["status"] = "approved"
@@ -3214,6 +4849,25 @@ class TradingService:
             source_type="emergency" if row.get("emergency_exit_triggered") == 1 else "proposal",
             approval_id=approval_id,
         )
+        if proposal.get("action") == "add" and proposal.get("pyramiding_milestone_key"):
+            try:
+                WinnerExpansionStore(self.storage).transition_milestone(
+                    str(proposal.get("position_lifecycle_id")),
+                    str(proposal.get("pyramiding_milestone_key")),
+                    "SUBMITTED" if result.submitted else "REJECTED",
+                    approval_id=approval_id,
+                    intent_id=result.intent_id,
+                    terminal_reason=None if result.submitted else (result.reason or result.status),
+                )
+            except Exception as exc:
+                logger.error("Winner milestone execution transition failed closed: %s", type(exc).__name__)
+                if result.submitted:
+                    # The intent already exists and remains idempotent; flag
+                    # reconciliation rather than attempting any second order.
+                    self.storage.audit(self.run_id, "winner_milestone_transition_reconciliation_required", {
+                        "proposal_id": proposal.get("id"), "intent_id": result.intent_id,
+                        "error_type": type(exc).__name__,
+                    })
 
         return result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
@@ -3224,6 +4878,10 @@ class TradingService:
             return False, "already_handled", "candidate already handled"
 
         row = rows[0]
+        if row.get("relationship_type") == "rotation_entry":
+            message = "This contingent candidate can only execute through its current approved rotation dependency."
+            self.telegram.send_message(message)
+            return False, "rotation_group_required", message
         if self._proposal_or_candidate_expired(row, batch_row):
             self.storage.execute("UPDATE trade_proposals SET status='expired' WHERE id=? AND status='pending'", (proposal_id,))
             self.storage.execute("UPDATE proposal_batch_candidates SET candidate_status='expired' WHERE proposal_id=? AND candidate_status='pending'", (proposal_id,))
@@ -3233,7 +4891,7 @@ class TradingService:
             self._update_batch_status(str(batch_row.get("batch_id") or ""))
             self.telegram.send_message("That candidate has expired, so I did not take action. I will not submit an order from an expired proposal.")
             return False, "expired", "candidate expired"
-        if self._sleep_mode_blocks_approval({**json.loads(row.get("payload") or "{}"), **row}):
+        if self._sleep_mode_blocks_approval(_hydrate_proposal_row(row)):
             msg = "Sleep mode is ON, so I did not process this BUY/ADD approval. Send awake first, then approve again if the proposal is still valid."
             self.telegram.send_message(msg)
             return False, "sleep_mode_active", msg
@@ -3277,9 +4935,9 @@ class TradingService:
 
         prop_symbol = row.get("symbol", "")
         prop_side = row.get("side", "").lower()
-        proposal = {**json.loads(row.get("payload") or "{}"), **row, "status": "approved"}
+        proposal = _hydrate_proposal_row(row, status="approved")
         final_revalidation_started_at = iso_now()
-        proposal = {**json.loads(row.get("payload") or "{}"), **row}
+        proposal = _hydrate_proposal_row(row)
         is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
 
         result, refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal = self._execute_final_revalidation(
@@ -3864,6 +5522,91 @@ class TradingService:
             return "Weak setup, watch only"
         return "No action suggested"
 
+    def _canonical_trade_score_components(
+        self,
+        *,
+        symbol: str,
+        signal: Any,
+        price: float,
+        price_at: datetime,
+        bars: pd.DataFrame,
+        asset_score: float,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Return the scanner's one canonical, current trade-score calculation."""
+        today_start = now.date().isoformat() + "T00:00:00"
+        prev_rows = self.storage.fetch_all(
+            "SELECT price,score,signal FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
+            (symbol,),
+        )
+        session_rows = self.storage.fetch_all(
+            "SELECT price FROM market_memory WHERE symbol=? AND created_at>=? ORDER BY created_at ASC LIMIT 1",
+            (symbol, today_start),
+        )
+        previous_price = float(prev_rows[0]["price"]) if prev_rows else price
+        session_start_price = float(session_rows[0]["price"]) if session_rows else price
+        score_rule = 25.0 if signal.action in {"ENTRY", "EXIT"} else 0.0
+        score_asset = 15.0 if asset_score >= 80 else 12.0 if asset_score >= 65 else 8.0 if asset_score >= 50 else 3.0
+        score_5m = 5.0
+        if prev_rows:
+            if signal.side == "buy":
+                score_5m = 10.0 if price > previous_price else 5.0 if price == previous_price else 0.0
+            elif signal.side == "sell":
+                score_5m = 10.0 if price < previous_price else 5.0 if price == previous_price else 0.0
+            else:
+                score_5m = 5.0 if price == previous_price else 10.0 if price > previous_price else 0.0
+        score_session = 5.0
+        if session_rows:
+            if signal.side == "buy":
+                score_session = 10.0 if price > session_start_price else 5.0 if price == session_start_price else 0.0
+            elif signal.side == "sell":
+                score_session = 10.0 if price < session_start_price else 5.0 if price == session_start_price else 0.0
+            else:
+                score_session = 5.0 if price == session_start_price else 10.0 if price > session_start_price else 0.0
+        vol_20 = signal.indicators.get("volatility_20")
+        if vol_20 is None:
+            score_vol, regime, gate = 0.0, "missing", "fail-safe HOLD"
+        elif float(vol_20) > 0.45:
+            score_vol, regime, gate = 0.0, "extreme", "blocked"
+        elif float(vol_20) > 0.35:
+            score_vol, regime, gate = 5.0, "high", "watch only"
+        elif float(vol_20) >= 0.25:
+            score_vol, regime, gate = 10.0, "elevated", "eligible"
+        elif float(vol_20) >= 0.08:
+            score_vol, regime, gate = 15.0, "normal", "eligible"
+        elif float(vol_20) >= 0.0:
+            score_vol, regime, gate = 8.0, "too quiet", "eligible"
+        else:
+            score_vol, regime, gate = 0.0, "unknown", "fail-safe HOLD"
+        port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
+        risk_budgeted = self._ranked_batch_mode_enabled()
+        safety_ok = not port_context.get("duplicate_order")
+        if not risk_budgeted and port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
+            safety_ok = False
+        if not risk_budgeted and signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
+            safety_ok = False
+        score_safety = 15.0 if safety_ok else 0.0
+        normalized_price_at = _parse_datetime(price_at)
+        age = (now - normalized_price_at).total_seconds()
+        fresh_price = -5 <= age <= self.config["risk"].get("max_price_age_seconds", 120)
+        enough_bars = len(bars) >= self.config["risk"].get("min_historical_bars", 50)
+        score_data = 10.0 if fresh_price and enough_bars else 5.0 if fresh_price else 0.0
+        score = float(round(score_rule + score_asset + score_5m + score_session + score_vol + score_safety + score_data, 2))
+        return {
+            "score": score,
+            "previous_price": previous_price,
+            "session_start_price": session_start_price,
+            "score_rule": score_rule,
+            "score_asset": score_asset,
+            "score_5m": score_5m,
+            "score_session": score_session,
+            "score_vol": score_vol,
+            "score_safety": score_safety,
+            "score_data": score_data,
+            "volatility_regime": regime,
+            "volatility_gate_result": gate,
+        }
+
     def _calculate_expiry_minutes(self, symbol: str, signal: Any, vol_20: float | None, score: float, price_at: datetime, now: datetime) -> int:
         default_exp = self.config.get("proposal_expiry_default_minutes", 15)
         high_vol_thresh = self.config.get("proposal_expiry_high_volatility_threshold", 0.20)
@@ -4291,82 +6034,20 @@ class TradingService:
                 asset_score = self._calculate_asset_selection_score(symbol, bars, price_at, signal, now, spy_ret_20d)
                 asset_classification = self._classify_asset_score(asset_score)
 
-                prev_row = self.storage.fetch_all("SELECT price, score, signal FROM market_memory WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (symbol,))
-                prev_price = float(prev_row[0]["price"]) if prev_row else price
-                session_row = self.storage.fetch_all("SELECT price FROM market_memory WHERE symbol=? AND created_at>=? ORDER BY created_at ASC LIMIT 1", (symbol, today_start))
-                session_start_price = float(session_row[0]["price"]) if session_row else price
+                score_components = self._canonical_trade_score_components(
+                    symbol=symbol, signal=signal, price=price, price_at=price_at,
+                    bars=bars, asset_score=asset_score, now=now,
+                )
+                prev_price = float(score_components["previous_price"])
+                session_start_price = float(score_components["session_start_price"])
                 price_change = price - prev_price
                 price_change_pct = (price / prev_price - 1) * 100 if prev_price > 0 else 0.0
                 session_change = price - session_start_price
                 session_change_pct = (price / session_start_price - 1) * 100 if session_start_price > 0 else 0.0
-
-                score_rule = 25.0 if signal.action in {"ENTRY", "EXIT"} else 0.0
-                score_asset = 15.0 if asset_score >= 80 else (12.0 if asset_score >= 65 else (8.0 if asset_score >= 50 else 3.0))
-
-                score_5m = 5.0
-                if prev_row:
-                    if signal.side == "buy":
-                        score_5m = 10.0 if price > prev_price else (5.0 if price == prev_price else 0.0)
-                    elif signal.side == "sell":
-                        score_5m = 10.0 if price < prev_price else (5.0 if price == prev_price else 0.0)
-                    else:
-                        score_5m = 5.0 if price == prev_price else (10.0 if price > prev_price else 0.0)
-
-                score_session = 5.0
-                if session_row:
-                    if signal.side == "buy":
-                        score_session = 10.0 if price > session_start_price else (5.0 if price == session_start_price else 0.0)
-                    elif signal.side == "sell":
-                        score_session = 10.0 if price < session_start_price else (5.0 if price == session_start_price else 0.0)
-                    else:
-                        score_session = 5.0 if price == session_start_price else (10.0 if price > session_start_price else 0.0)
-
-                volatility_regime = "unknown"
-                volatility_gate_result = "fail-safe HOLD"
-                if vol_20 is None:
-                    score_vol = 0.0
-                    volatility_regime = "missing"
-                    volatility_gate_result = "fail-safe HOLD"
-                elif vol_20 > 0.45:
-                    score_vol = 0.0
-                    volatility_regime = "extreme"
-                    volatility_gate_result = "blocked"
-                elif vol_20 > 0.35:
-                    score_vol = 5.0
-                    volatility_regime = "high"
-                    volatility_gate_result = "watch only"
-                elif vol_20 >= 0.25:
-                    score_vol = 10.0
-                    volatility_regime = "elevated"
-                    volatility_gate_result = "eligible"
-                elif vol_20 >= 0.08:
-                    score_vol = 15.0
-                    volatility_regime = "normal"
-                    volatility_gate_result = "eligible"
-                elif vol_20 >= 0.0:
-                    score_vol = 8.0
-                    volatility_regime = "too quiet"
-                    volatility_gate_result = "eligible"
-                else:
-                    score_vol = 0.0
-                    volatility_regime = "unknown"
-                    volatility_gate_result = "fail-safe HOLD"
-
-                port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
-                safety_ok = True
-                risk_budgeted_mode = self._ranked_batch_mode_enabled()
-                if port_context.get("duplicate_order") or (not risk_budgeted_mode and port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1)):
-                    safety_ok = False
-                if not risk_budgeted_mode and signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
-                    safety_ok = False
-                score_safety = 15.0 if safety_ok else 0.0
-
-                age = (now - price_at).total_seconds() if price_at else float("inf")
-                fresh_price = -5 <= age <= self.config["risk"].get("max_price_age_seconds", 120)
-                enough_bars = len(bars) >= self.config["risk"].get("min_historical_bars", 50)
-                score_data = 10.0 if (fresh_price and enough_bars) else (5.0 if fresh_price else 0.0)
-
-                score = float(round(score_rule + score_asset + score_5m + score_session + score_vol + score_safety + score_data, 2))
+                score_vol = float(score_components["score_vol"])
+                volatility_regime = str(score_components["volatility_regime"])
+                volatility_gate_result = str(score_components["volatility_gate_result"])
+                score = float(score_components["score"])
                 classification = self._classify_trade_score(score)
 
                 # Check pyramiding constraints that require trade score
@@ -4420,6 +6101,13 @@ class TradingService:
                 permitted_stop_risk_pct = None
                 strategy_policy_version = None
                 binding_policy_reason = None
+                average_dollar_volume = None
+                strategy_registry_snapshot_id = None
+                strategy_sleeve = None
+                sleeve_allocation_id = None
+                sleeve_stop_risk_ceiling = None
+                sleeve_notional_ceiling = None
+                strategy_sleeve_payload = None
 
                 if signal.action == "ENTRY" and signal.side == "buy":
                     size_dict = self._calculate_dynamic_size(
@@ -4458,6 +6146,13 @@ class TradingService:
                     permitted_stop_risk_pct = size_dict.get("permitted_stop_risk_pct")
                     strategy_policy_version = size_dict.get("strategy_policy_version")
                     binding_policy_reason = size_dict.get("binding_policy_reason")
+                    average_dollar_volume = size_dict.get("average_dollar_volume")
+                    strategy_registry_snapshot_id = size_dict.get("strategy_registry_snapshot_id")
+                    strategy_sleeve = size_dict.get("strategy_sleeve")
+                    sleeve_allocation_id = size_dict.get("sleeve_allocation_id")
+                    sleeve_stop_risk_ceiling = size_dict.get("sleeve_stop_risk_ceiling")
+                    sleeve_notional_ceiling = size_dict.get("sleeve_notional_ceiling")
+                    strategy_sleeve_payload = size_dict.get("strategy_sleeve_payload")
 
                 # Log add-on opportunity
                 if is_add:
@@ -4485,6 +6180,7 @@ class TradingService:
                 position_management_sell_fraction = None
                 position_management_sell_qty = None
                 position_management_add_notional = None
+                trend_management_decision = None
                 if has_position and self.config.get("position_management", {}).get("enabled", True):
                     previous_pm_state = self._position_management_state(symbol)
                     position_age_days = None
@@ -4521,9 +6217,60 @@ class TradingService:
                         now=now,
                     )
                     position_management_decision_id = self._record_position_management(position_management_decision, now)
+                    try:
+                        trend_management_decision = self._evaluate_held_position_trend(
+                            symbol=symbol,
+                            current_price=price,
+                            average_entry_price=float(avg_entry_price or 0.0),
+                            bars=bars,
+                            score=score,
+                            volatility_regime=volatility_regime,
+                            strategy_version=signal.strategy_version,
+                            position_age_days=position_age_days,
+                            normal_exit_signal=normal_exit_signal,
+                            emergency_exit=emergency_exit_triggered == 1,
+                            deterioration_detected=position_management_decision.decision_type in {
+                                "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT",
+                            },
+                            now=now,
+                        )
+                    except Exception as exc:
+                        self.storage.audit(self.run_id, "trend_management_evidence_blocked", {
+                            "symbol": symbol, "error_type": type(exc).__name__,
+                            "add_authorized": False, "sell_safety_preserved": True,
+                        })
+                    trend_mode = trend_management_decision.mode if trend_management_decision else None
+                    if trend_management_decision and trend_management_decision.is_exit_required and emergency_exit_triggered != 1:
+                        position_management_sell_fraction = 1.0
+                        position_management_sell_qty = float(qty_held or 0.0)
+                        signal = dataclasses.replace(
+                            signal, action="EXIT", side="sell",
+                            reason=f"EXIT_REQUIRED: {trend_management_decision.reason}",
+                        )
+                        is_add = False
+                        exit_trigger_reason = trend_management_decision.reason
+                        score = max(score, float(self.config.get("ai", {}).get("ai_review_min_score", 65)))
+                    elif (
+                        trend_management_decision
+                        and trend_management_decision.defer_fixed_profit_target
+                        and position_management_decision.decision_type == "TAKE_PROFIT_PARTIAL"
+                    ):
+                        signal = dataclasses.replace(
+                            signal, action="HOLD", side=None,
+                            reason=f"{trend_mode}: fixed profit target deferred; monotonic trend stop remains authoritative",
+                        )
+                        is_add = False
                     if position_management_decision.is_actionable and emergency_exit_triggered != 1:
-                        if position_management_decision.action == "sell":
-                            position_management_sell_fraction = position_management_decision.suggested_sell_fraction or 1.0
+                        if trend_management_decision and trend_management_decision.is_exit_required:
+                            pass
+                        elif trend_management_decision and trend_management_decision.defer_fixed_profit_target and position_management_decision.decision_type == "TAKE_PROFIT_PARTIAL":
+                            pass
+                        elif position_management_decision.action == "sell":
+                            position_management_sell_fraction = (
+                                trend_management_decision.recommended_partial_exit_fraction
+                                if trend_management_decision is not None
+                                else position_management_decision.suggested_sell_fraction or 1.0
+                            )
                             position_management_sell_qty = min(float(qty_held or 0.0), float(qty_held or 0.0) * position_management_sell_fraction)
                             decision_reason = position_management_decision.reason
                             if position_management_decision.decision_type == "NORMAL_RISK_EXIT":
@@ -4541,17 +6288,60 @@ class TradingService:
                             exit_trigger_reason = decision_reason
                             score = max(score, float(self.config.get("ai", {}).get("ai_review_min_score", 65)))
                         elif position_management_decision.decision_type == "HEALTHY_PULLBACK_ADD":
-                            position_management_add_notional = position_management_decision.suggested_add_notional
-                            signal = dataclasses.replace(
-                                signal,
-                                action="ENTRY",
-                                side="buy",
-                                reason=position_management_decision.reason,
-                            )
-                            is_add = True
-                            final_notional = float(position_management_add_notional or final_notional)
-                            suggested_shares = final_notional / price if price > 0 else 0.0
-                            score = max(score, float(self.config.get("position_management", {}).get("healthy_pullback_add", {}).get("minimum_trade_score", 85)))
+                            if trend_mode in {"DEFENSIVE_HARVEST", "PROFIT_PROTECT", "EXIT_REQUIRED"}:
+                                signal = dataclasses.replace(
+                                    signal, action="HOLD", side=None,
+                                    reason=f"{trend_mode}: winner expansion is not currently authorized",
+                                )
+                                is_add = False
+                            else:
+                                signal = dataclasses.replace(
+                                    signal, action="ENTRY", side="buy",
+                                    reason=position_management_decision.reason,
+                                )
+                                is_add = True
+                                score = max(score, float(self.config.get("position_management", {}).get("healthy_pullback_add", {}).get("minimum_trade_score", 85)))
+                                # The historical fixed display amount is never
+                                # executable; recompute through live ADD risk.
+                                size_dict = self._calculate_dynamic_size(
+                                    symbol, score, volatility_regime, price, bars, snapshot,
+                                    is_add=True, strategy_version=signal.strategy_version,
+                                )
+                                final_notional = size_dict["final_notional"]
+                                suggested_shares = size_dict["suggested_shares"]
+                                position_management_add_notional = final_notional
+                                stop_price = size_dict["stop_price"]
+                                stop_distance_pct = size_dict["stop_distance_pct"]
+                                stop_distance_dollars = size_dict["stop_distance_dollars"]
+                                risk_budget = size_dict["risk_budget"]
+                                score_mult = size_dict["score_multiplier"]
+                                vol_mult = size_dict["volatility_multiplier"]
+                                stop_method = size_dict["stop_model_used"]
+                                risk_based_shares = size_dict["risk_based_shares"]
+                                score_adjusted_notional = size_dict["score_adjusted_notional"]
+                                vol_adjusted_notional = size_dict["vol_adjusted_notional"]
+                                base_notional = size_dict["base_notional"]
+                                atr_value = size_dict.get("atr_value")
+                                technical_stop_price = size_dict.get("technical_stop_price")
+                                stop_validation_status = size_dict.get("stop_validation_status", "blocked")
+                                sizing_caps = size_dict.get("sizing_caps") or {}
+                                binding_caps = size_dict.get("binding_caps") or []
+                                phase4_mode = size_dict.get("phase4_mode", "disabled")
+                                performance_snapshot_id = size_dict.get("performance_snapshot_id")
+                                policy_decision_id = size_dict.get("policy_decision_id")
+                                strategy_quality_score = size_dict.get("strategy_quality_score")
+                                strategy_state = size_dict.get("strategy_state")
+                                strategy_risk_multiplier = size_dict.get("strategy_risk_multiplier")
+                                permitted_stop_risk_pct = size_dict.get("permitted_stop_risk_pct")
+                                strategy_policy_version = size_dict.get("strategy_policy_version")
+                                binding_policy_reason = size_dict.get("binding_policy_reason")
+                                average_dollar_volume = size_dict.get("average_dollar_volume")
+                                strategy_registry_snapshot_id = size_dict.get("strategy_registry_snapshot_id")
+                                strategy_sleeve = size_dict.get("strategy_sleeve")
+                                sleeve_allocation_id = size_dict.get("sleeve_allocation_id")
+                                sleeve_stop_risk_ceiling = size_dict.get("sleeve_stop_risk_ceiling")
+                                sleeve_notional_ceiling = size_dict.get("sleeve_notional_ceiling")
+                                strategy_sleeve_payload = size_dict.get("strategy_sleeve_payload")
                     classification = self._classify_trade_score(score)
 
                 system_confidence = "No action suggested"
@@ -4650,6 +6440,14 @@ class TradingService:
                     "permitted_stop_risk_pct": permitted_stop_risk_pct,
                     "strategy_policy_version": strategy_policy_version,
                     "binding_policy_reason": binding_policy_reason,
+                    "average_dollar_volume": average_dollar_volume,
+                    "strategy_registry_snapshot_id": strategy_registry_snapshot_id,
+                    "strategy_sleeve": strategy_sleeve,
+                    "sleeve_allocation_id": sleeve_allocation_id,
+                    "sleeve_stop_risk_ceiling": sleeve_stop_risk_ceiling,
+                    "sleeve_notional_ceiling": sleeve_notional_ceiling,
+                    "strategy_sleeve_payload": strategy_sleeve_payload,
+                    "score_improvement": add_score_improvement,
                     "score_multiplier": score_mult,
                     "volatility_multiplier": vol_mult,
                     "stop_model_used": stop_method,
@@ -4672,6 +6470,8 @@ class TradingService:
                     "position_management_sell_fraction": position_management_sell_fraction,
                     "position_management_sell_qty": position_management_sell_qty,
                     "position_management_add_notional": position_management_add_notional,
+                    "trend_management_decision": dataclasses.asdict(trend_management_decision) if trend_management_decision else None,
+                    "management_mode": trend_management_decision.mode if trend_management_decision else None,
                 })
 
             # Populate watchlist order first
@@ -4954,6 +6754,12 @@ class TradingService:
 
             any_generated = False
             batch_proposals: list[dict[str, Any]] = []
+            rotation_exit_proposals: list[dict[str, Any]] = []
+            rotation_candidate_available = bool(
+                (self.config.get("rotation", {}) or {}).get("enabled")
+                and exit_candidates_exist
+                and buy_candidates
+            )
 
             # Sort profile_results: EXITS first, then BUYS, then HOLDS
             def scan_processing_order(r):
@@ -5211,6 +7017,14 @@ class TradingService:
                                 "action": proposal_action,
                                 "notional": notional,
                                 "strategy_version": signal.strategy_version,
+                                "volatility_regime": volatility_regime,
+                                "score_improvement": res.get("score_improvement"),
+                                "position_lifecycle_id": res.get("position_lifecycle_id"),
+                                "higher_highs_and_lows": bool(
+                                    len(bars) >= 20
+                                    and float(bars["high"].tail(10).mean()) >= float(bars["high"].iloc[-20:-10].mean())
+                                    and float(bars["low"].tail(10).mean()) >= float(bars["low"].iloc[-20:-10].mean())
+                                ),
                                 "phase4_mode": res.get("phase4_mode"),
                                 "stop_risk_dollars": res.get("stop_risk_dollars"),
                             })
@@ -5264,6 +7078,12 @@ class TradingService:
                                 "permitted_stop_risk_pct": res.get("permitted_stop_risk_pct"),
                                 "strategy_policy_version": res.get("strategy_policy_version"),
                                 "binding_policy_reason": res.get("binding_policy_reason"),
+                                "strategy_registry_snapshot_id": res.get("strategy_registry_snapshot_id"),
+                                "strategy_sleeve": res.get("strategy_sleeve"),
+                                "sleeve_allocation_id": res.get("sleeve_allocation_id"),
+                                "sleeve_stop_risk_ceiling": res.get("sleeve_stop_risk_ceiling"),
+                                "sleeve_notional_ceiling": res.get("sleeve_notional_ceiling"),
+                                "strategy_sleeve_payload": res.get("strategy_sleeve_payload"),
                                 "classification": classification,
                                 "system_confidence": system_confidence,
                                 "expiry_minutes": expiry_minutes,
@@ -5399,11 +7219,32 @@ class TradingService:
                                     proposal["permitted_stop_risk_pct"] = proposal["adaptive_conviction"].get("recommended_stop_risk_pct")
                                     proposal["sizing_caps"] = dict(operational_adaptive.get("sizing_caps") or {})
                                     proposal["binding_caps"] = [operational_adaptive.get("binding_adaptive_cap")]
+                                    if (
+                                        proposal_action == "add"
+                                        and (self.config.get("winner_expansion", {}) or {}).get("enabled") is True
+                                        and (self.config.get("phase3", {}) or {}).get("active") is True
+                                        and (self.config.get("phase4", {}) or {}).get("active") is True
+                                    ):
+                                        try:
+                                            winner_decision, _, _ = self._evaluate_winner_expansion(
+                                                proposal,
+                                                decision_stage="proposal",
+                                            )
+                                            # The canonical winner engine owns
+                                            # risk consumed/released and the
+                                            # required persisted stop. Its
+                                            # result replaces leg-only risk.
+                                            proposal["stop_risk_dollars"] = winner_decision.risk_decision.consumed_risk
+                                            proposal["risk_budget"] = winner_decision.risk_decision.consumed_risk
+                                            proposal["risk_budget_dollars"] = winner_decision.risk_decision.consumed_risk
+                                        except Exception as exc:
+                                            no_action_reason = f"winner expansion blocked: {str(exc)}"
+                                            proposal_allowed = False
                                     port_context = self._portfolio_context(proposal)
                                     proposal["proposed_total_exposure_pct"] = port_context.get("proposed_total_exposure_pct")
                                     proposal["proposed_cluster_exposure_pct"] = port_context.get("proposed_cluster_exposure_pct")
                                     decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, port_context)
-                                    if not decision.passed:
+                                    if proposal_allowed and not decision.passed:
                                         no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                                         proposal_allowed = False
                             elif emergency_exit_triggered == 1:
@@ -5563,6 +7404,11 @@ class TradingService:
                         "permitted_stop_risk_pct": proposal.get("permitted_stop_risk_pct", res.get("permitted_stop_risk_pct")),
                         "strategy_policy_version": res.get("strategy_policy_version"),
                         "binding_policy_reason": res.get("binding_policy_reason"),
+                        "strategy_registry_snapshot_id": res.get("strategy_registry_snapshot_id"),
+                        "strategy_sleeve": res.get("strategy_sleeve"),
+                        "sleeve_allocation_id": res.get("sleeve_allocation_id"),
+                        "sleeve_stop_risk_ceiling": res.get("sleeve_stop_risk_ceiling"),
+                        "sleeve_notional_ceiling": res.get("sleeve_notional_ceiling"),
                     })
 
                 res["proposal_allowed"] = proposal_allowed
@@ -5722,14 +7568,56 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
 
-                if batch_mode_enabled and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1 and (is_buy or is_exit):
+                if rotation_candidate_available and is_buy and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
+                    # The grouped message is the sole approval surface for the
+                    # displayed contingent BUY.
+                    pass
+                elif rotation_candidate_available and is_exit and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
+                    rotation_exit_proposals.append(proposal)
+                elif batch_mode_enabled and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1 and (is_buy or is_exit):
                     batch_proposals.append(proposal)
                 else:
                     res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
                     if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
                         self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
 
-            if batch_mode_enabled:
+            if rotation_exit_proposals:
+                try:
+                    rotation_candidates = [
+                        candidate for candidate in buy_candidates
+                        if candidate.get("symbol") in allowed_buy_symbols
+                        and not candidate.get("preproposal_block_reason")
+                        and not candidate.get("risk_budget_block_reason")
+                    ]
+                    rotation_group = self._create_rotation_group(
+                        rotation_exit_proposals, rotation_candidates, now
+                    )
+                    self.telegram.send_message(self._format_rotation_group_message(rotation_group))
+                except Exception as exc:
+                    self.storage.audit(self.run_id, "rotation_group_creation_blocked", {
+                        "error_type": type(exc).__name__, "exit_proposal_count": len(rotation_exit_proposals),
+                        "contingent_candidate_count": len(buy_candidates), "exit_safety_preserved": True,
+                    })
+                    # A rotation feature failure must never suppress a genuine
+                    # reduce-risk proposal.
+                    for exit_proposal in rotation_exit_proposals:
+                        res_tg = self.telegram.send_message(format_proposal_message(exit_proposal, self.config))
+                        if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                            self.storage.execute(
+                                "UPDATE trade_proposals SET telegram_message_id=? WHERE id=?",
+                                (str(res_tg["message_id"]), exit_proposal["id"]),
+                            )
+                    for candidate in rotation_candidates:
+                        buy_proposal = candidate.get("performance_proposal_payload") or {}
+                        if not buy_proposal:
+                            continue
+                        res_tg = self.telegram.send_message(format_proposal_message(buy_proposal, self.config))
+                        if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                            self.storage.execute(
+                                "UPDATE trade_proposals SET telegram_message_id=? WHERE id=?",
+                                (str(res_tg["message_id"]), buy_proposal["id"]),
+                            )
+            if batch_mode_enabled and batch_proposals:
                 self._send_ranked_batch_if_needed(batch_proposals, buy_candidates, risk_snapshot)
 
             if profile_results:
@@ -5768,6 +7656,41 @@ class TradingService:
         top_blocker = top_blocker_rows[0]["blocker"] if top_blocker_rows else "none"
         suppressed = int(performance_lab.get("suppressed") or 0)
         return f"Setup tracking: {suppressed} suppressed or observation-only. Top blocker: {top_blocker}. Proposal count is uncapped."
+
+    def _format_strategy_allocation_report(self, *, compact: bool = False) -> str:
+        registry = self.storage.fetch_all(
+            """SELECT d.strategy_version,d.authorized,d.policy_state,d.reason
+               FROM strategy_registry_decisions d
+               JOIN strategy_registry_snapshots s ON s.id=d.snapshot_id
+               WHERE s.id=(SELECT id FROM strategy_registry_snapshots ORDER BY evaluated_at DESC,id DESC LIMIT 1)
+               ORDER BY d.strategy_version"""
+        )
+        allocation_rows = self.storage.fetch_all(
+            "SELECT decision,allocation_class,reason,payload FROM phase4_allocation_decisions ORDER BY decided_at DESC,id DESC LIMIT 1"
+        )
+        authorized = [str(row["strategy_version"]) for row in registry if int(row.get("authorized") or 0) == 1]
+        rejected = [str(row["strategy_version"]) for row in registry if int(row.get("authorized") or 0) == 0]
+        if not allocation_rows:
+            return "Multi-strategy allocation: unavailable; entry risk fails closed."
+        allocation = allocation_rows[0]
+        payload = json.loads(allocation.get("payload") or "{}")
+        sleeves = payload.get("strategy_sleeves") or {}
+        sleeve_text = ", ".join(
+            f"{strategy} {float(value.get('allocated_risk') or 0.0):.4f} allocated/"
+            f"{float(value.get('remaining_risk') or 0.0):.4f} remaining {value.get('risk_unit') or ''}".strip()
+            for strategy, value in sorted(sleeves.items())
+        ) or "none"
+        summary = (
+            f"Multi-strategy allocation: {allocation['decision']} ({allocation['allocation_class']}); "
+            f"authorized {', '.join(authorized) if authorized else 'none'}; sleeves {sleeve_text}."
+        )
+        if compact:
+            return summary
+        return (
+            summary
+            + f"\nRejected/research-only: {', '.join(rejected) if rejected else 'none'}."
+            + f"\nPortfolio rationale: {allocation.get('reason') or 'bounded by Phase 3 risk and allocation constraints'}."
+        )
 
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
@@ -6233,6 +8156,7 @@ class TradingService:
             "exit_watch": exit_watch,
             "proposal_capacity": proposal_capacity,
             "strategy_policy": strategy_policy_line,
+            "strategy_allocation": self._format_strategy_allocation_report(compact=True),
             "adaptive_conviction": adaptive_conviction_line,
             "crypto_research": crypto_research_line,
         }
@@ -6549,6 +8473,8 @@ class TradingService:
         self.storage.audit(self.run_id, "scan_cycle_started", {"run_dynamic_universe": run_dynamic_universe})
         BrokerReconciler(self.broker, self.storage, self.run_id, self.telegram).reconcile()
         self._refresh_strategy_performance()
+        if (self.config.get("rotation", {}) or {}).get("enabled"):
+            self._advance_rotation_workflows()
         if self.config.get("phase3", {}).get("active"):
             from .phase3_risk import Phase3Controller
             controller = Phase3Controller(self.storage, self.config, self.run_id)
@@ -6567,13 +8493,26 @@ class TradingService:
             canonical_phase4 = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(runtime_state.get("positions", []), runtime_state.get("account"))
             reservations_phase4 = DurableExecutionStore(self.storage).active_reservations()
             pending_phase4 = self._pending_execution_totals()
+            strategy_consumption = self._phase4_strategy_consumption(
+                list(runtime_state.get("positions") or []), equity
+            )
+            phase3_profile = Phase3Controller(self.storage, self.config, self.run_id).profile
             phase4_snapshot = {
+                "portfolio_equity": equity,
                 "heat_before_pct": ((float(canonical_phase4.projected_total_open_risk or 0.0) + float(pending_phase4.get("total_stop_risk") or 0.0)) / equity * 100.0) if equity > 0 else None,
                 "gross_exposure_before_pct": ((float(canonical_phase4.projected_gross_exposure or 0.0) + float(pending_phase4.get("total_notional") or 0.0)) / equity * 100.0) if equity > 0 else None,
                 "symbol_exposure_before": canonical_phase4.symbol_exposure,
                 "cluster_exposure_before": canonical_phase4.cluster_exposure,
                 "pending_risk": float(pending_phase4.get("total_stop_risk") or 0.0),
                 "reserved_risk": float(reservations_phase4.get("active_reserved_stop_risk") or 0.0),
+                "strategy_risk_by_strategy": strategy_consumption["risk_pct"] if strategy_consumption["complete"] else {},
+                "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
+                "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
+                "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
+                "strategy_attribution_complete": strategy_consumption["complete"],
+                "strategy_attribution_reason": strategy_consumption["reason"],
+                "phase3_gross_exposure_capacity_pct": phase3_profile.hard_gross_exposure_pct,
+                "strategy_registry_snapshot_id": self._ensure_strategy_registry_snapshot(),
             }
             self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                 regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot,
@@ -6622,17 +8561,34 @@ class TradingService:
             engine = StrategyPerformanceEngine(self.storage, self.config)
             snapshots = engine.refresh_all()
             self._strategy_policy_map = engine.valid_policy_map()
+            from .phase3_risk import AVAILABLE_STRATEGY_IMPLEMENTATIONS
+            from .strategy_execution_registry import StrategyExecutionRegistry, persist as persist_strategy_registry
+            registry_evaluation = StrategyExecutionRegistry(
+                self.config,
+                available_implementations=AVAILABLE_STRATEGY_IMPLEMENTATIONS,
+            ).evaluate(self._strategy_policy_map, as_of=iso_now())
+            registry_persistence = persist_strategy_registry(
+                self.storage, self.run_id, registry_evaluation
+            )
+            self._strategy_registry_snapshot_id = str(registry_persistence["snapshot_id"])
             detail = {
                 "strategy_count": len(snapshots),
                 "states": {key: snapshot.recommendation_state for key, snapshot in snapshots.items()},
                 "valid_policy_count": len(self._strategy_policy_map),
                 "enforcement_enabled": bool((self.config.get("profitability_engine", {}) or {}).get("enforcement_enabled")),
                 "report_only": False,
+                "strategy_registry_snapshot_id": self._strategy_registry_snapshot_id,
+                "authorized_strategies": list(registry_evaluation.authorized_versions),
+                "rejected_strategies": {
+                    decision.strategy_version: list(decision.reasons)
+                    for decision in registry_evaluation.rejected
+                },
             }
             record_heartbeat(self.storage, "strategy_performance", "healthy", attempted_at=started_at, completed_at=iso_now(), successful_at=iso_now(), detail=detail)
             self.storage.audit(self.run_id, "strategy_performance_refresh_complete", detail)
         except Exception as exc:
             self._strategy_policy_map = {}
+            self._strategy_registry_snapshot_id = None
             detail = {"error_type": type(exc).__name__, "report_only": False, "enforcement_enabled": True}
             record_heartbeat(self.storage, "strategy_performance", "failed", attempted_at=started_at, completed_at=iso_now(), blocked_reason="scorecard refresh failed", detail=detail)
             self.storage.audit(self.run_id, "strategy_performance_refresh_failed", detail)
@@ -6650,6 +8606,35 @@ class TradingService:
             from .strategy_performance import StrategyPerformanceEngine
             self._strategy_policy_map = StrategyPerformanceEngine(self.storage, self.config).valid_policy_map()
         return self._strategy_policy_map.get(strategy_version)
+
+    def _ensure_strategy_registry_snapshot(self) -> str | None:
+        if self._strategy_registry_snapshot_id:
+            return self._strategy_registry_snapshot_id
+        rows = self.storage.fetch_all(
+            "SELECT id FROM strategy_registry_snapshots WHERE run_id=? ORDER BY evaluated_at DESC,id DESC LIMIT 1",
+            (self.run_id,),
+        )
+        if rows:
+            self._strategy_registry_snapshot_id = str(rows[0]["id"])
+            return self._strategy_registry_snapshot_id
+        try:
+            from .phase3_risk import AVAILABLE_STRATEGY_IMPLEMENTATIONS
+            from .strategy_execution_registry import StrategyExecutionRegistry, persist as persist_strategy_registry
+
+            policies = self._strategy_policy_map
+            if policies is None:
+                from .strategy_performance import StrategyPerformanceEngine
+                policies = StrategyPerformanceEngine(self.storage, self.config).valid_policy_map()
+                self._strategy_policy_map = policies
+            evaluation = StrategyExecutionRegistry(
+                self.config,
+                available_implementations=AVAILABLE_STRATEGY_IMPLEMENTATIONS,
+            ).evaluate(policies or {}, as_of=iso_now())
+            persisted = persist_strategy_registry(self.storage, self.run_id, evaluation)
+            self._strategy_registry_snapshot_id = str(persisted["snapshot_id"])
+            return self._strategy_registry_snapshot_id
+        except Exception:
+            return None
 
     def notify_premarket_dynamic_universe_status(self, results: list[dict[str, Any]], trading_skipped_reason: str, now: datetime | None = None) -> str:
         if not results or not self.config.get("telegram", {}).get("dynamic_universe_premarket_updates_enabled", True):
@@ -7456,6 +9441,204 @@ class TradingService:
             "unknown_reason": "; ".join(f"{row['proposal_id']}: {row['reason']}" for row in unknown_rows) if unknown_rows else None,
         }
 
+    def _held_strategy_risk_pct(
+        self,
+        positions: list[Any],
+        portfolio_equity: float,
+    ) -> dict[str, float]:
+        """Attribute current durable-stop risk to strategy lots.
+
+        Active reservations are intentionally excluded: the allocator sleeve
+        reports held consumption, while the atomic reservation transaction adds
+        current active reservations exactly once immediately before an intent is
+        created.
+        """
+        if portfolio_equity <= 0:
+            return {}
+        lots = self.storage.fetch_all(
+            """SELECT symbol,strategy_version,remaining_quantity
+               FROM position_lots
+               WHERE remaining_quantity>0 AND strategy_version IS NOT NULL"""
+        )
+        quantity_by_symbol_strategy: dict[str, dict[str, float]] = {}
+        for lot in lots:
+            symbol = str(lot.get("symbol") or "").upper()
+            strategy = str(lot.get("strategy_version") or "")
+            quantity = max(0.0, float(lot.get("remaining_quantity") or 0.0))
+            if symbol and strategy and quantity > 0:
+                bucket = quantity_by_symbol_strategy.setdefault(symbol, {})
+                bucket[strategy] = bucket.get(strategy, 0.0) + quantity
+        attributed: dict[str, float] = {}
+        for position in positions:
+            symbol = str(_value(position, "symbol", "")).upper()
+            by_strategy = quantity_by_symbol_strategy.get(symbol) or {}
+            attributed_qty = sum(by_strategy.values())
+            current_price = float(_value(position, "current_price", 0.0) or 0.0)
+            if attributed_qty <= 0 or current_price <= 0:
+                continue
+            state = self._position_management_state(symbol) or {}
+            stops = [
+                float(value)
+                for value in (
+                    state.get("initial_stop_price"),
+                    state.get("trailing_stop_price"),
+                    state.get("authoritative_protective_stop"),
+                )
+                if value is not None and float(value) > 0
+            ]
+            if not stops:
+                continue
+            risk_per_share = max(0.0, current_price - max(stops))
+            for strategy, quantity in by_strategy.items():
+                attributed[strategy] = attributed.get(strategy, 0.0) + quantity * risk_per_share
+        return {
+            strategy: risk_dollars / portfolio_equity * 100.0
+            for strategy, risk_dollars in attributed.items()
+        }
+
+    def _phase4_strategy_consumption(
+        self,
+        positions: list[Any],
+        portfolio_equity: float,
+    ) -> dict[str, Any]:
+        """Current-mark held plus active-reservation consumption by strategy."""
+        if portfolio_equity <= 0:
+            return {"complete": False, "risk_pct": {}, "notional_dollars": {}, "reason": "portfolio equity unavailable"}
+        lots = self.storage.fetch_all(
+            """SELECT symbol,strategy_version,remaining_quantity FROM position_lots
+               WHERE remaining_quantity>0 AND strategy_version IS NOT NULL"""
+        )
+        position_map = {
+            str(_value(position, "symbol", "")).upper(): {
+                "quantity": max(0.0, float(_value(position, "qty", 0.0) or 0.0)),
+                "price": max(0.0, float(_value(position, "current_price", 0.0) or 0.0)),
+            }
+            for position in positions
+            if str(_value(position, "symbol", "")).strip()
+        }
+        quantities: dict[str, dict[str, float]] = {}
+        for lot in lots:
+            symbol = str(lot.get("symbol") or "").upper()
+            strategy = str(lot.get("strategy_version") or "")
+            quantity = max(0.0, float(lot.get("remaining_quantity") or 0.0))
+            if symbol and strategy and quantity > 0:
+                quantities.setdefault(symbol, {})[strategy] = quantities.setdefault(symbol, {}).get(strategy, 0.0) + quantity
+        complete = True
+        reasons: list[str] = []
+        risk_dollars: dict[str, float] = {}
+        notional_dollars: dict[str, float] = {}
+        for symbol, position in sorted(position_map.items()):
+            by_strategy = quantities.get(symbol, {})
+            attributed_quantity = sum(by_strategy.values())
+            if abs(attributed_quantity - position["quantity"]) > max(1e-8, position["quantity"] * 1e-8):
+                complete = False
+                reasons.append(f"{symbol}: lot quantity does not reconcile to broker position")
+                continue
+            if position["quantity"] > 0 and position["price"] <= 0:
+                complete = False
+                reasons.append(f"{symbol}: current broker mark unavailable")
+                continue
+            state = self._position_management_state(symbol) or {}
+            stops = [
+                float(value)
+                for value in (
+                    state.get("initial_stop_price"), state.get("trailing_stop_price"),
+                    state.get("authoritative_protective_stop"),
+                )
+                if value is not None and float(value) > 0
+            ]
+            if position["quantity"] > 0 and not stops:
+                complete = False
+                reasons.append(f"{symbol}: authoritative stop unavailable")
+                continue
+            risk_per_share = max(0.0, position["price"] - max(stops)) if stops else 0.0
+            for strategy, quantity in by_strategy.items():
+                risk_dollars[strategy] = risk_dollars.get(strategy, 0.0) + quantity * risk_per_share
+                notional_dollars[strategy] = notional_dollars.get(strategy, 0.0) + quantity * position["price"]
+        orphan_symbols = sorted(set(quantities) - set(position_map))
+        if orphan_symbols:
+            complete = False
+            reasons.append("open lots lack broker positions: " + ",".join(orphan_symbols))
+
+        # One statement captures both the amounts and exact reservation IDs in
+        # the same SQLite read snapshot. The persisted ID set is the atomic
+        # hand-off to intent creation: reservations absent from this set are
+        # incremental even when their wall-clock timestamp precedes allocation
+        # persistence, closing the consumption-read/allocation-write race.
+        reservations = self.storage.fetch_all(
+            """SELECT id,strategy_version,active_stop_risk,active_notional
+               FROM risk_reservations
+               WHERE state='active' AND strategy_version IS NOT NULL
+               ORDER BY strategy_version,id"""
+        )
+        reservation_ids_by_strategy: dict[str, list[str]] = {}
+        for row in reservations:
+            strategy = str(row.get("strategy_version") or "")
+            if not strategy:
+                continue
+            reservation_ids_by_strategy.setdefault(strategy, []).append(str(row["id"]))
+            risk_dollars[strategy] = risk_dollars.get(strategy, 0.0) + float(row.get("active_stop_risk") or 0.0)
+            notional_dollars[strategy] = notional_dollars.get(strategy, 0.0) + float(row.get("active_notional") or 0.0)
+
+        # Displayed ordinary entries and ADDs are zero-broker-state claims, but
+        # they still compete for the next strategy allocation so a batch cannot
+        # advertise the same sleeve repeatedly.  Rotation contingent entries
+        # remain explicit zero-capital identity claims until their exit fill is
+        # reconciled, as required by the exit-first contract.
+        pending_rows = self.storage.fetch_all(
+            """SELECT id,strategy_version,notional,payload FROM trade_proposals
+               WHERE status='pending' AND lower(side)='buy'
+                 AND (expires_at IS NULL OR expires_at>?)
+                 AND COALESCE(relationship_type,'')!='rotation_entry'""",
+            (iso_now(),),
+        )
+        pending_claims_by_strategy: dict[str, list[dict[str, Any]]] = {}
+        for row in pending_rows:
+            try:
+                payload = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            strategy = str(row.get("strategy_version") or payload.get("strategy_version") or "")
+            if not strategy:
+                complete = False
+                reasons.append(f"pending proposal {row['id']}: strategy attribution unavailable")
+                continue
+            try:
+                quantity = float(payload.get("qty") or 0.0)
+                reference = max(
+                    float(payload.get("latest_price") or 0.0),
+                    float(payload.get("limit_price") or 0.0),
+                )
+                notional = max(
+                    float(row.get("notional") or payload.get("notional") or 0.0),
+                    quantity * reference,
+                )
+                risk = max(
+                    float(payload.get("pending_add_stop_risk") or 0.0),
+                    float(payload.get("stop_risk_dollars") or 0.0),
+                )
+            except (TypeError, ValueError):
+                notional = risk = float("nan")
+            if not math.isfinite(notional) or not math.isfinite(risk) or notional < 0 or risk < 0:
+                complete = False
+                reasons.append(f"pending proposal {row['id']}: risk or notional claim is invalid")
+                continue
+            risk_dollars[strategy] = risk_dollars.get(strategy, 0.0) + risk
+            notional_dollars[strategy] = notional_dollars.get(strategy, 0.0) + notional
+            pending_claims_by_strategy.setdefault(strategy, []).append({
+                "proposal_id": str(row["id"]),
+                "notional": notional,
+                "stop_risk": risk,
+            })
+        return {
+            "complete": complete,
+            "risk_pct": {strategy: value / portfolio_equity * 100.0 for strategy, value in risk_dollars.items()},
+            "notional_dollars": notional_dollars,
+            "active_reservation_ids_by_strategy": reservation_ids_by_strategy,
+            "pending_proposal_claims_by_strategy": pending_claims_by_strategy,
+            "reason": "; ".join(reasons) if reasons else None,
+        }
+
     def _calculate_dynamic_size(
         self, symbol: str, score: float, volatility_regime: str, price: float,
         bars: pd.DataFrame, snapshot: dict[str, Any], is_add: bool = False,
@@ -7528,6 +9711,12 @@ class TradingService:
 
         phase3_enabled = bool(self.config.get("phase3", {}).get("enabled") and self.config.get("phase3", {}).get("active"))
         phase3_context: dict[str, Any] = {"phase4_mode": "disabled", "allocation_multiplier": 1.0, "regime_multiplier": 1.0, "drawdown_multiplier": 1.0}
+        strategy_registry_snapshot_id = None
+        sleeve_allocation_id = None
+        strategy_sleeve = None
+        sleeve_risk_remaining_dollars = None
+        sleeve_notional_remaining = None
+        strategy_sleeve_payload = None
         risk_per_trade_pct = finite(sizing_cfg.get("risk_per_trade_pct"))
         if risk_per_trade_pct is None or risk_per_trade_pct < 0:
             return empty("canonical stop-risk sizing policy is unavailable")
@@ -7542,8 +9731,10 @@ class TradingService:
             if "profitability_engine" in self.config and persisted_policy is None:
                 return empty("latest strategy performance policy unavailable or invalid; new entries and adds fail closed")
             resolved_policy = persisted_policy
-            states = {strategy_version: persisted_policy.state} if persisted_policy is not None else controller.refresh_strategy_states()
-            allocation_mult = controller.allocation(strategy_version, states) if persisted_policy is None else 1.0
+            states = controller.refresh_strategy_states()
+            allocation_mult = controller.allocation(strategy_version, states)
+            if persisted_policy is not None and allocation_mult <= 0:
+                return empty("strategy execution registry or Phase 3 sleeve does not authorize entry risk")
             regime_mult = phase3_regime_multiplier(volatility_regime)
             drawdown_mult = phase3_drawdown_multiplier(drawdown_pct)
             phase4_mode = "disabled"
@@ -7572,11 +9763,57 @@ class TradingService:
             if self.config.get("phase4", {}).get("active"):
                 from .phase4_allocator import AdaptiveAllocator
                 if self._phase4_allocation_cache is None:
+                    phase4_state = self._authoritative_runtime_state(force=True)
+                    phase4_canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(
+                        phase4_state.get("positions", []), phase4_state.get("account")
+                    )
+                    phase4_pending = self._pending_execution_totals()
+                    phase4_reservations = DurableExecutionStore(self.storage).active_reservations()
+                    strategy_consumption = self._phase4_strategy_consumption(
+                        list(phase4_state.get("positions") or []), equity
+                    )
+                    phase4_snapshot = {
+                        "portfolio_equity": equity,
+                        "heat_before_pct": (
+                            (float(phase4_canonical.projected_total_open_risk or 0.0)
+                             + float(phase4_pending.get("total_stop_risk") or 0.0))
+                            / equity * 100.0
+                        ),
+                        "gross_exposure_before_pct": (
+                            (float(phase4_canonical.projected_gross_exposure or 0.0)
+                             + float(phase4_pending.get("total_notional") or 0.0))
+                            / equity * 100.0
+                        ),
+                        "pending_risk": float(phase4_pending.get("total_stop_risk") or 0.0),
+                        "reserved_risk": float(phase4_reservations.get("active_reserved_stop_risk") or 0.0),
+                        "strategy_risk_by_strategy": strategy_consumption["risk_pct"] if strategy_consumption["complete"] else {},
+                        "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
+                        "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
+                        "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
+                        "strategy_attribution_complete": strategy_consumption["complete"],
+                        "strategy_attribution_reason": strategy_consumption["reason"],
+                        "phase3_gross_exposure_capacity_pct": controller.profile.hard_gross_exposure_pct,
+                        "strategy_registry_snapshot_id": self._ensure_strategy_registry_snapshot(),
+                    }
                     self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
                         regime=volatility_regime, drawdown_pct=drawdown_pct,
+                        portfolio_snapshot=phase4_snapshot,
                         strategy_policy_map=self._strategy_policy_map or {},
                     )
                 phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(strategy_version, {})
+                sleeve = self._phase4_allocation_cache.get("strategy_sleeves", {}).get(strategy_version) or {}
+                risk_unit = str(sleeve.get("risk_unit") or self._phase4_allocation_cache.get("phase3_available_risk_unit") or "pct_equity")
+                sleeve_risk_remaining = float(sleeve.get("remaining_risk") or 0.0)
+                sleeve_risk_remaining_dollars = (
+                    equity * sleeve_risk_remaining / 100.0
+                    if risk_unit == "pct_equity"
+                    else sleeve_risk_remaining
+                )
+                sleeve_notional_remaining = float(sleeve.get("remaining_notional") or 0.0)
+                strategy_registry_snapshot_id = self._ensure_strategy_registry_snapshot()
+                sleeve_allocation_id = self._phase4_allocation_cache.get("allocation_id")
+                strategy_sleeve = strategy_version
+                strategy_sleeve_payload = sleeve
                 phase4_mode = str(phase4_policy.get("mode") or "blocked")
                 if phase4_mode == "probe":
                     if is_add:
@@ -7618,6 +9855,12 @@ class TradingService:
                 "strategy_risk_multiplier": strategy_risk_multiplier,
                 "permitted_stop_risk_pct": permitted_stop_risk_pct,
                 "binding_policy_reason": policy_reason,
+                "strategy_registry_snapshot_id": strategy_registry_snapshot_id,
+                "sleeve_allocation_id": sleeve_allocation_id,
+                "strategy_sleeve": strategy_sleeve,
+                "sleeve_risk_remaining_dollars": sleeve_risk_remaining_dollars,
+                "sleeve_notional_remaining": sleeve_notional_remaining,
+                "strategy_sleeve_payload": strategy_sleeve_payload,
             }
         risk_budget = equity * risk_per_trade_pct / 100.0
 
@@ -7780,7 +10023,7 @@ class TradingService:
                 if phase3_context.get("phase4_mode") == "exploration":
                     existing_exploration = float(pending.get("exploration_stop_risk") or 0.0) + reserved_stop_risk
                     heat_remaining = max(0.0, equity * float(phase3_context.get("phase4_exploration_heat_cap_pct") or 0.25) / 100.0 - existing_exploration)
-                    strategy_remaining = max(0.0, equity * float(self.config["phase4"]["max_exploration_stop_risk_pct"]) / 100.0 - float((pending.get("exploration_risk_by_strategy") or {}).get(STRATEGY_VERSION, 0.0)))
+                    strategy_remaining = max(0.0, equity * float(self.config["phase4"]["max_exploration_stop_risk_pct"]) / 100.0 - float((pending.get("exploration_risk_by_strategy") or {}).get(strategy_version, 0.0)))
                     exploration_cap = min(
                         notional_from_stop_risk(heat_remaining, entry_price, stop_distance_dollars),
                         notional_from_stop_risk(strategy_remaining, entry_price, stop_distance_dollars),
@@ -7810,6 +10053,15 @@ class TradingService:
                     extra_caps["probe_heat_cap"] = notional_from_stop_risk(probe_heat_remaining, entry_price, stop_distance_dollars)
                     extra_caps["probe_gross_cap"] = probe_gross_remaining
                     extra_caps["probe_active_count_cap"] = 0.0 if blocked_reason else float("inf")
+                if self.config.get("phase4", {}).get("active"):
+                    sleeve_risk_dollars = float(phase3_context.get("sleeve_risk_remaining_dollars") or 0.0)
+                    sleeve_notional_dollars = float(phase3_context.get("sleeve_notional_remaining") or 0.0)
+                    extra_caps["strategy_sleeve_stop_risk"] = notional_from_stop_risk(
+                        sleeve_risk_dollars, entry_price, stop_distance_dollars
+                    )
+                    extra_caps["strategy_sleeve_notional"] = sleeve_notional_dollars
+                    if not phase3_context.get("strategy_registry_snapshot_id") or not phase3_context.get("sleeve_allocation_id"):
+                        blocked_reason = "strategy registry or sleeve allocation provenance is unavailable"
 
         caps: dict[str, float] = {
             "stage": stage_cap, "stop_risk": stop_risk_cap, "equity": equity_cap, "cash": cash_cap,
@@ -7935,6 +10187,12 @@ class TradingService:
             "permitted_stop_risk_pct": phase3_context.get("permitted_stop_risk_pct"),
             "strategy_policy_version": phase3_context.get("policy").policy_version if phase3_context.get("policy") else None,
             "binding_policy_reason": phase3_context.get("binding_policy_reason"),
+            "strategy_registry_snapshot_id": phase3_context.get("strategy_registry_snapshot_id"),
+            "strategy_sleeve": phase3_context.get("strategy_sleeve"),
+            "sleeve_allocation_id": phase3_context.get("sleeve_allocation_id"),
+            "sleeve_stop_risk_ceiling": phase3_context.get("sleeve_risk_remaining_dollars"),
+            "sleeve_notional_ceiling": phase3_context.get("sleeve_notional_remaining"),
+            "strategy_sleeve_payload": phase3_context.get("strategy_sleeve_payload"),
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8517,6 +10775,23 @@ class TradingService:
         allowed: set[str] = set()
         reasons: dict[str, str] = {}
 
+        sleeve_inputs: dict[str, dict[str, Any]] = {}
+        sleeve_notional_remaining: dict[str, float] = {}
+        global_sleeve_remaining = 0.0
+        if self.config.get("phase4", {}).get("active") and self._phase4_allocation_cache:
+            for strategy, sleeve in (self._phase4_allocation_cache.get("strategy_sleeves") or {}).items():
+                row = dict(sleeve)
+                remaining = float(row.get("remaining_risk") or 0.0)
+                if str(row.get("risk_unit") or "pct_equity") == "pct_equity":
+                    remaining = equity * remaining / 100.0
+                row["remaining_risk"] = max(0.0, remaining)
+                row["risk_unit"] = "stop_risk_dollars"
+                sleeve_inputs[str(strategy)] = row
+                sleeve_notional_remaining[str(strategy)] = max(0.0, float(row.get("remaining_notional") or 0.0))
+            global_sleeve_remaining = sum(
+                float(row.get("remaining_risk") or 0.0) for row in sleeve_inputs.values()
+            )
+
         for candidate in ranked_candidates:
             symbol = str(candidate["symbol"]).upper()
             rank = int(candidate.get("final_candidate_rank") or 0)
@@ -8600,6 +10875,68 @@ class TradingService:
                     if final_notional > limit_value:
                         final_notional = max(0.0, limit_value)
                         reduction_reason = reason
+
+            if cap_reason is None and candidate.get("preproposal_block_reason"):
+                cap_reason = f"not actionable - pre-proposal risk check failed: {candidate['preproposal_block_reason']}"
+            if cap_reason is None and final_notional < cfg["min_notional"]:
+                cap_reason = "not actionable - insufficient risk budget after higher-ranked candidates"
+
+            if cap_reason is None and sleeve_inputs:
+                from .phase4_allocator import allocate_candidates_to_sleeves
+
+                signal = candidate.get("signal")
+                strategy = str(
+                    candidate.get("strategy_version")
+                    or getattr(signal, "strategy_version", "")
+                    or STRATEGY_VERSION
+                )
+                remaining_notional = sleeve_notional_remaining.get(strategy)
+                if remaining_notional is None:
+                    cap_reason = "not actionable - Phase 4 strategy sleeve allocation rejected the candidate"
+                else:
+                    if final_notional > remaining_notional:
+                        final_notional = max(0.0, remaining_notional)
+                        reduction_reason = "Phase 4 strategy sleeve candidate-set notional budget"
+                    if final_notional < cfg["min_notional"]:
+                        cap_reason = "not actionable - Phase 4 sleeve remainder is below executable minimum"
+                    requested_risk = (
+                        final_notional * float(stop_distance_pct or 0.0) / 100.0
+                        if cap_reason is None else 0.0
+                    )
+                    sleeve_plan = allocate_candidates_to_sleeves(
+                        [{
+                            "candidate_id": f"{strategy}:{symbol}",
+                            "strategy_version": strategy,
+                            "symbol": symbol,
+                            "action": "add" if candidate.get("is_add") else "entry",
+                            "side": "buy",
+                            "requested_stop_risk": requested_risk,
+                            "minimum_stop_risk": cfg["min_notional"] * float(stop_distance_pct or 0.0) / 100.0,
+                            "setup_score": candidate.get("score"),
+                            "evidence_quality": candidate.get("strategy_quality_score"),
+                            "regime": candidate.get("volatility_regime"),
+                            "spread_bps": candidate.get("quote_spread_bps"),
+                            "average_dollar_volume": candidate.get("average_dollar_volume"),
+                        }],
+                        sleeve_inputs,
+                        global_available_risk=global_sleeve_remaining,
+                    )
+                    sleeve_decision = sleeve_plan["decisions"][0]
+                    if sleeve_decision.get("decision") not in {"ALLOCATE", "ALLOCATE_PARTIAL"}:
+                        cap_reason = "not actionable - Phase 4 strategy sleeve allocation rejected the candidate"
+                    else:
+                        allocated_risk = float(sleeve_decision["allocated_risk"])
+                        risk_factor = float(stop_distance_pct or 0.0) / 100.0
+                        sleeve_notional_cap = allocated_risk / risk_factor if risk_factor > 0 else 0.0
+                        if final_notional > sleeve_notional_cap:
+                            final_notional = max(0.0, sleeve_notional_cap)
+                            reduction_reason = "Phase 4 strategy sleeve candidate-set risk budget"
+                        candidate["phase4_candidate_allocation"] = sleeve_decision
+                        sleeve_inputs = {
+                            str(key): dict(value) for key, value in sleeve_plan["sleeves_after"].items()
+                        }
+                        global_sleeve_remaining = float(sleeve_plan["global_remaining_risk"])
+                        sleeve_notional_remaining[strategy] = max(0.0, remaining_notional - final_notional)
 
             risk_pct = (final_notional * (stop_distance_pct / 100) / equity) * 100 if equity and stop_distance_pct else 0.0
             exposure_pct = (final_notional / equity) * 100 if equity else 0.0
@@ -8705,7 +11042,7 @@ class TradingService:
             "Portfolio room:",
             f"- Total exposure after proposed trades: {_format_small_percent(risk_snapshot.get('total_exposure_pct', 0.0))} / {self._risk_budget_cfg()['max_total_portfolio_exposure_pct']:.1f}%",
             f"- Open risk after proposed trades: {_format_small_percent(risk_snapshot.get('open_risk_pct', 0.0))} / {self._risk_budget_cfg()['max_open_risk_pct']:.2f}%",
-            f"- Available paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f} (includes margin leverage)",
+            f"- Broker-reported paper buying power: ${risk_snapshot.get('buying_power', 0.0):,.2f} (sizing remains cash-only; margin and leverage are disabled)",
             f"- Account Equity: ${risk_snapshot.get('portfolio_equity', 0.0):,.2f}",
             f"- Available Cash: ${risk_snapshot.get('cash', 0.0):,.2f}",
             "Actionable:",

@@ -10,12 +10,14 @@ from .execution import DurableExecutionStore
 from .evidence import SHADOW_OUTCOME, classify_evidence_type, is_operational_evidence
 from .formula_versions import EVIDENCE_VERSION, PHASE3_DECISION_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
+from .strategy_execution_registry import StrategyExecutionRegistry, persist as persist_strategy_registry
 from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
 
 PHASE3_SCHEMA_VERSION = "phase3_adaptive_operational_paper_risk_v2"
 PROFILE_VERSION = "adaptive_operational_paper_risk_v2"
+AVAILABLE_STRATEGY_IMPLEMENTATIONS = {"rule_based_v2_evaluator": "rule_based_evaluator_v1"}
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,8 @@ class Phase3Controller:
     def __init__(self, storage: Any, config: Mapping[str, Any], run_id: str) -> None:
         self.storage, self.config, self.run_id = storage, config, run_id
         self.profile = Phase3RiskProfile.from_config(config)
+        self.registry_snapshot_id: str | None = None
+        self.authorized_strategy_versions: tuple[str, ...] = ()
 
     def update_equity(self, equity: float, account_key: str = "alpaca-paper") -> float:
         if not math.isfinite(equity) or equity <= 0: raise ValueError("authoritative positive equity required")
@@ -164,10 +168,39 @@ class Phase3Controller:
         # fail-closed branch below.
         build2 = "profitability_engine" in self.config
         engine = StrategyPerformanceEngine(self.storage, self.config)
-        versions = [(sleeve, version) for sleeve, version in STRATEGY_VERSIONS.items()]
-        versions.append(("executable", STRATEGY_VERSION))
+        registry_entries = (self.config.get("strategy_execution_registry", {}) or {}).get("entries", {})
+        if isinstance(registry_entries, Mapping) and registry_entries:
+            versions = [
+                (
+                    next((name for name, known in STRATEGY_VERSIONS.items() if known == version), "operational"),
+                    str(version),
+                )
+                for version in sorted(registry_entries)
+            ]
+        else:
+            # Compatibility only for isolated pre-registry fixtures. The
+            # release configuration always uses the explicit registry path.
+            versions = [(sleeve, version) for sleeve, version in STRATEGY_VERSIONS.items()]
+            versions.append(("executable", STRATEGY_VERSION))
+        policy_map = engine.valid_policy_map(version for _, version in versions) if build2 else {}
+        authorized: set[str] = set()
+        registry_reasons: dict[str, list[str]] = {}
+        if isinstance(registry_entries, Mapping) and registry_entries:
+            registry = StrategyExecutionRegistry(
+                self.config,
+                available_implementations=AVAILABLE_STRATEGY_IMPLEMENTATIONS,
+            )
+            evaluation = registry.evaluate(policy_map, as_of=now)
+            persisted = persist_strategy_registry(self.storage, self.run_id, evaluation)
+            self.registry_snapshot_id = str(persisted["snapshot_id"])
+            self.authorized_strategy_versions = evaluation.authorized_versions
+            authorized = set(evaluation.authorized_versions)
+            registry_reasons = {
+                decision.strategy_version: list(decision.reasons)
+                for decision in evaluation.rejected
+            }
         for sleeve, version in versions:
-            policy = engine.latest_valid_policy(version) if build2 else None
+            policy = policy_map.get(version) if build2 else None
             if not healthy:
                 state, reason = "SUSPENDED", "reconciliation health failed"
             elif policy is None:
@@ -178,6 +211,14 @@ class Phase3Controller:
                 state = policy.state if policy.state in POLICY_STATES else "SUSPENDED"
                 reason = policy.reason
                 metrics = policy.metrics
+                if (
+                    isinstance(registry_entries, Mapping)
+                    and registry_entries
+                    and state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"}
+                    and version not in authorized
+                ):
+                    state = "SUSPENDED"
+                    reason = "strategy execution registry rejected authorization: " + ", ".join(registry_reasons.get(version, ["unknown registry rejection"]))
             states[version] = state
             maturity = policy.maturity if policy is not None else {}
             sample_count = int(maturity.get("sample_count", metrics.get("sample_count", 0)) or 0)
@@ -191,6 +232,9 @@ class Phase3Controller:
                 "policy_version": policy.policy_version if policy else None,
                 "hard_gates": policy.hard_gates if policy else {},
                 "binding_policy_reason": reason,
+                "strategy_registry_snapshot_id": self.registry_snapshot_id,
+                "strategy_registry_authorized": version in authorized if registry_entries else version == STRATEGY_VERSION,
+                "strategy_registry_reasons": registry_reasons.get(version, []),
             }
             self.storage.execute("""INSERT INTO phase3_strategy_states(strategy_version,sleeve,state,reason,completed_oos_n,
               qualifying_regimes,mean_cost_adjusted_return,health_status,state_version,evaluated_at,activated_at,suspended_at,payload)
@@ -201,15 +245,45 @@ class Phase3Controller:
               suspended_at=CASE WHEN excluded.state='SUSPENDED' THEN excluded.evaluated_at ELSE phase3_strategy_states.suspended_at END,payload=excluded.payload""",
               (version,sleeve,state,reason,sample_count,regime_count,mean,"healthy" if healthy else "unhealthy",
                "phase3_strategy_policy_state_v1",now,now if state=="ACTIVE" else None,now if state=="SUSPENDED" else None,json_dumps(payload)))
-        # Shadow strategy states are persisted for research and promotion
-        # evidence, but never become executable Phase 3 allocations.
-        eligible = [STRATEGY_VERSION] if states.get(STRATEGY_VERSION) == "ACTIVE" else []
-        for version in eligible:
-            weight = 1.0 / len(eligible)
-            identifier = hashlib.sha256(f"{self.run_id}|{version}|{PROFILE_VERSION}".encode()).hexdigest()[:32]
-            self.storage.execute("INSERT OR IGNORE INTO phase3_strategy_allocations VALUES(?,?,?,?,?,?,?,?)",
-                                 (identifier,self.run_id,version,weight,"ACTIVE","authorised executable strategy risk sleeve",PROFILE_VERSION,now))
+        eligible = [
+            version for _, version in versions
+            if version in authorized and states.get(version) in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"}
+        ] if registry_entries else ([STRATEGY_VERSION] if states.get(STRATEGY_VERSION) == "ACTIVE" else [])
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if eligible:
+                placeholders = ",".join("?" for _ in eligible)
+                conn.execute(
+                    f"DELETE FROM phase3_strategy_allocations WHERE run_id=? AND strategy_version NOT IN ({placeholders})",
+                    (self.run_id, *eligible),
+                )
+            else:
+                conn.execute("DELETE FROM phase3_strategy_allocations WHERE run_id=?", (self.run_id,))
+            for version in eligible:
+                weight = 1.0 / len(eligible)
+                identifier = hashlib.sha256(f"{self.run_id}|{version}|{PROFILE_VERSION}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO phase3_strategy_allocations VALUES(?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO UPDATE SET allocation_weight=excluded.allocation_weight,
+                         state=excluded.state,reason=excluded.reason,
+                         profile_version=excluded.profile_version,created_at=excluded.created_at""",
+                    (identifier,self.run_id,version,weight,states[version],"explicit registry-authorised strategy risk sleeve",PROFILE_VERSION,now),
+                )
+            total = conn.execute(
+                "SELECT COALESCE(SUM(allocation_weight),0) FROM phase3_strategy_allocations WHERE run_id=?",
+                (self.run_id,),
+            ).fetchone()[0]
+            if float(total or 0.0) > 1.0 + 1e-9:
+                raise RuntimeError("Phase 3 strategy allocation weights exceed one")
         return states
 
     def allocation(self, strategy_version: str, states: Mapping[str, str]) -> float:
+        rows = self.storage.fetch_all(
+            "SELECT allocation_weight FROM phase3_strategy_allocations WHERE run_id=? AND strategy_version=?",
+            (self.run_id, strategy_version),
+        )
+        if rows:
+            return max(0.0, min(1.0, float(rows[0]["allocation_weight"])))
+        if "strategy_execution_registry" in self.config:
+            return 0.0
         return 1.0 if strategy_version == STRATEGY_VERSION and states.get(STRATEGY_VERSION) == "ACTIVE" else 0.0

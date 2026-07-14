@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import warnings
+from datetime import UTC, datetime
 from typing import Any
 
 from .formula_versions import (
@@ -23,6 +24,14 @@ from .formula_versions import (
     STRATEGY_PERFORMANCE_VERSION,
     STRATEGY_POLICY_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+    POSITION_RISK_FORMULA_VERSION,
+    ROTATION_FORMULA_VERSION,
+    ROTATION_SCHEMA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+    TREND_MANAGEMENT_FORMULA_VERSION,
+    WINNER_EXPANSION_FORMULA_VERSION,
+    WINNER_EXPANSION_SCHEMA_VERSION,
 )
 
 
@@ -46,7 +55,8 @@ _WARNED_DEPRECATIONS: set[str] = set()
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
     "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "execution_capabilities", "broker",
-    "require_power", "require_market_open", "preflight", "watchlist", "approved_strategy_versions", "strategies", "formula_versions", "crypto",
+    "strategy_execution_registry", "winner_expansion", "trend_management", "rotation",
+    "require_power", "require_market_open", "preflight", "watchlist", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
     "proposal_expiry_high_volatility_minutes", "proposal_expiry_low_volatility_minutes", "proposal_expiry_notify_on_expiry",
     "proposal_expiry_high_volatility_threshold", "proposal_expiry_low_volatility_threshold", "portfolio_execution_mode",
@@ -98,6 +108,24 @@ STRICT_SECTION_KEYS = {
         "minimum_liquidity_dollars", "maximum_quote_spread_bps", "kelly_operational", "covariance_operational",
     },
     "adaptive_sizing": {"enabled", "mode", "operational_enforcement", "allow_order_size_change", "formula_version", "schema_version"},
+    "strategy_execution_registry": {
+        "schema_version", "formula_version", "mode", "required_configuration_version", "required_evidence_version",
+        "required_performance_version", "required_policy_version", "required_policy_schema_version", "entries",
+    },
+    "winner_expansion": {
+        "enabled", "mode", "schema_version", "formula_version", "position_risk_formula_version", "require_manual_approval",
+        "require_authoritative_current_stop", "stop_freshness_seconds", "rounding_tolerance_dollars",
+        "mode_incremental_risk_allowance_pct", "milestones",
+    },
+    "trend_management": {
+        "enabled", "mode", "formula_version", "require_manual_approval_for_sells", "stop_never_moves_down", "mode_policies",
+    },
+    "rotation": {
+        "enabled", "mode", "schema_version", "formula_version", "require_explicit_group_approval", "approval_command_prefix",
+        "group_expiry_minutes", "allow_partial_fill_reallocation", "require_fill_before_capacity",
+        "require_reconciliation_before_entry", "prefill_capital_reservation_allowed",
+        "candidate_material_change_requires_new_approval", "maximum_contingent_entries",
+    },
     "risk_budget": {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
@@ -128,6 +156,8 @@ STRICT_NESTED_KEYS = {
         "require_price_above_ma50", "require_price_above_ma200", "require_no_profit_protection_warning", "require_no_exit_signal",
         "require_normal_or_elevated_volatility_only", "require_telegram_approval",
     },
+    "winner_expansion.mode_incremental_risk_allowance_pct": {"DEFENSIVE", "NORMAL", "OPPORTUNISTIC", "AGGRESSIVE"},
+    "winner_expansion.milestones": {"r_multiple_step", "price_advance_atr_step", "stop_advance_atr_step", "max_retries", "retry_after_minutes"},
 }
 
 
@@ -217,6 +247,137 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(adaptive_sizing.get("allow_order_size_change") is True, "adaptive sizing must control paper order size")
     require(adaptive_sizing.get("formula_version") == ADAPTIVE_SIZING_FORMULA_VERSION, f"adaptive_sizing.formula_version must be {ADAPTIVE_SIZING_FORMULA_VERSION}")
     require(adaptive_sizing.get("schema_version") == ADAPTIVE_SIZING_SCHEMA_VERSION, f"adaptive_sizing.schema_version must be {ADAPTIVE_SIZING_SCHEMA_VERSION}")
+
+    registry = config.get("strategy_execution_registry", {}) or {}
+    require(registry.get("schema_version") == STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+            f"strategy_execution_registry.schema_version must be {STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION}")
+    require(registry.get("formula_version") == STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+            f"strategy_execution_registry.formula_version must be {STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION}")
+    require(registry.get("mode") == "paper_only", "strategy execution registry must be paper_only")
+    require(registry.get("required_configuration_version") == CONFIGURATION_SCHEMA_VERSION,
+            "strategy registry configuration version must match the active configuration")
+    require(registry.get("required_evidence_version") == EVIDENCE_VERSION,
+            "strategy registry evidence version must match the active evidence formula")
+    require(registry.get("required_performance_version") == STRATEGY_PERFORMANCE_VERSION,
+            "strategy registry performance version must match the profitability engine")
+    require(registry.get("required_policy_version") == STRATEGY_POLICY_VERSION,
+            "strategy registry policy version must match the profitability engine")
+    require(registry.get("required_policy_schema_version") == STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+            "strategy registry policy schema must match the profitability engine")
+    registry_entries = registry.get("entries")
+    require(isinstance(registry_entries, dict) and bool(registry_entries),
+            "strategy_execution_registry.entries must be a non-empty mapping")
+    registry_entry_keys = {
+        "strategy_name", "strategy_version", "implementation_id", "implementation_version", "implementation_available",
+        "execution_eligible", "paper_eligible", "live_eligible", "human_authorized", "config_authorized",
+        "authorization_id", "effective_at", "expires_at", "suspended", "evidence_version", "performance_version",
+        "policy_version", "policy_schema_version",
+    }
+    if isinstance(registry_entries, dict):
+        for strategy_version, entry in registry_entries.items():
+            if not isinstance(entry, dict):
+                errors.append(f"strategy_execution_registry.entries.{strategy_version} must be a mapping")
+                continue
+            if config.get("strict_unknown_keys") is True:
+                errors.extend(
+                    f"unknown strategy_execution_registry.entries.{strategy_version} key: {key}"
+                    for key in sorted(set(entry) - registry_entry_keys)
+                )
+            require(entry.get("strategy_version") == strategy_version,
+                    f"strategy registry key {strategy_version} must match its strategy_version")
+            require(bool(entry.get("strategy_name")) and bool(entry.get("implementation_id")) and bool(entry.get("implementation_version")),
+                    f"strategy registry entry {strategy_version} requires name and implementation identity")
+            require(entry.get("live_eligible") is False,
+                    f"strategy registry entry {strategy_version} must forbid live execution")
+            require(entry.get("suspended") in {True, False},
+                    f"strategy registry entry {strategy_version} must declare suspension state")
+            if entry.get("execution_eligible") is True:
+                require(entry.get("implementation_available") is True,
+                        f"executable strategy {strategy_version} requires an available implementation")
+                require(entry.get("paper_eligible") is True,
+                        f"executable strategy {strategy_version} must be explicitly paper eligible")
+                require(entry.get("human_authorized") is True and entry.get("config_authorized") is True,
+                        f"executable strategy {strategy_version} requires explicit human and configuration authorization")
+                require(bool(entry.get("authorization_id")),
+                        f"executable strategy {strategy_version} requires an authorization ID")
+            try:
+                effective = datetime.fromisoformat(str(entry.get("effective_at") or "").replace("Z", "+00:00"))
+                expiry = datetime.fromisoformat(str(entry.get("expires_at") or "").replace("Z", "+00:00"))
+                require(effective.tzinfo is not None and expiry.tzinfo is not None and expiry.astimezone(UTC) > effective.astimezone(UTC),
+                        f"strategy registry entry {strategy_version} requires a valid timezone-aware authorization window")
+            except ValueError:
+                errors.append(f"strategy registry entry {strategy_version} has an invalid authorization timestamp")
+
+    winner = config.get("winner_expansion", {}) or {}
+    require(winner.get("enabled") is True and winner.get("mode") == "operational_paper",
+            "winner expansion must be active operational_paper")
+    require(winner.get("schema_version") == WINNER_EXPANSION_SCHEMA_VERSION,
+            f"winner expansion schema must be {WINNER_EXPANSION_SCHEMA_VERSION}")
+    require(winner.get("formula_version") == WINNER_EXPANSION_FORMULA_VERSION,
+            f"winner expansion formula must be {WINNER_EXPANSION_FORMULA_VERSION}")
+    require(winner.get("position_risk_formula_version") == POSITION_RISK_FORMULA_VERSION,
+            f"winner expansion position risk formula must be {POSITION_RISK_FORMULA_VERSION}")
+    require(winner.get("require_manual_approval") is True,
+            "every winner ADD must retain explicit manual approval")
+    require(winner.get("require_authoritative_current_stop") is True,
+            "winner expansion requires a current authoritative protective stop")
+    allowances = winner.get("mode_incremental_risk_allowance_pct") or {}
+    expected_allowance_modes = {"DEFENSIVE", "NORMAL", "OPPORTUNISTIC", "AGGRESSIVE"}
+    require(isinstance(allowances, dict) and set(allowances) == expected_allowance_modes,
+            "winner expansion must configure every deployment-mode risk allowance")
+    if isinstance(allowances, dict) and set(allowances) == expected_allowance_modes:
+        defensive_allowance = _bounded(allowances.get("DEFENSIVE"), "winner_expansion DEFENSIVE allowance", errors, 0, 0)
+        normal_allowance = _bounded(allowances.get("NORMAL"), "winner_expansion NORMAL allowance", errors, 0, 0)
+        opportunistic_allowance = _bounded(allowances.get("OPPORTUNISTIC"), "winner_expansion OPPORTUNISTIC allowance", errors, 0, 0.05)
+        aggressive_allowance = _bounded(allowances.get("AGGRESSIVE"), "winner_expansion AGGRESSIVE allowance", errors, 0, 0.10)
+        require(None not in {defensive_allowance, normal_allowance, opportunistic_allowance, aggressive_allowance}
+                and opportunistic_allowance <= aggressive_allowance,
+                "winner expansion allowances must be nondecreasing and remain within the hard envelope")
+    _bounded(winner.get("stop_freshness_seconds"), "winner_expansion.stop_freshness_seconds", errors, 1, 900)
+    _bounded(winner.get("rounding_tolerance_dollars"), "winner_expansion.rounding_tolerance_dollars", errors, 0, 0.01)
+
+    trend = config.get("trend_management", {}) or {}
+    require(trend.get("enabled") is True and trend.get("mode") == "operational_paper",
+            "trend management must be active operational_paper")
+    require(trend.get("formula_version") == TREND_MANAGEMENT_FORMULA_VERSION,
+            f"trend management formula must be {TREND_MANAGEMENT_FORMULA_VERSION}")
+    require(trend.get("require_manual_approval_for_sells") is True,
+            "trend-management SELLs require explicit manual approval")
+    require(trend.get("stop_never_moves_down") is True,
+            "long protective stops must be monotonic")
+    try:
+        from .trend_management import MODE_POLICY
+        configured_modes = trend.get("mode_policies") or {}
+        require(set(configured_modes) == {mode.value for mode in MODE_POLICY},
+                "trend management must configure every operational mode")
+        for mode, policy in MODE_POLICY.items():
+            configured = configured_modes.get(mode.value) or {}
+            require(float(configured.get("atr_multiplier")) == float(policy["atr_multiplier"]),
+                    f"trend mode {mode.value} ATR multiplier does not match its formula version")
+            require(float(configured.get("partial_exit_fraction")) == float(policy["partial_exit_fraction"]),
+                    f"trend mode {mode.value} partial fraction does not match its formula version")
+    except (TypeError, ValueError):
+        errors.append("trend_management.mode_policies must contain finite version-compatible values")
+
+    rotation = config.get("rotation", {}) or {}
+    require(rotation.get("enabled") is True and rotation.get("mode") == "operational_paper_exit_first",
+            "exit-first rotation must be active operational_paper_exit_first")
+    require(rotation.get("schema_version") == ROTATION_SCHEMA_VERSION,
+            f"rotation schema must be {ROTATION_SCHEMA_VERSION}")
+    require(rotation.get("formula_version") == ROTATION_FORMULA_VERSION,
+            f"rotation formula must be {ROTATION_FORMULA_VERSION}")
+    require(rotation.get("require_explicit_group_approval") is True,
+            "rotation requires explicit targeted group approval")
+    require(rotation.get("require_fill_before_capacity") is True,
+            "rotation cannot use capacity before an authoritative fill")
+    require(rotation.get("require_reconciliation_before_entry") is True,
+            "rotation cannot enter before post-fill reconciliation")
+    require(rotation.get("prefill_capital_reservation_allowed") is False,
+            "rotation cannot reserve assumed exit proceeds")
+    require(rotation.get("candidate_material_change_requires_new_approval") is True,
+            "material contingent-candidate changes require a new approval")
+    _bounded(rotation.get("group_expiry_minutes"), "rotation.group_expiry_minutes", errors, 1, 60)
+    _bounded(rotation.get("maximum_contingent_entries"), "rotation.maximum_contingent_entries", errors, 1, 1)
 
     profitability = config.get("profitability_engine", {}) or {}
     require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")
@@ -310,7 +471,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     # Safety-critical numeric units are validated recursively. A typo such as
     # a string percentage or a millisecond value in a seconds field must fail
     # before a runtime object or database is opened.
-    for section_name in ("risk", "risk_budget", "phase3", "phase4", "adaptive_conviction", "profitability_engine", "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight"):
+    for section_name in (
+        "risk", "risk_budget", "phase3", "phase4", "adaptive_conviction", "profitability_engine",
+        "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight",
+        "winner_expansion", "trend_management", "rotation",
+    ):
         _validate_units(config.get(section_name), section_name, errors)
 
     try:

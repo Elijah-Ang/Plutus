@@ -167,15 +167,37 @@ class RiskSnapshotBuilder:
         for position in positions:
             symbol = str(_value(position, "symbol", "")).upper()
             qty = _float(_value(position, "qty"))
-            if not symbol or qty is None or qty <= 0:
+            if not symbol or qty is None:
+                continue
+            if qty < 0:
+                # A short broker position is outside the supported safety
+                # envelope; do not understate its risk as zero.
+                return None
+            if qty == 0:
                 continue
             rows = self.storage.fetch_all(
-                "SELECT initial_stop_price,avg_entry_price FROM position_management_state WHERE symbol=?",
+                """SELECT initial_stop_price,trailing_stop_price,authoritative_protective_stop,
+                          avg_entry_price FROM position_management_state WHERE symbol=?""",
                 (symbol,),
             )
-            entry = _float(_value(position, "avg_entry_price"))
-            stop = _float(rows[0].get("initial_stop_price")) if rows else None
-            if entry is None or stop is None:
+            current_price = _float(_value(position, "current_price"))
+            if current_price is None and qty > 0:
+                market_value = _float(_value(position, "market_value"))
+                current_price = market_value / qty if market_value is not None else None
+            stops = []
+            if rows:
+                stops = [
+                    value for value in (
+                        _float(rows[0].get("initial_stop_price")),
+                        _float(rows[0].get("trailing_stop_price")),
+                        _float(rows[0].get("authoritative_protective_stop")),
+                    )
+                    if value is not None and value > 0
+                ]
+            if current_price is None or current_price <= 0 or not stops:
                 return None
-            total += qty * max(entry - stop, 0.0)
+            # For a long position, current open stop risk is the loss from the
+            # authoritative current mark to the tightest durable protective
+            # stop. Entry-price risk becomes stale after the stop advances.
+            total += qty * max(current_price - max(stops), 0.0)
         return total

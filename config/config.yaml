@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v7_release_gate_operational_paper
+configuration_schema_version: plutus_effective_config_v8_phase43_operational_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -50,7 +50,7 @@ phase4:
   enabled: true
   active: true
   mode: ACTIVE_ADAPTIVE_PAPER
-  allocator_version: adaptive_paper_allocator_v4_dimensionally_normalized
+  allocator_version: multi_strategy_paper_allocator_v5
   fractional_kelly: 0.20
   operational_kelly_enabled: false
   operational_allocation_mode: bounded_evidence_aware
@@ -101,6 +101,158 @@ adaptive_sizing:
   allow_order_size_change: true
   formula_version: adaptive_sizing_formula_v2_operational_paper
   schema_version: adaptive_sizing_operational_decisions_v2
+
+strategy_execution_registry:
+  schema_version: strategy_execution_registry_v1
+  formula_version: strategy_execution_registry_formula_v1
+  mode: paper_only
+  required_configuration_version: plutus_effective_config_v8_phase43_operational_paper
+  required_evidence_version: phase1_outcome_v2_exit_session
+  required_performance_version: strategy_performance_v2_2_probe
+  required_policy_version: strategy_policy_v2_2_probe
+  required_policy_schema_version: strategy_profitability_engine_v1
+  entries:
+    rule_based_v2:
+      strategy_name: Rule Based
+      strategy_version: rule_based_v2
+      implementation_id: rule_based_v2_evaluator
+      implementation_version: rule_based_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
+      live_eligible: false
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-rule-based-v2-20260714
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+    pullback_uptrend_v1:
+      strategy_name: Pullback Uptrend Research
+      strategy_version: pullback_uptrend_v1
+      implementation_id: pullback_uptrend_shadow
+      implementation_version: shadow_v1
+      implementation_available: false
+      execution_eligible: false
+      paper_eligible: false
+      live_eligible: false
+      human_authorized: false
+      config_authorized: false
+      authorization_id: null
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+    breakout_continuation_v1:
+      strategy_name: Breakout Continuation Research
+      strategy_version: breakout_continuation_v1
+      implementation_id: breakout_continuation_shadow
+      implementation_version: shadow_v1
+      implementation_available: false
+      execution_eligible: false
+      paper_eligible: false
+      live_eligible: false
+      human_authorized: false
+      config_authorized: false
+      authorization_id: null
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+    time_series_trend_v1:
+      strategy_name: Time Series Trend Research
+      strategy_version: time_series_trend_v1
+      implementation_id: time_series_trend_shadow
+      implementation_version: shadow_v1
+      implementation_available: false
+      execution_eligible: false
+      paper_eligible: false
+      live_eligible: false
+      human_authorized: false
+      config_authorized: false
+      authorization_id: null
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+    cross_sectional_momentum_v1:
+      strategy_name: Cross Sectional Momentum Research
+      strategy_version: cross_sectional_momentum_v1
+      implementation_id: cross_sectional_momentum_shadow
+      implementation_version: shadow_v1
+      implementation_available: false
+      execution_eligible: false
+      paper_eligible: false
+      live_eligible: false
+      human_authorized: false
+      config_authorized: false
+      authorization_id: null
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+    etf_sector_rotation_v1:
+      strategy_name: ETF Sector Rotation Research
+      strategy_version: etf_sector_rotation_v1
+      implementation_id: etf_sector_rotation_shadow
+      implementation_version: shadow_v1
+      implementation_available: false
+      execution_eligible: false
+      paper_eligible: false
+      live_eligible: false
+      human_authorized: false
+      config_authorized: false
+      authorization_id: null
+      effective_at: "2026-07-14T00:00:00+00:00"
+      expires_at: "2027-07-14T00:00:00+00:00"
+      suspended: false
+
+winner_expansion:
+  enabled: true
+  mode: operational_paper
+  schema_version: phase4_2c_winner_expansion_v1
+  formula_version: winner_expansion_v1_operational_paper
+  position_risk_formula_version: position_open_risk_v1_operational_paper
+  require_manual_approval: true
+  require_authoritative_current_stop: true
+  stop_freshness_seconds: 300
+  rounding_tolerance_dollars: 0.01
+  mode_incremental_risk_allowance_pct:
+    DEFENSIVE: 0.0
+    NORMAL: 0.0
+    OPPORTUNISTIC: 0.05
+    AGGRESSIVE: 0.10
+  milestones:
+    r_multiple_step: 0.5
+    price_advance_atr_step: 0.75
+    stop_advance_atr_step: 0.5
+    max_retries: 1
+    retry_after_minutes: 60
+
+trend_management:
+  enabled: true
+  mode: operational_paper
+  formula_version: trend_management_v1_operational_paper
+  require_manual_approval_for_sells: true
+  stop_never_moves_down: true
+  mode_policies:
+    DEFENSIVE_HARVEST: {atr_multiplier: 1.50, partial_exit_fraction: 0.33}
+    STANDARD_SCALE_OUT: {atr_multiplier: 2.00, partial_exit_fraction: 0.25}
+    TREND_HOLD: {atr_multiplier: 2.75, partial_exit_fraction: 0.10}
+    TREND_PYRAMID: {atr_multiplier: 3.00, partial_exit_fraction: 0.0}
+    PROFIT_PROTECT: {atr_multiplier: 1.25, partial_exit_fraction: 0.50}
+    EXIT_REQUIRED: {atr_multiplier: 0.00, partial_exit_fraction: 1.0}
+
+rotation:
+  enabled: true
+  mode: operational_paper_exit_first
+  schema_version: exit_first_rotation_v1
+  formula_version: actual_fill_reconciled_capacity_v1
+  require_explicit_group_approval: true
+  approval_command_prefix: APPROVE ROTATION
+  group_expiry_minutes: 15
+  allow_partial_fill_reallocation: true
+  require_fill_before_capacity: true
+  require_reconciliation_before_entry: true
+  prefill_capital_reservation_allowed: false
+  candidate_material_change_requires_new_approval: true
+  maximum_contingent_entries: 1
 profitability_engine:
   enabled: true
   enforcement_enabled: true
@@ -149,7 +301,6 @@ preflight:
     require_broker: true
     require_market_open: true
 watchlist: [SPY, QQQ, DIA, IWM]
-approved_strategy_versions: [rule_based_v2]
 strategies:
   rule_based_v2:
     enabled: true
@@ -158,9 +309,9 @@ strategies:
     stop_drawdown_pct: 0.08
 
 formula_versions:
-  stop_policy: validated_atr_or_technical_stop_v2
-  sizing_policy: adaptive_minimum_ceiling_notional_v4_operational_paper
-  risk_decision: risk_engine_adaptive_ceiling_stop_probe_v4
+  stop_policy: monotonic_trend_protective_stop_v3
+  sizing_policy: adaptive_strategy_sleeve_winner_v5_operational_paper
+  risk_decision: risk_engine_position_risk_rotation_sleeve_v5
   accounting: fifo_equity_unrealized_cashflow_v1
   evidence: phase1_outcome_v2_exit_session
   strategy_performance: strategy_performance_v2_2_probe

@@ -1,0 +1,879 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Mapping, Sequence
+
+from .utils import iso_now, json_dumps
+
+
+ROTATION_SCHEMA_VERSION = "exit_first_rotation_v1"
+ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v1"
+
+
+class RotationState(StrEnum):
+    PENDING_GROUP_APPROVAL = "pending_group_approval"
+    APPROVED_EXIT_PENDING = "approved_exit_pending"
+    EXIT_SUBMITTED = "exit_submitted"
+    EXIT_PARTIALLY_FILLED = "exit_partially_filled"
+    EXIT_FILLED = "exit_filled"
+    RECONCILIATION_PENDING = "reconciliation_pending"
+    RECONCILED = "reconciled"
+    ENTRY_REVALIDATING = "entry_revalidating"
+    ENTRY_RESERVED = "entry_reserved"
+    ENTRY_SUBMITTED = "entry_submitted"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    EXIT_FAILED = "exit_failed"
+    ENTRY_BLOCKED = "entry_blocked"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATES = {
+    RotationState.COMPLETED,
+    RotationState.REJECTED,
+    RotationState.EXPIRED,
+    RotationState.EXIT_FAILED,
+    RotationState.ENTRY_BLOCKED,
+    RotationState.CANCELLED,
+}
+
+
+ALLOWED_TRANSITIONS: dict[RotationState, set[RotationState]] = {
+    RotationState.PENDING_GROUP_APPROVAL: {
+        RotationState.APPROVED_EXIT_PENDING,
+        RotationState.REJECTED,
+        RotationState.EXPIRED,
+        RotationState.CANCELLED,
+    },
+    RotationState.APPROVED_EXIT_PENDING: {
+        RotationState.EXIT_SUBMITTED,
+        RotationState.EXIT_FAILED,
+        RotationState.EXPIRED,
+        RotationState.CANCELLED,
+    },
+    RotationState.EXIT_SUBMITTED: {
+        RotationState.EXIT_PARTIALLY_FILLED,
+        RotationState.EXIT_FILLED,
+        RotationState.EXIT_FAILED,
+        RotationState.EXPIRED,
+    },
+    RotationState.EXIT_PARTIALLY_FILLED: {
+        RotationState.EXIT_PARTIALLY_FILLED,
+        RotationState.EXIT_FILLED,
+        RotationState.RECONCILIATION_PENDING,
+        RotationState.EXIT_FAILED,
+        RotationState.EXPIRED,
+    },
+    RotationState.EXIT_FILLED: {RotationState.RECONCILIATION_PENDING},
+    RotationState.RECONCILIATION_PENDING: {
+        RotationState.RECONCILED,
+        RotationState.ENTRY_BLOCKED,
+    },
+    RotationState.RECONCILED: {
+        RotationState.ENTRY_REVALIDATING,
+        RotationState.ENTRY_BLOCKED,
+        RotationState.EXPIRED,
+    },
+    RotationState.ENTRY_REVALIDATING: {
+        RotationState.RECONCILED,
+        RotationState.ENTRY_RESERVED,
+        RotationState.ENTRY_BLOCKED,
+        RotationState.EXPIRED,
+    },
+    RotationState.ENTRY_RESERVED: {
+        RotationState.ENTRY_SUBMITTED,
+        RotationState.ENTRY_BLOCKED,
+    },
+    RotationState.ENTRY_SUBMITTED: {RotationState.COMPLETED, RotationState.ENTRY_BLOCKED},
+}
+
+
+@dataclass(frozen=True)
+class RotationApprovalResult:
+    accepted: bool
+    group_id: str | None
+    action: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RevalidatedRotationEntry:
+    allowed: bool
+    group_id: str
+    contingent_entry_id: str
+    symbol: str
+    final_quantity: float
+    final_notional: float
+    final_stop_risk: float
+    binding_cap: str
+    reason: str
+
+
+def _fingerprint(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _utc(value: str | datetime) -> datetime:
+    result = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
+
+
+def parse_rotation_approval(
+    text: str,
+    pending_groups: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> RotationApprovalResult:
+    """Parse only explicit rotation commands; a generic yes can never match."""
+    normalized = " ".join(str(text or "").strip().lower().split())
+    match = re.fullmatch(r"(approve|reject) rotation ([a-f0-9]{6,64})", normalized)
+    if not match:
+        return RotationApprovalResult(False, None, "unclear", "use APPROVE ROTATION <group-id>")
+    action, target = match.groups()
+    matches = [row for row in pending_groups if str(row.get("id") or "").lower().startswith(target)]
+    if len(matches) != 1:
+        return RotationApprovalResult(False, None, action, "rotation group target is missing or ambiguous")
+    group = matches[0]
+    if RotationState(str(group.get("state"))) != RotationState.PENDING_GROUP_APPROVAL:
+        return RotationApprovalResult(False, str(group.get("id")), action, "rotation group is no longer pending")
+    if _utc(str(group["expires_at"])) <= (now or datetime.now(UTC)):
+        return RotationApprovalResult(False, str(group.get("id")), action, "rotation group expired")
+    return RotationApprovalResult(True, str(group.get("id")), action, "explicit rotation group command")
+
+
+def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
+    statements = (
+        """CREATE TABLE IF NOT EXISTS rotation_groups(
+             id TEXT PRIMARY KEY,run_id TEXT,state TEXT NOT NULL,expires_at TEXT NOT NULL,
+             approval_id TEXT,approved_at TEXT,estimated_release_notional REAL NOT NULL DEFAULT 0,
+             actual_released_notional REAL NOT NULL DEFAULT 0,actual_released_risk REAL NOT NULL DEFAULT 0,
+             reconciled_cash REAL,reconciled_buying_power REAL,reconciliation_fingerprint TEXT,
+             registry_snapshot_id TEXT,allocation_id TEXT,terminal_reason TEXT,
+             schema_version TEXT NOT NULL,formula_version TEXT NOT NULL,config_hash TEXT,
+             decision_fingerprint TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS rotation_steps(
+             id TEXT PRIMARY KEY,group_id TEXT NOT NULL,sequence INTEGER NOT NULL,role TEXT NOT NULL,
+             proposal_id TEXT,intent_id TEXT,symbol TEXT NOT NULL,side TEXT NOT NULL,state TEXT NOT NULL,
+             requested_quantity REAL,filled_quantity REAL NOT NULL DEFAULT 0,filled_notional REAL NOT NULL DEFAULT 0,
+             released_risk REAL NOT NULL DEFAULT 0,reason TEXT,payload TEXT NOT NULL,updated_at TEXT NOT NULL,
+             UNIQUE(group_id,sequence,role))""",
+        """CREATE TABLE IF NOT EXISTS rotation_contingent_entries(
+             id TEXT PRIMARY KEY,group_id TEXT NOT NULL,candidate_key TEXT NOT NULL,strategy_version TEXT NOT NULL,
+             symbol TEXT NOT NULL,displayed_max_quantity REAL NOT NULL,displayed_max_notional REAL NOT NULL,
+             displayed_max_stop_risk REAL NOT NULL,expires_at TEXT NOT NULL,state TEXT NOT NULL,
+             final_quantity REAL,final_notional REAL,final_stop_risk REAL,binding_cap TEXT,
+             proposal_id TEXT,intent_id TEXT,payload TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+             UNIQUE(group_id,candidate_key))""",
+        """CREATE TABLE IF NOT EXISTS rotation_events(
+             id TEXT PRIMARY KEY,group_id TEXT NOT NULL,event_key TEXT NOT NULL,event_type TEXT NOT NULL,
+             from_state TEXT,to_state TEXT,safe_detail TEXT NOT NULL,created_at TEXT NOT NULL,
+             notification_claimed_at TEXT,notification_sent_at TEXT,UNIQUE(group_id,event_key))""",
+        """CREATE TABLE IF NOT EXISTS rotation_group_approvals(
+             id TEXT PRIMARY KEY,group_id TEXT NOT NULL,approval_id TEXT NOT NULL,sender_id TEXT NOT NULL,
+             command TEXT NOT NULL,ceiling_fingerprint TEXT NOT NULL,status TEXT NOT NULL,
+             created_at TEXT NOT NULL,consumed_at TEXT,UNIQUE(group_id,approval_id))""",
+        "CREATE INDEX IF NOT EXISTS idx_rotation_groups_state ON rotation_groups(state,expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_rotation_events_notify ON rotation_events(notification_sent_at,created_at)",
+    )
+    for statement in statements:
+        conn.execute(statement)
+    if record_migration:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (ROTATION_SCHEMA_VERSION, iso_now(), "additive exit-first rotation groups, dependencies, approvals and events"),
+        )
+
+
+class RotationCoordinator:
+    def __init__(self, storage: Any, *, config_hash: str | None = None) -> None:
+        self.storage = storage
+        self.config_hash = config_hash
+
+    def create_group(
+        self,
+        *,
+        run_id: str,
+        exit_legs: Sequence[Mapping[str, Any]],
+        contingent_entries: Sequence[Mapping[str, Any]],
+        expires_at: str | datetime,
+        registry_snapshot_id: str | None = None,
+        allocation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not exit_legs or not contingent_entries:
+            raise ValueError("rotation requires at least one exit and one contingent entry")
+        expiry = _utc(expires_at)
+        if expiry <= datetime.now(UTC):
+            raise ValueError("rotation expiry must be in the future")
+        canonical_exits: list[dict[str, Any]] = []
+        for leg in exit_legs:
+            if str(leg.get("side") or "").lower() != "sell" or float(leg.get("quantity") or 0) <= 0:
+                raise ValueError("rotation exits must be genuine positive-quantity sells")
+            canonical_exits.append({
+                "proposal_id": str(leg.get("proposal_id") or leg.get("id") or ""),
+                "symbol": str(leg.get("symbol") or "").upper(),
+                "quantity": float(leg.get("quantity") or 0),
+                "estimated_notional": max(0.0, float(leg.get("estimated_notional") or 0)),
+                "estimated_released_risk": max(0.0, float(leg.get("estimated_released_risk") or 0)),
+                "reason": str(leg.get("reason") or ""),
+                "position_state": str(leg.get("position_state") or ""),
+            })
+        canonical_entries: list[dict[str, Any]] = []
+        for candidate in contingent_entries:
+            if str(candidate.get("side") or "buy").lower() != "buy":
+                raise ValueError("rotation contingent entries must be buys")
+            candidate_key = str(candidate.get("candidate_key") or "")
+            quantity = float(candidate.get("max_quantity") or candidate.get("quantity") or 0)
+            notional = float(candidate.get("max_notional") or candidate.get("notional") or 0)
+            risk = float(candidate.get("max_stop_risk") or candidate.get("stop_risk") or 0)
+            if not candidate_key or quantity <= 0 or notional <= 0 or risk < 0:
+                raise ValueError("rotation candidate requires stable identity and positive displayed ceilings")
+            canonical_entries.append({
+                "proposal_id": str(candidate.get("proposal_id") or "") or None,
+                "candidate_key": candidate_key,
+                "strategy_version": str(candidate.get("strategy_version") or ""),
+                "symbol": str(candidate.get("symbol") or "").upper(),
+                "max_quantity": quantity,
+                "max_notional": notional,
+                "max_stop_risk": risk,
+                "payload": dict(candidate.get("payload") or {}),
+            })
+        fingerprint = _fingerprint({
+            "exits": canonical_exits,
+            "entries": canonical_entries,
+            "registry_snapshot_id": registry_snapshot_id,
+            "allocation_id": allocation_id,
+            "formula": ROTATION_FORMULA_VERSION,
+            "config_hash": self.config_hash,
+        })
+        group_id = fingerprint[:32]
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM rotation_groups WHERE decision_fingerprint=?", (fingerprint,)).fetchone()
+            if existing:
+                return dict(existing)
+            exit_symbols = sorted({row["symbol"] for row in canonical_exits})
+            if exit_symbols:
+                placeholders = ",".join("?" for _ in exit_symbols)
+                logical_existing = conn.execute(
+                    f"""SELECT DISTINCT g.* FROM rotation_groups g
+                        JOIN rotation_steps s ON s.group_id=g.id AND s.role='rotation_exit'
+                        WHERE s.symbol IN ({placeholders}) AND g.expires_at>?
+                          AND g.state NOT IN ({','.join('?' for _ in TERMINAL_STATES)})
+                        ORDER BY g.created_at LIMIT 1""",
+                    (*exit_symbols, now, *(state.value for state in TERMINAL_STATES)),
+                ).fetchone()
+                if logical_existing is not None:
+                    raise RuntimeError("an active logical rotation already owns this exit")
+            conn.execute(
+                """INSERT INTO rotation_groups(
+                     id,run_id,state,expires_at,estimated_release_notional,registry_snapshot_id,allocation_id,
+                     schema_version,formula_version,config_hash,decision_fingerprint,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (group_id, run_id, RotationState.PENDING_GROUP_APPROVAL.value, expiry.isoformat(),
+                 sum(row["estimated_notional"] for row in canonical_exits), registry_snapshot_id, allocation_id,
+                 ROTATION_SCHEMA_VERSION, ROTATION_FORMULA_VERSION, self.config_hash, fingerprint, now, now),
+            )
+            for sequence, leg in enumerate(canonical_exits):
+                conn.execute(
+                    """INSERT INTO rotation_steps(
+                         id,group_id,sequence,role,proposal_id,symbol,side,state,requested_quantity,payload,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), group_id, sequence, "rotation_exit", leg["proposal_id"], leg["symbol"],
+                     "sell", "pending", leg["quantity"], json_dumps(leg), now),
+                )
+            for candidate in canonical_entries:
+                entry_id = _fingerprint([group_id, candidate["candidate_key"]])[:32]
+                conn.execute(
+                    """INSERT INTO rotation_contingent_entries(
+                         id,group_id,candidate_key,strategy_version,symbol,displayed_max_quantity,
+                         displayed_max_notional,displayed_max_stop_risk,expires_at,state,proposal_id,payload,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (entry_id, group_id, candidate["candidate_key"], candidate["strategy_version"], candidate["symbol"],
+                     candidate["max_quantity"], candidate["max_notional"], candidate["max_stop_risk"],
+                     expiry.isoformat(), "contingent", candidate["proposal_id"], json_dumps(candidate["payload"]), now, now),
+                )
+            self._event(conn, group_id, "created", "rotation_group_created", None,
+                        RotationState.PENDING_GROUP_APPROVAL, {"capital_reserved": False, "estimated_release_only": True})
+        return self.get_group(group_id)
+
+    def approve(self, group_id: str, *, approval_id: str, sender_id: str, command: str) -> dict[str, Any]:
+        group = self.get_group(group_id)
+        if _utc(group["expires_at"]) <= datetime.now(UTC):
+            return self.transition(group_id, RotationState.EXPIRED, reason="group expired before approval")
+        entries = self.entries(group_id)
+        ceiling_fingerprint = _fingerprint([
+            (row["candidate_key"], row["displayed_max_quantity"], row["displayed_max_notional"], row["displayed_max_stop_risk"])
+            for row in entries
+        ])
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not current or current["state"] != RotationState.PENDING_GROUP_APPROVAL.value:
+                raise RuntimeError("rotation group is not pending approval")
+            conn.execute(
+                """INSERT INTO rotation_group_approvals(
+                     id,group_id,approval_id,sender_id,command,ceiling_fingerprint,status,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), group_id, approval_id, str(sender_id), command, ceiling_fingerprint, "active", now),
+            )
+            conn.execute(
+                "UPDATE rotation_groups SET state=?,approval_id=?,approved_at=?,updated_at=? WHERE id=?",
+                (RotationState.APPROVED_EXIT_PENDING.value, approval_id, now, now, group_id),
+            )
+            self._event(conn, group_id, f"approval:{approval_id}", "group_approved",
+                        RotationState.PENDING_GROUP_APPROVAL, RotationState.APPROVED_EXIT_PENDING,
+                        {"explicit_group_command": True, "entry_ceiling_fingerprint": ceiling_fingerprint})
+        return self.get_group(group_id)
+
+    def reject(self, group_id: str, *, reason: str = "explicit group rejection") -> dict[str, Any]:
+        return self.transition(group_id, RotationState.REJECTED, reason=reason)
+
+    def approval_is_current(self, group_id: str) -> bool:
+        entries = self.entries(group_id)
+        expected = _fingerprint([
+            (row["candidate_key"], row["displayed_max_quantity"], row["displayed_max_notional"], row["displayed_max_stop_risk"])
+            for row in entries
+        ])
+        rows = self.storage.fetch_all(
+            """SELECT a.*,g.approval_id AS group_approval_id,g.expires_at FROM rotation_group_approvals a
+               JOIN rotation_groups g ON g.id=a.group_id
+               WHERE a.group_id=? ORDER BY a.created_at DESC LIMIT 1""",
+            (group_id,),
+        )
+        if not rows:
+            return False
+        row = rows[0]
+        return bool(
+            row.get("approval_id") == row.get("group_approval_id")
+            and row.get("ceiling_fingerprint") == expected
+            and row.get("status") in {"active", "exit_submitted"}
+            and row.get("consumed_at")
+            and _utc(str(row.get("expires_at"))) > datetime.now(UTC)
+        )
+
+    def record_exit_submitted(self, group_id: str, *, step_id: str, intent_id: str) -> dict[str, Any]:
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not group:
+                raise KeyError(group_id)
+            current = RotationState(group["state"])
+            if current in {RotationState.EXIT_SUBMITTED, RotationState.EXIT_PARTIALLY_FILLED}:
+                linked = conn.execute(
+                    "SELECT intent_id FROM rotation_steps WHERE id=? AND group_id=? AND role='rotation_exit'",
+                    (step_id, group_id),
+                ).fetchone()
+                if not linked:
+                    raise RuntimeError("rotation exit step not found")
+                if linked["intent_id"] is not None and linked["intent_id"] != intent_id:
+                    raise RuntimeError("rotation exit step already belongs to another intent")
+                if linked["intent_id"] == intent_id:
+                    return dict(group)
+                conn.execute(
+                    "UPDATE rotation_steps SET intent_id=?,state='submitted',updated_at=? WHERE id=?",
+                    (intent_id, now, step_id),
+                )
+                self._event(conn, group_id, f"exit-submitted:{intent_id}", "exit_submitted",
+                            current, current, {"intent_id": intent_id, "additional_exit_leg": True})
+                return dict(group)
+            self._require_transition(current, RotationState.EXIT_SUBMITTED)
+            changed = conn.execute(
+                "UPDATE rotation_steps SET intent_id=?,state='submitted',updated_at=? WHERE id=? AND group_id=? AND role='rotation_exit'",
+                (intent_id, now, step_id, group_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("rotation exit step not found")
+            conn.execute("UPDATE rotation_groups SET state=?,updated_at=? WHERE id=?",
+                         (RotationState.EXIT_SUBMITTED.value, now, group_id))
+            self._event(conn, group_id, f"exit-submitted:{intent_id}", "exit_submitted", current,
+                        RotationState.EXIT_SUBMITTED, {"intent_id": intent_id})
+        return self.get_group(group_id)
+
+    def record_exit_fill(
+        self,
+        group_id: str,
+        *,
+        intent_id: str,
+        cumulative_quantity: float,
+        cumulative_notional: float,
+        released_risk: float,
+        exit_complete: bool,
+    ) -> dict[str, Any]:
+        values = (float(cumulative_quantity), float(cumulative_notional), float(released_risk))
+        if any(not math.isfinite(value) or value < 0 for value in values) or cumulative_quantity <= 0:
+            raise ValueError("authoritative cumulative fill values must be finite and non-negative")
+        now = iso_now()
+        target = RotationState.EXIT_FILLED if exit_complete else RotationState.EXIT_PARTIALLY_FILLED
+        event_key = f"exit-fill:{intent_id}:{cumulative_quantity:.12f}:{cumulative_notional:.8f}"
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            step = conn.execute(
+                "SELECT * FROM rotation_steps WHERE group_id=? AND intent_id=? AND role='rotation_exit'",
+                (group_id, intent_id),
+            ).fetchone()
+            if not group or not step:
+                raise RuntimeError("rotation exit intent linkage is missing")
+            if cumulative_quantity + 1e-12 < float(step["filled_quantity"] or 0) or cumulative_notional + 1e-9 < float(step["filled_notional"] or 0):
+                raise RuntimeError("cumulative exit fill cannot move backward")
+            current = RotationState(group["state"])
+            exit_dependency_active = current in {
+                RotationState.EXIT_SUBMITTED,
+                RotationState.EXIT_PARTIALLY_FILLED,
+            }
+            if exit_dependency_active:
+                self._require_transition(current, target)
+            conn.execute(
+                """UPDATE rotation_steps SET state=?,filled_quantity=?,filled_notional=?,released_risk=?,updated_at=?
+                   WHERE id=?""",
+                ("filled" if exit_complete else "partially_filled", cumulative_quantity, cumulative_notional,
+                 released_risk, now, step["id"]),
+            )
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM rotation_steps WHERE group_id=? AND role='rotation_exit' AND state!='filled'",
+                (group_id,),
+            ).fetchone()[0]
+            target = RotationState.EXIT_FILLED if int(remaining) == 0 else RotationState.EXIT_PARTIALLY_FILLED
+            if exit_dependency_active:
+                self._require_transition(current, target)
+            totals = conn.execute(
+                "SELECT COALESCE(SUM(filled_notional),0),COALESCE(SUM(released_risk),0) FROM rotation_steps WHERE group_id=? AND role='rotation_exit'",
+                (group_id,),
+            ).fetchone()
+            persisted_state = target if exit_dependency_active else current
+            conn.execute(
+                "UPDATE rotation_groups SET state=?,actual_released_notional=?,actual_released_risk=?,updated_at=? WHERE id=?",
+                (persisted_state.value, float(totals[0]), float(totals[1]), now, group_id),
+            )
+            event_type = (
+                "exit_filled" if target == RotationState.EXIT_FILLED else "exit_partially_filled"
+            ) if exit_dependency_active else "late_exit_fill_reconciled"
+            self._event(conn, group_id, event_key, event_type,
+                        current, persisted_state, {"intent_id": intent_id, "actual_capacity_only": True,
+                                                   "additional_capacity_not_reused": not exit_dependency_active,
+                                                   "cumulative_quantity": cumulative_quantity,
+                                                   "cumulative_notional": cumulative_notional,
+                                                   "released_risk": released_risk})
+        return self.get_group(group_id)
+
+    def record_exit_terminal(
+        self, group_id: str, *, intent_id: str, terminal_state: str
+    ) -> dict[str, Any]:
+        """Quiesce a terminal exit leg after all known partial fills are accounted.
+
+        A later increase in the linked intent's cumulative fill still makes the
+        terminal group recoverable, so late broker evidence can be reconciled
+        without reviving or enlarging the dependency decision.
+        """
+        terminal_state = str(terminal_state).lower()
+        if terminal_state not in {"cancelled", "rejected", "expired"}:
+            raise ValueError("rotation exit terminal state is unsupported")
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute(
+                "SELECT * FROM rotation_groups WHERE id=?", (group_id,)
+            ).fetchone()
+            step = conn.execute(
+                """SELECT * FROM rotation_steps
+                   WHERE group_id=? AND intent_id=? AND role='rotation_exit'""",
+                (group_id, intent_id),
+            ).fetchone()
+            if not group or not step:
+                raise RuntimeError("rotation exit intent linkage is missing")
+            state = f"terminal_{terminal_state}"
+            conn.execute(
+                "UPDATE rotation_steps SET state=?,reason=?,updated_at=? WHERE id=? AND state!='filled'",
+                (state, f"linked intent {terminal_state}", now, step["id"]),
+            )
+            self._event(
+                conn, group_id, f"exit-terminal:{intent_id}:{terminal_state}",
+                "exit_terminal_reconciled", RotationState(group["state"]),
+                RotationState(group["state"]),
+                {"intent_id": intent_id, "terminal_state": terminal_state,
+                 "known_partial_fill_accounted": float(step["filled_quantity"] or 0.0)},
+            )
+        return self.get_group(group_id)
+
+    def begin_reconciliation(self, group_id: str) -> dict[str, Any]:
+        return self.transition(group_id, RotationState.RECONCILIATION_PENDING,
+                               reason="authoritative exit fill requires account and position reconciliation")
+
+    def record_reconciliation(
+        self,
+        group_id: str,
+        *,
+        cash: float,
+        buying_power: float,
+        snapshot_fingerprint: str,
+    ) -> dict[str, Any]:
+        if not snapshot_fingerprint or any(not math.isfinite(float(value)) or float(value) < 0 for value in (cash, buying_power)):
+            raise ValueError("reconciliation requires finite account capacity and a snapshot fingerprint")
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not group:
+                raise KeyError(group_id)
+            current = RotationState(group["state"])
+            self._require_transition(current, RotationState.RECONCILED)
+            if float(group["actual_released_notional"] or 0) <= 0:
+                raise RuntimeError("reconciliation cannot authorize capacity without an actual exit fill")
+            conn.execute(
+                """UPDATE rotation_groups SET state=?,reconciled_cash=?,reconciled_buying_power=?,
+                   reconciliation_fingerprint=?,updated_at=? WHERE id=?""",
+                (RotationState.RECONCILED.value, float(cash), float(buying_power), snapshot_fingerprint, now, group_id),
+            )
+            self._event(conn, group_id, f"reconciled:{snapshot_fingerprint}", "reconciliation_complete",
+                        current, RotationState.RECONCILED, {"actual_fill_required": True})
+        return self.get_group(group_id)
+
+    def revalidate_entry(
+        self,
+        group_id: str,
+        contingent_entry_id: str,
+        *,
+        candidate_key: str,
+        price: float,
+        requested_quantity: float,
+        stop_risk_per_share: float,
+        allocation_notional_cap: float,
+        allocation_risk_cap: float,
+        other_available_cash: float,
+        minimum_notional: float,
+        registry_snapshot_id: str,
+        allocation_id: str,
+    ) -> RevalidatedRotationEntry:
+        numbers = (price, requested_quantity, stop_risk_per_share, allocation_notional_cap,
+                   allocation_risk_cap, other_available_cash, minimum_notional)
+        if any(not math.isfinite(float(value)) or float(value) < 0 for value in numbers) or price <= 0:
+            raise ValueError("rotation entry revalidation inputs must be finite and non-negative")
+        group = self.get_group(group_id)
+        if RotationState(group["state"]) != RotationState.RECONCILED:
+            raise RuntimeError("contingent entry cannot revalidate before fill reconciliation")
+        rows = [row for row in self.entries(group_id) if row["id"] == contingent_entry_id]
+        if len(rows) != 1:
+            raise KeyError(contingent_entry_id)
+        entry = rows[0]
+        if _utc(entry["expires_at"]) <= datetime.now(UTC):
+            self.transition(group_id, RotationState.EXPIRED, reason="contingent entry expired")
+            return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
+                                            "expiry", "contingent entry expired")
+        if candidate_key != entry["candidate_key"]:
+            self.transition(group_id, RotationState.ENTRY_BLOCKED, reason="contingent candidate changed materially")
+            return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
+                                            "candidate_identity", "candidate changed; new approval required")
+        if not registry_snapshot_id:
+            raise ValueError("current registry snapshot is required")
+        displayed_qty = float(entry["displayed_max_quantity"])
+        displayed_notional = float(entry["displayed_max_notional"])
+        displayed_risk = float(entry["displayed_max_stop_risk"])
+        caps = {
+            "displayed_quantity": displayed_qty * price,
+            "displayed_notional": displayed_notional,
+            "actual_exit_release": float(group["actual_released_notional"] or 0),
+            "reconciled_cash": float(group["reconciled_cash"] or 0),
+            "reconciled_buying_power": float(group["reconciled_buying_power"] or 0),
+            "other_available_cash": float(other_available_cash),
+            "current_strategy_allocation": float(allocation_notional_cap),
+            "requested_quantity": float(requested_quantity) * price,
+        }
+        binding_cap, final_notional = min(caps.items(), key=lambda item: (item[1], item[0]))
+        risk_qty = displayed_qty
+        if stop_risk_per_share > 0:
+            risk_qty = min(risk_qty, displayed_risk / stop_risk_per_share, allocation_risk_cap / stop_risk_per_share)
+        else:
+            risk_qty = 0.0
+        final_quantity = min(displayed_qty, requested_quantity, final_notional / price, risk_qty)
+        final_notional = max(0.0, final_quantity * price)
+        final_risk = max(0.0, final_quantity * stop_risk_per_share)
+        if final_notional < minimum_notional or final_quantity <= 0:
+            self.transition(group_id, RotationState.ENTRY_BLOCKED, reason="actual released capacity leaves no executable entry")
+            return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
+                                            binding_cap, "entry blocked after fresh post-fill allocation")
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT state FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not current or current["state"] != RotationState.RECONCILED.value:
+                raise RuntimeError("rotation group changed during entry revalidation")
+            conn.execute(
+                "UPDATE rotation_groups SET state=?,registry_snapshot_id=?,allocation_id=?,updated_at=? WHERE id=?",
+                (RotationState.ENTRY_REVALIDATING.value, registry_snapshot_id, allocation_id, now, group_id),
+            )
+            conn.execute(
+                """UPDATE rotation_contingent_entries SET state='revalidated',final_quantity=?,final_notional=?,
+                   final_stop_risk=?,binding_cap=?,updated_at=? WHERE id=? AND state='contingent'""",
+                (final_quantity, final_notional, final_risk, binding_cap, now, contingent_entry_id),
+            )
+            self._event(conn, group_id, f"entry-revalidated:{contingent_entry_id}:{allocation_id}",
+                        (
+                            "entry_reduced"
+                            if final_quantity < displayed_qty - 1e-12
+                            or final_notional < displayed_notional - 1e-9
+                            or final_risk < displayed_risk - 1e-9
+                            else "contingent_entry_revalidated"
+                        ), RotationState.RECONCILED,
+                        RotationState.ENTRY_REVALIDATING,
+                        {"preserve_reduce_or_block_only": True, "binding_cap": binding_cap,
+                         "final_quantity": final_quantity, "final_notional": final_notional,
+                         "final_stop_risk": final_risk})
+        return RevalidatedRotationEntry(True, group_id, contingent_entry_id, entry["symbol"], final_quantity,
+                                        final_notional, final_risk, binding_cap,
+                                        "fresh post-fill allocation passed without enlargement")
+
+    def record_entry_reserved(self, group_id: str, contingent_entry_id: str, *, intent_id: str) -> dict[str, Any]:
+        return self._entry_intent_transition(group_id, contingent_entry_id, intent_id,
+                                             RotationState.ENTRY_RESERVED, "entry_reserved")
+
+    def record_entry_submitted(self, group_id: str, contingent_entry_id: str, *, intent_id: str) -> dict[str, Any]:
+        return self._entry_intent_transition(group_id, contingent_entry_id, intent_id,
+                                             RotationState.ENTRY_SUBMITTED, "entry_submitted")
+
+    def complete(self, group_id: str) -> dict[str, Any]:
+        entries = self.entries(group_id)
+        intent_ids = [str(row.get("intent_id")) for row in entries if row.get("intent_id")]
+        if len(intent_ids) != 1:
+            raise RuntimeError("rotation completion requires exactly one linked entry intent")
+        rows = self.storage.fetch_all("SELECT state FROM order_intents WHERE id=?", (intent_ids[0],))
+        if not rows or rows[0]["state"] != "filled":
+            raise RuntimeError("rotation completion requires authoritative entry fill reconciliation")
+        return self.transition(group_id, RotationState.COMPLETED, reason="rotation entry fill reconciled")
+
+    def reset_entry_for_revalidation(self, group_id: str) -> dict[str, Any]:
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not group or group["state"] != RotationState.ENTRY_REVALIDATING.value:
+                raise RuntimeError("only an interrupted entry revalidation can be reset")
+            linked = conn.execute(
+                "SELECT COUNT(*) FROM rotation_contingent_entries WHERE group_id=? AND intent_id IS NOT NULL",
+                (group_id,),
+            ).fetchone()[0]
+            if int(linked):
+                raise RuntimeError("linked entry intent must be reconciled, not revalidated")
+            conn.execute(
+                """UPDATE rotation_contingent_entries SET state='contingent',final_quantity=NULL,
+                   final_notional=NULL,final_stop_risk=NULL,binding_cap=NULL,updated_at=? WHERE group_id=?""",
+                (now, group_id),
+            )
+            conn.execute(
+                "UPDATE rotation_groups SET state=?,registry_snapshot_id=NULL,allocation_id=NULL,updated_at=? WHERE id=?",
+                (RotationState.RECONCILED.value, now, group_id),
+            )
+            self._event(conn, group_id, "entry-revalidation-recovered", "entry_revalidation_recovered",
+                        RotationState.ENTRY_REVALIDATING, RotationState.RECONCILED,
+                        {"fresh_revalidation_required": True})
+        return self.get_group(group_id)
+
+    def fail_exit(self, group_id: str, *, reason: str) -> dict[str, Any]:
+        return self.transition(group_id, RotationState.EXIT_FAILED, reason=reason)
+
+    def transition(self, group_id: str, target: RotationState, *, reason: str) -> dict[str, Any]:
+        target = RotationState(target)
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if not group:
+                raise KeyError(group_id)
+            current = RotationState(group["state"])
+            if current == target:
+                return dict(group)
+            if current in TERMINAL_STATES:
+                return dict(group)
+            self._require_transition(current, target)
+            terminal_reason = reason if target in TERMINAL_STATES else group["terminal_reason"]
+            conn.execute("UPDATE rotation_groups SET state=?,terminal_reason=?,updated_at=? WHERE id=?",
+                         (target.value, terminal_reason, now, group_id))
+            if target in TERMINAL_STATES:
+                conn.execute(
+                    "UPDATE rotation_contingent_entries SET state='blocked',updated_at=? WHERE group_id=? AND state IN ('contingent','revalidated')",
+                    (now, group_id),
+                )
+                proposal_status = {
+                    RotationState.EXPIRED: "expired",
+                    RotationState.REJECTED: "rejected",
+                }.get(target, "blocked")
+                conn.execute(
+                    """UPDATE trade_proposals SET status=? WHERE id IN (
+                           SELECT proposal_id FROM rotation_contingent_entries WHERE group_id=?
+                       ) AND status IN ('pending','approved')""",
+                    (proposal_status, group_id),
+                )
+            self._event(conn, group_id, f"transition:{current.value}:{target.value}:{_fingerprint(reason)[:12]}",
+                        target.value, current, target, {"reason": reason})
+        return self.get_group(group_id)
+
+    def expire_stale(self, *, now: datetime | None = None) -> int:
+        instant = (now or datetime.now(UTC)).isoformat()
+        rows = self.storage.fetch_all(
+            "SELECT id FROM rotation_groups WHERE expires_at<=? AND state IN (?,?,?,?,?)",
+            (instant, RotationState.PENDING_GROUP_APPROVAL.value,
+             RotationState.APPROVED_EXIT_PENDING.value, RotationState.EXIT_SUBMITTED.value,
+             RotationState.EXIT_PARTIALLY_FILLED.value, RotationState.RECONCILED.value),
+        )
+        for row in rows:
+            self.transition(row["id"], RotationState.EXPIRED, reason="rotation group or candidate expired")
+        return len(rows)
+
+    def claim_notification(self, group_id: str, event_key: str) -> bool:
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                """UPDATE rotation_events SET notification_claimed_at=?
+                   WHERE group_id=? AND event_key=? AND notification_claimed_at IS NULL AND notification_sent_at IS NULL""",
+                (now, group_id, event_key),
+            )
+            return changed.rowcount == 1
+
+    def mark_notification_sent(self, group_id: str, event_key: str) -> None:
+        self.storage.execute(
+            "UPDATE rotation_events SET notification_sent_at=? WHERE group_id=? AND event_key=? AND notification_sent_at IS NULL",
+            (iso_now(), group_id, event_key),
+        )
+
+    def release_notification_claim(self, group_id: str, event_key: str) -> None:
+        self.storage.execute(
+            """UPDATE rotation_events SET notification_claimed_at=NULL
+               WHERE group_id=? AND event_key=? AND notification_sent_at IS NULL""",
+            (group_id, event_key),
+        )
+
+    def recovery_actions(self) -> list[dict[str, Any]]:
+        terminal = tuple(state.value for state in sorted(TERMINAL_STATES, key=lambda value: value.value))
+        placeholders = ",".join("?" for _ in terminal)
+        rows = self.storage.fetch_all(
+            f"""SELECT * FROM rotation_groups g
+                WHERE g.state NOT IN ({placeholders})
+                    OR EXISTS (
+                       SELECT 1 FROM rotation_steps s
+                       LEFT JOIN order_intents i ON i.id=s.intent_id
+                       WHERE s.group_id=g.id AND s.role='rotation_exit'
+                         AND s.intent_id IS NOT NULL
+                         AND (
+                           s.state NOT IN ('filled','terminal_cancelled','terminal_rejected','terminal_expired')
+                           OR COALESCE(i.filled_quantity,0)>COALESCE(s.filled_quantity,0)+0.000000000001
+                         )
+                   )
+                ORDER BY g.created_at,g.id""",
+            terminal,
+        )
+        actions: list[dict[str, Any]] = []
+        for row in rows:
+            state = RotationState(row["state"])
+            if state in {RotationState.EXIT_SUBMITTED, RotationState.EXIT_PARTIALLY_FILLED, RotationState.EXIT_FILLED}:
+                action = "reconcile_exit_only"
+            elif state == RotationState.RECONCILIATION_PENDING:
+                action = "finish_reconciliation"
+            elif state in {RotationState.RECONCILED, RotationState.ENTRY_REVALIDATING}:
+                action = "revalidate_contingent_entry"
+            elif state in {RotationState.ENTRY_RESERVED, RotationState.ENTRY_SUBMITTED}:
+                action = "reconcile_entry_only"
+            else:
+                action = "await_manual_or_exit_action"
+            actions.append({"group_id": row["id"], "state": state.value, "action": action,
+                            "broker_submission_allowed": False})
+        return actions
+
+    def get_group(self, group_id: str) -> dict[str, Any]:
+        rows = self.storage.fetch_all("SELECT * FROM rotation_groups WHERE id=?", (group_id,))
+        if not rows:
+            raise KeyError(group_id)
+        return rows[0]
+
+    def entries(self, group_id: str) -> list[dict[str, Any]]:
+        return self.storage.fetch_all(
+            "SELECT * FROM rotation_contingent_entries WHERE group_id=? ORDER BY id", (group_id,)
+        )
+
+    def steps(self, group_id: str) -> list[dict[str, Any]]:
+        return self.storage.fetch_all(
+            "SELECT * FROM rotation_steps WHERE group_id=? ORDER BY sequence,role,id", (group_id,)
+        )
+
+    def _entry_intent_transition(
+        self,
+        group_id: str,
+        contingent_entry_id: str,
+        intent_id: str,
+        target: RotationState,
+        event_type: str,
+    ) -> dict[str, Any]:
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            entry = conn.execute(
+                "SELECT * FROM rotation_contingent_entries WHERE id=? AND group_id=?",
+                (contingent_entry_id, group_id),
+            ).fetchone()
+            if not group or not entry:
+                raise RuntimeError("rotation contingent entry linkage is missing")
+            current = RotationState(group["state"])
+            if current == target:
+                if entry["intent_id"] == intent_id:
+                    return dict(group)
+                raise RuntimeError("rotation entry state already belongs to another intent")
+            self._require_transition(current, target)
+            if target == RotationState.ENTRY_RESERVED and entry["state"] != "revalidated":
+                raise RuntimeError("entry cannot reserve before post-fill revalidation")
+            conn.execute(
+                "UPDATE rotation_contingent_entries SET state=?,intent_id=?,updated_at=? WHERE id=?",
+                ("reserved" if target == RotationState.ENTRY_RESERVED else "submitted", intent_id, now,
+                 contingent_entry_id),
+            )
+            conn.execute("UPDATE rotation_groups SET state=?,updated_at=? WHERE id=?", (target.value, now, group_id))
+            self._event(conn, group_id, f"{event_type}:{intent_id}", event_type, current, target,
+                        {"intent_id": intent_id, "capital_reservation_after_reconciliation": True})
+        return self.get_group(group_id)
+
+    @staticmethod
+    def _require_transition(current: RotationState, target: RotationState) -> None:
+        if target not in ALLOWED_TRANSITIONS.get(current, set()):
+            raise RuntimeError(f"invalid rotation transition {current.value} -> {target.value}")
+
+    @staticmethod
+    def _event(
+        conn: Any,
+        group_id: str,
+        event_key: str,
+        event_type: str,
+        from_state: RotationState | None,
+        to_state: RotationState,
+        detail: Mapping[str, Any],
+    ) -> None:
+        conn.execute(
+            """INSERT OR IGNORE INTO rotation_events(
+                 id,group_id,event_key,event_type,from_state,to_state,safe_detail,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), group_id, event_key, event_type,
+             from_state.value if from_state is not None else None, to_state.value,
+             json_dumps(dict(detail)), iso_now()),
+        )
+
+
+__all__ = [
+    "ROTATION_FORMULA_VERSION",
+    "ROTATION_SCHEMA_VERSION",
+    "RevalidatedRotationEntry",
+    "RotationApprovalResult",
+    "RotationCoordinator",
+    "RotationState",
+    "apply_rotation_schema",
+    "parse_rotation_approval",
+]

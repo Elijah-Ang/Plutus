@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any, Callable
 
 from .execution import DurableExecutionStore
+from .order_state import OrderState
 from .utils import iso_now, json_dumps
 
 
@@ -80,6 +81,7 @@ ALLOWED_WORKFLOW_TRANSITIONS: dict[ApprovalWorkflowState, set[ApprovalWorkflowSt
     },
     ApprovalWorkflowState.SUBMISSION_PENDING: {
         ApprovalWorkflowState.SUBMISSION_STARTED,
+        ApprovalWorkflowState.BLOCKED,
         ApprovalWorkflowState.UNKNOWN,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
@@ -435,6 +437,7 @@ class ApprovalWorkflowStore:
         proposal_loader: Callable[[str], dict[str, Any] | None],
         run_id: str | None,
         validator: Callable[[dict[str, Any], dict[str, Any] | None], tuple[str, dict[str, Any] | None, str | None]] | None = None,
+        action_validator: Callable[[dict[str, Any], dict[str, Any] | None], tuple[str, dict[str, Any] | None, str | None]] | None = None,
         submitter: Callable[[dict[str, Any], dict[str, Any]], str] | None = None,
         lookup_reconciler: Callable[[dict[str, Any], dict[str, Any] | None], str] | None = None,
         max_items: int = 100,
@@ -528,6 +531,33 @@ class ApprovalWorkflowStore:
                         raise ValueError("validator returned an unsupported recovery decision")
                 if state == ApprovalWorkflowState.APPROVED_PENDING_INTENT:
                     proposal = proposal_for_recovery or proposal_loader(workflow["proposal_id"])
+                    action_allowed = True
+                    action_reason: str | None = None
+                    if proposal is not None and action_validator is not None:
+                        action_decision, validated_proposal, action_reason = action_validator(
+                            self.get(workflow_id), proposal
+                        )
+                        if validated_proposal is not None:
+                            proposal = validated_proposal
+                        if action_decision == "blocked":
+                            self.transition(
+                                workflow_id,
+                                ApprovalWorkflowState.BLOCKED,
+                                owner_token=owner_token,
+                                validation_status="blocked",
+                                safe_detail=action_reason or "recovery action authority is no longer current",
+                            )
+                            counts["blocked"] += 1
+                            action_allowed = False
+                        elif action_decision == "retry":
+                            self._audit(
+                                "approval_workflow_recovery_deferred",
+                                workflow_id,
+                                {"state": state.value, "reason": action_reason or "upstream coordinator owns recovery"},
+                            )
+                            action_allowed = False
+                        elif action_decision != "approved":
+                            raise ValueError("action validator returned an unsupported recovery decision")
                     if proposal is None:
                         self.transition(
                             workflow_id,
@@ -536,6 +566,8 @@ class ApprovalWorkflowStore:
                             safe_detail="proposal record unavailable during recovery",
                         )
                         counts["external_ambiguity"] += 1
+                    elif not action_allowed:
+                        pass
                     elif str(proposal.get("status")) in {"expired", "rejected", "superseded"}:
                         self.transition(
                             workflow_id,
@@ -630,33 +662,67 @@ class ApprovalWorkflowStore:
                         )
                         counts["external_ambiguity"] += 1
                     else:
-                        self.transition(
-                            workflow_id,
-                            ApprovalWorkflowState.SUBMISSION_STARTED,
-                            owner_token=owner_token,
-                            safe_detail="bounded submission callback starting",
-                        )
-                        # Deliberately outside every SQLite transaction.
-                        try:
-                            outcome = submitter(self.get(workflow_id), intent)
-                        except Exception as exc:
-                            outcome = "unknown"
-                            reason = type(exc).__name__
-                        target = {
-                            "submitted": ApprovalWorkflowState.SUBMITTED,
-                            "terminal": ApprovalWorkflowState.TERMINAL,
-                            "unknown": ApprovalWorkflowState.UNKNOWN,
-                        }.get(str(outcome).lower())
-                        if target is None:
-                            raise ValueError("submitter returned an unsupported recovery outcome")
-                        self.transition(
-                            workflow_id,
-                            target,
-                            owner_token=owner_token,
-                            safe_detail=("bounded submission result persisted" if target != ApprovalWorkflowState.UNKNOWN else f"ambiguous submission outcome: {locals().get('reason', 'unknown')}")
-                        )
-                        if target == ApprovalWorkflowState.UNKNOWN:
-                            counts["external_ambiguity"] += 1
+                        proposal = proposal_loader(workflow["proposal_id"])
+                        action_allowed = True
+                        action_reason: str | None = None
+                        if action_validator is not None:
+                            action_decision, _validated_proposal, action_reason = action_validator(
+                                self.get(workflow_id), proposal
+                            )
+                            if action_decision == "blocked":
+                                DurableExecutionStore(self.storage).transition(
+                                    str(intent["id"]),
+                                    OrderState.EXPIRED,
+                                    event_type="recovery_action_authority_expired",
+                                    safe_summary=action_reason or "dependent authority expired",
+                                    expected_state=OrderState(str(intent["state"])),
+                                )
+                                self.transition(
+                                    workflow_id,
+                                    ApprovalWorkflowState.BLOCKED,
+                                    owner_token=owner_token,
+                                    validation_status="blocked",
+                                    safe_detail=action_reason or "recovery submission authority is no longer current",
+                                )
+                                counts["blocked"] += 1
+                                action_allowed = False
+                            elif action_decision == "retry":
+                                self._audit(
+                                    "approval_workflow_recovery_deferred",
+                                    workflow_id,
+                                    {"state": state.value, "reason": action_reason or "upstream coordinator owns submission"},
+                                )
+                                action_allowed = False
+                            elif action_decision != "approved":
+                                raise ValueError("action validator returned an unsupported recovery decision")
+                        if action_allowed:
+                            self.transition(
+                                workflow_id,
+                                ApprovalWorkflowState.SUBMISSION_STARTED,
+                                owner_token=owner_token,
+                                safe_detail="bounded submission callback starting",
+                            )
+                            # Deliberately outside every SQLite transaction.
+                            try:
+                                outcome = submitter(self.get(workflow_id), intent)
+                            except Exception as exc:
+                                outcome = "unknown"
+                                reason = type(exc).__name__
+                            target = {
+                                "submitted": ApprovalWorkflowState.SUBMITTED,
+                                "terminal": ApprovalWorkflowState.TERMINAL,
+                                "unknown": ApprovalWorkflowState.UNKNOWN,
+                            }.get(str(outcome).lower())
+                            if target is None:
+                                raise ValueError("submitter returned an unsupported recovery outcome")
+                            self.transition(
+                                workflow_id,
+                                target,
+                                owner_token=owner_token,
+                                safe_detail=("bounded submission result persisted" if target != ApprovalWorkflowState.UNKNOWN else f"ambiguous submission outcome: {locals().get('reason', 'unknown')}")
+                            )
+                            if target == ApprovalWorkflowState.UNKNOWN:
+                                counts["external_ambiguity"] += 1
                 elif state == ApprovalWorkflowState.UNKNOWN and lookup_reconciler is not None:
                     intent = intent_rows[0] if intent_rows else None
                     # Lookup-only callback: this path never calls submitter and runs

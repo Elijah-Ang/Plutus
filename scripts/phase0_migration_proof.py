@@ -87,13 +87,13 @@ def run_proof(source: Path, workdir: Path) -> dict[str, object]:
     source_meta = _schema_metadata(pre)
     migration_started = _utc()
     start = time.monotonic()
-    Storage(migrated).initialize()
+    Storage(migrated).apply_explicit_migrations(production_paper=False)
     migration_seconds = time.monotonic() - start
     migration_completed = _utc()
     migrated_meta = _schema_metadata(migrated)
     # Repeated startup must be idempotent and cheap relative to the first pass.
     repeat_start = time.monotonic()
-    Storage(migrated).initialize()
+    Storage(migrated).apply_explicit_migrations(production_paper=False)
     repeat_seconds = time.monotonic() - repeat_start
     repeated_meta = _schema_metadata(migrated)
     # Restoration uses SQLite backup too, then verifies schema and every table count.
