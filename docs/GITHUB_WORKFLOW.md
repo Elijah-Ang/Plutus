@@ -32,6 +32,9 @@ Before committing or pushing code:
 2. **Review Diff**: Run `git diff --cached` to verify that no API keys or personal identifiers are written into code.
 3. **Run Tests**: Verify all tests pass by running `.venv/bin/pytest`.
 4. **Run Secret Scan**: Use `scripts/safe_commit_push.sh` to check staged files for supported secret-value patterns and forbidden runtime paths. This is defense in depth, not a substitute for reviewing `git diff --cached` or a maintained secret scanner.
+5. **Run Release Eligibility**: Run `python scripts/check_release_eligibility.py`. A release review requires a clean exact commit, valid configuration, compatible/idempotent migrations, paper-only identity, green local tests, and a successful GitHub `CI` workflow linked to that same SHA.
+
+GitHub Actions runs for every pull request, every push to `main`, and the audit-hardening branch. It compiles `app`, `tests`, and `scripts`; validates configuration and migrations; runs no-live and paper-only capability suites; checks schema/version and deterministic replay contracts; exercises critical approval/execution/reconciliation/recovery paths; and finishes with the full pytest suite. Failed steps are release-blocking and are not allowed to continue.
 
 The helper scans staged blobs only. It does not certify Git history, unstaged files, or arbitrary unknown secret formats. For sensitive releases, also use a maintained scanner such as Gitleaks and review the staged diff manually.
 

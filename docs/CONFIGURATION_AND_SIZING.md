@@ -24,7 +24,7 @@ decisions and evidence:
   ceilings consumed by operational Adaptive Sizing.
 - `risk_engine_adaptive_ceiling_stop_probe_v4`: final hard validation.
 - `phase3_adaptive_modes_v4_operational_paper` and
-  `phase4_evidence_aware_allocation_v5_dimensionally_normalized`: operational mode and
+  `phase4_multi_strategy_allocation_v7_stop_risk_dollars`: operational mode and
   evidence-aware allocation boundaries.
 - `fifo_equity_unrealized_cashflow_v1`: realized FIFO P&L, account-equity
   change, unrealized change, and external cash-flow separation.
@@ -36,8 +36,7 @@ The final executable notional is the minimum of Adaptive Conviction stop risk,
 mode heat/gross capacity, validated canonical risk/exposure/cash/buying-power
 ceilings, durable reservations and every Phase 3/PROBE limit. Every value is a
 ceiling; no constrained result is raised to meet an executable minimum. The
-historical `$250` initial and `$100` ADD stage values do not participate in the
-operational-paper ceiling path.
+legacy fixed-dollar stage values do not participate in the operational-paper ceiling path.
 
 Pending buy exposure must contain a positive notional, reference price, stop
 distance/risk, symbol, and cluster. A malformed or incomplete row makes risk
@@ -53,8 +52,10 @@ operational Phase 3/4 evidence population. Old outcome rows are invalidated and
 recomputed under the current evidence version; mixed versions are excluded from
 Phase 3/4 decisions.
 
-Phase 4 records adaptive allocation, bounded exploration, and unallocated risk
-separately. Kelly is a ceiling diagnostic; covariance/overlap is an operational
+Phase 4 records adaptive allocation, bounded `PROBE`/`EXPLORATION`, strategy sleeves,
+and unallocated risk separately. Every risk value carries `risk_value` and `risk_unit`;
+`pct_equity` is converted to canonical `stop_risk_dollars` using fresh authoritative
+equity and a persisted formula version. Kelly is a ceiling diagnostic; covariance/overlap is an operational
 constraint. Actual before/after heat, gross/symbol/cluster exposure, pending
 risk, reserved risk, binding caps, evidence versions, formula version, and
 configuration hash are persisted.

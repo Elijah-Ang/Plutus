@@ -69,6 +69,10 @@ The project follows a modular design with clear separation between:
 - [data_providers/](../app/data_providers): Research-provider abstraction and EODHD implementation. EODHD is used only for discovery/research data; Alpaca remains the paper broker/execution/reconciliation authority.
 - [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, optional read-only Alpaca crypto market-data methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
+- [profit_milestones.py](../app/profit_milestones.py): Fill-authoritative partial-profit milestone ledger keyed by active position lifecycle, take-profit level, proposal, intent, and unique broker fill event.
+- [phase4_allocator.py](../app/phase4_allocator.py): Deterministic multi-strategy paper allocator. All operational risk values carry a unit and normalize to stop-risk dollars using fresh authoritative equity.
+- [trend_management.py](../app/trend_management.py): Lifecycle-bound trend mode and monotonic protective-stop decisions with a final-mode contradiction validator.
+- [rotation_coordinator.py](../app/rotation_coordinator.py): Exit-first, exactly-one-contingent-entry workflows bound to active lifecycle and displayed approval fingerprints.
 - [reconciliation.py](../app/reconciliation.py): Read-only broker reconciliation that updates local order/fill/account/position records without submitting or retrying orders.
 - [capabilities.py](../app/capabilities.py): Non-configurable hard gates keeping live trading and auto-execution unsupported.
 - [run_lock.py](../app/run_lock.py): Inspects PID/timestamp lock metadata and identifies only safely recoverable stale locks.
@@ -182,9 +186,9 @@ The Dynamic Universe Engine follows `research many -> watch some -> trade few ->
 
 - **Proposal Conflict Handling after Approval**:
   - If a BUY proposal is approved and successfully submitted as an order:
-    - The system automatically marks all other pending BUY proposals as `superseded`.
-    - It sends a single notification message: `Other pending BUY proposals were cancelled because one paper position/trade is already active.`
-    - Superseded proposals are blocked from execution. Exits are never superseded by this logic.
+    - The system supersedes only an older equivalent or mutually exclusive BUY: the same logical action, active position lifecycle entry, setup, winner milestone, rotation dependency, or an explicitly replaced proposal.
+    - Unrelated ranked-batch, multi-position, `YES ALL`, and strategy-sleeve BUYs remain pending and receive independent final revalidation.
+    - Exits are never superseded by BUY conflict handling.
     - If approved, the approval token is consumed to prevent double-spending, and final validation is run.
 
 ## 10. Alpaca Paper Broker Flow

@@ -31,9 +31,8 @@ stop risk; displayed quantity and displayed stop risk at final approval;
 mode heat; mode gross; equity; absolute limit when configured; cash reserve;
 cash usage; cash; buying power; symbol; cluster; portfolio; non-ACTIVE policy
 allocation; exploration; PROBE; and their aggregate heat/gross/count limits.
-The historical initial `$250` and ADD `$100` stage ceilings are retained only
-as historical configuration evidence and are excluded from the operational
-minimum path. No replacement fixed-dollar bottleneck exists.
+Legacy fixed-dollar stage ceilings are excluded from the operational minimum
+path. No replacement fixed-dollar bottleneck exists.
 
 At proposal time, the persisted adaptive quantity/notional is the actual paper
 proposal and displayed approval ceiling. At approval, fresh account, quote,
@@ -63,7 +62,7 @@ configuration hash, fingerprints and formula/schema/evidence versions.
 
 Configuration/schema/formula versions:
 
-- `plutus_effective_config_v7_release_gate_operational_paper`
+- `plutus_effective_config_v9_audit_hardened_paper`
 
 Every ordinary or protective paper order requires manual approval. Extreme and
 sleep-mode exit detection can prioritise an urgent SELL proposal, but it cannot

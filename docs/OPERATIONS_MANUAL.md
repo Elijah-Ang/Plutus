@@ -47,7 +47,7 @@ During the June 2026 deployment:
 
 ## Position Sizing and Portfolio Constraints
 
-The system uses the canonical, versioned policy in `config/config.yaml` when `position_sizing.mode: risk_portfolio` is enabled. The configured moderate-paper defaults are `$250` initial and `$100` add; they are targets, not guarantees. A missing validated ATR/technical stop, malformed pending buy exposure, or incomplete MA50/MA200 evidence blocks the affected entry/add.
+The system uses the canonical, versioned policy in `config/config.yaml` when `position_sizing.mode: risk_portfolio` is enabled. Operational size comes from validated stop risk, Phase 3 hard limits, Phase 4 strategy sleeves, Adaptive Conviction, and Adaptive Sizing. A missing validated ATR/technical stop, malformed pending buy exposure, incomplete MA50/MA200 evidence, missing risk unit, or stale conversion equity blocks the affected entry/add.
 
 ### 1. Risk-Based Sizing Formula
 
@@ -86,7 +86,7 @@ The final notional is the minimum of every applicable ceiling: phase stage, vali
 2.  **Single Position Cap**: Limits maximum symbol exposure (e.g., `2.0%` of equity).
 3.  **Portfolio Exposure Cap**: Limits total active portfolio exposure (e.g., `6.0%` of equity).
 4.  **Cluster Exposure Cap**: Limits total exposure to a single sector/cluster (e.g., `5.0%` of equity).
-5.  **Stage Dollar Cap**: Enforces the configured initial/add stage ceilings. The temporary `$50` absolute cap is not part of the current policy.
+5.  **Strategy Sleeve Cap**: Phase 4 allocates canonical stop-risk dollars and notional to an authorized strategy sleeve. A candidate cannot borrow another sleeve's capacity.
 
 ### 4. Small-account and blocking rules
 
@@ -97,3 +97,18 @@ To facilitate testing on small accounts:
 
 See [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) for the formula and schema version contract.
 
+## Approval, exit, and recovery workflow
+
+Every order requires a current manual approval. `YES ALL` means “validate every candidate independently,” not “execute the batch blindly.” A submitted BUY supersedes only an equivalent or mutually exclusive proposal; unrelated BUYs remain pending until their own approval-time account, position, order, reservation, Phase 3, sleeve, exposure, registry, expiry, quote, and exit-first checks complete.
+
+SELL validation is directional. A lower refreshed price does not by itself block an ordinary, partial-profit, trailing-stop, profit-protection, time-stop, emergency, or rotation exit. The system still requires an open market, fresh quote, a current held long position, quantity no greater than holdings, no conflicting SELL, an unexpired proposal, and a bounded paper SELL mechanism. Manual approval and no-shorting remain mandatory.
+
+Take-profit levels are fill ledgers, not proposal flags. Partial fills retain only their cumulative quantity/fraction; cancellation retains that actual progress. Duplicate or restart reconciliation cannot double-count a broker fill event. Unknown submission outcomes keep their reservation and enter reconciliation; operators must never approve a blind retry.
+
+## Release verification, migration, and rollback
+
+Run `python scripts/check_release_eligibility.py` from a clean checkout. The command reports the exact commit, configuration hash, required schema versions, additive-migration compatibility/idempotence, paper-only identity, local compile/test result, and exact-commit GitHub CI result. `unverified`, `pending`, or failed remote CI is not eligible.
+
+Before deployment, back up the production-paper SQLite database and run the migration proof on a clone. Migrations are additive and must be applied by the explicit deployment workflow; ordinary runtime initialization is not a production migration mechanism. Verify the immutable release manifest, paper account identity, scanner/listener commit freshness, durable-integrity report, and migration ledger before cutover.
+
+Rollback switches scanner and listener together to the prior immutable release whose configuration and schema are compatible. Additive tables may remain. If an exact database rollback is required, stop both writers and restore the verified pre-migration backup. Never migrate production, restart processes, or move the runtime pointer as part of code review.

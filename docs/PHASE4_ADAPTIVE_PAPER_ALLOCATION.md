@@ -32,12 +32,21 @@ Operational policy states remain distinct: RESEARCH_ONLY and SUSPENDED receive
 zero entry risk; PROBE receives 0.03% per trade with 0.10% aggregate heat,
 2.5% gross, one active/reserved probe and no ADD; EXPLORATION receives bounded
 immature allocation; THROTTLED is reduced; ACTIVE may receive normal or
-expanded evidence-aware allocation. Only `rule_based_v2` is executable today;
-the architecture does not fabricate multi-strategy diversification.
+expanded evidence-aware allocation. The explicit execution registry currently
+covers rule-based, pullback, breakout, trend, momentum, and ETF-rotation
+strategies. Each must independently pass implementation, evidence, policy,
+paper-eligibility, and human/config authorization gates before receiving a sleeve.
 
-Schema: `phase4_evidence_aware_operational_paper_v3`. Allocator:
-`adaptive_paper_allocator_v4_dimensionally_normalized`. Formula:
-`phase4_evidence_aware_allocation_v5_dimensionally_normalized`.
+Schema: `phase4_multi_strategy_operational_paper_v5_units`. Allocator:
+`multi_strategy_paper_allocator_v6_explicit_units`. Formula:
+`phase4_multi_strategy_allocation_v7_stop_risk_dollars`.
+
+Candidate, sleeve, global-budget, allocation, reservation, and reconciliation
+risk values carry `risk_value` and `risk_unit`. Supported source units are
+`stop_risk_dollars` and `pct_equity`; every operational calculation normalizes
+to stop-risk dollars using current authoritative equity, its timestamp, and the
+persisted conversion formula version. Missing/unknown units, stale equity,
+non-finite/negative values, and zero requested candidate risk fail closed.
 
 `max_strategy_weight`, the conservative `0.175` ACTIVE fallback ceiling,
 `max_allocated_risk_fraction`, and `max_stress_loss` are portfolio allocation
