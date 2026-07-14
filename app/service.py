@@ -174,6 +174,7 @@ class TradingService:
         self._phase1_bar_cache: dict[str, Any] = {}
         self._phase4_allocation_cache: dict[str, Any] | None = None
         self._strategy_policy_map: dict[str, Any] | None = None
+        self._current_cycle_exit_blocker: dict[str, Any] | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
@@ -700,6 +701,75 @@ class TradingService:
         if source_type == "active_sell_reservation":
             return f"{symbol} sell reservation {status}"
         return blocker.get("reason") or f"fresh {symbol} EXIT decision has priority"
+
+    def _digest_exit_blocker_context(
+        self,
+        broker_orders: list[Any] | None,
+        positions: list[Any] | None,
+        validation_at: datetime,
+    ) -> dict[str, Any]:
+        """Revalidate persistent sources and retain only this scan's fresh decision."""
+        persistent = self._exit_blocker_context(
+            broker_orders,
+            positions=positions,
+            validation_at=validation_at,
+        )
+        if persistent.get("active"):
+            return persistent
+
+        cached = dict(self._current_cycle_exit_blocker or {})
+        if not cached.get("active") or cached.get("run_id") != self.run_id:
+            return persistent
+        if cached.get("source_type") not in {
+            "current_position_management_decision", "current_cycle_exit_signal",
+        }:
+            return persistent
+
+        symbol = str(cached.get("symbol") or "").upper()
+        if positions is not None:
+            position_symbols = {
+                str(_value(position, "symbol", "")).upper()
+                for position in positions
+                if abs(float(_value(position, "qty", 0.0) or 0.0)) > 1e-12
+            }
+            if symbol not in position_symbols:
+                detail = self._exit_blocker_audit_detail(
+                    {**cached, "latest_validation_at": validation_at.isoformat()},
+                    "stale",
+                    "position no longer exists at digest validation",
+                )
+                self.storage.audit(self.run_id, "exit_blocker_ignored_stale", detail)
+                return persistent
+
+        expires_at = cached.get("expires_at")
+        if expires_at:
+            try:
+                if _parse_datetime(expires_at) <= validation_at:
+                    detail = self._exit_blocker_audit_detail(
+                        {**cached, "latest_validation_at": validation_at.isoformat()},
+                        "stale",
+                        "current-cycle decision expired before digest validation",
+                    )
+                    self.storage.audit(self.run_id, "exit_blocker_ignored_stale", detail)
+                    return persistent
+            except (TypeError, ValueError):
+                return persistent
+
+        validated = {
+            **cached,
+            "latest_validation_at": validation_at.isoformat(),
+            "validation_reason": "same-cycle decision still has its broker position and remains unexpired",
+        }
+        self.storage.audit(
+            self.run_id,
+            "exit_blocker_validated",
+            self._exit_blocker_audit_detail(
+                validated,
+                "active",
+                validated["validation_reason"],
+            ),
+        )
+        return validated
 
     def _sleep_mode_active(self) -> bool:
         try:
@@ -3616,6 +3686,7 @@ class TradingService:
         return f"{symbol}:{side_str}:{action_str}:{above_50}:{above_200}:{vol_regime}:{score_band}"
 
     def scan(self) -> None:
+        self._current_cycle_exit_blocker = None
         if self.config.get("mode") == "live" and not self.config.get("live_enabled"):
             self.telegram.send_message("Blocked for safety: live trading is disabled.")
             return
@@ -4409,6 +4480,11 @@ class TradingService:
                 current_cycle_exits=exit_candidates,
                 validation_at=now,
             )
+            if exit_blocker.get("active"):
+                self._current_cycle_exit_blocker = {
+                    **exit_blocker,
+                    "run_id": self.run_id,
+                }
             exit_candidates_exist = bool(exit_blocker.get("active"))
 
             # Setup key and dedupe status pre-evaluation
@@ -5531,10 +5607,10 @@ class TradingService:
             current_orders = list(self.broker.get_open_orders())
         except Exception:
             current_orders = []
-        digest_exit_blocker = self._exit_blocker_context(
+        digest_exit_blocker = self._digest_exit_blocker_context(
             current_orders,
-            positions=current_positions,
-            validation_at=now,
+            current_positions,
+            now,
         )
         cluster_holdings = self._cluster_holdings(current_positions or [])
 

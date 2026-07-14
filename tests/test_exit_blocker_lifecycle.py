@@ -71,6 +71,64 @@ def test_fresh_current_cycle_exit_is_the_only_proposalless_blocker(tmp_path):
     assert "fresh ABBV TIME_STOP_EXIT decision" in blocker["reason"]
 
 
+def test_digest_revalidates_only_the_same_cycle_fresh_decision(tmp_path):
+    service, storage, broker = make_service(tmp_path, positions=[position()])
+    now = datetime.now(UTC)
+    result = {
+        "symbol": "ABBV",
+        "has_position": True,
+        "signal": Signal("EXIT", "sell", "ABBV", "time stop", 0.9, {}),
+        "signal_id": "sig-digest",
+        "position_management_decision_id": "pm-digest",
+        "position_lifecycle_id": "life-digest",
+        "position_management_decision": {
+            "decision_type": "TIME_STOP_EXIT", "action": "sell", "is_actionable": True,
+        },
+        "cycle_created_at": now.isoformat(),
+        "expiry": now + timedelta(minutes=5),
+    }
+    blocker = service._exit_blocker_context(
+        [], positions=broker.positions, current_cycle_exits=[result], validation_at=now,
+    )
+    service._current_cycle_exit_blocker = {**blocker, "run_id": service.run_id}
+
+    digest_blocker = service._digest_exit_blocker_context(
+        [], broker.positions, now + timedelta(seconds=30),
+    )
+
+    assert digest_blocker["active"] is True
+    assert digest_blocker["source_type"] == "current_position_management_decision"
+    assert digest_blocker["source_id"] == "pm-digest"
+    assert service._exit_blocker_display_reason(digest_blocker) == "fresh ABBV TIME_STOP_EXIT decision has priority"
+
+    service.run_id = "next-run"
+    assert service._digest_exit_blocker_context([], broker.positions, now + timedelta(minutes=1))["active"] is False
+
+
+def test_digest_clears_same_cycle_decision_when_position_disappears(tmp_path):
+    service, storage, broker = make_service(tmp_path, positions=[position()])
+    now = datetime.now(UTC)
+    service._current_cycle_exit_blocker = {
+        "active": True,
+        "source_type": "current_position_management_decision",
+        "source_id": "pm-missing",
+        "symbol": "ABBV",
+        "status": "TIME_STOP_EXIT",
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "latest_validation_at": now.isoformat(),
+        "position_lifecycle_id": "life-missing",
+        "reason": "fresh ABBV TIME_STOP_EXIT decision has priority",
+        "run_id": service.run_id,
+    }
+
+    digest_blocker = service._digest_exit_blocker_context([], [], now + timedelta(seconds=30))
+
+    assert digest_blocker["active"] is False
+    audits = storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='exit_blocker_ignored_stale'")
+    assert any("position no longer exists at digest validation" in row["detail"] for row in audits)
+
+
 def test_prior_run_position_management_decision_is_not_current(tmp_path):
     service, storage, broker = make_service(tmp_path, positions=[position()])
     storage.execute(
