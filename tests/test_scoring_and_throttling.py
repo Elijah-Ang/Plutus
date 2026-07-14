@@ -91,9 +91,20 @@ def test_github_workflow_docs_exist():
     assert "Never Commit" in content
     assert "Always Safe to Commit" in content
 
-def test_launchd_installed():
-    target = Path(os.path.expanduser("~/Library/LaunchAgents/com.elijah.tradingagent.plist"))
-    assert target.is_file()
+def test_launchd_definition_and_install_contract():
+    source = PROJECT_ROOT / "launchd" / "com.elijah.tradingagent.plist"
+    installer = PROJECT_ROOT / "scripts" / "install_launchd.sh"
+    assert source.is_file()
+    assert installer.is_file()
+    installer_text = installer.read_text()
+    assert 'launchd/com.elijah.tradingagent.plist' in installer_text
+    assert '$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist' in installer_text
+
+    # Installation is deployment state, not a portable unit-test precondition.
+    # Operators can opt into verifying that state on a configured macOS host.
+    if os.getenv("TRADING_AGENT_REQUIRE_LAUNCHD_INSTALLED") == "1":
+        target = Path(os.path.expanduser("~/Library/LaunchAgents/com.elijah.tradingagent.plist"))
+        assert target.is_file()
 
 def test_live_trading_disabled():
     config = load_config()
