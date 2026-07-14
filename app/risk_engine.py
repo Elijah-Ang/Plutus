@@ -121,7 +121,11 @@ class RiskEngine:
 
         max_cluster_pos = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_positions", 2)
         projected_cluster_count = context.get("proposed_cluster_positions_count")
-        check("portfolio_cluster_positions_limit", not is_entry or (isinstance(projected_cluster_count, (int, float)) and projected_cluster_count <= max_cluster_pos), "same cluster positions limit")
+        check(
+            "portfolio_cluster_positions_limit",
+            risk_budgeted_mode or not is_entry or (isinstance(projected_cluster_count, (int, float)) and projected_cluster_count <= max_cluster_pos),
+            "risk-budgeted mode treats position counts as targets; cluster exposure remains authoritative",
+        )
 
         max_cluster_exposure = self.config.get("portfolio_optimizer", {}).get("max_same_cluster_exposure_pct", 5.0)
         projected_cluster = context.get("proposed_cluster_exposure_pct")
@@ -161,8 +165,8 @@ class RiskEngine:
                 if sizing_cfg.get("mode", "fixed") == "risk_portfolio":
                     equity = float(context.get("portfolio_equity") or 100000.0)
                     pct = float(sizing_cfg.get("max_trade_notional_pct_equity", 0.25))
-                    stage = sizing_cfg.get("stage", "moderate_paper")
-                    stage_cap = float((sizing_cfg.get("stage_max_initial_notional_usd", {}) or {}).get(stage) or float("inf"))
+                    stage = sizing_cfg.get("stage", "adaptive_operational_paper")
+                    stage_cap = float("inf") if sizing_cfg.get("use_stage_dollar_cap") is False else float((sizing_cfg.get("stage_max_initial_notional_usd", {}) or {}).get(stage) or float("inf"))
                     limit = min(equity * pct / 100.0, stage_cap, float(limit))
                 else:
                     limit = float(limit)

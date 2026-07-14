@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v5_adaptive_sizing_shadow
+configuration_schema_version: plutus_effective_config_v6_adaptive_operational_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -19,7 +19,7 @@ phase3:
   enabled: true
   active: true
   mode: ACTIVE_PAPER
-  profile_version: moderate_paper_risk_v1
+  profile_version: adaptive_operational_paper_risk_v2
   require_manual_approval: true
   require_paper_account_identity: true
   require_healthy_reconciliation: true
@@ -34,7 +34,7 @@ phase3:
     base_stop_risk_pct: 0.20
     add_stop_risk_pct: 0.10
     max_trade_stop_risk_pct: 0.35
-    max_portfolio_heat_pct: 1.25
+    max_portfolio_heat_pct: 1.75
     favorable_portfolio_heat_pct: 1.50
     defensive_portfolio_heat_pct: 0.50
     normal_gross_exposure_pct: 30.0
@@ -50,10 +50,10 @@ phase4:
   enabled: true
   active: true
   mode: ACTIVE_ADAPTIVE_PAPER
-  allocator_version: adaptive_paper_allocator_v2_probe
+  allocator_version: adaptive_paper_allocator_v3_evidence_aware
   fractional_kelly: 0.20
   operational_kelly_enabled: false
-  operational_allocation_mode: deterministic_equal_risk
+  operational_allocation_mode: bounded_evidence_aware
   full_kelly_allowed: false
   llm_trading_decisions: false
   uncalibrated_score_sizing: false
@@ -82,9 +82,10 @@ phase4:
   phase3_hard_limits_authoritative: true
 adaptive_conviction:
   enabled: true
-  report_only: true
-  formula_version: adaptive_conviction_formula_v1
-  schema_version: adaptive_conviction_decisions_v1
+  enforcement_enabled: true
+  mode: operational_paper
+  formula_version: adaptive_conviction_formula_v2_operational_paper
+  schema_version: adaptive_conviction_operational_decisions_v2
   base_strategy_risk_pct: 0.20
   hard_trade_risk_ceiling_pct: 0.35
   maximum_symbol_exposure_pct: 6.0
@@ -92,12 +93,14 @@ adaptive_conviction:
   minimum_liquidity_dollars: 10000000.0
   maximum_quote_spread_bps: 40.0
   kelly_operational: false
-  covariance_operational: false
+  covariance_operational: true
 adaptive_sizing:
   enabled: true
-  mode: shadow_only
-  operational_enforcement: false
-  allow_order_size_change: false
+  mode: operational_paper
+  operational_enforcement: true
+  allow_order_size_change: true
+  formula_version: adaptive_sizing_formula_v2_operational_paper
+  schema_version: adaptive_sizing_operational_decisions_v2
 profitability_engine:
   enabled: true
   enforcement_enabled: true
@@ -156,14 +159,14 @@ strategies:
 
 formula_versions:
   stop_policy: validated_atr_or_technical_stop_v2
-  sizing_policy: canonical_minimum_ceiling_notional_v3_probe
-  risk_decision: risk_engine_ceiling_stop_probe_v3
+  sizing_policy: adaptive_minimum_ceiling_notional_v4_operational_paper
+  risk_decision: risk_engine_adaptive_ceiling_stop_probe_v4
   accounting: fifo_equity_unrealized_cashflow_v1
   evidence: phase1_outcome_v2_exit_session
   strategy_performance: strategy_performance_v2_2_probe
   strategy_policy: strategy_policy_v2_2_probe
-  adaptive_conviction: adaptive_conviction_formula_v1
-  adaptive_sizing: adaptive_sizing_formula_v1
+  adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
+  adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.
@@ -279,9 +282,9 @@ proposal_mode:
 
 risk_budget:
   risk_per_trade_pct: 0.20
-  max_open_risk_pct: 1.25
+  max_open_risk_pct: 1.75
   max_daily_realized_loss_pct: 0.75
-  max_total_portfolio_exposure_pct: 30.0
+  max_total_portfolio_exposure_pct: 50.0
   max_single_symbol_exposure_pct: 6.0
   max_cluster_exposure_pct: 15.0
   max_adds_only_if_profitable: true
@@ -626,7 +629,7 @@ portfolio_behavior:
   block_averaging_down: true
   max_adds_per_symbol_per_day: 1
   max_total_adds_per_symbol: 2
-  max_total_portfolio_exposure_pct: 30.0
+  max_total_portfolio_exposure_pct: 50.0
   max_single_symbol_exposure_pct: 6.0
   max_correlated_us_equity_exposure_pct: 15.0
   block_new_buy_if_exit_pending: true
@@ -635,25 +638,27 @@ portfolio_behavior:
 position_sizing:
   enabled: true
   mode: risk_portfolio
-  stage: moderate_paper
+  stage: adaptive_operational_paper
 
-  use_stage_dollar_cap: true
+  use_stage_dollar_cap: false
   stage_max_initial_notional_usd:
     smoke_test: 25
     moderate_paper: 250
     realistic_paper: null
     performance_calibrated: null
+    adaptive_operational_paper: null
 
   stage_max_add_notional_usd:
     smoke_test: 10
     moderate_paper: 100
     realistic_paper: null
     performance_calibrated: null
+    adaptive_operational_paper: null
 
   risk_per_trade_pct: 0.20
   max_trade_notional_pct_equity: 6.0
   max_position_notional_pct_equity: 6.0
-  max_total_portfolio_exposure_pct: 30.0
+  max_total_portfolio_exposure_pct: 50.0
   max_cluster_exposure_pct: 15.0
   min_cash_reserve_pct: 20.0
   max_cash_usage_pct: 10.0
@@ -692,7 +697,7 @@ portfolio_optimizer:
     energy: [XLE]
   max_same_cluster_positions: 2
   max_same_cluster_exposure_pct: 15.0
-  max_total_portfolio_exposure_pct: 30.0
+  max_total_portfolio_exposure_pct: 50.0
   max_single_symbol_exposure_pct: 6.0
 
 add_to_position:

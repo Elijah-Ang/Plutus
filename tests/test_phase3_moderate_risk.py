@@ -9,7 +9,7 @@ from app.storage import Storage
 def config():
     return {"phase3": {"enabled": True, "active": True, "promotion": {"minimum_completed_oos": 100}, "risk_profile": {
         "base_stop_risk_pct": .20, "add_stop_risk_pct": .10, "max_trade_stop_risk_pct": .35,
-        "max_portfolio_heat_pct": 1.25, "favorable_portfolio_heat_pct": 1.50,
+        "max_portfolio_heat_pct": 1.75, "favorable_portfolio_heat_pct": 1.50,
         "defensive_portfolio_heat_pct": .50, "normal_gross_exposure_pct": 30,
         "favorable_gross_exposure_pct": 40, "hard_gross_exposure_pct": 50,
         "max_symbol_exposure_pct": 6, "max_cluster_exposure_pct": 15,
@@ -31,6 +31,7 @@ def test_profile_and_deterministic_scalers():
     assert [drawdown_multiplier(x) for x in (0, 2, 4, 6)] == [1, .75, .5, 0]
     assert regime_multiplier("downtrend_high_vol") == .5
     assert regime_multiplier("uptrend_normal_vol") == 1
+    assert regime_multiplier("favorable") > 1
 
 
 def test_sleeves_fail_closed_without_evidence_and_can_recover(tmp_path):

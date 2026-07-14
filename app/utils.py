@@ -380,22 +380,22 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         adaptive = proposal.get("adaptive_conviction") or {}
         if adaptive:
             adaptive_section = (
-                "Adaptive Conviction (report-only): "
+                "Adaptive Conviction (operational paper): "
                 f"{adaptive.get('deployment_mode')}/{adaptive.get('opportunity_class')}; "
-                f"future recommendation {float(adaptive.get('recommended_stop_risk_pct') or 0.0):.4f}% "
-                f"vs current operational {float(adaptive.get('operational_stop_risk_pct') or 0.0):.4f}%; "
-                f"binding {adaptive.get('binding_cap')}. This does not change this proposal's size.\n\n"
+                f"permitted stop risk {float(adaptive.get('recommended_stop_risk_pct') or 0.0):.4f}%; "
+                f"heat target {float(adaptive.get('portfolio_heat_target_pct') or 0.0):.2f}%, "
+                f"gross target {float(adaptive.get('gross_exposure_target_pct') or 0.0):.1f}%; "
+                f"binding {adaptive.get('binding_cap')}.\n\n"
             )
         adaptive_sizing = proposal.get("adaptive_sizing") or {}
         if adaptive_sizing:
             adaptive_section += (
-                "Adaptive Sizing (report-only): "
-                f"current operational ${float(adaptive_sizing.get('operational_notional') or 0.0):,.2f} "
+                "Adaptive Sizing (operational paper): "
+                f"actual proposed ${float(adaptive_sizing.get('operational_notional') or 0.0):,.2f} "
                 f"({float(adaptive_sizing.get('operational_quantity') or 0.0):.6f} shares); "
-                f"adaptive shadow ${float(adaptive_sizing.get('adaptive_notional') or 0.0):,.2f} "
-                f"({float(adaptive_sizing.get('adaptive_quantity') or 0.0):.6f} shares), "
+                f"canonical baseline ${float(proposal.get('baseline_operational_notional') or 0.0):,.2f}; "
                 f"{adaptive_sizing.get('comparison_direction')}, binding {adaptive_sizing.get('binding_adaptive_cap')}. "
-                "Report-only; the operational proposal size and quantity remain authoritative.\n\n"
+                "This displayed adaptive size is the maximum that approval can submit.\n\n"
             )
 
         scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}"

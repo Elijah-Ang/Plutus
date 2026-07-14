@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from app.phase4_allocator import AdaptiveAllocator, STRATEGIES, apply_phase4_schema
+from app.phase4_allocator import AdaptiveAllocator, STRATEGIES, apply_phase4_schema, candidate_allocation_rank
 from app.formula_versions import EVIDENCE_VERSION
 from app.storage import Storage
 from app.utils import load_config
@@ -76,6 +76,19 @@ def test_qualified_strategy_uses_adaptive_allocation(tmp_path):
     assert result["weights"][STRATEGIES[0]] > 0
 
 
+def test_reliable_current_regime_performance_is_an_operational_weight_input(tmp_path):
+    storage=Storage(tmp_path/"p4-regime.sqlite3"); storage.initialize(); cfg=load_config()
+    for index in range(100):
+        _outcome(storage, STRATEGIES[0], .02 + (index % 3) * .0001,
+                 regime="normal" if index < 20 else "favorable", index=index)
+    result=AdaptiveAllocator(storage,cfg,"run-regime").run(regime="normal",drawdown_pct=0.0)
+    regime_metric=result["strategy_policies"][STRATEGIES[0]]["current_regime_performance"]
+    assert regime_metric["reliable"] is True
+    assert regime_metric["sample_n"] == 20
+    assert regime_metric["conservative_expected_return"] > 0
+    assert result["weights"][STRATEGIES[0]] > 0
+
+
 def test_phase4_exploration_defaults_are_bounded():
     cfg=load_config()["phase4"]
     assert cfg["exploration_heat_pct"] == .25
@@ -93,7 +106,38 @@ def test_fractional_kelly_is_bounded_and_phase3_authoritative():
     assert cfg["llm_trading_decisions"] is False
     assert cfg["uncalibrated_score_sizing"] is False
     assert cfg["operational_kelly_enabled"] is False
-    assert cfg["operational_allocation_mode"] == "deterministic_equal_risk"
+    assert cfg["operational_allocation_mode"] == "bounded_evidence_aware"
+
+
+def test_candidate_ranking_is_operationally_evidence_aware_and_deterministic():
+    strong = {
+        "setup_score": 94, "evidence_quality": 92, "regime": "favorable",
+        "execution_fill_rate": .98, "execution_shortfall_bps": 2,
+        "conservative_expected_return": .04, "uncertainty": .05,
+        "deterioration_score": 0, "symbol_exposure_pct": 0,
+        "cluster_exposure_pct": 0, "stop_risk_pct": .20,
+    }
+    weak = {
+        **strong, "conservative_expected_return": -.01, "uncertainty": .80,
+        "deterioration_score": .70, "symbol_exposure_pct": 5.5,
+        "cluster_exposure_pct": 14.0,
+    }
+    first = candidate_allocation_rank(strong)
+    assert first == candidate_allocation_rank(strong)
+    assert first["ranking_score"] > candidate_allocation_rank(weak)["ranking_score"]
+
+
+def test_covariance_overlap_reduces_rank_and_low_correlation_capacity_expands_rank():
+    inputs = {
+        "setup_score": 90, "evidence_quality": 85, "regime": "normal",
+        "execution_fill_rate": .90, "execution_shortfall_bps": 5,
+        "conservative_expected_return": .02, "uncertainty": .10,
+        "deterioration_score": 0, "stop_risk_pct": .20,
+    }
+    diversified = candidate_allocation_rank({**inputs, "symbol_exposure_pct": 0, "cluster_exposure_pct": 0})
+    overlapping = candidate_allocation_rank({**inputs, "symbol_exposure_pct": 5.5, "cluster_exposure_pct": 14.0})
+    assert diversified["diversification_score"] > overlapping["diversification_score"]
+    assert diversified["ranking_score"] > overlapping["ranking_score"]
 
 
 def test_shadow_evidence_never_becomes_operational_allocation(tmp_path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only forward evidence report for Phase 4.2B shadow sizing."""
+"""Read-only evidence report for operational-paper Phase 4.2B sizing."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def build_report(database: str | Path) -> dict[str, Any]:
 
 def format_report(report: dict[str, Any]) -> str:
     return (
-        "Phase 4.2B Adaptive Sizing Forward Evidence (report-only)\n"
+        "Phase 4.2B Adaptive Sizing Evidence (operational paper; read-only report)\n"
         f"Decisions: {report['total_decisions']}; complete by stage: {report['complete_counts']}\n"
         f"Modes: {report['deployment_modes']}; opportunity classes: {report['opportunity_classes']}\n"
         f"Comparisons: {report['comparison_directions']}; binding caps: {report['binding_cap_frequency']}\n"

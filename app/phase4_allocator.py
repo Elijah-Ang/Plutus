@@ -12,18 +12,64 @@ import numpy as np
 
 from .execution import DurableExecutionStore
 from .evidence import OPERATIONAL_EVIDENCE_TYPES, SHADOW_OUTCOME, classify_evidence_type
-from .formula_versions import EVIDENCE_VERSION, PHASE4_ALLOCATION_VERSION
+from .formula_versions import EVIDENCE_VERSION, PHASE4_ALLOCATION_VERSION, PHASE4_ALLOCATOR_VERSION, PHASE4_SCHEMA_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
 
-PHASE4_SCHEMA_VERSION = "phase4_adaptive_paper_allocation_v2_probe"
-ALLOCATOR_VERSION = "adaptive_paper_allocator_v2_probe"
+ALLOCATOR_VERSION = PHASE4_ALLOCATOR_VERSION
 ESTIMATOR_VERSION = "shrunk_oos_estimator_v1"
 COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
 EXECUTABLE_STRATEGIES = (STRATEGY_VERSION,)
 STRATEGIES = (*EXECUTABLE_STRATEGIES, *tuple(sorted(STRATEGY_VERSIONS.values())))
+
+
+def candidate_allocation_rank(inputs: Mapping[str, Any]) -> dict[str, float]:
+    """Deterministic evidence-aware candidate rank; never an order quantity."""
+    def unit(value: Any, *, scale: float = 1.0, default: float = 0.5) -> float:
+        try:
+            number = float(value) / scale
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(1.0, number)) if math.isfinite(number) else default
+
+    setup = unit(inputs.get("setup_score"), scale=100.0)
+    evidence = unit(inputs.get("evidence_quality"), scale=100.0)
+    regime = {
+        "favorable": 1.0, "normal": 0.80, "too quiet": 0.55,
+        "elevated": 0.40, "high": 0.15, "extreme": 0.0,
+    }.get(str(inputs.get("regime") or "").lower(), 0.50)
+    fill_rate = unit(inputs.get("execution_fill_rate"), default=0.50)
+    shortfall = unit(inputs.get("execution_shortfall_bps"), scale=50.0, default=0.50)
+    execution = min(fill_rate, 1.0 - shortfall)
+    conservative_return = inputs.get("conservative_expected_return")
+    try:
+        expected_value = 0.5 + 0.5 * math.tanh(float(conservative_return) * 10.0)
+    except (TypeError, ValueError):
+        expected_value = 0.50
+    uncertainty = unit(inputs.get("uncertainty"), default=1.0)
+    deterioration = unit(inputs.get("deterioration_score"), default=0.0)
+    symbol_exposure = unit(inputs.get("symbol_exposure_pct"), scale=6.0, default=1.0)
+    cluster_exposure = unit(inputs.get("cluster_exposure_pct"), scale=15.0, default=1.0)
+    diversification = 1.0 - max(symbol_exposure, cluster_exposure)
+    risk_consumption = unit(inputs.get("stop_risk_pct"), scale=0.35, default=1.0)
+    risk_efficiency = 1.0 - 0.50 * risk_consumption
+    conviction = statistics.fmean((setup, evidence, regime, execution))
+    score = 100.0 * (
+        0.30 * conviction + 0.20 * expected_value + 0.20 * diversification
+        + 0.15 * execution + 0.15 * risk_efficiency
+    )
+    score -= 15.0 * uncertainty + 30.0 * deterioration
+    return {
+        "ranking_score": round(max(0.0, score), 8),
+        "conviction_score": round(conviction * 100.0, 8),
+        "expected_value_score": round(expected_value * 100.0, 8),
+        "diversification_score": round(diversification * 100.0, 8),
+        "regime_alignment_score": round(regime * 100.0, 8),
+        "execution_quality_score": round(execution * 100.0, 8),
+        "risk_efficiency_score": round(risk_efficiency * 100.0, 8),
+    }
 
 
 @dataclass(frozen=True)
@@ -131,8 +177,8 @@ class AdaptiveAllocator:
         if self.cfg.get("full_kelly_allowed") is not False: raise ValueError("full Kelly is forbidden")
         if self.cfg.get("llm_trading_decisions") is not False: raise ValueError("LLM trading decisions are forbidden")
         if self.cfg.get("operational_kelly_enabled") is not False: raise ValueError("operational Kelly must remain disabled")
-        if self.cfg.get("operational_allocation_mode") != "deterministic_equal_risk":
-            raise ValueError("operational allocation must be deterministic equal risk")
+        if self.cfg.get("operational_allocation_mode") != "bounded_evidence_aware":
+            raise ValueError("operational allocation must be bounded evidence-aware")
         if self.cfg.get("allocator_version") != ALLOCATOR_VERSION:
             raise ValueError(f"allocator version must be {ALLOCATOR_VERSION}")
 
@@ -244,6 +290,29 @@ class AdaptiveAllocator:
                                                  "evidence_class":estimate.evidence_class,
                                                  "state_version":"phase4_strategy_state_v3_probe"}),))
             self._persist_state(estimate,eid,now)
+        current_regime_metrics: dict[str, dict[str, Any]] = {}
+        target_regime = str(regime or "").strip().lower()
+        minimum_regime_samples = int((self.config.get("profitability_engine", {}) or {}).get("minimum_samples_per_regime", 10))
+        for strategy, rows in evidence.items():
+            values = [
+                float(row["cost_adjusted_return"])
+                for row in rows
+                if str(row.get("regime") or "").strip().lower() == target_regime
+            ]
+            reliable = len(values) >= minimum_regime_samples
+            mean = statistics.fmean(values) if values else None
+            standard_error = (
+                statistics.stdev(values) / math.sqrt(len(values))
+                if len(values) > 1 else None
+            )
+            conservative = (
+                mean - float(self.cfg.get("confidence_z", 1.96)) * float(standard_error or 0.0)
+                if reliable and mean is not None else None
+            )
+            current_regime_metrics[strategy] = {
+                "regime": regime, "sample_n": len(values), "reliable": reliable,
+                "mean_return": mean, "conservative_expected_return": conservative,
+            }
         policy_authoritative = strategy_policy_map is not None
 
         def policy_value(strategy: str, name: str, default: Any = None) -> Any:
@@ -294,13 +363,42 @@ class AdaptiveAllocator:
             if e.state!="ACTIVE" or e.conservative_expected_return is None: continue
             kelly=max(0.0,e.conservative_expected_return/max(cov[i,i],1e-12))*fraction
             kelly_diagnostics[s] = min(max_weight,kelly)*e.data_quality*(1-e.uncertainty)
-        # Kelly/covariance remain diagnostics.  Operational allocation is
-        # deterministic and only executable strategies can receive it.
+        # Kelly is only a ceiling. Conservative expected return, uncertainty,
+        # evidence quality, deterioration and covariance determine the bounded
+        # operational weight below it; no Kelly result dictates quantity.
         active_executable = [s for s in EXECUTABLE_STRATEGIES if operational_states[s] == "ACTIVE"]
-        if active_executable:
-            equal_weight = min(max_weight, 1.0 / len(active_executable))
-            for strategy in active_executable:
-                weights[STRATEGIES.index(strategy)] = equal_weight
+        for strategy in active_executable:
+            i = STRATEGIES.index(strategy)
+            estimate = estimates[strategy]
+            ceiling = kelly_diagnostics.get(strategy, 0.0)
+            if estimate.deterioration_score > 0 and not policy_authoritative:
+                continue
+            policy_quality = policy_value(strategy, "quality_score")
+            quality = estimate.data_quality
+            uncertainty = estimate.uncertainty
+            if ceiling <= 0 and policy_authoritative and policy_quality is not None:
+                # A validated ACTIVE profitability policy is authoritative.
+                # Missing/immature secondary Kelly inputs may authorize only a
+                # reduced baseline weight; they can never create expansion.
+                quality = max(0.0, min(1.0, float(policy_quality) / 100.0))
+                uncertainty = max(0.50, 1.0 - quality)
+                ceiling = max_weight * 0.50
+            if ceiling <= 0:
+                continue
+            peer_indexes = [STRATEGIES.index(peer) for peer in active_executable if peer != strategy]
+            overlap_penalty = max(0.35, 1.0 - max(0.0, max((float(corr[i, j]) for j in peer_indexes), default=0.0)))
+            deterioration_penalty = (
+                1.0 if estimate.sample_n == 0
+                else max(0.0, 1.0 - min(1.0, estimate.deterioration_score))
+            )
+            regime_metric = current_regime_metrics[strategy]
+            regime_return = regime_metric.get("conservative_expected_return")
+            if regime_metric["reliable"]:
+                regime_penalty = 0.50 if float(regime_return or 0.0) <= 0 else min(1.25, 1.0 + float(regime_return) * 5.0)
+            else:
+                regime_penalty = 0.75
+            evidence_weight = max_weight * quality * (1.0 - uncertainty) * overlap_penalty * deterioration_penalty * regime_penalty
+            weights[i] = min(max_weight, ceiling, max(0.0, evidence_weight))
         total=float(weights.sum()); max_invested=float(self.cfg.get("max_allocated_risk_fraction",0.75))
         if total>max_invested: weights*=max_invested/total
         port_var=float(weights@cov@weights); port_vol=math.sqrt(max(0.0,port_var)); mu=np.array([estimates[s].conservative_expected_return or 0.0 for s in STRATEGIES]); expected=float(weights@mu)
@@ -383,6 +481,11 @@ class AdaptiveAllocator:
                 "policy_version": policy_value(strategy, "policy_version"),
                 "binding_policy_reason": operational_reasons[strategy],
                 "policy_authoritative": policy_authoritative,
+                "conservative_expected_return": estimate.conservative_expected_return,
+                "uncertainty": estimate.uncertainty,
+                "data_quality": estimate.data_quality,
+                "deterioration_score": estimate.deterioration_score,
+                "current_regime_performance": current_regime_metrics[strategy],
             })
             if phase3_profile is not None and strategy in EXECUTABLE_STRATEGIES:
                 permitted, multiplier, _risk_reason = state_risk_policy(
@@ -415,8 +518,8 @@ class AdaptiveAllocator:
             "probe_max_active_count": int(self.cfg.get("probe_max_active_count", 1)),
         }
         payload={"covariance_id":cov_id,"phase3_limits_authoritative":True,"full_kelly":False,"llm_decisions":False,"covariance_fallback":fallback,
-                 "operational_kelly_enabled":False,"operational_allocation_mode":"deterministic_equal_risk",
-                 "kelly_diagnostics":kelly_diagnostics,
+                 "operational_kelly_enabled":False,"operational_allocation_mode":"bounded_evidence_aware",
+                 "kelly_diagnostics":kelly_diagnostics,"current_regime_performance":current_regime_metrics,
                  "exploration_heat_pct":exploration_heat,"exploration_heat_cap_pct":exploration_heat_cap,"exploration_weights":exploration_weights,
                  "probe_heat_pct":probe_heat,"probe_heat_cap_pct":probe_heat_cap,"probe_weights":probe_weights,
                  "exploration_gross_exposure_cap_pct":float(self.cfg.get("exploration_gross_exposure_pct",7.5)),"strategy_policies":strategy_policies,

@@ -1,9 +1,9 @@
-"""Deterministic, report-only strategy performance and policy engine.
+"""Deterministic strategy performance and operational-paper policy engine.
 
 This module is deliberately downstream of proposal, sizing, approval, order,
 reconciliation, and FIFO accounting state.  It reads those records, creates a
-canonical strategy-trade projection, and persists a scorecard/policy.  Build 2
-consumers validate the persisted policy before new entries/adds; exits and all
+canonical strategy-trade projection, and persists a scorecard/policy. Policy
+consumers validate the persisted authority before new entries/adds; exits and all
 existing canonical portfolio ceilings remain independent and available.
 """
 

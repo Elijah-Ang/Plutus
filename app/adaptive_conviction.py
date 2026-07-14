@@ -1,8 +1,7 @@
-"""Deterministic, report-only adaptive-conviction diagnostics.
+"""Deterministic operational-paper conviction authority.
 
-This module never sizes a proposal, approves an action, creates a reservation,
-or talks to a broker.  It produces replayable recommendations for a possible
-future sizing system while canonical Phase 3/4 sizing remains authoritative.
+The engine owns classification and permitted stop risk. It cannot approve an
+action, create a reservation, submit an order, or communicate with a broker.
 """
 
 from __future__ import annotations
@@ -24,16 +23,16 @@ from .utils import iso_now, json_dumps
 
 
 DEPLOYMENT_MODES: dict[str, dict[str, float]] = {
-    "DEFENSIVE": {"trade_risk_cap_pct": 0.15, "portfolio_heat_target_pct": 0.50, "gross_exposure_target_pct": 20.0},
-    "NORMAL": {"trade_risk_cap_pct": 0.20, "portfolio_heat_target_pct": 1.25, "gross_exposure_target_pct": 30.0},
-    "OPPORTUNISTIC": {"trade_risk_cap_pct": 0.30, "portfolio_heat_target_pct": 1.50, "gross_exposure_target_pct": 40.0},
-    "AGGRESSIVE": {"trade_risk_cap_pct": 0.35, "portfolio_heat_target_pct": 1.75, "gross_exposure_target_pct": 50.0},
+    "DEFENSIVE": {"trade_risk_cap_pct": 0.15, "portfolio_heat_target_pct": 0.50, "gross_exposure_target_pct": 20.0, "position_target": 2},
+    "NORMAL": {"trade_risk_cap_pct": 0.20, "portfolio_heat_target_pct": 1.25, "gross_exposure_target_pct": 30.0, "position_target": 3},
+    "OPPORTUNISTIC": {"trade_risk_cap_pct": 0.30, "portfolio_heat_target_pct": 1.50, "gross_exposure_target_pct": 40.0, "position_target": 4},
+    "AGGRESSIVE": {"trade_risk_cap_pct": 0.35, "portfolio_heat_target_pct": 1.75, "gross_exposure_target_pct": 50.0, "position_target": 5},
 }
 OPPORTUNITY_CLASSES = ("REJECTED", "STANDARD", "STRONG", "HIGH_CONVICTION", "EXCEPTIONAL")
 OPPORTUNITY_MULTIPLIERS = {"REJECTED": 0.0, "STANDARD": 0.85, "STRONG": 1.0, "HIGH_CONVICTION": 1.15, "EXCEPTIONAL": 1.25}
 EXECUTABLE_POLICY_STATES = frozenset({"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"})
 BINDING_CAP_ORDER = (
-    "formula_request", "deployment_mode_trade_risk", "hard_trade_risk", "portfolio_heat",
+    "formula_request", "strategy_authorization", "deployment_mode_trade_risk", "hard_trade_risk", "portfolio_heat",
     "gross_exposure", "symbol_exposure", "cluster_exposure",
 )
 
@@ -84,6 +83,7 @@ class AdaptiveConvictionDecision:
     per_trade_ceiling_pct: float
     portfolio_heat_target_pct: float
     gross_exposure_target_pct: float
+    position_target: int
     heat_ceiling_pct: float
     gross_ceiling_pct: float
     symbol_ceiling_pct: float
@@ -98,18 +98,26 @@ class AdaptiveConvictionDecision:
     configuration_schema_version: str
     config_hash: str | None
     decision_fingerprint: str
-    report_only: bool = True
+    operating_mode: str
+    operational_enforced: bool
+    report_only: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
             "decision_id": self.id,
             "decision_stage": self.decision_stage,
-            "report_only": True,
+            "report_only": False,
+            "operating_mode": self.operating_mode,
+            "operational_enforced": self.operational_enforced,
             "deployment_mode": self.deployment_mode,
             "opportunity_class": self.opportunity_class,
             "recommended_stop_risk_pct": self.recommended_stop_risk_pct,
             "operational_stop_risk_pct": self.operational_stop_risk_pct,
+            "per_trade_ceiling_pct": self.per_trade_ceiling_pct,
+            "portfolio_heat_target_pct": self.portfolio_heat_target_pct,
+            "gross_exposure_target_pct": self.gross_exposure_target_pct,
             "binding_cap": self.binding_cap,
+            "position_target": self.position_target,
             "confidence": self.confidence,
             "missing_inputs": list(self.raw_inputs.get("derived", {}).get("missing", [])),
             "formula_version": self.formula_version,
@@ -141,15 +149,35 @@ def apply_adaptive_conviction_schema(conn: Any, *, record_migration: bool = True
         conn.execute("ALTER TABLE adaptive_conviction_decisions ADD COLUMN decision_stage TEXT NOT NULL DEFAULT 'proposal'")
     if "approval_id" not in present:
         conn.execute("ALTER TABLE adaptive_conviction_decisions ADD COLUMN approval_id TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS adaptive_conviction_operational_decisions(
+          id TEXT PRIMARY KEY,created_at TEXT NOT NULL,run_id TEXT,proposal_id TEXT,candidate_id TEXT,setup_id TEXT,
+          decision_stage TEXT NOT NULL,approval_id TEXT,strategy_version TEXT NOT NULL,policy_decision_id TEXT,
+          performance_snapshot_id TEXT,deployment_mode TEXT NOT NULL,opportunity_class TEXT NOT NULL,
+          base_strategy_risk_pct REAL NOT NULL,opportunity_multiplier REAL NOT NULL,regime_multiplier REAL NOT NULL,
+          account_health_multiplier REAL NOT NULL,execution_quality_multiplier REAL NOT NULL,
+          diversification_multiplier REAL NOT NULL,requested_stop_risk_pct REAL NOT NULL,
+          recommended_stop_risk_pct REAL NOT NULL,operational_stop_risk_pct REAL NOT NULL,
+          per_trade_ceiling_pct REAL NOT NULL,portfolio_heat_target_pct REAL NOT NULL,
+          gross_exposure_target_pct REAL NOT NULL,position_target INTEGER NOT NULL,
+          heat_ceiling_pct REAL NOT NULL,gross_ceiling_pct REAL NOT NULL,symbol_ceiling_pct REAL NOT NULL,
+          cluster_ceiling_pct REAL NOT NULL,binding_cap TEXT NOT NULL,confidence REAL NOT NULL,data_quality REAL NOT NULL,
+          reason TEXT NOT NULL,raw_inputs_json TEXT NOT NULL,evidence_version TEXT NOT NULL,formula_version TEXT NOT NULL,
+          configuration_schema_version TEXT NOT NULL,config_hash TEXT,decision_fingerprint TEXT NOT NULL UNIQUE,
+          operating_mode TEXT NOT NULL CHECK(operating_mode='operational_paper'),
+          operational_enforced INTEGER NOT NULL CHECK(operational_enforced=1),
+          report_only INTEGER NOT NULL CHECK(report_only=0))"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptive_conviction_operational_proposal ON adaptive_conviction_operational_decisions(proposal_id,decision_stage,created_at)")
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
-            (ADAPTIVE_CONVICTION_SCHEMA_VERSION, iso_now(), "additive report-only adaptive-conviction decisions"),
+            (ADAPTIVE_CONVICTION_SCHEMA_VERSION, iso_now(), "additive operational-paper adaptive-conviction decisions; historical report-only rows preserved"),
         )
 
 
 class AdaptiveConvictionEngine:
-    """Independent deterministic classifier and bounded diagnostic-risk engine."""
+    """Independent deterministic operational-paper conviction engine."""
 
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = dict(config)
@@ -157,14 +185,18 @@ class AdaptiveConvictionEngine:
         self._validate()
 
     def _validate(self) -> None:
-        if self.cfg.get("enabled") is not True or self.cfg.get("report_only") is not True:
-            raise ValueError("adaptive conviction must be enabled and report-only")
+        if self.cfg.get("enabled") is not True or self.cfg.get("enforcement_enabled") is not True or self.cfg.get("mode") != "operational_paper":
+            raise ValueError("adaptive conviction must be enabled and operational in paper mode")
         if self.cfg.get("formula_version") != ADAPTIVE_CONVICTION_FORMULA_VERSION:
             raise ValueError("adaptive conviction formula version mismatch")
         if self.cfg.get("schema_version") != ADAPTIVE_CONVICTION_SCHEMA_VERSION:
             raise ValueError("adaptive conviction schema version mismatch")
-        if self.cfg.get("kelly_operational") is not False or self.cfg.get("covariance_operational") is not False:
-            raise ValueError("Kelly and covariance must remain diagnostic only")
+        if self.cfg.get("kelly_operational") is not False or self.cfg.get("covariance_operational") is not True:
+            raise ValueError("Kelly must remain a ceiling diagnostic and covariance must constrain allocation")
+        if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
+            raise ValueError("operational conviction requires paper-only mode")
+        if self.config.get("auto_execution_enabled") is not False or self.config.get("auto_execution_mode") != "manual_only":
+            raise ValueError("operational conviction requires manual approval")
         if float(self.cfg.get("hard_trade_risk_ceiling_pct", -1)) != 0.35:
             raise ValueError("adaptive conviction hard trade-risk ceiling must be 0.35%")
 
@@ -331,7 +363,7 @@ class AdaptiveConvictionEngine:
             return "AGGRESSIVE", ["exceptional_multisignal_evidence_and_capacity"]
         if opportunity_class in {"HIGH_CONVICTION", "EXCEPTIONAL"} and complete_expansion and derived["account_score"] >= 0.75 and derived["execution_score"] >= 0.75 and derived["diversification_score"] >= 0.75:
             return "OPPORTUNISTIC", ["high_conviction_multisignal_evidence_and_capacity"]
-        return "NORMAL", ["baseline_diagnostic_mode"]
+        return "NORMAL", ["baseline_operational_mode"]
 
     def evaluate(self, inputs: Mapping[str, Any]) -> AdaptiveConvictionDecision | None:
         raw = dict(inputs)
@@ -366,6 +398,10 @@ class AdaptiveConvictionEngine:
         cluster_ceiling = capacity_ceiling(derived["cluster_exposure"], float(self.cfg["maximum_cluster_exposure_pct"]))
         caps = {
             "formula_request": max(0.0, requested),
+            "strategy_authorization": max(0.0, min(
+                hard_cap,
+                float(raw.get("strategy_stop_risk_cap_pct") or (hard_cap if str(raw.get("strategy_policy_state")) == "ACTIVE" else base)),
+            )),
             "deployment_mode_trade_risk": mode["trade_risk_cap_pct"],
             "hard_trade_risk": hard_cap,
             "portfolio_heat": max(0.0, heat_ceiling),
@@ -376,9 +412,9 @@ class AdaptiveConvictionEngine:
         binding_cap = min(BINDING_CAP_ORDER, key=lambda name: (caps[name], BINDING_CAP_ORDER.index(name)))
         recommended = 0.0 if opportunity_class == "REJECTED" else caps[binding_cap]
         operational = max(0.0, float(raw.get("operational_stop_risk_pct") or 0.0))
-        diagnostic_context = {
+        decision_context = {
             "kelly": {"label": "diagnostic_only", "operational": False, "value": raw.get("kelly_diagnostic")},
-            "covariance": {"label": "diagnostic_only", "operational": False, "value": raw.get("covariance_diagnostic")},
+            "covariance": {"label": "operational_constraint", "operational": True, "value": raw.get("covariance_diagnostic")},
         }
         persisted_raw = {
             **raw,
@@ -386,8 +422,8 @@ class AdaptiveConvictionEngine:
             "caps_pct": caps,
             "class_reasons": class_reasons,
             "mode_reasons": mode_reasons,
-            "diagnostic_context": diagnostic_context,
-            "operational_authority": "canonical sizing, Phase 3 limits, final one-way reduction, and stage cap",
+            "decision_context": decision_context,
+            "operational_authority": "adaptive conviction recommendation bounded by Phase 3 and durable execution ceilings",
         }
         reason_parts = [f"{opportunity_class}/{deployment_mode}", *class_reasons, *mode_reasons, f"binding={binding_cap}"]
         if derived["missing"]:
@@ -411,23 +447,25 @@ class AdaptiveConvictionEngine:
             diversification_multiplier=round(diversification_multiplier, 8), requested_stop_risk_pct=round(requested, 8),
             recommended_stop_risk_pct=round(recommended, 8), operational_stop_risk_pct=round(operational, 8),
             per_trade_ceiling_pct=mode["trade_risk_cap_pct"], portfolio_heat_target_pct=mode["portfolio_heat_target_pct"],
-            gross_exposure_target_pct=mode["gross_exposure_target_pct"], heat_ceiling_pct=round(heat_ceiling, 8),
+            gross_exposure_target_pct=mode["gross_exposure_target_pct"], position_target=int(mode["position_target"]), heat_ceiling_pct=round(heat_ceiling, 8),
             gross_ceiling_pct=round(gross_ceiling, 8), symbol_ceiling_pct=round(symbol_ceiling, 8),
             cluster_ceiling_pct=round(cluster_ceiling, 8), binding_cap=binding_cap,
             confidence=round(derived["confidence"], 8), data_quality=round(derived["data_quality"], 8),
             reason="; ".join(reason_parts), raw_inputs=persisted_raw, evidence_version=EVIDENCE_VERSION,
             formula_version=ADAPTIVE_CONVICTION_FORMULA_VERSION, configuration_schema_version=CONFIGURATION_SCHEMA_VERSION,
-            config_hash=self.config.get("effective_config_hash"), decision_fingerprint=fingerprint, report_only=True,
+            config_hash=self.config.get("effective_config_hash"), decision_fingerprint=fingerprint,
+            operating_mode="operational_paper", operational_enforced=True, report_only=False,
         )
 
     @staticmethod
     def persist(storage: Any, decision: AdaptiveConvictionDecision) -> None:
         values = asdict(decision)
         values["raw_inputs_json"] = json_dumps(values.pop("raw_inputs"))
-        values["report_only"] = 1
+        values["operational_enforced"] = 1
+        values["report_only"] = 0
         columns = list(values)
         storage.execute(
-            f"INSERT OR IGNORE INTO adaptive_conviction_decisions({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+            f"INSERT OR IGNORE INTO adaptive_conviction_operational_decisions({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
             tuple(values[name] for name in columns),
         )
 
@@ -462,7 +500,8 @@ class AdaptiveConvictionEngine:
                 "average_pct": round(sum(values) / len(values), 8), "maximum_pct": max(values),
             }
         return {
-            "report_only": True,
+            "report_only": False,
+            "operating_mode": "operational_paper",
             "records_evaluated": len(decisions),
             "deployment_modes": dict(sorted(modes.items())),
             "opportunity_classes": dict(sorted(classes.items())),
@@ -483,18 +522,18 @@ class AdaptiveConvictionEngine:
     @staticmethod
     def format_report(storage: Any) -> str:
         rows = storage.fetch_all(
-            "SELECT deployment_mode,opportunity_class,recommended_stop_risk_pct,operational_stop_risk_pct,binding_cap FROM adaptive_conviction_decisions ORDER BY created_at DESC,id DESC LIMIT 100"
+            "SELECT deployment_mode,opportunity_class,recommended_stop_risk_pct,operational_stop_risk_pct,binding_cap FROM adaptive_conviction_operational_decisions ORDER BY created_at DESC,id DESC LIMIT 100"
         )
         if not rows:
-            return "Adaptive Conviction (report-only): no persisted entry diagnostics."
+            return "Adaptive Conviction (operational paper): no persisted entry decisions."
         modes = Counter(str(row["deployment_mode"]) for row in rows)
         classes = Counter(str(row["opportunity_class"]) for row in rows)
         latest = rows[0]
         return (
-            "Adaptive Conviction (report-only)\n"
-            f"Latest: {latest['deployment_mode']} / {latest['opportunity_class']} | recommended {float(latest['recommended_stop_risk_pct']):.4f}% vs operational {float(latest['operational_stop_risk_pct']):.4f}% | binding {latest['binding_cap']}\n"
+            "Adaptive Conviction (operational paper)\n"
+            f"Latest: {latest['deployment_mode']} / {latest['opportunity_class']} | permitted {float(latest['recommended_stop_risk_pct']):.4f}% | binding {latest['binding_cap']}\n"
             f"Last {len(rows)}: modes {dict(sorted(modes.items()))}; classes {dict(sorted(classes.items()))}.\n"
-            "Diagnostic only; canonical sizing, Phase 3 limits, final one-way reduction, and the $250 stage cap remain authoritative."
+            "Operational input: Adaptive Sizing applies this permitted risk; Phase 3 hard limits and final one-way reduction remain authoritative."
         )
 
 

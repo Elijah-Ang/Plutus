@@ -20,23 +20,24 @@ decisions and evidence:
 
 - `validated_atr_or_technical_stop_v2`: executable entries/adds require a valid
   ATR or technical stop; percentage/fixed/default fallback stops are blocked.
-- `canonical_minimum_ceiling_notional_v2`: one canonical notional policy and
-  minimum-of-ceilings sizing.
-- `risk_engine_ceiling_and_stop_v2`: final risk validation and ceiling checks.
-- `phase3_risk_audit_v2` and `phase4_allocation_audit_v2`: operational audit
-  records and binding caps.
+- `adaptive_minimum_ceiling_notional_v4_operational_paper`: shared canonical
+  ceilings consumed by operational Adaptive Sizing.
+- `risk_engine_adaptive_ceiling_stop_probe_v4`: final hard validation.
+- `phase3_adaptive_modes_v4_operational_paper` and
+  `phase4_evidence_aware_allocation_v4_operational_paper`: operational mode and
+  evidence-aware allocation boundaries.
 - `fifo_equity_unrealized_cashflow_v1`: realized FIFO P&L, account-equity
   change, unrealized change, and external cash-flow separation.
 - `phase1_outcome_v2_exit_session`: corrected early-exit attribution.
 
 ## Effective paper sizing
 
-The final executable notional is the minimum of target, stage, validated stop
-risk, equity, cash, buying power, symbol, cluster, portfolio, allocation,
-exploration, optional absolute, and Phase 3/4 heat/gross ceilings. Every value
-is a ceiling; no constrained result is raised to meet the executable minimum.
-The temporary `$50` cap is removed. The configured moderate-paper defaults are
-`$250` initial and `$100` add, subject to manual Telegram approval.
+The final executable notional is the minimum of Adaptive Conviction stop risk,
+mode heat/gross capacity, validated canonical risk/exposure/cash/buying-power
+ceilings, durable reservations and every Phase 3/PROBE limit. Every value is a
+ceiling; no constrained result is raised to meet an executable minimum. The
+historical `$250` initial and `$100` ADD stage values do not participate in the
+operational-paper ceiling path.
 
 Pending buy exposure must contain a positive notional, reference price, stop
 distance/risk, symbol, and cluster. A malformed or incomplete row makes risk
@@ -53,8 +54,8 @@ recomputed under the current evidence version; mixed versions are excluded from
 Phase 3/4 decisions.
 
 Phase 4 records adaptive allocation, bounded exploration, and unallocated risk
-separately. Kelly and covariance are diagnostics only; `operational_kelly_used`
-remains false. Actual before/after heat, gross/symbol/cluster exposure, pending
+separately. Kelly is a ceiling diagnostic; covariance/overlap is an operational
+constraint. Actual before/after heat, gross/symbol/cluster exposure, pending
 risk, reserved risk, binding caps, evidence versions, formula version, and
 configuration hash are persisted.
 

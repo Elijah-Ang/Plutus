@@ -1680,7 +1680,7 @@ class TradingService:
         stage: str = "proposal",
         approval_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Gather diagnostic inputs; formula and classification stay in the engine."""
+        """Gather authoritative inputs; formula and classification stay in the engine."""
         if proposal.get("action") not in {"entry", "add"} or str(proposal.get("side") or "").lower() != "buy":
             return None
         adaptive_config = self.config.get("adaptive_conviction")
@@ -1710,10 +1710,49 @@ class TradingService:
                 reward_to_risk = max(0.0, (float(target_price) - float(entry_price)) / (float(entry_price) - float(stop_price)))
         except (TypeError, ValueError):
             reward_to_risk = None
+        if reward_to_risk is None:
+            snapshot_id = sizing.get("performance_snapshot_id") or proposal.get("performance_snapshot_id")
+            if snapshot_id:
+                rows = self.storage.fetch_all(
+                    "SELECT metrics_json FROM strategy_performance_snapshots WHERE id=? LIMIT 1",
+                    (snapshot_id,),
+                )
+                if rows:
+                    try:
+                        metrics = json.loads(rows[0]["metrics_json"] or "{}")
+                        payoff = metrics.get("payoff_ratio")
+                        reward_to_risk = float(payoff) if payoff is not None and math.isfinite(float(payoff)) else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        reward_to_risk = None
         state = str(proposal.get("strategy_state") or "")
+        strategy_version = str(proposal.get("strategy_version") or "")
+        phase4_policy = (self._phase4_allocation_cache or {}).get("strategy_policies", {}).get(strategy_version, {})
+        phase4_quality = phase4_policy.get("data_quality")
+        policy_quality = sizing.get("strategy_quality_score", proposal.get("strategy_quality_score"))
+        if policy_quality is not None:
+            evidence_quality = float(policy_quality) / 100.0
+            if phase4_quality is not None:
+                evidence_quality = min(evidence_quality, float(phase4_quality))
+        else:
+            evidence_quality = None
+        current_regime_performance = phase4_policy.get("current_regime_performance") or {}
+        if str(current_regime_performance.get("regime") or "").lower() != str(proposal.get("volatility_regime") or "").lower():
+            current_regime_performance = {}
+        current_regime_negative = (
+            current_regime_performance.get("reliable") is True
+            and float(current_regime_performance.get("conservative_expected_return") or 0.0) <= 0.0
+        )
         operational_risk = proposal.get("permitted_stop_risk_pct")
         if operational_risk is None and equity > 0:
             operational_risk = float(proposal.get("stop_risk_dollars") or 0.0) / equity * 100.0
+        phase3_profile = ((self.config.get("phase3", {}) or {}).get("risk_profile", {}) or {})
+        base_strategy_risk = (
+            float(phase3_profile.get("add_stop_risk_pct", 0.10))
+            if proposal.get("action") == "add"
+            else float(phase3_profile.get("base_stop_risk_pct", 0.20))
+        )
+        if state != "ACTIVE":
+            base_strategy_risk = float(operational_risk or 0.0)
         inputs = {
             "run_id": proposal.get("run_id"), "proposal_id": proposal.get("id"),
             "candidate_id": proposal.get("signal_id"), "setup_id": proposal.get("setup_key"),
@@ -1724,7 +1763,12 @@ class TradingService:
             "action": proposal.get("action"), "side": proposal.get("side"),
             "strategy_authorized": state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
             "strategy_policy_state": state,
-            "evidence_quality": (float(sizing.get("strategy_quality_score", proposal.get("strategy_quality_score"))) / 100.0) if sizing.get("strategy_quality_score", proposal.get("strategy_quality_score")) is not None else None,
+            "base_strategy_risk_pct": base_strategy_risk,
+            "strategy_stop_risk_cap_pct": (
+                float((self.config.get("phase3", {}) or {}).get("risk_profile", {}).get("max_trade_stop_risk_pct", 0.35))
+                if state == "ACTIVE" else float(operational_risk or 0.0)
+            ),
+            "evidence_quality": evidence_quality,
             "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"} and (sizing.get("performance_snapshot_id") or proposal.get("performance_snapshot_id")) is not None,
             "market_regime": proposal.get("volatility_regime"),
             "account_drawdown_pct": sizing.get("phase3_account_drawdown_pct"),
@@ -1746,7 +1790,8 @@ class TradingService:
             "quote_spread_bps": proposal.get("quote_spread_bps"),
             "market_data_fresh": proposal.get("proposal_price_age_seconds_at_send") is not None and float(proposal.get("proposal_price_age_seconds_at_send")) <= float(self.config.get("telegram", {}).get("proposal_price_freshness_threshold_seconds", 60.0)),
             "risk_checks_passed": risk_checks_passed,
-            "deterioration_detected": state == "THROTTLED" or "deterior" in str(proposal.get("binding_policy_reason") or "").lower(),
+            "deterioration_detected": current_regime_negative or state == "THROTTLED" or "deterior" in str(proposal.get("binding_policy_reason") or "").lower(),
+            "phase4_current_regime_performance": current_regime_performance,
             "operational_stop_risk_pct": operational_risk,
             **execution,
         }
@@ -1756,8 +1801,24 @@ class TradingService:
             return None
         engine.persist(self.storage, adaptive)
         summary = adaptive.summary()
-        self.storage.audit(self.run_id, "adaptive_conviction_report_only", summary)
+        self.storage.audit(self.run_id, "adaptive_conviction_operational_paper", summary)
         return summary
+
+    def _operational_adaptive_enabled(self) -> bool:
+        """Return whether the complete compatible paper-adaptive stack is active."""
+        phase3 = self.config.get("phase3", {}) or {}
+        phase4 = self.config.get("phase4", {}) or {}
+        conviction = self.config.get("adaptive_conviction", {}) or {}
+        sizing = self.config.get("adaptive_sizing", {}) or {}
+        return bool(
+            phase3.get("enabled") and phase3.get("active")
+            and phase4.get("enabled") and phase4.get("active")
+            and conviction.get("enabled") and conviction.get("enforcement_enabled")
+            and conviction.get("mode") == "operational_paper"
+            and sizing.get("enabled") and sizing.get("mode") == "operational_paper"
+            and sizing.get("operational_enforcement") is True
+            and sizing.get("allow_order_size_change") is True
+        )
 
     def _record_adaptive_sizing(
         self,
@@ -1778,10 +1839,11 @@ class TradingService:
             return None
         equity = float(portfolio.get("portfolio_equity") or 0.0)
         operational_notional = float(sizing.get("final_notional") or proposal.get("notional") or 0.0)
-        operational_pct = operational_notional / equity * 100.0 if equity > 0 else None
-        current_gross = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_total_exposure_pct") or 0.0) - operational_pct)
-        current_symbol = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_symbol_exposure_pct") or 0.0) - operational_pct)
-        current_cluster = None if operational_pct is None else max(0.0, float(portfolio.get("proposed_cluster_exposure_pct") or 0.0) - operational_pct)
+        proposal_notional = float(proposal.get("notional") or operational_notional)
+        proposal_pct = proposal_notional / equity * 100.0 if equity > 0 else None
+        current_gross = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_total_exposure_pct") or 0.0) - proposal_pct)
+        current_symbol = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_symbol_exposure_pct") or 0.0) - proposal_pct)
+        current_cluster = None if proposal_pct is None else max(0.0, float(portfolio.get("proposed_cluster_exposure_pct") or 0.0) - proposal_pct)
         current_heat = None
         if equity > 0:
             current_heat = (
@@ -1810,8 +1872,8 @@ class TradingService:
                 "stop_risk": portfolio.get("active_reserved_stop_risk"),
             },
             "entry_price": proposal.get("latest_price") or proposal.get("proposal_price"),
-            "stop_price": sizing.get("stop_price") or proposal.get("stop_price"),
-            "stop_distance_dollars": sizing.get("stop_distance_dollars") or proposal.get("stop_distance_dollars"),
+            "stop_price": proposal.get("stop_price") or sizing.get("stop_price"),
+            "stop_distance_dollars": proposal.get("stop_distance_dollars") or sizing.get("stop_distance_dollars"),
             "strategy_policy_state": sizing.get("strategy_state") or proposal.get("strategy_state"),
             "strategy_policy_version": sizing.get("strategy_policy_version") or proposal.get("strategy_policy_version"),
             "current_portfolio_heat_pct": current_heat, "current_gross_exposure_pct": current_gross,
@@ -1823,6 +1885,12 @@ class TradingService:
                 "cluster_exposure": phase3_profile.get("max_cluster_exposure_pct"),
             },
             "displayed_adaptive_ceiling": displayed_adaptive_ceiling,
+            "displayed_quantity_ceiling": (
+                proposal.get("approved_quantity_ceiling") or proposal.get("qty")
+            ) if stage == "final_revalidation" else None,
+            "displayed_stop_risk_dollars": (
+                proposal.get("approved_stop_risk_ceiling") or proposal.get("stop_risk_dollars")
+            ) if stage == "final_revalidation" else None,
             "proposal_adaptive_notional": proposal_adaptive_notional,
             "final_revalidation_blocked": final_revalidation_blocked,
             "missing_inputs": list(missing_inputs or []),
@@ -1835,7 +1903,7 @@ class TradingService:
             return None
         engine.persist(self.storage, decision)
         summary = decision.summary()
-        self.storage.audit(self.run_id, "adaptive_sizing_report_only", summary)
+        self.storage.audit(self.run_id, "adaptive_sizing_operational_paper", summary)
         return summary
 
     def replay_adaptive_conviction(self, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2998,12 +3066,12 @@ class TradingService:
                         stage="final_revalidation", approval_id=approval_id,
                     )
                     if blocked_conviction is not None:
-                        proposal_shadow = proposal.get("adaptive_sizing") or {}
+                        proposal_adaptive = proposal.get("adaptive_sizing") or {}
                         self._record_adaptive_sizing(
                             proposal, blocked_sizing, blocked_context, blocked_conviction,
                             stage="final_revalidation", approval_id=approval_id,
-                            displayed_adaptive_ceiling=proposal_shadow.get("displayed_adaptive_ceiling"),
-                            proposal_adaptive_notional=proposal_shadow.get("adaptive_notional"),
+                            displayed_adaptive_ceiling=proposal_adaptive.get("displayed_adaptive_ceiling"),
+                            proposal_adaptive_notional=proposal_adaptive.get("adaptive_notional"),
                             final_revalidation_blocked=True,
                             missing_inputs=["complete_fresh_final_operational_sizing"],
                         )
@@ -3046,17 +3114,13 @@ class TradingService:
                     policy_override=final_policy_override,
                 )
 
-                recalc_notional = size_dict["final_notional"]
-                
-                # Final validation is a one-way ceiling: it may reduce to a
-                # stricter current-policy result, but can never expand the
-                # proposal-time approved notional (including a zero value).
-                final_notional = min(max(0.0, approved_notional), max(0.0, recalc_notional))
-                if recalc_notional > approved_notional:
-                    proposal["notional_reduced_by_cap"] = True
-                    
-                proposal["notional"] = final_notional
-                proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val > 0 else size_dict["suggested_shares"]
+                # This is the fresh canonical safety baseline and cap set. The
+                # adaptive engine below owns the final paper notional.
+                proposal["canonical_revalidation_notional"] = float(size_dict["final_notional"] or 0.0)
+                if not self._operational_adaptive_enabled():
+                    final_notional = min(max(0.0, approved_notional), max(0.0, float(size_dict["final_notional"] or 0.0)))
+                    proposal["notional"] = final_notional
+                    proposal["qty"] = final_notional / refreshed_price_val if refreshed_price_val and refreshed_price_val > 0 else 0.0
                 proposal["phase4_mode"] = size_dict.get("phase4_mode")
                 proposal["strategy_state"] = size_dict.get("strategy_state")
                 proposal["strategy_policy_version"] = size_dict.get("strategy_policy_version")
@@ -3068,23 +3132,28 @@ class TradingService:
                 logger.warning("Recalculate dynamic size failed during revalidation: %s", type(e).__name__)
                 block_reason = "final validated sizing could not be recomputed"
 
-        # Recompute report-only Adaptive Conviction and sizing from the same
-        # fresh authoritative inputs. Shadow disagreement never blocks or
-        # changes the already-computed operational notional/quantity.
+        # Recompute operational Adaptive Conviction and Adaptive Sizing from
+        # fresh authoritative inputs. Approval may preserve, reduce, or block;
+        # the displayed approved ceiling can never be enlarged.
         context = self._portfolio_context(proposal, approval_valid=True)
-        if prop_side == "buy" and proposal.get("action") in {"entry", "add"} and size_dict is not None:
-            operational_before_shadow = (proposal.get("notional"), proposal.get("qty"))
+        if self._operational_adaptive_enabled() and prop_side == "buy" and proposal.get("action") in {"entry", "add"} and size_dict is not None:
             try:
                 proposal["proposal_price_age_seconds_at_send"] = refreshed_price_age_seconds
                 final_conviction = self._record_adaptive_conviction(
                     proposal,
                     size_dict,
                     context,
-                    risk_checks_passed=block_reason is None and float(proposal.get("notional") or 0.0) > 0,
+                    risk_checks_passed=(
+                        block_reason is None
+                        and float(size_dict.get("final_notional") or 0.0) > 0
+                        and not size_dict.get("blocked_reason")
+                    ),
                     stage="final_revalidation",
                     approval_id=approval_id,
                 )
-                proposal_shadow = proposal.get("adaptive_sizing") or {}
+                proposal_adaptive = proposal.get("adaptive_sizing") or {}
+                if proposal_adaptive.get("operating_mode") != "operational_paper":
+                    block_reason = "proposal was not created by the compatible operational adaptive-sizing version"
                 if final_conviction is not None:
                     proposal["adaptive_sizing_final"] = self._record_adaptive_sizing(
                         proposal,
@@ -3093,18 +3162,50 @@ class TradingService:
                         final_conviction,
                         stage="final_revalidation",
                         approval_id=approval_id,
-                        displayed_adaptive_ceiling=proposal_shadow.get("displayed_adaptive_ceiling"),
-                        proposal_adaptive_notional=proposal_shadow.get("adaptive_notional"),
+                        displayed_adaptive_ceiling=proposal_adaptive.get("displayed_adaptive_ceiling"),
+                        proposal_adaptive_notional=proposal_adaptive.get("adaptive_notional"),
                         final_revalidation_blocked=bool(block_reason),
                     )
             except Exception as exc:
-                logger.warning("Report-only adaptive sizing final revalidation unavailable: %s", type(exc).__name__)
-                self.storage.audit(self.run_id, "adaptive_sizing_final_report_unavailable", {
+                logger.warning("Operational adaptive sizing final revalidation unavailable: %s", type(exc).__name__)
+                self.storage.audit(self.run_id, "adaptive_sizing_final_operational_unavailable", {
                     "proposal_id": row.get("id"), "approval_id": approval_id,
-                    "error_type": type(exc).__name__, "operational_sizing_unchanged": True,
+                    "error_type": type(exc).__name__, "order_submitted": False,
                 })
-            if operational_before_shadow != (proposal.get("notional"), proposal.get("qty")):
-                raise RuntimeError("report-only adaptive sizing attempted to mutate operational size")
+                block_reason = "final operational adaptive sizing could not be recomputed"
+
+            final_adaptive = proposal.get("adaptive_sizing_final") or {}
+            final_notional = min(
+                max(0.0, approved_notional),
+                max(0.0, float(final_adaptive.get("operational_notional") or 0.0)),
+            )
+            if final_notional <= 0:
+                block_reason = block_reason or "final operational adaptive sizing found no safe executable size"
+            else:
+                displayed_quantity = float(row.get("qty") or proposal.get("approved_quantity_ceiling") or proposal.get("qty") or 0.0)
+                displayed_stop_risk = float(proposal.get("approved_stop_risk_ceiling") or proposal.get("stop_risk_dollars") or 0.0)
+                recomputed_quantity = final_notional / refreshed_price_val if refreshed_price_val and refreshed_price_val > 0 else 0.0
+                stop_distance = float(proposal.get("stop_distance_dollars") or 0.0)
+                risk_quantity_ceiling = displayed_stop_risk / stop_distance if displayed_stop_risk > 0 and stop_distance > 0 else recomputed_quantity
+                final_quantity = min(recomputed_quantity, displayed_quantity, risk_quantity_ceiling)
+                final_notional = min(final_notional, final_quantity * float(refreshed_price_val or 0.0))
+                proposal["notional_reduced_by_cap"] = final_notional < approved_notional - 1e-9
+                proposal["notional"] = final_notional
+                proposal["qty"] = final_quantity
+                proposal["stop_risk_dollars"] = float(proposal["qty"]) * float(proposal.get("stop_distance_dollars") or 0.0)
+                proposal["approved_quantity_ceiling"] = displayed_quantity
+                proposal["approved_notional_ceiling"] = approved_notional
+                proposal["sizing_caps"] = dict(final_adaptive.get("sizing_caps") or {})
+                proposal["binding_caps"] = [final_adaptive.get("binding_adaptive_cap")]
+                proposal["deployment_mode"] = final_conviction.get("deployment_mode") if final_conviction else proposal.get("deployment_mode")
+                proposal["opportunity_class"] = final_conviction.get("opportunity_class") if final_conviction else proposal.get("opportunity_class")
+                proposal["permitted_stop_risk_pct"] = final_conviction.get("recommended_stop_risk_pct") if final_conviction else proposal.get("permitted_stop_risk_pct")
+                context = self._portfolio_context(proposal, approval_valid=True)
+                if final_notional <= 0 or final_quantity <= 0:
+                    block_reason = "displayed quantity or stop-risk ceiling leaves no executable final size"
+
+        if block_reason:
+            return ExecutionResult(False, "blocked", None, reason=block_reason), refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
 
         # Execute
         proposal["status"] = "approved"
@@ -5261,22 +5362,18 @@ class TradingService:
                                 "sleep_mode_ended_at": sleep_mode_ended_at,
                             }
 
-                            if emergency_exit_triggered == 1:
-                                # Emergency exits bypass standard risk engine proposal evaluations
-                                pass
-                            else:
+                            if self._operational_adaptive_enabled() and is_buy and proposal_action in {"entry", "add"}:
                                 self._should_auto_execute(proposal)
-                                decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, port_context)
-                                if not decision.passed:
-                                    no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
-                                    proposal_allowed = False
-
-                            if is_buy and proposal_action in {"entry", "add"}:
+                                # First prove the candidate and canonical inputs are
+                                # executable, then let the independent engines own
+                                # conviction and operational size. The actual size is
+                                # checked again against the complete risk engine below.
+                                baseline_decision = self._risk_engine(proposal_id, "proposal_baseline").evaluate(proposal, port_context)
                                 proposal["adaptive_conviction"] = self._record_adaptive_conviction(
                                     proposal,
                                     res,
                                     port_context,
-                                    risk_checks_passed=bool(decision is not None and decision.passed),
+                                    risk_checks_passed=baseline_decision.passed,
                                     stage="proposal",
                                 )
                                 if proposal["adaptive_conviction"] is not None:
@@ -5287,6 +5384,52 @@ class TradingService:
                                         proposal["adaptive_conviction"],
                                         stage="proposal",
                                     )
+                                operational_adaptive = proposal.get("adaptive_sizing") or {}
+                                adaptive_notional = float(operational_adaptive.get("operational_notional") or 0.0)
+                                adaptive_quantity = float(operational_adaptive.get("operational_quantity") or 0.0)
+                                if not baseline_decision.passed or adaptive_notional <= 0 or adaptive_quantity <= 0:
+                                    reasons = baseline_decision.reasons if not baseline_decision.passed else ["adaptive operational sizing found no safe executable size"]
+                                    no_action_reason = f"blocked by risk checks: {'; '.join(reasons)}"
+                                    proposal_allowed = False
+                                else:
+                                    proposal["baseline_operational_notional"] = float(proposal.get("notional") or 0.0)
+                                    proposal["notional"] = adaptive_notional
+                                    proposal["qty"] = adaptive_quantity
+                                    proposal["displayed_adaptive_ceiling"] = adaptive_notional
+                                    proposal["approved_quantity_ceiling"] = adaptive_quantity
+                                    proposal["approved_stop_risk_ceiling"] = float(operational_adaptive.get("stop_risk_dollars") or 0.0)
+                                    proposal["stop_risk_dollars"] = adaptive_quantity * float(proposal.get("stop_distance_dollars") or 0.0)
+                                    proposal["initial_risk_dollars"] = proposal["stop_risk_dollars"]
+                                    proposal["initial_risk_pct"] = (
+                                        proposal["stop_risk_dollars"] / float(snapshot["portfolio_equity"]) * 100.0
+                                        if float(snapshot["portfolio_equity"] or 0.0) > 0 else 0.0
+                                    )
+                                    proposal["risk_budget"] = proposal["stop_risk_dollars"]
+                                    proposal["risk_budget_dollars"] = proposal["stop_risk_dollars"]
+                                    notional = adaptive_notional
+                                    qty_val = adaptive_quantity
+                                    risk_budget = proposal["stop_risk_dollars"]
+                                    proposal["deployment_mode"] = proposal["adaptive_conviction"].get("deployment_mode")
+                                    proposal["opportunity_class"] = proposal["adaptive_conviction"].get("opportunity_class")
+                                    proposal["permitted_stop_risk_pct"] = proposal["adaptive_conviction"].get("recommended_stop_risk_pct")
+                                    proposal["sizing_caps"] = dict(operational_adaptive.get("sizing_caps") or {})
+                                    proposal["binding_caps"] = [operational_adaptive.get("binding_adaptive_cap")]
+                                    port_context = self._portfolio_context(proposal)
+                                    proposal["proposed_total_exposure_pct"] = port_context.get("proposed_total_exposure_pct")
+                                    proposal["proposed_cluster_exposure_pct"] = port_context.get("proposed_cluster_exposure_pct")
+                                    decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, port_context)
+                                    if not decision.passed:
+                                        no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                                        proposal_allowed = False
+                            elif emergency_exit_triggered == 1:
+                                # Exits remain independent of entry conviction and sizing.
+                                pass
+                            else:
+                                self._should_auto_execute(proposal)
+                                decision = self._risk_engine(proposal_id, "proposal").evaluate(proposal, port_context)
+                                if not decision.passed:
+                                    no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
+                                    proposal_allowed = False
 
                             if proposal_allowed:
                                 if is_buy:
@@ -5459,7 +5602,7 @@ class TradingService:
                         "strategy_quality_score": res.get("strategy_quality_score"),
                         "strategy_state": res.get("strategy_state"),
                         "strategy_risk_multiplier": res.get("strategy_risk_multiplier"),
-                        "permitted_stop_risk_pct": res.get("permitted_stop_risk_pct"),
+                        "permitted_stop_risk_pct": proposal.get("permitted_stop_risk_pct", res.get("permitted_stop_risk_pct")),
                         "strategy_policy_version": res.get("strategy_policy_version"),
                         "binding_policy_reason": res.get("binding_policy_reason"),
                     })
@@ -5612,10 +5755,10 @@ class TradingService:
                            permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=?
                            WHERE id=?""",
                         (STOP_POLICY_VERSION, SIZING_POLICY_VERSION, RISK_DECISION_VERSION,
-                         json_dumps(res.get("sizing_caps") or {}), json_dumps(res.get("binding_caps") or []),
+                         json_dumps(proposal.get("sizing_caps") or {}), json_dumps(proposal.get("binding_caps") or []),
                          EVIDENCE_VERSION, self.config.get("effective_config_hash"), res.get("performance_snapshot_id"),
                          res.get("policy_decision_id"), res.get("strategy_quality_score"), res.get("strategy_state"),
-                         res.get("strategy_risk_multiplier"), res.get("permitted_stop_risk_pct"), res.get("strategy_policy_version"),
+                         res.get("strategy_risk_multiplier"), proposal.get("permitted_stop_risk_pct", res.get("permitted_stop_risk_pct")), res.get("strategy_policy_version"),
                          res.get("binding_policy_reason"), sizing_decision_id),
                     )
 
@@ -6063,27 +6206,27 @@ class TradingService:
         adaptive_conviction_line = None
         adaptive_rows = self.storage.fetch_all(
             """SELECT deployment_mode,opportunity_class,recommended_stop_risk_pct,operational_stop_risk_pct,binding_cap
-               FROM adaptive_conviction_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+               FROM adaptive_conviction_operational_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
             (window_start_iso,),
         )
         if adaptive_rows:
             adaptive = adaptive_rows[0]
             adaptive_conviction_line = (
-                f"Adaptive Conviction report-only: {adaptive['deployment_mode']}/{adaptive['opportunity_class']}; "
-                f"future {float(adaptive['recommended_stop_risk_pct']):.4f}% vs operational {float(adaptive['operational_stop_risk_pct']):.4f}%; "
+                f"Adaptive Conviction operational paper: {adaptive['deployment_mode']}/{adaptive['opportunity_class']}; "
+                f"permitted {float(adaptive['recommended_stop_risk_pct']):.4f}%; "
                 f"binding {adaptive['binding_cap']}"
             )
         adaptive_sizing_rows = self.storage.fetch_all(
-            """SELECT operational_constrained_notional,adaptive_constrained_notional,comparison_direction,binding_adaptive_cap
-               FROM adaptive_sizing_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+            """SELECT operational_constrained_notional,final_operational_notional,comparison_direction,binding_adaptive_cap
+               FROM adaptive_sizing_operational_decisions WHERE created_at>=? ORDER BY created_at DESC,id DESC LIMIT 1""",
             (window_start_iso,),
         )
         if adaptive_sizing_rows:
-            sizing_shadow = adaptive_sizing_rows[0]
+            sizing_operational = adaptive_sizing_rows[0]
             sizing_line = (
-                f"Adaptive Sizing report-only: operational ${float(sizing_shadow['operational_constrained_notional']):,.2f}; "
-                f"shadow ${float(sizing_shadow['adaptive_constrained_notional']):,.2f}; "
-                f"{sizing_shadow['comparison_direction']}; binding {sizing_shadow['binding_adaptive_cap']}; operational unchanged"
+                f"Adaptive Sizing operational paper: baseline ${float(sizing_operational['operational_constrained_notional']):,.2f}; "
+                f"actual ${float(sizing_operational['final_operational_notional']):,.2f}; "
+                f"{sizing_operational['comparison_direction']}; binding {sizing_operational['binding_adaptive_cap']}"
             )
             adaptive_conviction_line = f"{adaptive_conviction_line}; {sizing_line}" if adaptive_conviction_line else sizing_line
         crypto_research_line = None
@@ -6454,7 +6597,7 @@ class TradingService:
             states = controller.refresh_strategy_states()
             healthy, report = controller.reconciliation_health()
             self.storage.audit(self.run_id, "phase3_active_risk_cycle", {
-                "profile": "moderate_paper_risk_v1", "reconciliation_healthy": healthy,
+                "profile": "adaptive_operational_paper_risk_v2", "reconciliation_healthy": healthy,
                 "strategy_states": states, "integrity": report, "manual_approval_required": True,
             })
         if self.config.get("phase4", {}).get("active"):
@@ -7786,7 +7929,7 @@ class TradingService:
                  sizing_caps.get("stop_risk"),sizing_caps.get("stage"),sizing_caps.get("equity"),sizing_caps.get("cash"),sizing_caps.get("buying_power"),sizing_caps.get("symbol"),sizing_caps.get("cluster"),sizing_caps.get("portfolio"),sizing_caps.get("allocation"),sizing_caps.get("exploration"),
                  pending_stop_risk,reserved_stop_risk,pending_stop_risk + final_notional / entry_price * stop_distance_dollars,reserved_stop_risk,
                  before_heat_pct,after_heat_pct,after_gross_pct,after_symbol_pct.get(symbol.upper(), 0.0),after_cluster_pct.get(cluster_name, 0.0) if cluster_name else None,
-                 volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],phase3_context["allocation_multiplier"],json_dumps(binding_caps),EVIDENCE_VERSION,PHASE3_DECISION_VERSION,self.config.get("effective_config_hash"),"moderate_paper_risk_v1",json_dumps(payload)))
+                 volatility_regime,phase3_context["regime_multiplier"],phase3_context["drawdown_multiplier"],phase3_context["allocation_multiplier"],json_dumps(binding_caps),EVIDENCE_VERSION,PHASE3_DECISION_VERSION,self.config.get("effective_config_hash"),"adaptive_operational_paper_risk_v2",json_dumps(payload)))
             self.storage.execute(
                 """UPDATE phase3_risk_decisions SET performance_snapshot_id=?,policy_decision_id=?,strategy_quality_score=?,
                    strategy_state=?,strategy_risk_multiplier=?,permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=? WHERE id=?""",
@@ -7834,28 +7977,37 @@ class TradingService:
         }
 
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        from .phase4_allocator import candidate_allocation_rank
+
         ranked = []
         for c in buy_candidates:
             symbol = c["symbol"]
-            score = c["score"]
-            notional = c.get("final_notional", 0.0)
-
-            setup_quality = score
-
             c_name = self._get_symbol_cluster(symbol)
             cluster_exp = snapshot["cluster_exposures"].get(c_name or "", 0.0)
-            portfolio_fit = 100.0 - (cluster_exp * 10.0)
-
-            diversification = 100.0
-            if c_name:
-                if snapshot["cluster_counts"].get(c_name, 0) > 0:
-                    diversification -= 20.0
-                else:
-                    diversification += 10.0
-
-            sizing_score = min(100.0, notional * 2.0)
-
-            ranking_score = setup_quality * 0.4 + portfolio_fit * 0.3 + diversification * 0.2 + sizing_score * 0.1
+            strategy = str(getattr(c.get("signal"), "strategy_version", None) or c.get("strategy_version") or STRATEGY_VERSION)
+            phase4_policy = (self._phase4_allocation_cache or {}).get("strategy_policies", {}).get(strategy, {})
+            execution = self._adaptive_conviction_execution_evidence(strategy)
+            current_regime = phase4_policy.get("current_regime_performance") or {}
+            if str(current_regime.get("regime") or "").lower() != str(c.get("volatility_regime") or "").lower():
+                current_regime = {}
+            rank = candidate_allocation_rank({
+                "setup_score": c.get("score"),
+                "evidence_quality": c.get("strategy_quality_score"),
+                "regime": c.get("volatility_regime"),
+                "execution_fill_rate": execution.get("execution_fill_rate"),
+                "execution_shortfall_bps": execution.get("execution_shortfall_bps"),
+                "conservative_expected_return": (
+                    current_regime.get("conservative_expected_return")
+                    if current_regime.get("reliable") is True
+                    else phase4_policy.get("conservative_expected_return")
+                ),
+                "uncertainty": phase4_policy.get("uncertainty"),
+                "deterioration_score": phase4_policy.get("deterioration_score"),
+                "symbol_exposure_pct": snapshot["single_exposures"].get(symbol, 0.0),
+                "cluster_exposure_pct": cluster_exp,
+                "stop_risk_pct": c.get("permitted_stop_risk_pct"),
+            })
+            ranking_score = rank["ranking_score"]
 
             if c.get("is_observation"):
                 ranking_score -= 50.0
@@ -7864,11 +8016,8 @@ class TradingService:
 
             ranked.append({
                 **c,
-                "setup_quality_score": setup_quality,
-                "portfolio_fit_score": portfolio_fit,
-                "diversification_score": diversification,
-                "sizing_score": sizing_score,
-                "ranking_score": ranking_score
+                **rank,
+                "ranking_score": ranking_score,
             })
 
         ranked.sort(key=lambda x: (-x["ranking_score"], x["symbol"]))

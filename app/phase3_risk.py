@@ -14,8 +14,8 @@ from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
 
-PHASE3_SCHEMA_VERSION = "phase3_moderate_paper_risk_v1"
-PROFILE_VERSION = "moderate_paper_risk_v1"
+PHASE3_SCHEMA_VERSION = "phase3_adaptive_operational_paper_risk_v2"
+PROFILE_VERSION = "adaptive_operational_paper_risk_v2"
 
 
 @dataclass(frozen=True)
@@ -44,18 +44,16 @@ class Phase3RiskProfile:
         return profile
 
     def validate(self) -> None:
-        if not math.isclose(self.base_stop_risk_pct, 0.20, abs_tol=1e-9):
-            raise ValueError("Phase 3 base stop risk must be 0.20%")
-        if not 0 < self.add_stop_risk_pct <= 0.15:
-            raise ValueError("add stop risk must be within 0.10-0.15%")
-        if not self.base_stop_risk_pct <= self.max_trade_stop_risk_pct <= 0.35:
-            raise ValueError("maximum trade stop risk exceeds Phase 3 bound")
-        if not self.defensive_portfolio_heat_pct <= 0.50 < self.max_portfolio_heat_pct <= 1.25:
-            raise ValueError("portfolio heat bounds are invalid")
-        if not self.normal_gross_exposure_pct <= 30 < self.favorable_gross_exposure_pct <= 40:
-            raise ValueError("gross exposure profile is invalid")
-        if self.hard_gross_exposure_pct != 50 or self.max_symbol_exposure_pct > 6 or self.max_cluster_exposure_pct > 15:
-            raise ValueError("hard exposure bounds exceed requirements")
+        if not 0 < self.base_stop_risk_pct <= self.max_trade_stop_risk_pct <= 0.35:
+            raise ValueError("trade stop-risk targets must fit the 0.35% hard envelope")
+        if not 0 < self.add_stop_risk_pct <= self.max_trade_stop_risk_pct:
+            raise ValueError("ADD stop risk must fit the per-trade hard envelope")
+        if not 0 < self.defensive_portfolio_heat_pct <= self.favorable_portfolio_heat_pct <= self.max_portfolio_heat_pct <= 1.75:
+            raise ValueError("portfolio heat targets exceed the 1.75% hard envelope")
+        if not 0 < self.normal_gross_exposure_pct <= self.favorable_gross_exposure_pct <= self.hard_gross_exposure_pct <= 50:
+            raise ValueError("gross exposure targets exceed the 50% hard envelope")
+        if self.max_symbol_exposure_pct > 6 or self.max_cluster_exposure_pct > 15:
+            raise ValueError("symbol or cluster exposure exceeds the hard envelope")
         if self.drawdown_halt_pct != 6:
             raise ValueError("new risk must halt at 6% drawdown")
 
@@ -116,7 +114,9 @@ def regime_multiplier(regime: str) -> float:
         return 0.50
     if "high" in value or "elevated" in value or "mixed" in value or "uncertain" in value:
         return 0.75
-    if "favorable" in value or ("uptrend" in value and "normal" in value):
+    if "favorable" in value:
+        return 1.15
+    if "normal" in value or "uptrend" in value:
         return 1.0
     return 0.75
 
@@ -208,7 +208,7 @@ class Phase3Controller:
             weight = 1.0 / len(eligible)
             identifier = hashlib.sha256(f"{self.run_id}|{version}|{PROFILE_VERSION}".encode()).hexdigest()[:32]
             self.storage.execute("INSERT OR IGNORE INTO phase3_strategy_allocations VALUES(?,?,?,?,?,?,?,?)",
-                                 (identifier,self.run_id,version,weight,"ACTIVE","equal risk across eligible evidence-approved strategies",PROFILE_VERSION,now))
+                                 (identifier,self.run_id,version,weight,"ACTIVE","authorised executable strategy risk sleeve",PROFILE_VERSION,now))
         return states
 
     def allocation(self, strategy_version: str, states: Mapping[str, str]) -> float:

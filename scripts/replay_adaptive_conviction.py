@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only offline replay for report-only Adaptive Conviction."""
+"""Read-only offline replay of operational-paper Adaptive Conviction inputs."""
 
 from __future__ import annotations
 

@@ -270,7 +270,8 @@ def test_probe_sizing_respects_score_stage_risk_and_active_count(monkeypatch, tm
     probe = service._calculate_dynamic_size("SPY", 85, "normal", 100, bars, account, strategy_version="rule_based_v2")
     assert probe["phase4_mode"] == "probe"
     assert probe["permitted_stop_risk_pct"] == 0.03
-    assert 0 < probe["final_notional"] <= 250.0
+    assert probe["final_notional"] > 250.0
+    assert probe["stop_risk_dollars"] <= 30.0 + 1e-9
     assert probe["score_multiplier"] == 1.0
     add = service._calculate_dynamic_size("SPY", 99, "normal", 100, bars, account, is_add=True, strategy_version="rule_based_v2")
     assert add["final_notional"] == 0 and "adds are blocked" in add["blocked_reason"]

@@ -133,15 +133,14 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
         finally:
             app.service.evaluate_symbol = original_evaluate
 
-    base_notional = float(config["risk"].get("max_trade_notional_paper", 5))
-
     # Case A: 15% (normal volatility) -> eligible, normal notional
     run_scan_with_vol(0.15)
     props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
     assert len(props) == 1
     p_payload = json.loads(props[0]["payload"])
-    assert 0 < p_payload["notional"] <= base_notional
-    assert p_payload["notional"] <= p_payload["sizing_caps"]["stage"]
+    assert p_payload["notional"] > 250.0
+    normal_notional = p_payload["notional"]
+    assert "stage" not in p_payload["sizing_caps"]
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY'")[0]
     assert memory["volatility_regime"] == "normal"
     assert memory["paper_size_adjustment"] == 1.0
@@ -151,8 +150,8 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
     assert len(props) == 1
     p_payload = json.loads(props[0]["payload"])
-    assert 0 < p_payload["notional"] <= base_notional
-    assert p_payload["notional"] <= p_payload["sizing_caps"]["stage"]
+    assert 0 < p_payload["notional"] <= normal_notional
+    assert "stage" not in p_payload["sizing_caps"]
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY'")[0]
     assert memory["volatility_regime"] == "elevated"
     assert memory["paper_size_adjustment"] == 0.5

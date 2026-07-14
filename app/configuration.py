@@ -11,10 +11,12 @@ from .formula_versions import (
     ADAPTIVE_CONVICTION_FORMULA_VERSION,
     ADAPTIVE_CONVICTION_SCHEMA_VERSION,
     ADAPTIVE_SIZING_FORMULA_VERSION,
+    ADAPTIVE_SIZING_SCHEMA_VERSION,
     CONFIGURATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE3_DECISION_VERSION,
     PHASE4_ALLOCATION_VERSION,
+    PHASE4_ALLOCATOR_VERSION,
     RISK_DECISION_VERSION,
     SIZING_POLICY_VERSION,
     STOP_POLICY_VERSION,
@@ -91,11 +93,11 @@ STRICT_SECTION_KEYS = {
         "require_manual_approval", "phase3_hard_limits_authoritative",
     },
     "adaptive_conviction": {
-        "enabled", "report_only", "formula_version", "schema_version", "base_strategy_risk_pct",
+        "enabled", "enforcement_enabled", "mode", "formula_version", "schema_version", "base_strategy_risk_pct",
         "hard_trade_risk_ceiling_pct", "maximum_symbol_exposure_pct", "maximum_cluster_exposure_pct",
         "minimum_liquidity_dollars", "maximum_quote_spread_bps", "kelly_operational", "covariance_operational",
     },
-    "adaptive_sizing": {"enabled", "mode", "operational_enforcement", "allow_order_size_change"},
+    "adaptive_sizing": {"enabled", "mode", "operational_enforcement", "allow_order_size_change", "formula_version", "schema_version"},
     "risk_budget": {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
@@ -195,7 +197,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     conviction = config.get("adaptive_conviction", {}) or {}
     require(conviction.get("enabled") is True, "adaptive_conviction.enabled must be true")
-    require(conviction.get("report_only") is True, "adaptive conviction must remain report-only")
+    require(conviction.get("enforcement_enabled") is True, "adaptive conviction must be operational in paper mode")
+    require(conviction.get("mode") == "operational_paper", "adaptive conviction mode must be operational_paper")
     require(conviction.get("formula_version") == ADAPTIVE_CONVICTION_FORMULA_VERSION, f"adaptive_conviction.formula_version must be {ADAPTIVE_CONVICTION_FORMULA_VERSION}")
     require(conviction.get("schema_version") == ADAPTIVE_CONVICTION_SCHEMA_VERSION, f"adaptive_conviction.schema_version must be {ADAPTIVE_CONVICTION_SCHEMA_VERSION}")
     require(conviction.get("base_strategy_risk_pct") == 0.20, "adaptive conviction base strategy risk must be 0.20%")
@@ -205,13 +208,15 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(conviction.get("minimum_liquidity_dollars") == 10000000.0, "adaptive conviction liquidity floor must remain $10M")
     require(conviction.get("maximum_quote_spread_bps") == 40.0, "adaptive conviction quote-spread ceiling must remain 40 bps")
     require(conviction.get("kelly_operational") is False, "adaptive conviction Kelly must remain diagnostic only")
-    require(conviction.get("covariance_operational") is False, "adaptive conviction covariance must remain diagnostic only")
+    require(conviction.get("covariance_operational") is True, "adaptive conviction diversification inputs must be operational")
 
     adaptive_sizing = config.get("adaptive_sizing", {}) or {}
     require(adaptive_sizing.get("enabled") is True, "adaptive_sizing.enabled must be true")
-    require(adaptive_sizing.get("mode") == "shadow_only", "adaptive sizing mode must remain shadow_only")
-    require(adaptive_sizing.get("operational_enforcement") is False, "operational adaptive sizing is forbidden in this build")
-    require(adaptive_sizing.get("allow_order_size_change") is False, "adaptive sizing order-size changes are forbidden in this build")
+    require(adaptive_sizing.get("mode") == "operational_paper", "adaptive sizing mode must be operational_paper")
+    require(adaptive_sizing.get("operational_enforcement") is True, "adaptive sizing must enforce in paper mode")
+    require(adaptive_sizing.get("allow_order_size_change") is True, "adaptive sizing must control paper order size")
+    require(adaptive_sizing.get("formula_version") == ADAPTIVE_SIZING_FORMULA_VERSION, f"adaptive_sizing.formula_version must be {ADAPTIVE_SIZING_FORMULA_VERSION}")
+    require(adaptive_sizing.get("schema_version") == ADAPTIVE_SIZING_SCHEMA_VERSION, f"adaptive_sizing.schema_version must be {ADAPTIVE_SIZING_SCHEMA_VERSION}")
 
     profitability = config.get("profitability_engine", {}) or {}
     require(profitability.get("enabled") is True, "profitability_engine.enabled must be true")
@@ -256,8 +261,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if phase4.get("active"):
         require(phase4.get("enabled") is True, "active Phase 4 must be enabled")
         require(phase4.get("mode") == "ACTIVE_ADAPTIVE_PAPER", "Phase 4 mode must be ACTIVE_ADAPTIVE_PAPER")
+        require(phase4.get("allocator_version") == PHASE4_ALLOCATOR_VERSION, f"Phase 4 allocator version must be {PHASE4_ALLOCATOR_VERSION}")
         require(phase4.get("full_kelly_allowed") is False, "full Kelly is forbidden")
         require(phase4.get("llm_trading_decisions") is False, "LLM trading decisions are forbidden")
+        require(phase4.get("operational_kelly_enabled") is False, "Kelly may bound but never directly size an order")
+        require(phase4.get("operational_allocation_mode") == "bounded_evidence_aware", "Phase 4 must use bounded evidence-aware allocation")
         require(phase4.get("uncalibrated_score_sizing") is False, "uncalibrated score sizing is forbidden")
         require(phase4.get("require_manual_approval") is True, "Phase 4 exploration and probe entries require manual approval")
         kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)

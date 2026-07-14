@@ -1,42 +1,40 @@
-# Phase 4 adaptive paper allocation
+# Phase 4 evidence-aware operational-paper allocation
 
-`adaptive_paper_allocator_v1` is active only in paper mode. It consumes only
-completed out-of-sample evidence explicitly classified as executable portfolio
-returns or actual paper-trade returns; signal and shadow outcomes remain
-separate diagnostics. Qualified evidence uses adaptive allocation. Healthy
-immature executable strategies are persisted as `EXPLORATION`
-with an explicit `insufficient` evidence class and may receive bounded paper
-exploration; negative, deteriorating, stale, or unsafe evidence is persisted as
-`SUSPENDED` and receives zero new risk. Mature but uncertain positive evidence is
-`THROTTLED` and receives zero adaptive risk. These states are versioned and
-fingerprinted; insufficient evidence is never represented as negative evidence.
+Phase 4 consumes completed operational out-of-sample or actual paper evidence.
+It persists shrinkage toward zero, conservative expected return, uncertainty,
+data quality, current-regime performance, deterioration, execution quality,
+covariance, marginal risk, overlap/correlation and stress results.
 
-Each estimate stores beta-prior calibrated positive probability, normal-prior
-mean shrinkage toward zero, a conservative lower confidence estimate, uncertainty,
-cost completeness, regime coverage, evidence fingerprint, and recent deterioration.
-Strategies promote to `ACTIVE`, throttle for incomplete evidence, suspend for
-negative conservative evidence or unhealthy integrity, and recover deterministically.
+For authorised mature candidates, deterministic ranking is operational:
 
-Allocation uses a covariance matrix shrunk 50% toward its diagonal. Insufficient
-paired observations use a conservative 0.50 correlation fallback. Marginal and
-component risk, expected shortfall, overlap, uncertainty, costs, data quality,
-regime, and drawdown are persisted. Stress scenarios include SPY -3%/-5%, sector
--7%, doubled volatility, two-ATR gaps, correlations to one, and largest strategy
--15%.
+```text
+conviction = mean(setup quality, evidence quality, regime alignment, execution quality)
+rank = 100 × (0.30 × conviction
+            + 0.20 × conservative expected-value score
+            + 0.20 × diversification capacity
+            + 0.15 × execution quality
+            + 0.15 × risk efficiency)
+       - 15 × uncertainty
+       - 30 × deterioration
+```
 
-Kelly, covariance, calibration, and shrinkage remain persisted research
-diagnostics. They do not size operational paper proposals. Qualified
-executable strategies use deterministic equal-risk allocation, capped at 35%
-per strategy and 75% total allocation; operational Kelly is disabled until
-synchronized strategy-level return and covariance evidence is explicitly
-introduced. Exploration is capped at 0.25% total stop-risk heat, 0.05% stop
-risk per immature strategy, 0.10% maximum per strategy, and 7.5% gross
-exposure. Research-only and shadow strategies retain evidence and state
-transitions but never receive executable allocation. If no safe adaptive or
-exploration policy is eligible, the allocator records `PRESERVE_CASH` with
-zero new strategy risk.
+All inputs are clamped to bounded unit scores. Symbol/cluster overlap lowers
+diversification; strong low-overlap opportunities rank higher. The strategy
+optimizer uses conservative expected return divided by shrunk covariance risk,
+then applies evidence, uncertainty, deterioration, overlap, regime, drawdown,
+stress and concentration penalties before normalising within Phase 3 limits.
 
-Phase 3 stop-risk sizing, heat, gross, symbol, cluster, liquidity, loss, drawdown,
-no-leverage, durable intent/reservation, final validation, and Telegram approval
-limits remain authoritative and cannot be raised by Phase 4. Full Kelly, score
-sizing, LLM decisions, live trading, and Phase 5 behavior are forbidden.
+Fractional Kelly (maximum 0.25; configured 0.20) is only a ceiling diagnostic.
+It never directly produces an order quantity, and unreliable Kelly inputs
+cannot expand risk. Full Kelly is forbidden.
+
+Operational policy states remain distinct: RESEARCH_ONLY and SUSPENDED receive
+zero entry risk; PROBE receives 0.03% per trade with 0.10% aggregate heat,
+2.5% gross, one active/reserved probe and no ADD; EXPLORATION receives bounded
+immature allocation; THROTTLED is reduced; ACTIVE may receive normal or
+expanded evidence-aware allocation. Only `rule_based_v2` is executable today;
+the architecture does not fabricate multi-strategy diversification.
+
+Schema: `phase4_evidence_aware_operational_paper_v3`. Allocator:
+`adaptive_paper_allocator_v3_evidence_aware`. Formula:
+`phase4_evidence_aware_allocation_v4_operational_paper`.

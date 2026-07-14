@@ -22,6 +22,7 @@ def _inputs(**overrides):
         "run_id": "run-1", "proposal_id": "proposal-1", "candidate_id": "candidate-1", "setup_id": "setup-1",
         "strategy_version": "rule_based_v2", "policy_decision_id": "policy-1", "performance_snapshot_id": "snapshot-1",
         "action": "entry", "side": "buy", "strategy_authorized": True, "strategy_policy_state": "ACTIVE",
+        "strategy_stop_risk_cap_pct": 0.35,
         "evidence_quality": 1.0, "evidence_calibrated": True, "regime_alignment": 1.0,
         "account_drawdown_pct": 0.0, "daily_realized_loss_pct": 0.0, "weekly_realized_loss_pct": 0.0,
         "execution_quality": 1.0, "execution_integrity_ok": True, "reconciliation_ok": True,
@@ -113,11 +114,12 @@ def test_degradation_integrity_correlation_and_concentration_never_expand(overri
     assert decision.recommended_stop_risk_pct <= 0.20
 
 
-def test_probe_is_diagnostic_only_and_exit_bypasses_classification():
-    probe = _engine().evaluate(_inputs(strategy_policy_state="PROBE", evidence_calibrated=False, operational_stop_risk_pct=0.03))
+def test_probe_is_operationally_bounded_and_exit_bypasses_classification():
+    probe = _engine().evaluate(_inputs(strategy_policy_state="PROBE", strategy_stop_risk_cap_pct=0.03, evidence_calibrated=False, operational_stop_risk_pct=0.03))
     assert probe is not None
     assert probe.operational_stop_risk_pct == 0.03
-    assert probe.report_only is True
+    assert probe.report_only is False
+    assert probe.recommended_stop_risk_pct <= 0.03
     assert _engine().evaluate(_inputs(action="exit", side="sell")) is None
 
 
@@ -131,7 +133,7 @@ def test_persistence_and_replay_are_deterministic(tmp_path):
     assert first.decision_fingerprint == second.decision_fingerprint
     engine.persist(storage, first)
     engine.persist(storage, second)
-    assert storage.fetch_all("SELECT COUNT(*) n FROM adaptive_conviction_decisions")[0]["n"] == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM adaptive_conviction_operational_decisions")[0]["n"] == 1
     before = {table: storage.fetch_all(f"SELECT COUNT(*) n FROM {table}")[0]["n"] for table in ("trade_proposals", "approvals", "risk_reservations", "order_intents", "orders", "fills")}
     replay = engine.replay([_inputs(), _inputs(proposal_id="proposal-2")])
     after = {table: storage.fetch_all(f"SELECT COUNT(*) n FROM {table}")[0]["n"] for table in before}
@@ -161,10 +163,10 @@ def test_read_only_database_replay_does_not_mutate_trading_state(tmp_path):
 def test_schema_and_configuration_are_strict(tmp_path):
     storage = Storage(tmp_path / "schema.sqlite3")
     storage.initialize()
-    columns = {row["name"] for row in storage.fetch_all("PRAGMA table_info(adaptive_conviction_decisions)")}
-    assert {"recommended_stop_risk_pct", "operational_stop_risk_pct", "raw_inputs_json", "report_only"} <= columns
+    columns = {row["name"] for row in storage.fetch_all("PRAGMA table_info(adaptive_conviction_operational_decisions)")}
+    assert {"recommended_stop_risk_pct", "operational_stop_risk_pct", "raw_inputs_json", "operating_mode", "operational_enforced", "report_only"} <= columns
     config = load_config()
-    config["adaptive_conviction"]["report_only"] = False
+    config["adaptive_conviction"]["enforcement_enabled"] = False
     with pytest.raises(ConfigurationError):
         validate_config(config)
 
@@ -176,4 +178,6 @@ def test_operational_sizing_formula_does_not_reference_adaptive_conviction():
     assert "adaptive_conviction" not in sizing_source
     assert "AdaptiveConviction" not in final_validation_source
     assert "_record_adaptive_conviction" in final_validation_source
-    assert "min(max(0.0, approved_notional), max(0.0, recalc_notional))" in final_validation_source
+    assert "approved_notional" in final_validation_source
+    assert "displayed_quantity" in final_validation_source
+    assert "final_adaptive" in final_validation_source
