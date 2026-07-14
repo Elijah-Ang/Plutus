@@ -131,7 +131,14 @@ def candidate_allocation_rank(inputs: Mapping[str, Any]) -> dict[str, float]:
     correlation = unit(inputs.get("correlation_score"), default=0.0)
     marginal_risk = unit(inputs.get("marginal_portfolio_risk"), default=0.0)
     diversification = 1.0 - max(symbol_exposure, cluster_exposure, correlation, marginal_risk)
-    risk_consumption = unit(inputs.get("stop_risk_pct"), scale=0.35, default=1.0)
+    canonical_risk = normalize_risk_to_dollars(
+        inputs.get("risk_value"), str(inputs.get("risk_unit") or ""),
+        conversion_equity=inputs.get("conversion_equity"),
+        conversion_equity_as_of=str(inputs.get("conversion_equity_as_of") or ""),
+        evaluation_time=str(inputs.get("evaluation_time") or ""),
+    )
+    authoritative_equity = float(canonical_risk["conversion_equity"])
+    risk_consumption = unit(float(canonical_risk["risk_value"]) / authoritative_equity, scale=0.0035)
     stop_quality = unit(inputs.get("stop_quality"), scale=100.0, default=0.50)
     reward_to_risk = unit(inputs.get("reward_to_risk"), scale=3.0, default=0.50)
     risk_efficiency = statistics.fmean((1.0 - 0.50 * risk_consumption, stop_quality, reward_to_risk))
@@ -223,6 +230,7 @@ def allocate_candidates_to_sleeves(
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, float]]] = []
     exits: list[tuple[str, dict[str, Any]]] = []
+    invalid_risk_evidence: list[tuple[str, dict[str, Any], str]] = []
     for raw in candidates:
         candidate = dict(raw)
         identity = _candidate_identity(candidate)
@@ -231,7 +239,16 @@ def allocate_candidates_to_sleeves(
         if action in {"exit", "reduce", "sell"} or side == "sell":
             exits.append((identity, candidate))
             continue
-        rank = candidate_allocation_rank(candidate)
+        try:
+            rank = candidate_allocation_rank({
+                **candidate,
+                "conversion_equity": conversion_equity,
+                "conversion_equity_as_of": conversion_equity_as_of,
+                "evaluation_time": evaluation_time,
+            })
+        except ValueError as exc:
+            invalid_risk_evidence.append((identity, candidate, str(exc)))
+            continue
         ranked.append((-rank["ranking_score"], identity, candidate, rank))
     ranked.sort(key=lambda item: (item[0], item[1]))
     exits.sort(key=lambda item: item[0])
@@ -250,6 +267,16 @@ def allocate_candidates_to_sleeves(
             "allocated_risk": 0.0,
             "ranking_score": None,
             "reason": "exits do not compete for entry risk sleeves",
+        })
+    for identity, candidate, reason in invalid_risk_evidence:
+        decisions.append({
+            "candidate_id": identity,
+            "strategy_version": str(candidate.get("strategy_version") or ""),
+            "symbol": str(candidate.get("symbol") or ""),
+            "action": str(candidate.get("action") or "entry").lower(),
+            "decision": "REJECT", "requested_risk": None, "allocated_risk": 0.0,
+            "risk_value": 0.0, "risk_unit": "stop_risk_dollars", "ranking_score": None,
+            "rank_components": None, "reason": f"invalid or stale risk conversion evidence: {reason}",
         })
 
     allocated_by_strategy = {strategy: 0.0 for strategy in normalized_sleeves}

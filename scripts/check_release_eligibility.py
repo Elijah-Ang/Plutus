@@ -25,6 +25,8 @@ from app.formula_versions import REQUIRED_SCHEMA_VERSIONS  # noqa: E402
 from app.storage import Storage  # noqa: E402
 from app.utils import load_config  # noqa: E402
 
+REQUIRED_CI_JOBS = frozenset({"offline-tests"})
+
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=ROOT, text=True, capture_output=True, check=False)
@@ -58,19 +60,45 @@ def _remote_ci(sha: str, repository: str | None, *, skip: bool) -> dict[str, Any
         run for run in payload.get("workflow_runs", [])
         if run.get("head_sha") == sha and run.get("name") == "CI"
     ]
-    passed = next((run for run in runs if run.get("status") == "completed" and run.get("conclusion") == "success"), None)
-    if passed:
-        return {
-            "status": "passed", "passed": True, "run_id": passed.get("id"),
-            "url": passed.get("html_url"), "conclusion": "success", "head_sha": sha,
-        }
-    failed = next((run for run in runs if run.get("status") == "completed"), None)
-    if failed:
-        return {
-            "status": "failed", "passed": False, "run_id": failed.get("id"),
-            "url": failed.get("html_url"), "conclusion": failed.get("conclusion"), "head_sha": sha,
-        }
-    return {"status": "pending" if runs else "unverified", "passed": False, "head_sha": sha}
+    if not runs:
+        return {"status": "unverified", "passed": False, "head_sha": sha, "reason": "no exact-SHA CI run"}
+    newest = max(runs, key=lambda run: (str(run.get("created_at") or ""), int(run.get("id") or 0)))
+    result = {
+        "status": "pending" if newest.get("status") != "completed" else "failed",
+        "passed": False, "run_id": newest.get("id"), "url": newest.get("html_url"),
+        "conclusion": newest.get("conclusion"), "head_sha": sha,
+    }
+    if newest.get("status") != "completed" or newest.get("conclusion") != "success":
+        result["reason"] = "newest exact-SHA CI run is not completed successfully"
+        return result
+    jobs_url = f"https://api.github.com/repos/{repository}/actions/runs/{newest.get('id')}/jobs?per_page=100"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(jobs_url, headers=headers), timeout=15) as response:
+            jobs_payload = json.load(response)
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return {**result, "status": "unverified", "reason": f"GitHub jobs lookup failed: {type(exc).__name__}"}
+    jobs = {str(job.get("name") or ""): job for job in jobs_payload.get("jobs", [])}
+    missing = sorted(REQUIRED_CI_JOBS - jobs.keys())
+    unsuccessful = sorted(
+        name for name in REQUIRED_CI_JOBS
+        if name in jobs and (jobs[name].get("status") != "completed" or jobs[name].get("conclusion") != "success")
+    )
+    if missing or unsuccessful:
+        return {**result, "required_jobs_missing": missing, "required_jobs_unsuccessful": unsuccessful,
+                "reason": "required CI jobs are missing or unsuccessful"}
+    return {**result, "status": "passed", "passed": True, "required_jobs": sorted(REQUIRED_CI_JOBS)}
+
+
+def _release_reachability(sha: str) -> dict[str, Any]:
+    on_main = _run("git", "merge-base", "--is-ancestor", sha, "origin/main").returncode == 0
+    tags = _run("git", "tag", "--points-at", sha).stdout.splitlines()
+    approved_tags = sorted(tag for tag in tags if tag.startswith("immutable-release-"))
+    return {
+        "passed": on_main or bool(approved_tags),
+        "reachable_from_origin_main": on_main,
+        "approved_immutable_release_tags": approved_tags,
+        "reason": None if on_main or approved_tags else "commit is not on origin/main or an approved immutable release tag",
+    }
 
 
 def build_report(*, run_tests: bool, check_remote: bool, repository: str | None = None) -> dict[str, Any]:
@@ -130,6 +158,7 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
         tail = remote.removesuffix(".git").split("github.com")[-1].lstrip(":/")
         repository = tail if "/" in tail else None
     remote_ci = _remote_ci(sha, repository, skip=not check_remote)
+    release_reachability = _release_reachability(sha)
     report = {
         "commit_sha": sha,
         "branch": _run("git", "branch", "--show-current").stdout.strip(),
@@ -148,10 +177,11 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
         "paper_only_verified": paper_only,
         "local_tests": local_tests,
         "github_ci": remote_ci,
+        "release_reachability": release_reachability,
     }
     report["release_eligible"] = all((
         report["worktree_clean"], report["configuration_valid"], migration_compatible,
-        paper_only, local_tests["passed"], remote_ci["passed"],
+        paper_only, local_tests["passed"], remote_ci["passed"], release_reachability["passed"],
     ))
     return report
 

@@ -326,10 +326,16 @@ class RotationCoordinator:
             ).fetchall()
             for row in existing:
                 exact = (
-                    row["exit_proposal_fingerprint"] == exit_fingerprint
+                    row["position_lifecycle_id"] == lifecycle_id
+                    and row["exit_proposal_fingerprint"] == exit_fingerprint
                     and row["contingent_candidate_fingerprint"] == candidate_fingerprint
                     and row["displayed_approval_fingerprint"] == displayed_fingerprint
                     and row["workflow_structure_fingerprint"] == structure_fingerprint
+                    and row["registry_snapshot_id"] == registry_snapshot_id
+                    and row["allocation_id"] == allocation_id
+                    and row["config_hash"] == self.config_hash
+                    and row["formula_version"] == ROTATION_FORMULA_VERSION
+                    and row["schema_version"] == ROTATION_SCHEMA_VERSION
                 )
                 if exact:
                     return dict(row)

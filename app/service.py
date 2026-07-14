@@ -1148,22 +1148,26 @@ class TradingService:
         if len(lifecycle_rows) != 1:
             return unavailable("r_multiple_unavailable_active_position_lifecycle_invalid")
         fill_rows = self.storage.fetch_all(
-            """SELECT f.id AS entry_fill_id,f.fill_price,f.occurred_at,
+            """SELECT f.id AS entry_fill_id,
                       i.id AS entry_order_intent_id,i.proposal_id,i.intended_stop_price,
-                      i.average_fill_price,p.payload
+                      i.average_fill_price,i.state,p.payload
                FROM order_intents i
-               JOIN broker_fill_events f ON f.intent_id=i.id AND f.delta_quantity>0
+               LEFT JOIN broker_fill_events f ON f.id=(
+                   SELECT first_fill.id FROM broker_fill_events first_fill
+                   WHERE first_fill.intent_id=i.id AND first_fill.delta_quantity>0
+                   ORDER BY first_fill.occurred_at,first_fill.id LIMIT 1
+               )
                LEFT JOIN trade_proposals p ON p.id=i.proposal_id
                WHERE i.position_lifecycle_id=? AND i.symbol=? AND i.side='buy'
-                 AND i.filled_quantity>0
-               ORDER BY f.occurred_at,f.id LIMIT 1""",
+                 AND i.intended_action='entry' AND i.filled_quantity>0
+               ORDER BY i.created_at,i.id LIMIT 1""",
             (lifecycle_id, symbol),
         )
         if not fill_rows:
             return unavailable("r_multiple_unavailable_current_lifecycle_entry_fill_missing")
         fill = fill_rows[0]
         try:
-            entry_price = float(fill.get("fill_price") or fill.get("average_fill_price") or 0.0)
+            entry_price = float(fill.get("average_fill_price") or 0.0)
         except (TypeError, ValueError):
             entry_price = 0.0
         if not math.isfinite(entry_price) or entry_price <= 0:
@@ -5931,6 +5935,8 @@ class TradingService:
             account = None
 
         snapshot = self._get_exposure_snapshot(positions, account)
+        snapshot["as_of"] = now.isoformat()
+        snapshot["equity_as_of"] = now.isoformat()
 
         # Insert portfolio exposure snapshot
         snapshot_id = str(uuid.uuid4())
@@ -10457,23 +10463,44 @@ class TradingService:
             current_regime = phase4_policy.get("current_regime_performance") or {}
             if str(current_regime.get("regime") or "").lower() != str(c.get("volatility_regime") or "").lower():
                 current_regime = {}
-            rank = candidate_allocation_rank({
-                "setup_score": c.get("score"),
-                "evidence_quality": c.get("strategy_quality_score"),
-                "regime": c.get("volatility_regime"),
-                "execution_fill_rate": execution.get("execution_fill_rate"),
-                "execution_shortfall_bps": execution.get("execution_shortfall_bps"),
-                "conservative_expected_return": (
-                    current_regime.get("conservative_expected_return")
-                    if current_regime.get("reliable") is True
-                    else phase4_policy.get("conservative_expected_return")
-                ),
-                "uncertainty": phase4_policy.get("uncertainty"),
-                "deterioration_score": phase4_policy.get("deterioration_score"),
-                "symbol_exposure_pct": snapshot["single_exposures"].get(symbol, 0.0),
-                "cluster_exposure_pct": cluster_exp,
-                "stop_risk_pct": c.get("permitted_stop_risk_pct"),
-            })
+            risk_value = c.get("risk_value", c.get("stop_risk_dollars"))
+            risk_unit = c.get("risk_unit")
+            if risk_value is None:
+                try:
+                    risk_value = (
+                        float(c["final_notional"]) / float(c["price"])
+                        * float(c["stop_distance_dollars"])
+                    )
+                    risk_unit = "stop_risk_dollars"
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    risk_value = None
+            try:
+                rank = candidate_allocation_rank({
+                    "setup_score": c.get("score"),
+                    "evidence_quality": c.get("strategy_quality_score"),
+                    "regime": c.get("volatility_regime"),
+                    "execution_fill_rate": execution.get("execution_fill_rate"),
+                    "execution_shortfall_bps": execution.get("execution_shortfall_bps"),
+                    "conservative_expected_return": (
+                        current_regime.get("conservative_expected_return")
+                        if current_regime.get("reliable") is True
+                        else phase4_policy.get("conservative_expected_return")
+                    ),
+                    "uncertainty": phase4_policy.get("uncertainty"),
+                    "deterioration_score": phase4_policy.get("deterioration_score"),
+                    "symbol_exposure_pct": snapshot["single_exposures"].get(symbol, 0.0),
+                    "cluster_exposure_pct": cluster_exp,
+                    "risk_value": risk_value,
+                    "risk_unit": risk_unit,
+                    "conversion_equity": snapshot.get("portfolio_equity"),
+                    "conversion_equity_as_of": snapshot.get("equity_as_of", snapshot.get("as_of")),
+                    "evaluation_time": snapshot.get("as_of"),
+                })
+            except ValueError:
+                # Ranking is an entry-admission step. Missing or stale canonical
+                # conversion evidence rejects the candidate rather than assigning
+                # a synthetic worst-risk score that could later become actionable.
+                continue
             ranking_score = rank["ranking_score"]
 
             if c.get("is_observation"):

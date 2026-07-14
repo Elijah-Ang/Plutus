@@ -164,6 +164,12 @@ def sized_candidate(symbol: str, score: float, notional: float, stop_distance: f
     }
 
 
+def exposure_snapshot(equity: float) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {"portfolio_equity": equity, "total_exposure_pct": 0.0, "single_exposures": {},
+            "cluster_exposures": {}, "cluster_counts": {}, "as_of": now, "equity_as_of": now}
+
+
 def test_ranked_batch_tables_created(tmp_path):
     storage = Storage(tmp_path / "schema.db")
     storage.initialize()
@@ -183,13 +189,7 @@ def test_risk_budget_allows_multiple_candidates_without_fixed_count_cap(tmp_path
     candidates = service._rank_candidates([
         sized_candidate("SPY", 88, 20.0),
         sized_candidate("IWM", 84, 20.0),
-    ], {
-        "portfolio_equity": 10000.0,
-        "total_exposure_pct": 0.0,
-        "single_exposures": {},
-        "cluster_exposures": {},
-        "cluster_counts": {},
-    })
+    ], exposure_snapshot(10000.0))
 
     allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
         candidates,
@@ -210,7 +210,7 @@ def test_lower_ranked_candidate_blocked_when_open_risk_budget_exhausted(tmp_path
     candidates = service._rank_candidates([
         sized_candidate("SPY", 90, 30.0, 8.0),
         sized_candidate("IWM", 80, 30.0, 8.0),
-    ], {"portfolio_equity": 1000.0, "total_exposure_pct": 0.0, "single_exposures": {}, "cluster_exposures": {}, "cluster_counts": {}})
+        ], exposure_snapshot(1000.0))
 
     allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
         candidates,
@@ -232,7 +232,7 @@ def test_preproposal_risk_block_is_recorded_as_non_actionable(tmp_path):
     candidate["preproposal_block_reason"] = "new buy blocked because an exit is pending"
 
     allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
-        service._rank_candidates([candidate], {"portfolio_equity": 10000.0, "total_exposure_pct": 0.0, "single_exposures": {}, "cluster_exposures": {}, "cluster_counts": {}}),
+        service._rank_candidates([candidate], exposure_snapshot(10000.0)),
         {"portfolio_equity": 10000.0, "total_exposure_pct": 0.0, "single_exposures": {}, "cluster_exposures": {}, "cluster_counts": {}},
         service.broker.get_account(),
         datetime.now(UTC),

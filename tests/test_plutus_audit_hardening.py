@@ -151,13 +151,16 @@ def test_initial_r_requires_current_lifecycle_fill_provenance(tmp_path) -> None:
         "position_lifecycle_id": "life-spy", "trading_mode": "paper",
     }, run_id="run", source_type="proposal")
     store.transition(entry["id"], OrderState.SUBMITTING, event_type="test")
-    store.record_fill(entry["id"], cumulative_quantity=10.0, fill_price=100.0, broker_event_key="current-entry-fill")
+    store.record_fill(entry["id"], cumulative_quantity=5.0, fill_price=100.0, broker_event_key="current-entry-fill-1")
+    partial = service._initial_risk_seed_for_position("SPY")
+    assert partial["entry_price_for_r"] == 100.0
+    store.record_fill(entry["id"], cumulative_quantity=10.0, fill_price=102.0, broker_event_key="current-entry-fill-2")
     seeded = service._initial_risk_seed_for_position("SPY")
     assert seeded["position_lifecycle_id"] == "life-spy"
     assert seeded["entry_order_intent_id"] == entry["id"]
-    assert seeded["entry_price_for_r"] == 100.0
+    assert seeded["entry_price_for_r"] == 101.0
     assert seeded["initial_stop_price"] == 95.0
-    assert seeded["initial_risk_per_share"] == 5.0
+    assert seeded["initial_risk_per_share"] == 6.0
     assert seeded["initial_risk_reconstruction_source"] == "linked_order_intent"
 
 
@@ -252,6 +255,27 @@ def test_terminal_rotation_is_not_reused_and_active_conflict_is_blocked(tmp_path
             contingent_entries=[{**entries[0], "proposal_id": "entry-2", "candidate_key": "candidate-2"}],
             evaluation_time="2026-07-14T08:02:00+00:00", expires_at="2026-07-14T08:17:00+00:00",
         )
+
+
+@pytest.mark.parametrize("changed", [
+    {"registry_snapshot_id": "registry-2"},
+    {"allocation_id": "allocation-2"},
+])
+def test_rotation_reuse_requires_exact_authority_identity(tmp_path, changed) -> None:
+    storage = _storage(tmp_path)
+    _seed_active_position(storage)
+    manager = RotationCoordinator(storage, config_hash="config-1")
+    exits = [{"proposal_id": "exit-1", "position_lifecycle_id": "life-spy", "symbol": "SPY",
+              "side": "sell", "quantity": 2.0, "estimated_notional": 200.0}]
+    entries = [{"proposal_id": "entry-1", "candidate_key": "candidate-1", "strategy_version": "rule_based_v2",
+                "symbol": "QQQ", "side": "buy", "max_quantity": 1.0, "max_notional": 100.0,
+                "max_stop_risk": 5.0, "payload": {}}]
+    kwargs = {"run_id": "run", "exit_legs": exits, "contingent_entries": entries,
+              "evaluation_time": AS_OF, "expires_at": "2026-07-14T08:15:00+00:00",
+              "registry_snapshot_id": "registry-1", "allocation_id": "allocation-1"}
+    manager.create_group(**kwargs)
+    with pytest.raises(RuntimeError, match="conflicting active rotation"):
+        manager.create_group(**{**kwargs, **changed})
 
 
 def test_phase4_replay_is_stable_for_same_as_of_and_rejects_missing_time(tmp_path) -> None:

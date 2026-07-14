@@ -179,14 +179,16 @@ def test_candidate_ranking(base_config, temp_storage):
         "cluster_exposures": {
             "us_broad_market": 4.0 # Elevated exposure in us_broad_market
         },
+        "as_of": "2026-07-14T08:00:00+00:00",
+        "equity_as_of": "2026-07-14T08:00:00+00:00",
         "cluster_counts": {
             "us_broad_market": 1
         }
     }
 
     candidates = [
-        {"symbol": "SPY", "score": 90.0, "final_notional": 15.0, "is_observation": False},
-        {"symbol": "QQQ", "score": 85.0, "final_notional": 10.0, "is_observation": False}
+        {"symbol": "SPY", "score": 90.0, "final_notional": 15.0, "price": 100.0, "stop_distance_dollars": 5.0, "is_observation": False},
+        {"symbol": "QQQ", "score": 85.0, "final_notional": 10.0, "price": 100.0, "stop_distance_dollars": 5.0, "is_observation": False}
     ]
 
     ranked = service._rank_candidates(candidates, snapshot)

@@ -143,7 +143,8 @@ def test_candidate_ranking_is_operationally_evidence_aware_and_deterministic():
         "execution_fill_rate": .98, "execution_shortfall_bps": 2,
         "conservative_expected_return": .04, "uncertainty": .05,
         "deterioration_score": 0, "symbol_exposure_pct": 0,
-        "cluster_exposure_pct": 0, "stop_risk_pct": .20,
+        "cluster_exposure_pct": 0, "risk_value": 200.0, "risk_unit": "stop_risk_dollars",
+        "conversion_equity": 100_000.0, "conversion_equity_as_of": AS_OF, "evaluation_time": AS_OF,
     }
     weak = {
         **strong, "conservative_expected_return": -.01, "uncertainty": .80,
@@ -160,12 +161,24 @@ def test_covariance_overlap_reduces_rank_and_low_correlation_capacity_expands_ra
         "setup_score": 90, "evidence_quality": 85, "regime": "normal",
         "execution_fill_rate": .90, "execution_shortfall_bps": 5,
         "conservative_expected_return": .02, "uncertainty": .10,
-        "deterioration_score": 0, "stop_risk_pct": .20,
+        "deterioration_score": 0, "risk_value": 200.0, "risk_unit": "stop_risk_dollars",
+        "conversion_equity": 100_000.0, "conversion_equity_as_of": AS_OF, "evaluation_time": AS_OF,
     }
     diversified = candidate_allocation_rank({**inputs, "symbol_exposure_pct": 0, "cluster_exposure_pct": 0})
     overlapping = candidate_allocation_rank({**inputs, "symbol_exposure_pct": 5.5, "cluster_exposure_pct": 14.0})
     assert diversified["diversification_score"] > overlapping["diversification_score"]
     assert diversified["ranking_score"] > overlapping["ranking_score"]
+
+
+def test_candidate_ranking_uses_canonical_risk_and_rejects_stale_conversion() -> None:
+    base = {"setup_score": 90, "evidence_quality": 90, "regime": "normal",
+            "risk_unit": "stop_risk_dollars", "conversion_equity": 100_000.0,
+            "conversion_equity_as_of": AS_OF, "evaluation_time": AS_OF}
+    assert candidate_allocation_rank({**base, "risk_value": 100.0})["risk_efficiency_score"] > \
+        candidate_allocation_rank({**base, "risk_value": 350.0})["risk_efficiency_score"]
+    with pytest.raises(ValueError, match="stale"):
+        candidate_allocation_rank({**base, "risk_value": 100.0,
+                                   "conversion_equity_as_of": "2026-07-14T07:00:00+00:00"})
 
 
 def test_shadow_evidence_never_becomes_operational_allocation(tmp_path):
