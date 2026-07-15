@@ -22,6 +22,22 @@ from .formula_versions import (
 from .utils import iso_now, json_dumps
 
 
+def _authorized_strategy_ids(value: Any, *, label: str) -> set[str]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"{label} authorized strategy set is empty or invalid")
+    result: set[str] = set()
+    for item in value:
+        if isinstance(item, Mapping):
+            identifier = item.get("strategy_version") or item.get("id") or item.get("name")
+        else:
+            identifier = item
+        identifier = str(identifier or "").strip()
+        if not identifier or identifier in result:
+            raise RuntimeError(f"{label} authorized strategy identity is invalid or duplicated")
+        result.add(identifier)
+    return result
+
+
 class RotationState(StrEnum):
     PENDING_GROUP_APPROVAL = "pending_group_approval"
     APPROVED_EXIT_PENDING = "approved_exit_pending"
@@ -270,7 +286,7 @@ class RotationCoordinator:
             authorized_strategies = json.loads(registry.get("authorized_strategies_json") or "[]")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("rotation registry authorized strategy record is invalid") from exc
-        if strategy_version not in {str(value) for value in authorized_strategies}:
+        if strategy_version not in _authorized_strategy_ids(authorized_strategies, label="rotation registry"):
             raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
         if str(registry.get("config_hash") or "") != expected_config_hash or str(registry.get("decision_config_hash") or "") != expected_config_hash:
             raise RuntimeError("rotation registry configuration hash does not match current configuration")
@@ -310,8 +326,10 @@ class RotationCoordinator:
             raise RuntimeError("rotation allocation payload configuration hash mismatch")
         if str(payload.get("registry_snapshot_id") or "") != snapshot_id:
             raise RuntimeError("rotation allocation is not linked to the referenced registry snapshot")
-        authorized = {str(value) for value in payload.get("authorized_strategies") or []}
-        if authorized and strategy_version not in authorized:
+        authorized = _authorized_strategy_ids(
+            payload.get("authorized_strategies"), label="rotation allocation"
+        )
+        if strategy_version not in authorized:
             raise RuntimeError("rotation strategy is not authorized in the referenced allocation")
 
         for label, timestamp in (

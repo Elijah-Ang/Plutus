@@ -44,11 +44,14 @@ def _proposal(identifier: str = "p-state", side: str = "buy") -> dict:
 def _authorize(storage: Storage, candidate: dict, approval_id: str = "approval-state") -> dict:
     now = datetime.now(UTC).isoformat()
     expires_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
-    candidate = {**candidate, "notional": 500.0, "expires_at": expires_at, "strategy_version": "rule_based_v2"}
+    canonical_notional = float(candidate["qty"]) * max(
+        float(candidate["latest_price"]), float(candidate["limit_price"])
+    )
+    candidate = {**candidate, "notional": canonical_notional, "expires_at": expires_at, "strategy_version": "rule_based_v2"}
     storage.execute(
         """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
            VALUES(?,?,?,?,?,?,?,?,?)""",
-        (candidate["id"], candidate["symbol"], candidate["side"], 500.0, "pending", now,
+        (candidate["id"], candidate["symbol"], candidate["side"], canonical_notional, "pending", now,
          expires_at, "rule_based_v2", json.dumps(candidate)),
     )
     store = ApprovalWorkflowStore(storage)

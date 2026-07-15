@@ -852,7 +852,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
             highest_str = "None"
             blocker_str = "None"
             
-        if actions.get("active_proposals", 0) > 0:
+        if exit_first_blocker:
+            action_note = f"Exit action pending: {exit_first_blocker}. Do not open a new BUY."
+        elif actions.get("active_proposals", 0) > 0:
             action_note = "No action needed unless approving the active proposal above."
         elif actions.get("expired", 0) > 0 and actions.get("orders", 0) == 0:
             action_note = "No active proposal remains; previous proposal expired with no order."
@@ -927,7 +929,9 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
 
         msg_parts.append(f"Summary: {digest_data.get('summary', '')}\n")
 
-        if actions.get("active_proposals", 0) > 0:
+        if exit_first_blocker:
+            msg_parts.append(f"Exit action pending: {exit_first_blocker}. Do not open a new BUY.")
+        elif actions.get("active_proposals", 0) > 0:
             msg_parts.append("No action needed unless approving the active proposal above.")
         elif actions.get("expired", 0) > 0 and actions.get("orders", 0) == 0:
             msg_parts.append("No active proposal remains; previous proposal expired with no order.")

@@ -10,7 +10,13 @@ from typing import Any, Iterator
 
 from .utils import PROJECT_ROOT, iso_now, json_dumps
 from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
-from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION, REQUIRED_SCHEMA_VERSIONS, RISK_DECISION_VERSION
+from .formula_versions import (
+    ACCOUNTING_VERSION,
+    EVIDENCE_VERSION,
+    FINAL_HARDENING_SCHEMA_VERSION,
+    REQUIRED_SCHEMA_VERSIONS,
+    RISK_DECISION_VERSION,
+)
 
 
 # CPython 3.13 on macOS can deadlock two threads when one closes a WAL
@@ -45,6 +51,9 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "reconciliation_attempts": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, lookup_type TEXT NOT NULL, lookup_value_redacted TEXT NOT NULL, outcome TEXT NOT NULL, broker_status TEXT, safe_detail TEXT, created_at TEXT NOT NULL, UNIQUE(intent_id, lookup_type, outcome, broker_status, created_at)",
     "telegram_updates": "update_id INTEGER PRIMARY KEY, message_id INTEGER, message_timestamp INTEGER, received_at TEXT NOT NULL, processing_state TEXT NOT NULL, processed_at TEXT, approval_id TEXT, safe_message_type TEXT, normalized_action TEXT, target_hint TEXT, sender_authorized INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT",
     "approval_workflows": "id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, proposal_id TEXT NOT NULL, telegram_update_id INTEGER UNIQUE, logical_workflow_key TEXT UNIQUE, state TEXT NOT NULL, intent_id TEXT, validation_status TEXT, safe_detail TEXT, claim_owner TEXT, claim_until TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT, update_processed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, manual_review_reason TEXT, version INTEGER NOT NULL DEFAULT 0",
+    "proposal_display_envelopes": "id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL, proposal_version INTEGER NOT NULL, telegram_message_id TEXT NOT NULL, displayed_at TEXT NOT NULL, displayed_envelope_json TEXT NOT NULL, displayed_fingerprint TEXT NOT NULL UNIQUE, display_context_type TEXT NOT NULL, display_context_id TEXT, created_at TEXT NOT NULL, UNIQUE(proposal_id,proposal_version)",
+    "execution_risk_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, proposal_id TEXT NOT NULL, approval_id TEXT NOT NULL, account_id_hash TEXT NOT NULL, trading_mode TEXT NOT NULL CHECK(trading_mode='paper'), account_status TEXT NOT NULL, equity REAL NOT NULL, cash REAL NOT NULL, buying_power REAL NOT NULL, positions_json TEXT NOT NULL, open_orders_json TEXT NOT NULL, active_reservations_json TEXT NOT NULL, loss_controls_json TEXT NOT NULL, kill_switch_active INTEGER NOT NULL CHECK(kill_switch_active IN (0,1)), market_clock_json TEXT NOT NULL, data_health_json TEXT NOT NULL, config_hash TEXT, formula_versions_json TEXT NOT NULL, captured_at TEXT NOT NULL, expires_at TEXT NOT NULL, snapshot_fingerprint TEXT NOT NULL UNIQUE, authoritative INTEGER NOT NULL DEFAULT 1 CHECK(authoritative IN (0,1))",
+    "exit_blocker_states": "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, position_lifecycle_id TEXT, generation INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL, source_type TEXT NOT NULL, source_id TEXT NOT NULL, run_id TEXT, proposal_id TEXT, approval_id TEXT, workflow_id TEXT, intent_id TEXT, broker_order_id TEXT, trigger_reason TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)), user_action_required TEXT, automatic_recovery TEXT, recovery_classification TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cleared_at TEXT, terminal_at TEXT, detail_json TEXT NOT NULL, UNIQUE(symbol,position_lifecycle_id,generation)",
     "position_lifecycles": "id TEXT PRIMARY KEY, symbol TEXT NOT NULL, broker_position_id TEXT, side TEXT NOT NULL, state TEXT NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, opening_quantity REAL NOT NULL, current_quantity REAL NOT NULL, average_entry_price REAL, source TEXT NOT NULL, management_state_archive TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL",
     # Prospective FIFO accounting.  Historical basis is never inferred: coverage
     # and confidence are recorded independently in pnl_ledger_status.
@@ -133,6 +142,11 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "proposal_reference_price": "REAL", "refreshed_bid": "REAL", "refreshed_ask": "REAL",
         "directional_price_move_bps": "REAL", "movement_classification": "TEXT",
         "final_limit_price": "REAL", "directional_validation_reason": "TEXT",
+        "display_envelope_id": "TEXT", "displayed_fingerprint": "TEXT",
+        "approval_source_type": "TEXT", "execution_path": "TEXT", "request_basis": "TEXT",
+        "emergency_trigger_identity": "TEXT", "emergency_trigger_reason": "TEXT",
+        "emergency_trigger_mode": "TEXT", "rotation_step_id": "TEXT",
+        "proposal_eligibility_status": "TEXT",
     },
     "risk_checks": {
         "formula_version": "TEXT", "evidence_version": "TEXT", "config_hash": "TEXT",
@@ -152,6 +166,7 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "opening_quantity_frozen": "INTEGER NOT NULL DEFAULT 0",
     },
     "trade_proposals": {
+        "proposal_version": "INTEGER NOT NULL DEFAULT 1", "displayed_fingerprint": "TEXT",
         "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
         "strategy_registry_snapshot_id": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
         "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
@@ -171,6 +186,9 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "pyramiding_milestone_key": "TEXT", "management_mode": "TEXT",
         "pre_add_open_risk": "REAL", "post_add_open_risk": "REAL", "incremental_risk": "REAL",
         "rotation_step_id": "TEXT",
+        "displayed_fingerprint": "TEXT", "execution_path": "TEXT", "risk_snapshot_id": "TEXT",
+        "canonical_quantity": "REAL", "canonical_notional": "REAL", "canonical_stop_risk": "REAL",
+        "broker_invocation_started_at": "TEXT", "broker_invocation_occurred": "INTEGER NOT NULL DEFAULT 0",
     },
     "risk_reservations": {
         "strategy_version": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
@@ -236,6 +254,39 @@ def apply_p1_execution_schema(conn: sqlite3.Connection, *, record_migration: boo
         )
 
 
+def apply_final_hardening_schema(conn: sqlite3.Connection, *, record_migration: bool = True) -> None:
+    """Install immutable display authority and auditable execution/recovery state."""
+    for table in ("proposal_display_envelopes", "execution_risk_snapshots", "exit_blocker_states"):
+        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({TABLE_DEFINITIONS[table]})')
+    _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_display_proposal_message "
+        "ON proposal_display_envelopes(proposal_id,telegram_message_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_risk_snapshot_approval "
+        "ON execution_risk_snapshots(approval_id,captured_at)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_exit_blocker_one_active "
+        "ON exit_blocker_states(symbol) WHERE active=1"
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO runtime_metadata(key,value,updated_at)
+           VALUES('final_hardening_effective_at',?,?)""",
+        (iso_now(), iso_now()),
+    )
+    if record_migration:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (
+                FINAL_HARDENING_SCHEMA_VERSION,
+                iso_now(),
+                "immutable displayed approval authority, authoritative risk snapshots, and durable exit blockers",
+            ),
+        )
+
+
 class Storage:
     def __init__(self, path: str | Path = PROJECT_ROOT / "data" / "trading_agent.db") -> None:
         self.path = Path(path)
@@ -289,6 +340,7 @@ class Storage:
             from .rotation_coordinator import apply_rotation_schema
             from .profit_milestones import apply_profit_milestone_schema
             apply_p1_execution_schema(conn)
+            apply_final_hardening_schema(conn)
 
             apply_phase1_schema(conn)
             apply_phase2_schema(conn)
@@ -362,6 +414,7 @@ class Storage:
                 from .profit_milestones import apply_profit_milestone_schema
                 apply_profit_milestone_schema(conn, record_migration=False)
                 apply_p1_execution_schema(conn, record_migration=False)
+                apply_final_hardening_schema(conn, record_migration=False)
                 from .strategy_performance import apply_strategy_performance_schema
                 apply_strategy_performance_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
@@ -384,6 +437,9 @@ class Storage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_reservations_active ON risk_reservations(state, symbol)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_reconciliation_intent ON reconciliation_attempts(intent_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_approval_workflows_state ON approval_workflows(state, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_display_proposal_message ON proposal_display_envelopes(proposal_id,telegram_message_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_snapshot_approval ON execution_risk_snapshots(approval_id,captured_at)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_exit_blocker_one_active ON exit_blocker_states(symbol) WHERE active=1")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_position_lifecycle_one_active ON position_lifecycles(symbol) WHERE state='active'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_position_lots_fifo ON position_lots(symbol,opened_at,id) WHERE remaining_quantity>0")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_realized_pnl_day ON realized_pnl_events(trading_day,confidence)")

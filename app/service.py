@@ -26,6 +26,7 @@ logger = logging.getLogger("trading_agent")
 SGT = ZoneInfo("Asia/Singapore")
 
 from .approval_parser import parse_approval
+from .approval_display import record_display
 from .approval_workflow import (
     ApprovalWorkflowConflict,
     ApprovalWorkflowState,
@@ -35,6 +36,7 @@ from .data_providers.eodhd import EODHDProvider
 from .dynamic_universe import DynamicUniverseEngine, OBSERVATION, PAPER_TRADABLE, RESEARCH_CANDIDATE
 from .execution import Executor, ExecutionResult
 from .execution import DurableExecutionStore
+from .exit_blocker import ExitBlockerStore
 from .health import HealthMonitor, record_heartbeat
 from .internet import internet_available
 from .lot_ledger import LotLedger
@@ -634,7 +636,7 @@ class TradingService:
                 **source,
             }
             self.storage.audit(self.run_id, "exit_blocker_validated", self._exit_blocker_audit_detail(source, "active", source.get("validation_reason")))
-            return source
+            return ExitBlockerStore(self.storage, self.run_id).observe(source)
 
         # Broker state is the strongest current source. A sell order remains
         # blocking until reconciliation proves it terminal; elapsed wall-clock
@@ -849,7 +851,12 @@ class TradingService:
             })
 
         if stale_sources:
+            ExitBlockerStore(self.storage, self.run_id).clear_absent(
+                observed_symbols={str(stale_sources[0].get("symbol") or "").upper()},
+                reason=str(stale_sources[0].get("stale_reason") or "stale blocker cleared"),
+            )
             return stale_sources[0]
+        ExitBlockerStore(self.storage, self.run_id).clear_absent()
         return {
             "active": False, "symbol": None, "reason": None, "status": None,
             "source": None, "source_type": None, "source_id": None,
@@ -5201,6 +5208,32 @@ class TradingService:
         proposal["status"] = "approved"
         if row.get("emergency_exit_triggered") == 1:
             proposal["execution_path"] = "protective_paper_exit"
+        authority_rows = self.storage.fetch_all(
+            "SELECT authority_envelope_json FROM approvals WHERE id=? AND proposal_id=?",
+            (approval_id, row.get("id")),
+        )
+        try:
+            approved_terms = json.loads(authority_rows[0]["authority_envelope_json"] or "{}")
+            approved_basis = str(approved_terms["request_basis"])
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            approved_basis = ""
+        if approved_basis not in {"quantity", "notional"}:
+            return ExecutionResult(False, "blocked", None, reason="displayed request basis is unavailable"), refreshed_price_val, refreshed_price_at, price_refreshed_at, refreshed_price_age_seconds, price_move_bps_since_proposal
+        proposal["request_basis"] = approved_basis
+        # Final sizing has already run. Normalize its representational fields
+        # once so only the displayed basis controls the broker instruction and
+        # every risk number is recomputed from the fresh conservative price.
+        if approved_basis == "notional":
+            proposal.pop("qty", None)
+            proposal.pop("quantity", None)
+        else:
+            reference = max(
+                float(proposal.get("latest_price") or 0.0),
+                float(proposal.get("reference_price") or 0.0),
+                float(proposal.get("limit_price") or 0.0),
+            )
+            proposal["notional"] = float(proposal.get("qty") or 0.0) * reference
+        proposal.pop("stop_risk_dollars", None)
         context["execution_path"] = proposal.get("execution_path")
         result = Executor(
             self.broker,
@@ -7961,7 +7994,7 @@ class TradingService:
                 else:
                     res_tg = self.telegram.send_message(format_proposal_message(proposal, self.config))
                     if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                        self.storage.execute("UPDATE trade_proposals SET telegram_message_id=? WHERE id=?", (str(res_tg["message_id"]), proposal_id))
+                        record_display(self.storage, proposal_id, str(res_tg["message_id"]))
 
             if rotation_exit_proposals:
                 try:
@@ -7974,7 +8007,22 @@ class TradingService:
                     rotation_group = self._create_rotation_group(
                         rotation_exit_proposals, rotation_candidates, now
                     )
-                    self.telegram.send_message(self._format_rotation_group_message(rotation_group))
+                    rotation_result = self.telegram.send_message(self._format_rotation_group_message(rotation_group))
+                    if rotation_result and isinstance(rotation_result, dict) and "message_id" in rotation_result:
+                        rotation_message_id = str(rotation_result["message_id"])
+                        rotation_group_id = str(rotation_group.get("id") or rotation_group.get("group_id") or "")
+                        for displayed_proposal in rotation_exit_proposals:
+                            record_display(
+                                self.storage, displayed_proposal["id"], rotation_message_id,
+                                context_type="rotation", context_id=rotation_group_id,
+                            )
+                        for candidate in rotation_candidates:
+                            displayed_proposal = candidate.get("performance_proposal_payload") or {}
+                            if displayed_proposal.get("id"):
+                                record_display(
+                                    self.storage, displayed_proposal["id"], rotation_message_id,
+                                    context_type="rotation", context_id=rotation_group_id,
+                                )
                 except Exception as exc:
                     self.storage.audit(self.run_id, "rotation_group_creation_blocked", {
                         "error_type": type(exc).__name__, "exit_proposal_count": len(rotation_exit_proposals),
@@ -7985,20 +8033,14 @@ class TradingService:
                     for exit_proposal in rotation_exit_proposals:
                         res_tg = self.telegram.send_message(format_proposal_message(exit_proposal, self.config))
                         if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                            self.storage.execute(
-                                "UPDATE trade_proposals SET telegram_message_id=? WHERE id=?",
-                                (str(res_tg["message_id"]), exit_proposal["id"]),
-                            )
+                            record_display(self.storage, exit_proposal["id"], str(res_tg["message_id"]))
                     for candidate in rotation_candidates:
                         buy_proposal = candidate.get("performance_proposal_payload") or {}
                         if not buy_proposal:
                             continue
                         res_tg = self.telegram.send_message(format_proposal_message(buy_proposal, self.config))
                         if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                            self.storage.execute(
-                                "UPDATE trade_proposals SET telegram_message_id=? WHERE id=?",
-                                (str(res_tg["message_id"]), buy_proposal["id"]),
-                            )
+                            record_display(self.storage, buy_proposal["id"], str(res_tg["message_id"]))
             if batch_mode_enabled and batch_proposals:
                 self._send_ranked_batch_if_needed(batch_proposals, buy_candidates, risk_snapshot)
 
@@ -11624,6 +11666,11 @@ class TradingService:
                 f"UPDATE trade_proposals SET telegram_message_id=? WHERE id IN ({','.join(['?'] * len(proposals))})",
                 (msg_id, *[p["id"] for p in proposals]),
             )
+            for proposal in proposals:
+                record_display(
+                    self.storage, proposal["id"], msg_id,
+                    context_type="batch", context_id=batch_id,
+                )
 
     def _run_phase2_shadow(self, profile_results: list[dict[str, Any]], now: datetime) -> None:
         phase2 = self.config.get("phase2_shadow_strategies", {})

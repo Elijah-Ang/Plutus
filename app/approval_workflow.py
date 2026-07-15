@@ -8,7 +8,8 @@ from enum import StrEnum
 from typing import Any, Callable
 
 from .execution import DurableExecutionStore
-from .approval_authority import authority_envelope, authority_fingerprint, canonical_json
+from .approval_authority import authority_fingerprint, canonical_json
+from .approval_display import load_display_for_approval
 from .order_state import OrderState
 from .utils import iso_now, json_dumps
 
@@ -238,19 +239,22 @@ class ApprovalWorkflowStore:
             ).fetchone()
             if active:
                 raise ApprovalWorkflowConflict("proposal already has an active executable workflow")
-            proposal_row = conn.execute(
-                "SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)
-            ).fetchone()
-            envelope = authority_envelope(
-                dict(proposal_row) if proposal_row else {"proposal_id": proposal_id},
-                proposal_id=proposal_id,
+            display_row, envelope = load_display_for_approval(
+                conn,
+                proposal_id,
+                reply_to_message_id=reply_to_message_id,
             )
+            source_type = str(envelope.get("approval_source_type") or "proposal")
+            execution_path = str(envelope.get("execution_path") or "manual_paper_order")
             conn.execute(
                 """INSERT INTO approvals(
                        id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
                        reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at,
-                       authority_envelope_json,authority_fingerprint)
-                   VALUES(?,?,?,?,?,?,1,'accepted',?,?,?,?,?,?,?)""",
+                       authority_envelope_json,authority_fingerprint,display_envelope_id,
+                       displayed_fingerprint,approval_source_type,execution_path,request_basis,
+                       emergency_trigger_identity,emergency_trigger_reason,emergency_trigger_mode,
+                       rotation_step_id,proposal_eligibility_status)
+                   VALUES(?,?,?,?,?,?,1,'accepted',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     approval_id,
                     run_id,
@@ -265,6 +269,16 @@ class ApprovalWorkflowStore:
                     approval_received_at,
                     canonical_json(envelope),
                     authority_fingerprint(envelope),
+                    display_row["id"],
+                    display_row["displayed_fingerprint"],
+                    source_type,
+                    execution_path,
+                    envelope.get("request_basis"),
+                    envelope.get("emergency_trigger_identity"),
+                    envelope.get("emergency_trigger_reason"),
+                    envelope.get("emergency_trigger_mode"),
+                    envelope.get("rotation_step_id"),
+                    envelope.get("proposal_eligibility_status"),
                 ),
             )
             conn.execute(
@@ -414,7 +428,7 @@ class ApprovalWorkflowStore:
         proposal: dict[str, Any],
         *,
         run_id: str | None,
-        source_type: str = "telegram",
+        source_type: str = "proposal",
     ) -> dict[str, Any]:
         workflow = self.get(workflow_id)
         if workflow.get("intent_id"):

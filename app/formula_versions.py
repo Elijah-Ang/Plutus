@@ -32,6 +32,7 @@ WINNER_EXPANSION_SCHEMA_VERSION = "phase4_2c_winner_expansion_v1"
 ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v2_lifecycle_bound"
 ROTATION_SCHEMA_VERSION = "exit_first_rotation_v2_lifecycle_bound"
 PLUTUS_AUDIT_SCHEMA_VERSION = "plutus_audit_hardening_v1"
+FINAL_HARDENING_SCHEMA_VERSION = "plutus_final_hardening_v1"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -52,5 +53,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         WINNER_EXPANSION_SCHEMA_VERSION,
         ROTATION_SCHEMA_VERSION,
         PLUTUS_AUDIT_SCHEMA_VERSION,
+        FINAL_HARDENING_SCHEMA_VERSION,
     }
 )
