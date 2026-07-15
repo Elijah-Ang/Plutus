@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any, Callable
 
 from .execution import DurableExecutionStore
+from .approval_authority import authority_envelope, authority_fingerprint, canonical_json
 from .order_state import OrderState
 from .utils import iso_now, json_dumps
 
@@ -51,37 +52,44 @@ ALLOWED_WORKFLOW_TRANSITIONS: dict[ApprovalWorkflowState, set[ApprovalWorkflowSt
     ApprovalWorkflowState.RECEIVED: {
         ApprovalWorkflowState.AUTHORIZED,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.AUTHORIZED: {
         ApprovalWorkflowState.TARGET_RESOLVED,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.TARGET_RESOLVED: {
         ApprovalWorkflowState.VALIDATING,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.VALIDATING: {
         ApprovalWorkflowState.APPROVED_PENDING_INTENT,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.APPROVED_PENDING_INTENT: {
         ApprovalWorkflowState.INTENT_CREATED,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.INTENT_CREATED: {
         ApprovalWorkflowState.SUBMISSION_PENDING,
         ApprovalWorkflowState.SUBMISSION_STARTED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.UNKNOWN,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.SUBMISSION_PENDING: {
         ApprovalWorkflowState.SUBMISSION_STARTED,
         ApprovalWorkflowState.BLOCKED,
+        ApprovalWorkflowState.TERMINAL,
         ApprovalWorkflowState.UNKNOWN,
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
@@ -230,11 +238,19 @@ class ApprovalWorkflowStore:
             ).fetchone()
             if active:
                 raise ApprovalWorkflowConflict("proposal already has an active executable workflow")
+            proposal_row = conn.execute(
+                "SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            envelope = authority_envelope(
+                dict(proposal_row) if proposal_row else {"proposal_id": proposal_id},
+                proposal_id=proposal_id,
+            )
             conn.execute(
                 """INSERT INTO approvals(
                        id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
-                       reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at)
-                   VALUES(?,?,?,?,?,?,1,'accepted',?,?,?,?,?)""",
+                       reply_to_message_id,proposal_targeting_method,acknowledgement_status,approval_received_at,
+                       authority_envelope_json,authority_fingerprint)
+                   VALUES(?,?,?,?,?,?,1,'accepted',?,?,?,?,?,?,?)""",
                 (
                     approval_id,
                     run_id,
@@ -247,6 +263,8 @@ class ApprovalWorkflowStore:
                     targeting_method,
                     acknowledgement_status,
                     approval_received_at,
+                    canonical_json(envelope),
+                    authority_fingerprint(envelope),
                 ),
             )
             conn.execute(
@@ -414,8 +432,19 @@ class ApprovalWorkflowStore:
         if state != ApprovalWorkflowState.APPROVED_PENDING_INTENT:
             raise ApprovalWorkflowConflict("workflow is not eligible to create an intent")
         # create_or_get_intent commits intent + reservation + workflow link together.
+        approval_rows = self.storage.fetch_all(
+            "SELECT authority_fingerprint FROM approvals WHERE id=? AND proposal_id=?",
+            (workflow["approval_id"], workflow["proposal_id"]),
+        )
+        durable_proposal = {
+            **proposal,
+            "proposal_id": workflow["proposal_id"],
+            "source_id": workflow["proposal_id"],
+        }
+        if approval_rows and approval_rows[0].get("authority_fingerprint"):
+            durable_proposal["approval_authority_fingerprint"] = approval_rows[0]["authority_fingerprint"]
         intent = DurableExecutionStore(self.storage).create_or_get_intent(
-            {**proposal, "proposal_id": workflow["proposal_id"], "source_id": workflow["proposal_id"]},
+            durable_proposal,
             run_id=run_id,
             source_type=source_type,
             approval_id=workflow["approval_id"],
@@ -510,13 +539,13 @@ class ApprovalWorkflowStore:
                     elif decision == "blocked":
                         self.transition(
                             workflow_id,
-                            ApprovalWorkflowState.BLOCKED,
+                            ApprovalWorkflowState.TERMINAL,
                             owner_token=owner_token,
                             validation_status="blocked",
                             safe_detail=reason or "recovery validation blocked",
                         )
                         counts["blocked"] += 1
-                        state = ApprovalWorkflowState.BLOCKED
+                        state = ApprovalWorkflowState.TERMINAL
                     elif decision == "manual_review":
                         self.transition(
                             workflow_id,
@@ -542,7 +571,7 @@ class ApprovalWorkflowStore:
                         if action_decision == "blocked":
                             self.transition(
                                 workflow_id,
-                                ApprovalWorkflowState.BLOCKED,
+                                ApprovalWorkflowState.TERMINAL,
                                 owner_token=owner_token,
                                 validation_status="blocked",
                                 safe_detail=action_reason or "recovery action authority is no longer current",
@@ -571,7 +600,7 @@ class ApprovalWorkflowStore:
                     elif str(proposal.get("status")) in {"expired", "rejected", "superseded"}:
                         self.transition(
                             workflow_id,
-                            ApprovalWorkflowState.BLOCKED,
+                            ApprovalWorkflowState.TERMINAL,
                             owner_token=owner_token,
                             validation_status="expired_or_ineligible",
                             safe_detail="recovery did not revive an ineligible proposal",
@@ -679,7 +708,7 @@ class ApprovalWorkflowStore:
                                 )
                                 self.transition(
                                     workflow_id,
-                                    ApprovalWorkflowState.BLOCKED,
+                                    ApprovalWorkflowState.TERMINAL,
                                     owner_token=owner_token,
                                     validation_status="blocked",
                                     safe_detail=action_reason or "recovery submission authority is no longer current",

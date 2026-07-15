@@ -191,6 +191,21 @@ class DurableExecutionStore:
                     raise RuntimeError("approval workflow references an unavailable existing intent")
                 if workflow["state"] != "approved_pending_intent":
                     raise RuntimeError("approval workflow is not eligible for intent creation")
+                approval_row = conn.execute(
+                    """SELECT authority_fingerprint FROM approvals
+                       WHERE id=? AND proposal_id=? AND authorized=1
+                         AND status='consumed' AND consumed_at IS NOT NULL""",
+                    (approval_id, proposal.get("proposal_id") or proposal.get("id")),
+                ).fetchone()
+                stored_fingerprint = str(approval_row["authority_fingerprint"] or "") if approval_row else ""
+                candidate_fingerprint = str(proposal.get("approval_authority_fingerprint") or "")
+                if not stored_fingerprint:
+                    raise RuntimeError("approval authority envelope is missing")
+                if not candidate_fingerprint:
+                    candidate_fingerprint = stored_fingerprint
+                    proposal["approval_authority_fingerprint"] = stored_fingerprint
+                if candidate_fingerprint != stored_fingerprint:
+                    raise RuntimeError("approval authority fingerprint does not match the durable approval")
             conflict = conn.execute(
                 """SELECT id,state FROM order_intents
                    WHERE symbol=? AND side=? AND state IN (?,?,?,?,?,?,?,?) LIMIT 1""",
@@ -460,8 +475,8 @@ class DurableExecutionStore:
                        strategy_registry_snapshot_id,strategy_sleeve,sleeve_allocation_id,sleeve_notional_ceiling,
                        sleeve_stop_risk_ceiling,winner_expansion_decision_id,pyramiding_milestone_id,
                        pyramiding_milestone_key,management_mode,pre_add_open_risk,post_add_open_risk,
-                       incremental_risk,rotation_step_id)
-                   VALUES({','.join('?' for _ in range(59))})""",
+                       incremental_risk,rotation_step_id,approval_authority_fingerprint)
+                   VALUES({','.join('?' for _ in range(60))})""",
                 (
                     intent_id,
                     run_id,
@@ -522,6 +537,7 @@ class DurableExecutionStore:
                     proposal.get("post_add_open_risk"),
                     incremental_risk,
                     proposal.get("rotation_step_id"),
+                    proposal.get("approval_authority_fingerprint"),
                 ),
             )
             conn.execute(
@@ -961,6 +977,7 @@ class Executor:
         only approval-less path is recovery of an already-linked intent; it
         cannot create a new intent or a new authority chain.
         """
+        from .approval_authority import authority_envelope, authority_fingerprint
         from .approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 
         if self.storage is None:
@@ -990,8 +1007,33 @@ class Executor:
         if str(workflow.get("proposal_id") or "") != proposal_id:
             return workflow_store, existing_intent, "approval workflow is not linked to this proposal"
 
+        proposal_rows = self.storage.fetch_all(
+            "SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)
+        )
+        if len(proposal_rows) != 1:
+            return workflow_store, existing_intent, "authoritative trade proposal is missing"
+        stored_proposal = proposal_rows[0]
+        stored_envelope = authority_envelope(stored_proposal, proposal_id=proposal_id)
+
+        def parse_expiry(value: Any) -> datetime | None:
+            if value is None or value == "":
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+        stored_expiry = parse_expiry(stored_envelope.get("expires_at"))
+        if stored_expiry is None:
+            return workflow_store, existing_intent, "authoritative approval expiry is invalid"
+        if stored_expiry <= datetime.now(UTC):
+            return workflow_store, existing_intent, "approval or proposal has expired"
+
         approval_rows = self.storage.fetch_all(
-            "SELECT id,proposal_id,authorized,status,consumed_at FROM approvals WHERE id=?",
+            """SELECT id,proposal_id,authorized,status,consumed_at,authority_envelope_json,
+                      authority_fingerprint
+               FROM approvals WHERE id=?""",
             (effective_approval_id,),
         )
         if len(approval_rows) != 1:
@@ -1003,17 +1045,75 @@ class Executor:
             return workflow_store, existing_intent, "approval is not authorized"
         if approval.get("consumed_at") is None or str(approval.get("status") or "").lower() != "consumed":
             return workflow_store, existing_intent, "approval has not been consumed exactly once"
+        try:
+            approved_envelope = json.loads(approval.get("authority_envelope_json") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            approved_envelope = None
+        approved_fingerprint = str(approval.get("authority_fingerprint") or "")
+        if not isinstance(approved_envelope, dict) or not approved_fingerprint:
+            return workflow_store, existing_intent, "approval authority envelope is missing"
+        if approved_fingerprint != authority_fingerprint(approved_envelope):
+            return workflow_store, existing_intent, "approval authority fingerprint is invalid"
+        if approved_envelope != stored_envelope:
+            return workflow_store, existing_intent, "stored proposal terms changed after approval"
 
-        expires_at = proposal.get("expires_at")
-        if expires_at:
+        # Older internal callers may omit fields that are durably present on the
+        # proposal row. Hydrate only absent values from that authoritative row;
+        # any caller-supplied value is still compared exactly below.
+        for field in (
+            "strategy_version", "position_lifecycle_id", "relationship_type",
+            "relationship_group_id", "config_hash",
+        ):
+            if proposal.get(field) in (None, "") and stored_envelope.get(field) is not None:
+                proposal[field] = stored_envelope[field]
+        if proposal.get("formula_versions") in (None, "") and stored_envelope.get("formula_versions"):
+            proposal["formula_versions"] = stored_envelope["formula_versions"]
+        caller_envelope = authority_envelope(proposal, proposal_id=proposal_id)
+        exact_fields = (
+            "proposal_id", "symbol", "side", "action", "position_lifecycle_id",
+            "strategy_version", "relationship_type", "relationship_group_id",
+            "expires_at", "config_hash", "formula_versions",
+        )
+        for field in exact_fields:
+            if caller_envelope.get(field) != stored_envelope.get(field):
+                return workflow_store, existing_intent, f"approved {field} does not match the stored proposal"
+
+        def number(value: Any) -> float | None:
             try:
-                expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-                if expiry.tzinfo is None:
-                    expiry = expiry.replace(tzinfo=UTC)
-                if expiry.astimezone(UTC) <= datetime.now(UTC):
-                    return workflow_store, existing_intent, "approval or proposal has expired"
+                result = float(value)
             except (TypeError, ValueError):
-                return workflow_store, existing_intent, "approval expiry is invalid"
+                return None
+            return result if math.isfinite(result) else None
+
+        try:
+            quantity, reference, stop_price, _basis, requested_notional = DurableExecutionStore._quantity_and_reference(proposal)
+        except (TypeError, ValueError):
+            return workflow_store, existing_intent, "approved quantity is invalid"
+        actual_notional = number(proposal.get("notional"))
+        if actual_notional is None:
+            actual_notional = quantity * reference
+        actual_stop_risk = number(proposal.get("stop_risk_dollars"))
+        if actual_stop_risk is None:
+            actual_stop_risk = quantity * max(reference - float(stop_price or 0.0), 0.0)
+        candidate_limits = (
+            ("quantity", quantity, stored_envelope.get("max_quantity")),
+            ("notional", actual_notional, stored_envelope.get("max_notional")),
+            ("stop risk", actual_stop_risk, stored_envelope.get("max_stop_risk")),
+        )
+        for label, actual, maximum in candidate_limits:
+            if maximum is not None and actual > float(maximum) + 1e-9:
+                return workflow_store, existing_intent, f"approved {label} may only stay equal or decrease"
+        ceiling_fields = (
+            ("approved quantity", "approved_quantity_ceiling", "max_quantity"),
+            ("approved notional", "approved_notional_ceiling", "max_notional"),
+            ("approved stop risk", "approved_stop_risk_ceiling", "max_stop_risk"),
+        )
+        for label, candidate_key, envelope_key in ceiling_fields:
+            candidate_ceiling = number(proposal.get(candidate_key))
+            maximum = stored_envelope.get(envelope_key)
+            if candidate_ceiling is not None and maximum is not None and candidate_ceiling > float(maximum) + 1e-9:
+                return workflow_store, existing_intent, f"approved {label} may not increase"
+        proposal["approval_authority_fingerprint"] = approved_fingerprint
 
         try:
             state = ApprovalWorkflowState(str(workflow.get("state")))

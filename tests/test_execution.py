@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta
+import json
+import pytest
 
 from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.execution import Executor
@@ -23,12 +25,18 @@ class SpyRisk:
 def authorize(storage, proposal, approval_id="approval-1"):
     now = datetime.now(UTC)
     proposal_id = str(proposal.get("proposal_id") or proposal.get("id"))
+    authority_payload = {
+        **proposal,
+        "max_quantity": float(proposal.get("qty") or proposal.get("notional") or 0.0) / float(proposal.get("latest_price") or 1.0),
+        "max_notional": float(proposal.get("notional") or 0.0),
+        "max_stop_risk": 1.0,
+    }
     storage.execute(
         """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
            VALUES(?,?,?,?,?,?,?,?,?)""",
         (proposal_id, proposal["symbol"], proposal["side"], proposal.get("notional"), "pending",
          proposal.get("created_at", now.isoformat()), proposal.get("expires_at"),
-         proposal.get("strategy_version", "rule_based_v2"), "{}"),
+         proposal.get("strategy_version", "rule_based_v2"), json.dumps(authority_payload)),
     )
     store = ApprovalWorkflowStore(storage)
     workflow = store.accept_approval(
@@ -115,3 +123,45 @@ def test_recovery_reuses_linked_intent_without_second_broker_call(safe_config, p
     second = Executor(broker, SpyRisk(), storage, "restart").execute(approved, context)
     assert first.submitted and second.status == "submitted"
     assert broker.called
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"symbol": "SPY"},
+        {"side": "sell", "action": "exit"},
+        {"action": "add"},
+        {"position_lifecycle_id": "different-lifecycle"},
+        {"expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        {"qty": 0.02},
+        {"approved_notional_ceiling": 6.0},
+        {"relationship_group_id": "different-rotation-group"},
+    ],
+)
+def test_approval_binds_exact_trade_terms(safe_config, proposal, context, tmp_path, mutation):
+    broker = Broker()
+    storage = Storage(tmp_path / "term-binding.db")
+    storage.initialize()
+    context["approval_valid"] = True
+    approved = authorize(storage, {**proposal, "status": "approved"})
+    changed = {**approved, **mutation}
+    result = Executor(broker, SpyRisk(), storage, "run").execute(
+        changed, context, approval_id="approval-1"
+    )
+    assert not result.submitted
+    assert not broker.called
+
+
+def test_intent_stores_approval_authority_fingerprint(safe_config, proposal, context, tmp_path):
+    broker = Broker()
+    storage = Storage(tmp_path / "authority-fingerprint.db")
+    storage.initialize()
+    context["approval_valid"] = True
+    approved = authorize(storage, {**proposal, "status": "approved"})
+    result = Executor(broker, SpyRisk(), storage, "run").execute(
+        approved, context, approval_id="approval-1"
+    )
+    assert result.submitted
+    intent = storage.fetch_all("SELECT approval_authority_fingerprint FROM order_intents")[0]
+    approval = storage.fetch_all("SELECT authority_fingerprint FROM approvals")[0]
+    assert intent["approval_authority_fingerprint"] == approval["authority_fingerprint"]

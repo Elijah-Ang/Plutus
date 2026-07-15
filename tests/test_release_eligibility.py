@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import base64
 from types import SimpleNamespace
 
 import scripts.check_release_eligibility as release_check
-from scripts.check_release_eligibility import _remote_ci, build_report
+from scripts.check_release_eligibility import RELEASE_FORMULA_VERSIONS, _remote_ci, build_report
+from app.formula_versions import REQUIRED_SCHEMA_VERSIONS
 
 
 def test_release_eligibility_never_treats_skipped_local_or_remote_checks_as_passed() -> None:
@@ -118,3 +120,65 @@ def test_release_reachability_is_unverified_when_github_is_unavailable(monkeypat
     result = release_check._release_reachability("candidate", "owner/repo")
     assert result["passed"] is False
     assert result["status"] == "unverified"
+
+
+def test_lightweight_tag_is_not_release_authority(monkeypatch) -> None:
+    monkeypatch.setattr(
+        release_check,
+        "_run",
+        lambda *args: SimpleNamespace(returncode=0 if args[:3] == ("git", "fetch", "--prune") else 1, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        release_check,
+        "_github_json",
+        lambda url: (
+            ({"object": {"sha": "github-main"}}, None, 200)
+            if url.endswith("/git/ref/heads/main")
+            else ([{"ref": "refs/tags/immutable-release-light", "object": {"sha": "candidate", "type": "commit"}}], None, 200)
+            if "/git/matching-refs/tags/" in url
+            else (None, "unexpected", 404)
+        ),
+    )
+    result = release_check._release_reachability(
+        "candidate", "owner/repo", config_hash="config", remote_ci={"passed": True, "run_id": 1, "head_sha": "candidate", "workflow_name": "CI"}
+    )
+    assert result["passed"] is False
+    assert "lightweight" in result["tag_rejection_reasons"][0]
+
+
+def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> None:
+    manifest = {
+        "release_commit": "candidate",
+        "configuration_hash": "config",
+        "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
+        "formula_versions": RELEASE_FORMULA_VERSIONS,
+        "ci": {"workflow_name": "CI", "run_id": "42", "head_sha": "candidate"},
+    }
+    encoded = base64.b64encode(json.dumps(manifest).encode()).decode()
+
+    def fake_run(*args):
+        if args[:3] == ("git", "fetch", "--prune"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:3] == ("git", "merge-base", "--is-ancestor"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_github(url):
+        if url.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": "github-main"}}, None, 200
+        if "/git/matching-refs/tags/" in url:
+            return [{"ref": "refs/tags/immutable-release-good", "object": {"sha": "tag-object", "type": "tag"}}], None, 200
+        if url.endswith("/git/tags/tag-object"):
+            return {"object": {"sha": "candidate", "type": "commit"}}, None, 200
+        if "/contents/release-manifest.json?ref=candidate" in url:
+            return {"content": encoded}, None, 200
+        raise AssertionError(url)
+
+    monkeypatch.setattr(release_check, "_run", fake_run)
+    monkeypatch.setattr(release_check, "_github_json", fake_github)
+    result = release_check._release_reachability(
+        "candidate", "owner/repo", config_hash="config",
+        remote_ci={"passed": True, "run_id": 42, "head_sha": "candidate", "workflow_name": "CI"},
+    )
+    assert result["passed"] is True
+    assert result["verified_release_manifest"] == ["immutable-release-good"]

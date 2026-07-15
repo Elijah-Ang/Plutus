@@ -467,10 +467,18 @@ def test_service_recovery_blocks_expired_rotation_before_intent_and_releases_res
          __import__("json").dumps(proposal)),
     )
     workflow_store = ApprovalWorkflowStore(storage)
-    before_intent = workflow_store.create_or_get(
-        approval_id="derived-before", proposal_id="exit-proposal", telegram_update_id=101,
-        initial_state=ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+    before_intent = workflow_store.accept_approval(
+        approval_id="derived-before", run_id="run", proposal_id="exit-proposal", sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=101,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now.isoformat(),
     )
+    storage.execute(
+        "UPDATE approvals SET status='consumed',consumed_at=? WHERE id='derived-before'",
+        (now.isoformat(),),
+    )
+    workflow_store.transition(before_intent["id"], ApprovalWorkflowState.VALIDATING)
+    before_intent = workflow_store.transition(before_intent["id"], ApprovalWorkflowState.APPROVED_PENDING_INTENT)
     storage.execute(
         "UPDATE rotation_groups SET expires_at=? WHERE id=?",
         ((now - timedelta(seconds=1)).isoformat(), group["id"]),
@@ -481,17 +489,26 @@ def test_service_recovery_blocks_expired_rotation_before_intent_and_releases_res
     service.broker = None
     service.run_id = "recovery"
     service._recover_local_workflows()
-    assert workflow_store.get(before_intent["id"])["state"] == "blocked"
+    assert workflow_store.get(before_intent["id"])["state"] == "terminal"
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
+    storage.execute("UPDATE approvals SET status='superseded' WHERE id='derived-before'")
 
     storage.execute(
         "UPDATE rotation_groups SET expires_at=? WHERE id=?",
         ((now + timedelta(minutes=5)).isoformat(), group["id"]),
     )
-    second = workflow_store.create_or_get(
-        approval_id="derived-after", proposal_id="exit-proposal", telegram_update_id=102,
-        initial_state=ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+    second = workflow_store.accept_approval(
+        approval_id="derived-after", run_id="run", proposal_id="exit-proposal", sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=102,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now.isoformat(),
     )
+    storage.execute(
+        "UPDATE approvals SET status='consumed',consumed_at=? WHERE id='derived-after'",
+        (now.isoformat(),),
+    )
+    workflow_store.transition(second["id"], ApprovalWorkflowState.VALIDATING)
+    second = workflow_store.transition(second["id"], ApprovalWorkflowState.APPROVED_PENDING_INTENT)
     intent = workflow_store.ensure_intent(second["id"], proposal, run_id="run")
     workflow_store.transition(second["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
     storage.execute(
@@ -499,7 +516,7 @@ def test_service_recovery_blocks_expired_rotation_before_intent_and_releases_res
         ((now - timedelta(seconds=1)).isoformat(), group["id"]),
     )
     service._recover_local_workflows()
-    assert workflow_store.get(second["id"])["state"] == "blocked"
+    assert workflow_store.get(second["id"])["state"] == "terminal"
     assert DurableExecutionStore(storage).get_intent(intent["id"])["state"] == "expired"
     assert storage.fetch_all(
         "SELECT state FROM risk_reservations WHERE intent_id=?", (intent["id"],)
@@ -594,10 +611,18 @@ def test_service_rotation_recovery_defers_when_broker_unavailable_then_resumes(c
          __import__("json").dumps(proposal)),
     )
     workflow_store = ApprovalWorkflowStore(storage)
-    workflow = workflow_store.create_or_get(
-        approval_id="derived", proposal_id="exit-proposal", telegram_update_id=201,
-        initial_state=ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+    workflow = workflow_store.accept_approval(
+        approval_id="derived", run_id="run", proposal_id="exit-proposal", sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=201,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now.isoformat(),
     )
+    storage.execute(
+        "UPDATE approvals SET status='consumed',consumed_at=? WHERE id='derived'",
+        (now.isoformat(),),
+    )
+    workflow_store.transition(workflow["id"], ApprovalWorkflowState.VALIDATING)
+    workflow = workflow_store.transition(workflow["id"], ApprovalWorkflowState.APPROVED_PENDING_INTENT)
     intent = workflow_store.ensure_intent(workflow["id"], proposal, run_id="run")
     workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
     service = TradingService.__new__(TradingService)

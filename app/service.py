@@ -334,21 +334,25 @@ class TradingService:
             return "approved", proposal, "current rotation dependency and expiry revalidated"
 
         def recover_submission(workflow: dict[str, Any], intent: dict[str, Any]) -> str:
-            proposal = load_local_proposal(workflow["proposal_id"])
-            if proposal is None:
-                return "terminal"
-            authority, proposal, _reason = recover_action_authority(workflow, proposal)
-            if authority != "approved" or proposal is None:
+            def expire_reserved_intent(reason: str) -> None:
                 current_intent = DurableExecutionStore(self.storage).get_intent(str(intent["id"]))
                 if str(current_intent.get("state")) in {"created", "reserved"}:
                     from .order_state import OrderState
 
                     DurableExecutionStore(self.storage).transition(
                         str(intent["id"]), OrderState.EXPIRED,
-                        event_type="rotation_recovery_authority_expired",
-                        safe_summary="rotation dependency failed the immediate pre-submission check",
+                        event_type="recovery_submission_blocked",
+                        safe_summary=reason,
                         expected_state=OrderState(str(current_intent["state"])),
                     )
+
+            proposal = load_local_proposal(workflow["proposal_id"])
+            if proposal is None:
+                expire_reserved_intent("authoritative proposal disappeared during recovery")
+                return "terminal"
+            authority, proposal, _reason = recover_action_authority(workflow, proposal)
+            if authority != "approved" or proposal is None:
+                expire_reserved_intent(_reason or "recovery submission authority is no longer current")
                 return "terminal"
             if self.broker is None:
                 return "unknown"
@@ -364,7 +368,12 @@ class TradingService:
                 "stop_price": intent.get("intended_stop_price"),
                 "trading_mode": "paper",
             }
-            context = self._portfolio_context(executable, approval_valid=True)
+            context = self._portfolio_context(
+                executable,
+                approval_valid=True,
+                exclude_intent_id=str(intent["id"]),
+                exclude_logical_action_key=str(intent.get("logical_action_key") or "") or None,
+            )
             result = Executor(self.broker, self._risk_engine(intent.get("proposal_id"), "recovery_final"), self.storage, self.run_id).execute(
                 executable,
                 context,
@@ -373,6 +382,8 @@ class TradingService:
             )
             if result.status == "unknown":
                 return "unknown"
+            if not result.submitted:
+                expire_reserved_intent(result.reason or "final recovery validation blocked submission")
             return "submitted" if result.submitted else "terminal"
 
         def recover_lookup(_workflow: dict[str, Any], intent: dict[str, Any] | None) -> str:
@@ -2294,7 +2305,14 @@ class TradingService:
             return blocker.get("reason") or "portfolio exit-first rule active"
         return "portfolio exit-first rule active"
 
-    def _portfolio_context(self, proposal: dict[str, Any], approval_valid: bool = False) -> dict[str, Any]:
+    def _portfolio_context(
+        self,
+        proposal: dict[str, Any],
+        approval_valid: bool = False,
+        *,
+        exclude_intent_id: str | None = None,
+        exclude_logical_action_key: str | None = None,
+    ) -> dict[str, Any]:
         # Order-side conflicts and sell capacity are admission-critical broker
         # state; do not let the general runtime cache turn a current holding or
         # open-order change into a stale duplicate/oversell decision.
@@ -2321,18 +2339,41 @@ class TradingService:
             try:
                 if raw_remaining is not None:
                     return max(0.0, float(raw_remaining))
-                requested = float(_value(order, "qty", _value(order, "quantity", 0)) or 0)
-                filled = float(_value(order, "filled_qty", _value(order, "filled_quantity", 0)) or 0)
+                requested_raw = _value(order, "requested_quantity")
+                if not requested_raw:
+                    requested_raw = _value(order, "qty") or _value(order, "quantity") or 0
+                filled_raw = _value(order, "filled_quantity")
+                if not filled_raw:
+                    filled_raw = _value(order, "filled_qty") or 0
+                requested = float(requested_raw)
+                filled = float(filled_raw)
                 return max(0.0, requested - filled)
             except (TypeError, ValueError):
                 return 0.0
 
         symbol_upper = str(symbol).upper()
+        excluded_keys: set[str] = set()
+        if exclude_intent_id:
+            excluded_intent_rows = self.storage.fetch_all(
+                "SELECT id,logical_action_key,client_order_id,broker_order_id FROM order_intents WHERE id=?",
+                (exclude_intent_id,),
+            )
+            for excluded in excluded_intent_rows:
+                for key in ("id", "logical_action_key", "client_order_id", "broker_order_id"):
+                    if excluded.get(key):
+                        excluded_keys.add(str(excluded[key]))
+        if exclude_logical_action_key:
+            excluded_keys.add(str(exclude_logical_action_key))
+
         active_orders = [
             order for order in orders
             if is_active_order(order)
             and str(_value(order, "symbol", "")).upper() == symbol_upper
             and str(_value(order, "side", "")).lower() in {"buy", "sell"}
+            and not any(
+                str(_value(order, field, "")) in excluded_keys
+                for field in ("id", "logical_action_key", "client_order_id", "broker_order_id")
+            )
         ]
         known_order_keys = {
             str(_value(order, field, ""))
@@ -2348,11 +2389,17 @@ class TradingService:
             "cancel_pending", "unknown", "reconciliation_required",
         )
         placeholders = ",".join("?" for _ in active_intent_states)
+        intent_conditions = [f"upper(symbol)=?", f"state IN ({placeholders})", "lower(side) IN ('buy','sell')"]
+        intent_parameters: list[Any] = [symbol_upper, *active_intent_states]
+        if exclude_intent_id:
+            intent_conditions.append("id != ?")
+            intent_parameters.append(exclude_intent_id)
+        if exclude_logical_action_key:
+            intent_conditions.append("logical_action_key != ?")
+            intent_parameters.append(exclude_logical_action_key)
         active_intents = self.storage.fetch_all(
-            f"""SELECT * FROM order_intents
-                WHERE upper(symbol)=? AND state IN ({placeholders})
-                  AND lower(side) IN ('buy','sell')""",
-            (symbol_upper, *active_intent_states),
+            f"SELECT * FROM order_intents WHERE {' AND '.join(intent_conditions)}",
+            tuple(intent_parameters),
         )
         for intent in active_intents:
             intent_keys = {

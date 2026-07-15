@@ -66,7 +66,15 @@ def authorize(db: Storage, candidate: dict, approval_id: str = "approval-1", *, 
     if ready:
         workflows.transition(workflow["id"], ApprovalWorkflowState.APPROVED_PENDING_INTENT,
                              expected_state=ApprovalWorkflowState.VALIDATING)
-    return {**candidate, "id": proposal_id, "proposal_id": proposal_id, "status": "approved"}
+    return {
+        **candidate,
+        "id": proposal_id,
+        "proposal_id": proposal_id,
+        "status": "approved",
+        "approval_authority_fingerprint": db.fetch_all(
+            "SELECT authority_fingerprint FROM approvals WHERE id=?", (approval_id,)
+        )[0]["authority_fingerprint"],
+    }
 
 
 class InspectingBroker:

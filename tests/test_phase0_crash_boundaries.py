@@ -90,6 +90,8 @@ def _proposal(identifier="proposal-1", symbol="SPY", side="buy"):
         "qty": None if side == "buy" else 10,
         "latest_price": 10,
         "stop_price": 9,
+        "strategy_version": "rule_based_v2",
+        "expires_at": "2099-01-01T00:00:00+00:00",
         "trading_mode": "paper",
         "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 9.99,
         "quote_ask": 10.01, "quote_midpoint": 10.0, "quote_timestamp": datetime.now(UTC).isoformat(),
@@ -103,7 +105,7 @@ def _workflow(storage, state=ApprovalWorkflowState.VALIDATING):
         """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
            VALUES(?,?,?,?,?,?,?,?,?)""",
         ("proposal-1", "SPY", "buy", 100.0, "pending", now.isoformat(),
-         (now + timedelta(minutes=10)).isoformat(), "rule_based_v2", "{}"),
+         _proposal()["expires_at"], "rule_based_v2", "{}"),
     )
     store = ApprovalWorkflowStore(storage)
     workflow = store.accept_approval(

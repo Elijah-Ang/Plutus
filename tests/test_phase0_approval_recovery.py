@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import uuid
 import sqlite3
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -40,7 +41,7 @@ def _proposal(proposal_id: str = "proposal-1", *, status: str = "approved") -> d
         "order_type": "limit", "quote_source": "alpaca_quote", "quote_bid": 99.9,
         "quote_ask": 100.1, "quote_midpoint": 100.0, "quote_timestamp": now.isoformat(),
         "quote_spread_bps": 20.0, "limit_price": 100.36,
-        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        "expires_at": "2099-01-01T00:00:00+00:00",
     }
 
 
@@ -52,12 +53,52 @@ def _workflow(
     update_id: int = 101,
     state: ApprovalWorkflowState = ApprovalWorkflowState.APPROVED_PENDING_INTENT,
 ):
-    return ApprovalWorkflowStore(storage).create_or_get(
-        approval_id=approval_id,
-        proposal_id=proposal_id,
-        telegram_update_id=update_id,
-        initial_state=state,
+    proposal = _proposal(proposal_id)
+    now = datetime.now(UTC)
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (proposal_id, proposal["symbol"], proposal["side"], proposal["notional"], "pending",
+         now.isoformat(), proposal["expires_at"], "rule_based_v2", json.dumps(proposal)),
     )
+    if state in {
+        ApprovalWorkflowState.RECEIVED,
+        ApprovalWorkflowState.AUTHORIZED,
+        ApprovalWorkflowState.UNKNOWN,
+    }:
+        workflow = ApprovalWorkflowStore(storage).create_or_get(
+            approval_id=approval_id,
+            proposal_id=proposal_id,
+            telegram_update_id=update_id,
+            initial_state=state,
+        )
+        from app.approval_authority import authority_envelope, authority_fingerprint, canonical_json
+        envelope = authority_envelope(proposal, proposal_id=proposal_id)
+        storage.execute(
+            """INSERT INTO approvals(
+                 id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
+                 consumed_at,authority_envelope_json,authority_fingerprint)
+               VALUES(?,?,?,?,?,?,1,'consumed',?,?,?,?)""",
+            (approval_id, "run", proposal_id, "owner", "approve", "approve", now.isoformat(), now.isoformat(),
+             canonical_json(envelope), authority_fingerprint(envelope)),
+        )
+        return workflow
+    store = ApprovalWorkflowStore(storage)
+    accepted = store.accept_approval(
+        approval_id=approval_id, run_id="run", proposal_id=proposal_id,
+        sender_id="owner", raw_message="approve", parsed_action="approve",
+        telegram_update_id=update_id, reply_to_message_id=None, targeting_method="test",
+        acknowledgement_status="received", approval_received_at=now.isoformat(),
+    )
+    assert storage.consume_approval(proposal_id, approval_id)
+    if state == ApprovalWorkflowState.APPROVED_PENDING_INTENT:
+        store.transition(accepted["id"], ApprovalWorkflowState.VALIDATING,
+                         expected_state=ApprovalWorkflowState.TARGET_RESOLVED)
+        return store.transition(accepted["id"], state, expected_state=ApprovalWorkflowState.VALIDATING)
+    if state == ApprovalWorkflowState.VALIDATING:
+        return store.transition(accepted["id"], state, expected_state=ApprovalWorkflowState.TARGET_RESOLVED)
+    return accepted
 
 
 def test_duplicate_telegram_update_has_one_stable_workflow(tmp_path):
@@ -211,7 +252,7 @@ def test_recovery_never_revives_expired_proposal(tmp_path):
     )
 
     assert summary.blocked == 1
-    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "blocked"
+    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "terminal"
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
 
 
@@ -230,7 +271,7 @@ def test_recovery_action_authority_blocks_before_intent_creation(tmp_path):
     )
 
     assert summary.blocked == 1
-    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "blocked"
+    assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "terminal"
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
 
 
@@ -255,7 +296,7 @@ def test_recovery_action_authority_rechecked_before_submission_and_releases_inte
 
     assert summary.blocked == 1
     assert submitted == []
-    assert store.get(workflow["id"])["state"] == "blocked"
+    assert store.get(workflow["id"])["state"] == "terminal"
     assert DurableExecutionStore(storage).get_intent(intent["id"])["state"] == "expired"
     assert storage.fetch_all(
         "SELECT state FROM risk_reservations WHERE intent_id=?", (intent["id"],)
@@ -499,21 +540,9 @@ def test_submission_started_is_durable_before_broker_invocation(tmp_path):
     storage = _storage(tmp_path)
     workflow = _workflow(storage, state=ApprovalWorkflowState.VALIDATING)
     candidate = _proposal()
-    now = datetime.now(UTC)
-    storage.execute(
-        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (candidate["id"], candidate["symbol"], candidate["side"], candidate["notional"], "pending",
-         now.isoformat(), candidate["expires_at"], "rule_based_v2", "{}"),
-    )
-    storage.execute(
-        """INSERT INTO approvals(
-             id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
-             acknowledgement_status,approval_received_at)
-           VALUES(?,?,?,?,?,?,1,'accepted',?,?,?)""",
-        ("approval-1", "run", candidate["id"], "owner", "approve", "approve", now.isoformat(), "received", now.isoformat()),
-    )
-    assert storage.consume_approval(candidate["id"], "approval-1")
+    candidate["expires_at"] = storage.fetch_all(
+        "SELECT expires_at FROM trade_proposals WHERE id=?", (candidate["id"],)
+    )[0]["expires_at"]
 
     class Risk:
         config = {}

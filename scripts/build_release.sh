@@ -22,9 +22,21 @@ RELEASE_ID="$RELEASE_ID" COMMIT="$COMMIT" BRANCH="$BRANCH" FINGERPRINT="$FINGERP
 import json, os, platform
 from datetime import UTC, datetime
 from pathlib import Path
+from app.formula_versions import REQUIRED_SCHEMA_VERSIONS
+from scripts.check_release_eligibility import RELEASE_FORMULA_VERSIONS
+from app.utils import load_config
+from app.runtime_guard import REQUIRED_SCHEMA_VERSION
+config = load_config()
 Path('release-manifest.json').write_text(json.dumps({
   'release_id': os.environ['RELEASE_ID'], 'release_commit': os.environ['COMMIT'],
-  'schema_version': __import__('app.runtime_guard', fromlist=['REQUIRED_SCHEMA_VERSION']).REQUIRED_SCHEMA_VERSION, 'mode': 'paper',
+  'schema_version': REQUIRED_SCHEMA_VERSION, 'required_schema_versions': sorted(REQUIRED_SCHEMA_VERSIONS),
+  'formula_versions': RELEASE_FORMULA_VERSIONS,
+  'configuration_hash': config.get('effective_config_hash'), 'mode': 'paper',
+  'ci': {
+    'workflow_name': os.environ.get('RELEASE_CI_WORKFLOW_NAME', 'CI'),
+    'run_id': os.environ.get('RELEASE_CI_RUN_ID', ''),
+    'head_sha': os.environ['COMMIT'],
+  },
   'built_at_utc': datetime.now(UTC).isoformat(), 'python_version': platform.python_version(),
   'dependency_fingerprint': os.environ['FINGERPRINT'], 'source_branch': os.environ['BRANCH'],
   'tests_verified': True,
