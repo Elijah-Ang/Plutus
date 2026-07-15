@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
@@ -42,11 +43,13 @@ def _proposal(identifier: str = "p-state", side: str = "buy") -> dict:
 
 def _authorize(storage: Storage, candidate: dict, approval_id: str = "approval-state") -> dict:
     now = datetime.now(UTC).isoformat()
+    expires_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    candidate = {**candidate, "notional": 500.0, "expires_at": expires_at, "strategy_version": "rule_based_v2"}
     storage.execute(
         """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
            VALUES(?,?,?,?,?,?,?,?,?)""",
         (candidate["id"], candidate["symbol"], candidate["side"], 500.0, "pending", now,
-         (datetime.now(UTC) + timedelta(minutes=5)).isoformat(), "rule_based_v2", "{}"),
+         expires_at, "rule_based_v2", json.dumps(candidate)),
     )
     store = ApprovalWorkflowStore(storage)
     workflow = store.accept_approval(

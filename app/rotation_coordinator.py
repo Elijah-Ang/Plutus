@@ -162,7 +162,9 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
              approval_id TEXT,approved_at TEXT,estimated_release_notional REAL NOT NULL DEFAULT 0,
              actual_released_notional REAL NOT NULL DEFAULT 0,actual_released_risk REAL NOT NULL DEFAULT 0,
              reconciled_cash REAL,reconciled_buying_power REAL,reconciliation_fingerprint TEXT,
-             registry_snapshot_id TEXT,allocation_id TEXT,terminal_reason TEXT,
+             registry_snapshot_id TEXT,allocation_id TEXT,origin_run_id TEXT,
+             revalidation_run_id TEXT,revalidation_registry_snapshot_id TEXT,
+             revalidation_allocation_id TEXT,revalidated_at TEXT,terminal_reason TEXT,
              schema_version TEXT NOT NULL,formula_version TEXT NOT NULL,config_hash TEXT,
              decision_fingerprint TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS rotation_steps(
@@ -197,6 +199,11 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
         "contingent_candidate_fingerprint": "TEXT",
         "displayed_approval_fingerprint": "TEXT",
         "workflow_structure_fingerprint": "TEXT",
+        "origin_run_id": "TEXT",
+        "revalidation_run_id": "TEXT",
+        "revalidation_registry_snapshot_id": "TEXT",
+        "revalidation_allocation_id": "TEXT",
+        "revalidated_at": "TEXT",
     }
     present = {row[1] for row in conn.execute("PRAGMA table_info(rotation_groups)")}
     for name, kind in additions.items():
@@ -225,7 +232,8 @@ class RotationCoordinator:
         registry_snapshot_id: str,
         allocation_id: str,
         evaluation_time: str | datetime,
-    ) -> None:
+        allow_later_run: bool = False,
+    ) -> str:
         """Verify the immutable registry/allocation pair at an action boundary."""
         snapshot_id = str(registry_snapshot_id or "").strip()
         allocation_key = str(allocation_id or "").strip()
@@ -250,7 +258,11 @@ class RotationCoordinator:
         if len(registry_rows) != 1:
             raise RuntimeError("rotation registry snapshot or strategy decision does not exist")
         registry = registry_rows[0]
-        if str(registry.get("run_id") or "") != str(group.get("run_id") or "") or str(registry.get("decision_run_id") or "") != str(group.get("run_id") or ""):
+        authority_run_id = str(registry.get("run_id") or "")
+        expected_run_id = str(group.get("origin_run_id") or group.get("run_id") or "")
+        if not authority_run_id or str(registry.get("decision_run_id") or "") != authority_run_id:
+            raise RuntimeError("rotation registry authority has inconsistent run identity")
+        if not allow_later_run and authority_run_id != expected_run_id:
             raise RuntimeError("rotation registry authority belongs to a different run")
         if int(registry.get("authorized") or 0) != 1:
             raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
@@ -278,7 +290,7 @@ class RotationCoordinator:
         if len(allocation_rows) != 1:
             raise RuntimeError("rotation allocation authority does not exist")
         allocation = allocation_rows[0]
-        if str(allocation.get("run_id") or "") != str(group.get("run_id") or ""):
+        if str(allocation.get("run_id") or "") != authority_run_id:
             raise RuntimeError("rotation allocation authority belongs to a different run")
         if str(allocation.get("config_hash") or "") != expected_config_hash:
             raise RuntimeError("rotation allocation configuration hash does not match current configuration")
@@ -312,6 +324,7 @@ class RotationCoordinator:
                 raise RuntimeError(f"{label} freshness timestamp is invalid") from exc
             if age < -5.0 or age > 300.0:
                 raise RuntimeError(f"{label} authority is stale for the supplied evaluation time")
+        return authority_run_id
 
     def create_group(
         self,
@@ -447,12 +460,12 @@ class RotationCoordinator:
                 raise RuntimeError("a conflicting active rotation already owns this position lifecycle")
             conn.execute(
                 """INSERT INTO rotation_groups(
-                     id,run_id,state,expires_at,estimated_release_notional,registry_snapshot_id,allocation_id,
+                     id,run_id,origin_run_id,state,expires_at,estimated_release_notional,registry_snapshot_id,allocation_id,
                      schema_version,formula_version,config_hash,decision_fingerprint,created_at,updated_at,
                      position_lifecycle_id,exit_proposal_fingerprint,contingent_candidate_fingerprint,
                      displayed_approval_fingerprint,workflow_structure_fingerprint)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (group_id, run_id, RotationState.PENDING_GROUP_APPROVAL.value, expiry.isoformat(),
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (group_id, run_id, run_id, RotationState.PENDING_GROUP_APPROVAL.value, expiry.isoformat(),
                  sum(row["estimated_notional"] for row in canonical_exits), registry_snapshot_id, allocation_id,
                  ROTATION_SCHEMA_VERSION, ROTATION_FORMULA_VERSION, self.config_hash, fingerprint, now, now,
                  lifecycle_id, exit_fingerprint, candidate_fingerprint, displayed_fingerprint,
@@ -491,7 +504,7 @@ class RotationCoordinator:
                 group,
                 registry_snapshot_id=str(group.get("registry_snapshot_id") or ""),
                 allocation_id=str(group.get("allocation_id") or ""),
-                evaluation_time=str(group.get("created_at") or datetime.now(UTC).isoformat()),
+                evaluation_time=datetime.now(UTC),
             )
         except (RuntimeError, ValueError) as exc:
             self.transition(group_id, RotationState.CANCELLED, reason=f"rotation authority blocked: {exc}")
@@ -762,11 +775,12 @@ class RotationCoordinator:
             return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
                 "candidate_identity", "candidate changed; new approval required")
         try:
-            self._verify_authority_records(
+            authority_run_id = self._verify_authority_records(
                 group,
                 registry_snapshot_id=registry_snapshot_id,
                 allocation_id=allocation_id,
                 evaluation_time=evaluation_time or datetime.now(UTC),
+                allow_later_run=True,
             )
         except (RuntimeError, ValueError) as exc:
             self.transition(group_id, RotationState.ENTRY_BLOCKED, reason=f"rotation authority blocked: {exc}")
@@ -804,8 +818,11 @@ class RotationCoordinator:
             if not current or current["state"] != RotationState.RECONCILED.value:
                 raise RuntimeError("rotation group changed during entry revalidation")
             conn.execute(
-                "UPDATE rotation_groups SET state=?,registry_snapshot_id=?,allocation_id=?,updated_at=? WHERE id=?",
-                (RotationState.ENTRY_REVALIDATING.value, registry_snapshot_id, allocation_id, now, group_id),
+                """UPDATE rotation_groups SET state=?,revalidation_run_id=?
+                   ,revalidation_registry_snapshot_id=?,revalidation_allocation_id=?,revalidated_at=?,updated_at=?
+                   WHERE id=?""",
+                (RotationState.ENTRY_REVALIDATING.value, authority_run_id, registry_snapshot_id,
+                 allocation_id, now, now, group_id),
             )
             conn.execute(
                 """UPDATE rotation_contingent_entries SET state='revalidated',final_quantity=?,final_notional=?,
@@ -865,7 +882,9 @@ class RotationCoordinator:
                 (now, group_id),
             )
             conn.execute(
-                "UPDATE rotation_groups SET state=?,registry_snapshot_id=NULL,allocation_id=NULL,updated_at=? WHERE id=?",
+                """UPDATE rotation_groups SET state=?,revalidation_run_id=NULL,
+                   revalidation_registry_snapshot_id=NULL,revalidation_allocation_id=NULL,
+                   revalidated_at=NULL,updated_at=? WHERE id=?""",
                 (RotationState.RECONCILED.value, now, group_id),
             )
             self._event(conn, group_id, "entry-revalidation-recovered", "entry_revalidation_recovered",

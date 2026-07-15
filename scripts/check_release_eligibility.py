@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -21,11 +22,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.configuration import validate_config  # noqa: E402
-from app.formula_versions import REQUIRED_SCHEMA_VERSIONS  # noqa: E402
+from app.formula_versions import (  # noqa: E402
+    CONFIGURATION_SCHEMA_VERSION,
+    PHASE4_ALLOCATION_VERSION,
+    PHASE4_SCHEMA_VERSION,
+    REQUIRED_SCHEMA_VERSIONS,
+    ROTATION_FORMULA_VERSION,
+    ROTATION_SCHEMA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+)
 from app.storage import Storage  # noqa: E402
 from app.utils import load_config  # noqa: E402
 
 REQUIRED_CI_JOBS = frozenset({"offline-tests"})
+RELEASE_FORMULA_VERSIONS = {
+    "configuration_schema": CONFIGURATION_SCHEMA_VERSION,
+    "phase4_allocation": PHASE4_ALLOCATION_VERSION,
+    "phase4_schema": PHASE4_SCHEMA_VERSION,
+    "rotation": ROTATION_FORMULA_VERSION,
+    "rotation_schema": ROTATION_SCHEMA_VERSION,
+    "strategy_registry": STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    "strategy_registry_schema": STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+}
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -67,6 +86,7 @@ def _remote_ci(sha: str, repository: str | None, *, skip: bool) -> dict[str, Any
         "status": "pending" if newest.get("status") != "completed" else "failed",
         "passed": False, "run_id": newest.get("id"), "url": newest.get("html_url"),
         "conclusion": newest.get("conclusion"), "head_sha": sha,
+        "workflow_name": newest.get("name"),
     }
     if newest.get("status") != "completed" or newest.get("conclusion") != "success":
         result["reason"] = "newest exact-SHA CI run is not completed successfully"
@@ -115,11 +135,82 @@ def _repository_from_remote(remote: str) -> str | None:
     return tail if tail.count("/") == 1 else None
 
 
+def _decode_release_manifest(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        decoded = base64.b64decode(content.replace("\n", ""), validate=True)
+        manifest = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _manifest_ci_identity(manifest: dict[str, Any]) -> tuple[str, str, str]:
+    ci = manifest.get("ci") if isinstance(manifest.get("ci"), dict) else {}
+    workflow = str(ci.get("workflow_name") or manifest.get("ci_workflow_name") or "")
+    run_id = str(ci.get("run_id") or manifest.get("ci_run_id") or "")
+    head_sha = str(ci.get("head_sha") or manifest.get("ci_head_sha") or manifest.get("release_commit") or "")
+    return workflow, run_id, head_sha
+
+
+def _verify_release_manifest(
+    repository: str,
+    tag_name: str,
+    tag_object_sha: str,
+    sha: str,
+    config_hash: str | None,
+    remote_ci: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    tag_payload, tag_error, _ = _github_json(
+        f"https://api.github.com/repos/{repository}/git/tags/{tag_object_sha}"
+    )
+    tag_object = tag_payload.get("object") if isinstance(tag_payload, dict) else None
+    if tag_error or not isinstance(tag_object, dict) or str(tag_object.get("type") or "") != "commit":
+        return False, f"{tag_name}: annotated tag object is unavailable"
+    if str(tag_object.get("sha") or "") != sha:
+        return False, f"{tag_name}: annotated tag does not point to the candidate commit"
+
+    manifest_payload, manifest_error, _ = _github_json(
+        f"https://api.github.com/repos/{repository}/contents/release-manifest.json?ref={urllib.parse.quote(sha, safe='')}"
+    )
+    manifest = _decode_release_manifest(manifest_payload)
+    if manifest_error or manifest is None:
+        return False, f"{tag_name}: immutable release manifest is missing or invalid"
+    if str(manifest.get("release_commit") or manifest.get("commit_sha") or "") != sha:
+        return False, f"{tag_name}: release manifest commit does not match the candidate"
+    if not config_hash or str(manifest.get("configuration_hash") or manifest.get("config_hash") or "") != str(config_hash):
+        return False, f"{tag_name}: release manifest configuration hash does not match"
+    schema_versions = manifest.get("required_schema_versions") or manifest.get("schema_versions")
+    if not isinstance(schema_versions, (list, tuple, set)) or set(map(str, schema_versions)) != set(REQUIRED_SCHEMA_VERSIONS):
+        return False, f"{tag_name}: release manifest schema versions are incomplete or mismatched"
+    formula_versions = manifest.get("formula_versions")
+    if not isinstance(formula_versions, dict) or any(
+        str(formula_versions.get(key) or "") != value
+        for key, value in RELEASE_FORMULA_VERSIONS.items()
+    ):
+        return False, f"{tag_name}: release manifest formula versions are incomplete or mismatched"
+    workflow, run_id, head_sha = _manifest_ci_identity(manifest)
+    if workflow != "CI" or not run_id or head_sha != sha:
+        return False, f"{tag_name}: release manifest CI identity is missing or mismatched"
+    if not remote_ci or not remote_ci.get("passed"):
+        return False, f"{tag_name}: exact-SHA CI is not verified"
+    if str(remote_ci.get("run_id") or "") != run_id or str(remote_ci.get("head_sha") or "") != sha:
+        return False, f"{tag_name}: release manifest CI run does not match the remote exact-SHA run"
+    if str(remote_ci.get("workflow_name") or "CI") != workflow:
+        return False, f"{tag_name}: release manifest workflow identity does not match remote CI"
+    return True, f"{tag_name}: verified immutable release manifest"
+
+
 def _release_reachability(
     sha: str,
     repository: str | None = None,
     *,
     config_hash: str | None = None,
+    remote_ci: dict[str, Any] | None = None,
     skip: bool = False,
 ) -> dict[str, Any]:
     if skip:
@@ -162,6 +253,7 @@ def _release_reachability(
 
     approved_tags: list[str] = []
     tag_manifest_verified: list[str] = []
+    tag_rejection_reasons: list[str] = []
     tags_payload, tags_error, tags_status = _github_json(
         f"https://api.github.com/repos/{repository}/git/matching-refs/tags/immutable-release-"
     )
@@ -183,36 +275,32 @@ def _release_reachability(
             target = ref.get("object") or {}
             target_sha = str(target.get("sha") or "") if isinstance(target, dict) else ""
             target_type = str(target.get("type") or "") if isinstance(target, dict) else ""
-            exact = target_type == "commit" and target_sha == sha
-            annotated = False
-            if target_type == "tag" and target_sha:
-                tag_payload, tag_error, _tag_status = _github_json(
-                    f"https://api.github.com/repos/{repository}/git/tags/{target_sha}"
-                )
-                tag_object = tag_payload.get("object") if isinstance(tag_payload, dict) else None
-                exact = (
-                    not tag_error
-                    and isinstance(tag_object, dict)
-                    and str(tag_object.get("type") or "") == "commit"
-                    and str(tag_object.get("sha") or "") == sha
-                )
-                annotated = exact
-            if exact:
+            if target_type != "tag" or not target_sha:
+                if target_type == "commit" and target_sha == sha:
+                    tag_rejection_reasons.append(f"{tag_name}: lightweight tags are not release authority")
+                continue
+            verified, reason = _verify_release_manifest(
+                repository, tag_name, target_sha, sha, config_hash, remote_ci
+            )
+            if verified:
                 approved_tags.append(tag_name)
-                if annotated:
-                    tag_manifest_verified.append(tag_name)
+                tag_manifest_verified.append(tag_name)
+            else:
+                tag_rejection_reasons.append(reason)
 
     approved_tags = sorted(set(approved_tags))
     return {
-        "passed": on_main or bool(approved_tags),
-        "status": "passed" if on_main or approved_tags else "failed",
+        "passed": on_main or bool(tag_manifest_verified),
+        "status": "passed" if on_main or tag_manifest_verified else "failed",
         "repository": repository,
         "remote_main_sha": remote_main_sha,
         "reachable_from_github_main": on_main,
         "approved_immutable_release_tags": approved_tags,
         "annotated_immutable_release_tags": sorted(set(tag_manifest_verified)),
-        "configuration_hash_checked": bool(config_hash),
-        "reason": None if on_main or approved_tags else "commit is not reachable from GitHub main or an exact remote immutable release tag",
+        "verified_release_manifest": sorted(set(tag_manifest_verified)),
+        "configuration_hash_checked": bool(on_main and config_hash) or bool(tag_manifest_verified),
+        "tag_rejection_reasons": tag_rejection_reasons,
+        "reason": None if on_main or tag_manifest_verified else "commit is not reachable from GitHub main or a verified remote immutable release manifest",
     }
 
 
@@ -273,7 +361,7 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
         repository = _repository_from_remote(remote)
     remote_ci = _remote_ci(sha, repository, skip=not check_remote)
     release_reachability = _release_reachability(
-        sha, repository, config_hash=config_hash, skip=not check_remote
+        sha, repository, config_hash=config_hash, remote_ci=remote_ci, skip=not check_remote
     )
     report = {
         "commit_sha": sha,
