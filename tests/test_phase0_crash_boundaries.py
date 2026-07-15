@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import functools
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -98,12 +98,31 @@ def _proposal(identifier="proposal-1", symbol="SPY", side="buy"):
 
 
 def _workflow(storage, state=ApprovalWorkflowState.VALIDATING):
-    return ApprovalWorkflowStore(storage).create_or_get(
-        approval_id="approval-1",
-        proposal_id="proposal-1",
-        telegram_update_id=101,
-        initial_state=state,
+    now = datetime.now(UTC)
+    storage.execute(
+        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        ("proposal-1", "SPY", "buy", 100.0, "pending", now.isoformat(),
+         (now + timedelta(minutes=10)).isoformat(), "rule_based_v2", "{}"),
     )
+    store = ApprovalWorkflowStore(storage)
+    workflow = store.accept_approval(
+        approval_id="approval-1", run_id="run", proposal_id="proposal-1", sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=101,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now.isoformat(),
+    )
+    assert storage.consume_approval("proposal-1", "approval-1")
+    if state != ApprovalWorkflowState.TARGET_RESOLVED:
+        store.transition(workflow["id"], ApprovalWorkflowState.VALIDATING,
+                         expected_state=ApprovalWorkflowState.TARGET_RESOLVED)
+    if state == ApprovalWorkflowState.APPROVED_PENDING_INTENT:
+        workflow = store.transition(workflow["id"], state, expected_state=ApprovalWorkflowState.VALIDATING)
+    elif state == ApprovalWorkflowState.TARGET_RESOLVED:
+        workflow = store.get(workflow["id"])
+    else:
+        workflow = store.get(workflow["id"])
+    return workflow
 
 
 def _crash_at(boundary):
@@ -153,9 +172,10 @@ def test_crash_01_failure_before_intent_persistence(tmp_path):
 
 def test_crash_02_after_intent_commit_before_broker_call(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker()
+    _workflow(storage)
     with pytest.raises(SimulatedProcessCrash):
         Executor(broker, PassingRisk(), storage, "run", _crash_at("after_intent_and_reservation_commit")).execute(
-            _proposal(), {"approval_valid": True}
+            _proposal(), {"approval_valid": True}, approval_id="approval-1"
         )
     intent = storage.fetch_all("SELECT * FROM order_intents")[0]
     assert broker.submit_calls == 0 and intent["state"] == "reserved"
@@ -184,7 +204,10 @@ def test_crash_03_immediately_before_broker_invocation(tmp_path):
 
 def test_crash_04_broker_accepts_then_ambiguous_timeout(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker(submit_error=TimeoutError("synthetic timeout"))
-    first = Executor(broker, PassingRisk(), storage, "run").execute(_proposal(), {"approval_valid": True})
+    _workflow(storage)
+    first = Executor(broker, PassingRisk(), storage, "run").execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+    )
     second = Executor(broker, PassingRisk(), Storage(storage.path), "restart").execute(
         _proposal(), {"approval_valid": True}
     )
@@ -195,9 +218,10 @@ def test_crash_04_broker_accepts_then_ambiguous_timeout(tmp_path):
 
 def test_crash_05_broker_success_before_local_success_update(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker()
+    _workflow(storage)
     with pytest.raises(SimulatedProcessCrash):
         Executor(broker, PassingRisk(), storage, "run", _crash_at("after_broker_success_before_local_update")).execute(
-            _proposal(), {"approval_valid": True}
+            _proposal(), {"approval_valid": True}, approval_id="approval-1"
         )
     assert broker.submit_calls == 1
     assert storage.fetch_all("SELECT state FROM order_intents")[0]["state"] == "submitting"
@@ -327,7 +351,10 @@ def test_crash_13_database_lock_during_state_transition(tmp_path):
 
 def test_crash_14_restart_with_unknown_intent_is_lookup_only(tmp_path):
     storage, broker = _db(tmp_path), FakeBroker(submit_error=TimeoutError("synthetic"))
-    result = Executor(broker, PassingRisk(), storage, "run").execute(_proposal(), {"approval_valid": True})
+    _workflow(storage)
+    result = Executor(broker, PassingRisk(), storage, "run").execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+    )
     assert result.status == "unknown" and broker.submit_calls == 1
     BrokerReconciler(broker, Storage(storage.path), "restart").reconcile()
     assert broker.submit_calls == 1 and broker.lookup_calls == 1

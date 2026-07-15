@@ -30,6 +30,47 @@ class PositionLifecycleManager:
                     "average_entry_price": _float_or_none(_value(position, "avg_entry_price")),
                 }
 
+        def refresh_opening_quantity(conn: Any, lifecycle: Any) -> None:
+            """Grow opening quantity from the original entry intent only.
+
+            Broker position quantity can temporarily represent only a partial
+            fill. The lifecycle's opening quantity is therefore sourced from
+            the cumulative fill ledger of its first lifecycle-bound ENTRY
+            intent, never from later ADD intents or from a reduced position.
+            """
+            entry = conn.execute(
+                """SELECT id,state,filled_quantity
+                   FROM order_intents
+                   WHERE position_lifecycle_id=? AND symbol=? AND lower(side)='buy'
+                     AND lower(intended_action)='entry' AND filled_quantity>0
+                   ORDER BY created_at,id LIMIT 1""",
+                (lifecycle["id"], lifecycle["symbol"]),
+            ).fetchone()
+            if not entry:
+                return
+            try:
+                cumulative_filled = float(entry["filled_quantity"] or 0.0)
+                prior_opening = float(lifecycle["opening_quantity"] or 0.0)
+            except (TypeError, ValueError):
+                return
+            if int(lifecycle["opening_quantity_frozen"] or 0) == 1:
+                return
+            entry_terminal = str(entry["state"] or "").lower() in {
+                "filled", "cancelled", "rejected", "expired",
+            }
+            if entry_terminal:
+                conn.execute(
+                    """UPDATE position_lifecycles
+                       SET opening_quantity=?,opening_quantity_frozen=1,updated_at=?
+                       WHERE id=?""",
+                    (max(prior_opening, cumulative_filled), now, lifecycle["id"]),
+                )
+            elif cumulative_filled > prior_opening + 1e-12:
+                conn.execute(
+                    "UPDATE position_lifecycles SET opening_quantity=?,updated_at=? WHERE id=? AND opening_quantity<=?",
+                    (cumulative_filled, now, lifecycle["id"], cumulative_filled + 1e-12),
+                )
+
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             active_rows = {row["symbol"]: row for row in conn.execute("SELECT * FROM position_lifecycles WHERE state='active'").fetchall()}
@@ -56,11 +97,24 @@ class PositionLifecycleManager:
             for symbol, observed in current.items():
                 lifecycle = active_symbols.get(symbol)
                 if lifecycle:
+                    boundary_row = conn.execute(
+                        "SELECT MAX(closed_at) boundary FROM position_lifecycles WHERE symbol=? AND state='closed'",
+                        (symbol,),
+                    ).fetchone()
+                    boundary = boundary_row["boundary"] if boundary_row else None
+                    conn.execute(
+                        """UPDATE order_intents SET position_lifecycle_id=?,updated_at=?
+                           WHERE symbol=? AND lower(side)='buy' AND lower(intended_action)='entry'
+                             AND filled_quantity>0 AND position_lifecycle_id IS NULL
+                             AND (? IS NULL OR created_at>?)""",
+                        (lifecycle["id"], now, symbol, boundary, boundary),
+                    )
                     conn.execute(
                         """UPDATE position_lifecycles SET broker_position_id=COALESCE(?,broker_position_id),
                            current_quantity=?,average_entry_price=COALESCE(?,average_entry_price),updated_at=? WHERE id=?""",
                         (observed["broker_position_id"], observed["quantity"], observed["average_entry_price"], now, lifecycle["id"]),
                     )
+                    refresh_opening_quantity(conn, lifecycle)
                     conn.execute(
                         "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(NULL,?,?,?,?)",
                         ("position_lifecycle_observed", "position_lifecycle", json_dumps({"symbol": symbol, "lifecycle_id": lifecycle["id"]}), now),
@@ -81,7 +135,8 @@ class PositionLifecycleManager:
                     boundary = boundary_row["boundary"] if boundary_row else None
                     conn.execute(
                         """UPDATE order_intents SET position_lifecycle_id=?,updated_at=?
-                           WHERE symbol=? AND side='buy' AND filled_quantity>0 AND position_lifecycle_id IS NULL
+                           WHERE symbol=? AND lower(side)='buy' AND lower(intended_action)='entry'
+                             AND filled_quantity>0 AND position_lifecycle_id IS NULL
                              AND (? IS NULL OR created_at>?)""",
                         (lifecycle_id, now, symbol, boundary, boundary),
                     )
@@ -90,6 +145,12 @@ class PositionLifecycleManager:
                            WHERE symbol=? AND position_lifecycle_id IS NULL AND (? IS NULL OR opened_at>?)""",
                         (lifecycle_id, now, symbol, boundary, boundary),
                     )
+                    created = conn.execute(
+                        "SELECT * FROM position_lifecycles WHERE id=?",
+                        (lifecycle_id,),
+                    ).fetchone()
+                    if created:
+                        refresh_opening_quantity(conn, created)
         return {
             row["symbol"]: row["id"]
             for row in self.storage.fetch_all("SELECT symbol,id FROM position_lifecycles WHERE state='active'")

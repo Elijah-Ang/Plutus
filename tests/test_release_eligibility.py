@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 
+import scripts.check_release_eligibility as release_check
 from scripts.check_release_eligibility import _remote_ci, build_report
 
 
@@ -54,3 +56,65 @@ def test_remote_ci_requires_named_jobs_to_pass(monkeypatch) -> None:
     result = _remote_ci("abc", "owner/repo", skip=False)
     assert result["passed"] is True
     assert result["required_jobs"] == ["offline-tests"]
+
+
+def test_release_reachability_uses_exact_github_main_sha(monkeypatch) -> None:
+    def fake_run(*args):
+        if args[:3] == ("git", "fetch", "--prune"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:3] == ("git", "merge-base", "--is-ancestor"):
+            assert args[3:] == ("candidate", "github-main")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_github(url):
+        if url.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": "github-main"}}, None, 200
+        if "/git/matching-refs/tags/" in url:
+            return [], None, 200
+        raise AssertionError(url)
+
+    monkeypatch.setattr(release_check, "_run", fake_run)
+    monkeypatch.setattr(release_check, "_github_json", fake_github)
+    result = release_check._release_reachability("candidate", "owner/repo")
+    assert result["passed"] is True
+    assert result["remote_main_sha"] == "github-main"
+
+
+def test_unpushed_local_tag_and_stale_local_main_do_not_pass_release_check(monkeypatch) -> None:
+    def fake_run(*args):
+        if args[:3] == ("git", "fetch", "--prune"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:3] == ("git", "merge-base", "--is-ancestor"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        # A local tag or local origin/main is intentionally not consulted.
+        if args[:3] == ("git", "tag", "--points-at"):
+            return SimpleNamespace(returncode=0, stdout="immutable-release-local\n", stderr="")
+        raise AssertionError(args)
+
+    def fake_github(url):
+        if url.endswith("/git/ref/heads/main"):
+            return {"object": {"sha": "new-github-main"}}, None, 200
+        if "/git/matching-refs/tags/" in url:
+            return [], None, 200
+        raise AssertionError(url)
+
+    monkeypatch.setattr(release_check, "_run", fake_run)
+    monkeypatch.setattr(release_check, "_github_json", fake_github)
+    result = release_check._release_reachability("candidate", "owner/repo")
+    assert result["passed"] is False
+    assert result["status"] == "failed"
+
+
+def test_release_reachability_is_unverified_when_github_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        release_check, "_run",
+        lambda *args: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        release_check, "_github_json",
+        lambda _url: (None, "network unavailable", None),
+    )
+    result = release_check._release_reachability("candidate", "owner/repo")
+    assert result["passed"] is False
+    assert result["status"] == "unverified"

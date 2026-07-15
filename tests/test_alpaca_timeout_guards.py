@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.broker_alpaca import AlpacaBroker, AlpacaBrokerError
+from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.execution import Executor
 from app.service import TradingService
 from app.storage import Storage
@@ -165,7 +166,25 @@ def test_order_submission_timeout_is_unknown_and_not_retried(tmp_path):
         "quote_ask": 100.01, "quote_midpoint": 100.0, "quote_timestamp": now.isoformat(),
         "quote_spread_bps": 2.0, "limit_price": 100.27,
     }
-    result = Executor(broker, PassingRisk(), storage, "run").execute(proposal, {"approval_valid": True})
+    storage.execute(
+        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        ("p1", "SPY", "buy", 5.0, "pending", now.isoformat(), proposal["expires_at"], "rule_based_v2", "{}"),
+    )
+    workflow = ApprovalWorkflowStore(storage).accept_approval(
+        approval_id="approval-timeout", run_id="run", proposal_id="p1", sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=None,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now.isoformat(),
+    )
+    assert storage.consume_approval("p1", "approval-timeout")
+    ApprovalWorkflowStore(storage).transition(
+        workflow["id"], ApprovalWorkflowState.VALIDATING,
+        expected_state=ApprovalWorkflowState.TARGET_RESOLVED,
+    )
+    result = Executor(broker, PassingRisk(), storage, "run").execute(
+        proposal, {"approval_valid": True}, approval_id="approval-timeout"
+    )
 
     assert calls["submit"] == 1
     assert result.submitted is False

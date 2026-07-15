@@ -181,6 +181,15 @@ def test_candidate_ranking_uses_canonical_risk_and_rejects_stale_conversion() ->
                                    "conversion_equity_as_of": "2026-07-14T07:00:00+00:00"})
 
 
+def test_candidate_stop_risk_efficiency_prefers_fifty_dollars_over_one_fifty() -> None:
+    base = {"setup_score": 90, "evidence_quality": 90, "regime": "normal",
+            "risk_unit": "stop_risk_dollars", "conversion_equity": 100_000.0,
+            "conversion_equity_as_of": AS_OF, "evaluation_time": AS_OF}
+    fifty = candidate_allocation_rank({**base, "risk_value": 50.0})
+    one_fifty = candidate_allocation_rank({**base, "risk_value": 150.0})
+    assert fifty["risk_efficiency_score"] > one_fifty["risk_efficiency_score"]
+
+
 def test_shadow_evidence_never_becomes_operational_allocation(tmp_path):
     storage=Storage(tmp_path/"p4-shadow.sqlite3"); storage.initialize(); cfg=load_config()
     for index in range(100):

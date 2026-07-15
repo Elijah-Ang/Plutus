@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -13,6 +14,13 @@ from app.rotation_coordinator import (
 )
 from app.execution import DurableExecutionStore, ExecutionResult
 from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
+from app.formula_versions import (
+    CONFIGURATION_SCHEMA_VERSION,
+    PHASE4_ALLOCATION_VERSION,
+    PHASE4_SCHEMA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+)
 from app.order_state import OrderState
 from app.service import TradingService
 from app.storage import Storage
@@ -25,6 +33,44 @@ def coordinator(tmp_path):
     with storage.connect() as conn:
         apply_rotation_schema(conn)
     now = datetime.now(UTC).isoformat()
+    for snapshot_id, allocation_id in (("registry-before", "allocation-before"), ("registry-after", "allocation-after")):
+        storage.execute(
+            """INSERT INTO strategy_registry_snapshots(
+                 id,run_id,evaluated_at,registry_schema_version,registry_formula_version,
+                 configuration_version,config_hash,authorized_strategies_json,rejected_strategies_json,
+                 global_reasons_json,raw_inputs_json,evaluation_fingerprint,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (snapshot_id, "run-1", now, STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+             STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION, CONFIGURATION_SCHEMA_VERSION, "config-hash",
+             '["rule_based_v2"]', "[]", "[]", "{}", f"fingerprint-{snapshot_id}", now),
+        )
+        storage.execute(
+            """INSERT INTO strategy_registry_decisions(
+                 id,snapshot_id,run_id,strategy_name,strategy_version,authorized,policy_state,
+                 reasons_json,reason,decision_json,raw_inputs_json,evidence_version,performance_version,
+                 policy_version,policy_schema_version,configuration_version,config_hash,decision_fingerprint,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"decision-{snapshot_id}", snapshot_id, "run-1", "Rule", "rule_based_v2", 1, "ACTIVE",
+             "[]", "authorized", "{}", "{}", "evidence", "performance", "policy", "policy-schema",
+             CONFIGURATION_SCHEMA_VERSION, "config-hash", f"decision-fingerprint-{snapshot_id}", now),
+        )
+        payload = json.dumps({
+            "schema_version": PHASE4_SCHEMA_VERSION,
+            "formula_version": PHASE4_ALLOCATION_VERSION,
+            "config_hash": "config-hash",
+            "registry_snapshot_id": snapshot_id,
+            "authorized_strategies": ["rule_based_v2"],
+        })
+        storage.execute(
+            """INSERT INTO phase4_allocation_decisions(
+                 id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
+                 fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
+                 uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,formula_version,config_hash,payload)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (allocation_id, "run-1", now, "ACTIVE_ADAPTIVE_PAPER", "test", "{\"rule_based_v2\":1}", 0.0,
+             0.25, "{}", "{}", "normal", 0.0, 0.0, 1.0, "ALLOCATE", "test",
+             f"allocation-fingerprint-{allocation_id}", PHASE4_ALLOCATION_VERSION, "config-hash", payload),
+        )
     storage.execute(
         """INSERT INTO position_lifecycles(
              id,symbol,side,state,opened_at,opening_quantity,current_quantity,average_entry_price,
@@ -34,7 +80,8 @@ def coordinator(tmp_path):
     return storage, RotationCoordinator(storage, config_hash="config-hash")
 
 
-def _create(coordinator, *, entries=None, exits=None, minutes=30):
+def _create(coordinator, *, entries=None, exits=None, minutes=30,
+            registry_snapshot_id="registry-before", allocation_id="allocation-before"):
     _storage, manager = coordinator
     evaluated_at = datetime.now(UTC)
     exit_rows = exits or [{
@@ -63,8 +110,8 @@ def _create(coordinator, *, entries=None, exits=None, minutes=30):
         contingent_entries=entry_rows,
         expires_at=evaluated_at + timedelta(minutes=minutes),
         evaluation_time=evaluated_at,
-        registry_snapshot_id="registry-before",
-        allocation_id="allocation-before",
+        registry_snapshot_id=registry_snapshot_id,
+        allocation_id=allocation_id,
     )
 
 
@@ -84,6 +131,37 @@ def test_rotation_command_requires_explicit_group_target(coordinator):
     parsed = parse_rotation_approval(f"APPROVE ROTATION {group['id'][:8]}", [group])
     assert parsed.accepted
     assert parsed.group_id == group["id"]
+
+
+def test_rotation_creation_requires_both_authority_ids(coordinator):
+    with pytest.raises(ValueError, match="registry_snapshot_id and allocation_id"):
+        _create(coordinator, registry_snapshot_id="")
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda storage: storage.execute(
+        "UPDATE strategy_registry_snapshots SET evaluated_at=? WHERE id='registry-before'",
+        ((datetime.now(UTC) - timedelta(minutes=6)).isoformat(),),
+    ),
+    lambda storage: storage.execute(
+        "UPDATE strategy_registry_snapshots SET config_hash='wrong-hash' WHERE id='registry-before'"
+    ),
+])
+def test_rotation_approval_fails_closed_for_stale_or_mismatched_authority(coordinator, mutation):
+    storage, manager = coordinator
+    group = _create(coordinator)
+    mutation(storage)
+    with pytest.raises(RuntimeError, match="rotation approval blocked"):
+        manager.approve(group["id"], approval_id="authority-test", sender_id="owner", command="APPROVE ROTATION")
+    assert manager.get_group(group["id"])["state"] == RotationState.CANCELLED.value
+
+
+def test_rotation_approval_fails_closed_for_nonexistent_authority(coordinator):
+    _storage, manager = coordinator
+    group = _create(coordinator, registry_snapshot_id="missing-registry", allocation_id="missing-allocation")
+    with pytest.raises(RuntimeError, match="rotation approval blocked"):
+        manager.approve(group["id"], approval_id="missing-authority", sender_id="owner", command="APPROVE ROTATION")
+    assert manager.get_group(group["id"])["state"] == RotationState.CANCELLED.value
 
 
 def test_ambiguous_group_prefix_is_rejected():

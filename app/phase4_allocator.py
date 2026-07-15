@@ -240,8 +240,16 @@ def allocate_candidates_to_sleeves(
             exits.append((identity, candidate))
             continue
         try:
+            candidate_risk_value = candidate.get("stop_risk_dollars")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("risk_value")
+            candidate_risk_unit = candidate.get("risk_unit")
+            if candidate_risk_unit is None and candidate.get("stop_risk_dollars") is not None:
+                candidate_risk_unit = "stop_risk_dollars"
             rank = candidate_allocation_rank({
                 **candidate,
+                "risk_value": candidate_risk_value,
+                "risk_unit": candidate_risk_unit,
                 "conversion_equity": conversion_equity,
                 "conversion_equity_as_of": conversion_equity_as_of,
                 "evaluation_time": evaluation_time,
@@ -285,8 +293,14 @@ def allocate_candidates_to_sleeves(
         requested = None
         requested_conversion: dict[str, Any] | None = None
         try:
+            candidate_risk_value = candidate.get("stop_risk_dollars")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("risk_value")
+            candidate_risk_unit = candidate.get("risk_unit")
+            if candidate_risk_unit is None and candidate.get("stop_risk_dollars") is not None:
+                candidate_risk_unit = "stop_risk_dollars"
             requested_conversion = normalize_risk_to_dollars(
-                candidate.get("risk_value"), str(candidate.get("risk_unit") or ""),
+                candidate_risk_value, str(candidate_risk_unit or ""),
                 conversion_equity=conversion_equity,
                 conversion_equity_as_of=conversion_equity_as_of,
                 evaluation_time=evaluation_time,
@@ -344,6 +358,7 @@ def allocate_candidates_to_sleeves(
             "risk_value": allocated,
             "risk_unit": "stop_risk_dollars",
             "risk_conversion": requested_conversion,
+            "candidate_stop_risk": requested,
             "ranking_score": rank["ranking_score"],
             "rank_components": rank,
             "reason": reason,
@@ -1211,6 +1226,7 @@ class AdaptiveAllocator:
         fingerprint = _fingerprint(raw_replay_inputs)
         allocation_id = _fingerprint([self.run_id, fingerprint, full_weights, sleeves])[:32]
         payload = {
+            "schema_version": PHASE4_SCHEMA_VERSION,
             "covariance_id": covariance_id, "phase3_limits_authoritative": True, "full_kelly": False, "llm_decisions": False,
             "covariance_fallback": fallback, "covariance_validation": self._last_covariance_payload,
             "operational_kelly_enabled": False, "operational_allocation_mode": "bounded_evidence_aware",

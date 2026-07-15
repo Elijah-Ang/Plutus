@@ -10,7 +10,15 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
-from .formula_versions import ROTATION_FORMULA_VERSION, ROTATION_SCHEMA_VERSION
+from .formula_versions import (
+    CONFIGURATION_SCHEMA_VERSION,
+    PHASE4_ALLOCATION_VERSION,
+    PHASE4_SCHEMA_VERSION,
+    ROTATION_FORMULA_VERSION,
+    ROTATION_SCHEMA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+)
 from .utils import iso_now, json_dumps
 
 
@@ -210,6 +218,101 @@ class RotationCoordinator:
         self.storage = storage
         self.config_hash = config_hash
 
+    def _verify_authority_records(
+        self,
+        group: Mapping[str, Any],
+        *,
+        registry_snapshot_id: str,
+        allocation_id: str,
+        evaluation_time: str | datetime,
+    ) -> None:
+        """Verify the immutable registry/allocation pair at an action boundary."""
+        snapshot_id = str(registry_snapshot_id or "").strip()
+        allocation_key = str(allocation_id or "").strip()
+        if not snapshot_id or not allocation_key:
+            raise ValueError("rotation requires non-empty registry snapshot and allocation authority IDs")
+
+        strategy_rows = self.entries(str(group["id"]))
+        if len(strategy_rows) != 1 or not str(strategy_rows[0].get("strategy_version") or ""):
+            raise RuntimeError("rotation contingent strategy authority is missing")
+        strategy_version = str(strategy_rows[0]["strategy_version"])
+        expected_config_hash = str(group.get("config_hash") or self.config_hash or "")
+        evaluated_at = _utc(evaluation_time)
+
+        registry_rows = self.storage.fetch_all(
+            """SELECT s.*,d.strategy_version,d.authorized,d.configuration_version AS decision_configuration_version,
+                      d.config_hash AS decision_config_hash,d.run_id AS decision_run_id
+               FROM strategy_registry_snapshots s
+               JOIN strategy_registry_decisions d ON d.snapshot_id=s.id
+               WHERE s.id=? AND d.strategy_version=?""",
+            (snapshot_id, strategy_version),
+        )
+        if len(registry_rows) != 1:
+            raise RuntimeError("rotation registry snapshot or strategy decision does not exist")
+        registry = registry_rows[0]
+        if str(registry.get("run_id") or "") != str(group.get("run_id") or "") or str(registry.get("decision_run_id") or "") != str(group.get("run_id") or ""):
+            raise RuntimeError("rotation registry authority belongs to a different run")
+        if int(registry.get("authorized") or 0) != 1:
+            raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
+        try:
+            authorized_strategies = json.loads(registry.get("authorized_strategies_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("rotation registry authorized strategy record is invalid") from exc
+        if strategy_version not in {str(value) for value in authorized_strategies}:
+            raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
+        if str(registry.get("config_hash") or "") != expected_config_hash or str(registry.get("decision_config_hash") or "") != expected_config_hash:
+            raise RuntimeError("rotation registry configuration hash does not match current configuration")
+        if str(registry.get("registry_schema_version") or "") != STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION:
+            raise RuntimeError("rotation registry schema version mismatch")
+        if str(registry.get("registry_formula_version") or "") != STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION:
+            raise RuntimeError("rotation registry formula version mismatch")
+        if str(registry.get("configuration_version") or "") != CONFIGURATION_SCHEMA_VERSION:
+            raise RuntimeError("rotation registry configuration version mismatch")
+        if str(registry.get("decision_configuration_version") or "") != CONFIGURATION_SCHEMA_VERSION:
+            raise RuntimeError("rotation strategy decision configuration version mismatch")
+
+        allocation_rows = self.storage.fetch_all(
+            "SELECT * FROM phase4_allocation_decisions WHERE id=?",
+            (allocation_key,),
+        )
+        if len(allocation_rows) != 1:
+            raise RuntimeError("rotation allocation authority does not exist")
+        allocation = allocation_rows[0]
+        if str(allocation.get("run_id") or "") != str(group.get("run_id") or ""):
+            raise RuntimeError("rotation allocation authority belongs to a different run")
+        if str(allocation.get("config_hash") or "") != expected_config_hash:
+            raise RuntimeError("rotation allocation configuration hash does not match current configuration")
+        if not str(allocation.get("decision") or "").startswith("ALLOCATE"):
+            raise RuntimeError("rotation allocation is not executable for the referenced strategy")
+        if str(allocation.get("formula_version") or "") != PHASE4_ALLOCATION_VERSION:
+            raise RuntimeError("rotation allocation formula version mismatch")
+        try:
+            payload = json.loads(allocation.get("payload") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("rotation allocation payload is invalid") from exc
+        if str(payload.get("schema_version") or "") != PHASE4_SCHEMA_VERSION:
+            raise RuntimeError("rotation allocation schema version mismatch")
+        if str(payload.get("formula_version") or "") != PHASE4_ALLOCATION_VERSION:
+            raise RuntimeError("rotation allocation payload formula version mismatch")
+        if str(payload.get("config_hash") or "") != expected_config_hash:
+            raise RuntimeError("rotation allocation payload configuration hash mismatch")
+        if str(payload.get("registry_snapshot_id") or "") != snapshot_id:
+            raise RuntimeError("rotation allocation is not linked to the referenced registry snapshot")
+        authorized = {str(value) for value in payload.get("authorized_strategies") or []}
+        if authorized and strategy_version not in authorized:
+            raise RuntimeError("rotation strategy is not authorized in the referenced allocation")
+
+        for label, timestamp in (
+            ("registry snapshot", registry.get("evaluated_at")),
+            ("allocation", allocation.get("decided_at")),
+        ):
+            try:
+                age = (evaluated_at - _utc(str(timestamp))).total_seconds()
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"{label} freshness timestamp is invalid") from exc
+            if age < -5.0 or age > 300.0:
+                raise RuntimeError(f"{label} authority is stale for the supplied evaluation time")
+
     def create_group(
         self,
         *,
@@ -221,6 +324,8 @@ class RotationCoordinator:
         allocation_id: str | None = None,
         evaluation_time: str | datetime,
     ) -> dict[str, Any]:
+        if not str(registry_snapshot_id or "").strip() or not str(allocation_id or "").strip():
+            raise ValueError("rotation requires non-empty registry_snapshot_id and allocation_id")
         if not exit_legs or len(contingent_entries) != 1:
             raise ValueError("rotation requires valid exits and exactly one contingent entry")
         evaluated_at = _utc(evaluation_time)
@@ -381,6 +486,16 @@ class RotationCoordinator:
         if _utc(group["expires_at"]) <= datetime.now(UTC):
             return self.transition(group_id, RotationState.EXPIRED, reason="group expired before approval")
         entries = self.entries(group_id)
+        try:
+            self._verify_authority_records(
+                group,
+                registry_snapshot_id=str(group.get("registry_snapshot_id") or ""),
+                allocation_id=str(group.get("allocation_id") or ""),
+                evaluation_time=str(group.get("created_at") or datetime.now(UTC).isoformat()),
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.transition(group_id, RotationState.CANCELLED, reason=f"rotation authority blocked: {exc}")
+            raise RuntimeError(f"rotation approval blocked: {exc}") from exc
         ceiling_fingerprint = _fingerprint([
             (row["candidate_key"], row["displayed_max_quantity"], row["displayed_max_notional"], row["displayed_max_stop_risk"])
             for row in entries
@@ -625,6 +740,7 @@ class RotationCoordinator:
         minimum_notional: float,
         registry_snapshot_id: str,
         allocation_id: str,
+        evaluation_time: str | datetime | None = None,
     ) -> RevalidatedRotationEntry:
         numbers = (price, requested_quantity, stop_risk_per_share, allocation_notional_cap,
                    allocation_risk_cap, other_available_cash, minimum_notional)
@@ -644,9 +760,17 @@ class RotationCoordinator:
         if candidate_key != entry["candidate_key"]:
             self.transition(group_id, RotationState.ENTRY_BLOCKED, reason="contingent candidate changed materially")
             return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
-                                            "candidate_identity", "candidate changed; new approval required")
-        if not registry_snapshot_id:
-            raise ValueError("current registry snapshot is required")
+                "candidate_identity", "candidate changed; new approval required")
+        try:
+            self._verify_authority_records(
+                group,
+                registry_snapshot_id=registry_snapshot_id,
+                allocation_id=allocation_id,
+                evaluation_time=evaluation_time or datetime.now(UTC),
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.transition(group_id, RotationState.ENTRY_BLOCKED, reason=f"rotation authority blocked: {exc}")
+            raise
         displayed_qty = float(entry["displayed_max_quantity"])
         displayed_notional = float(entry["displayed_max_notional"])
         displayed_risk = float(entry["displayed_max_stop_risk"])
