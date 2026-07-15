@@ -14,6 +14,8 @@ Deploy a built release while both jobs are stopped:
 ./scripts/deploy_release.sh /Users/elijahang/TradingAgentReleases/<release-id>
 ```
 
+Use `--mode forward` explicitly for ordinary exact-current-main deployment. Controlled rollback is `./scripts/deploy_release.sh --mode rollback /Users/elijahang/TradingAgentReleases/<approved-prior-release-id>` and succeeds only for the manifest-bound annotated tag plus immutable GitHub Release/attestation asset ID and digest described in `RELEASE_VERIFICATION.md`.
+
 Apply a production migration only during deployment:
 
 ```sh

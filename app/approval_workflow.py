@@ -95,6 +95,7 @@ ALLOWED_WORKFLOW_TRANSITIONS: dict[ApprovalWorkflowState, set[ApprovalWorkflowSt
         ApprovalWorkflowState.MANUAL_REVIEW,
     },
     ApprovalWorkflowState.SUBMISSION_STARTED: {
+        ApprovalWorkflowState.SUBMISSION_PENDING,
         ApprovalWorkflowState.SUBMITTED,
         ApprovalWorkflowState.UNKNOWN,
         ApprovalWorkflowState.TERMINAL,
@@ -513,6 +514,30 @@ class ApprovalWorkflowStore:
                     )
                     counts["existing_intent_linked"] += 1
                     state = ApprovalWorkflowState.INTENT_CREATED
+                if (
+                    state == ApprovalWorkflowState.SUBMISSION_STARTED
+                    and intent_rows
+                    and int(intent_rows[0].get("broker_invocation_occurred") or 0) == 0
+                    and str(intent_rows[0].get("state")) in {"submitting", "retryable_pre_submission"}
+                ):
+                    if str(intent_rows[0].get("state")) == "submitting":
+                        DurableExecutionStore(self.storage).transition(
+                            str(intent_rows[0]["id"]),
+                            OrderState.RETRYABLE_PRE_SUBMISSION,
+                            event_type="restart_proved_submission_never_invoked_broker",
+                            safe_summary="broker invocation flag proves deterministic pre-submission recovery",
+                            expected_state=OrderState.SUBMITTING,
+                        )
+                    self.transition(
+                        workflow_id,
+                        ApprovalWorkflowState.SUBMISSION_PENDING,
+                        owner_token=owner_token,
+                        safe_detail="broker was never invoked; lookup reconciliation suppressed",
+                    )
+                    state = ApprovalWorkflowState.SUBMISSION_PENDING
+                    intent_rows = self.storage.fetch_all(
+                        "SELECT * FROM order_intents WHERE approval_id=?", (workflow["approval_id"],)
+                    )
                 if state in {
                     ApprovalWorkflowState.RECEIVED,
                     ApprovalWorkflowState.AUTHORIZED,
@@ -633,12 +658,27 @@ class ApprovalWorkflowStore:
                 elif state == ApprovalWorkflowState.INTENT_CREATED:
                     intent = intent_rows[0] if intent_rows else None
                     intent_state = str(intent.get("state")) if intent else "missing"
-                    if intent_state in {"created", "reserved"}:
+                    if intent_state in {"created", "reserved", "retryable_pre_submission"}:
                         self.transition(
                             workflow_id,
                             ApprovalWorkflowState.SUBMISSION_PENDING,
                             owner_token=owner_token,
                             safe_detail="existing reserved intent ready for bounded submission",
+                        )
+                        counts["submission_pending"] += 1
+                    elif intent_state == "submitting" and int(intent.get("broker_invocation_occurred") or 0) == 0:
+                        DurableExecutionStore(self.storage).transition(
+                            str(intent["id"]),
+                            OrderState.RETRYABLE_PRE_SUBMISSION,
+                            event_type="restart_proved_no_broker_invocation",
+                            safe_summary="submission state recovered before any broker invocation",
+                            expected_state=OrderState.SUBMITTING,
+                        )
+                        self.transition(
+                            workflow_id,
+                            ApprovalWorkflowState.SUBMISSION_PENDING,
+                            owner_token=owner_token,
+                            safe_detail="pre-submission state is deterministically retryable",
                         )
                         counts["submission_pending"] += 1
                     elif intent_state in {"submitting", "unknown", "reconciliation_required"}:
@@ -696,7 +736,7 @@ class ApprovalWorkflowStore:
                             safe_detail="submission-pending workflow has no durable intent",
                         )
                         counts["external_ambiguity"] += 1
-                    elif str(intent.get("state")) not in {"created", "reserved"}:
+                    elif str(intent.get("state")) not in {"created", "reserved", "retryable_pre_submission"}:
                         self.transition(
                             workflow_id,
                             ApprovalWorkflowState.UNKNOWN,
@@ -730,6 +770,17 @@ class ApprovalWorkflowStore:
                                 counts["blocked"] += 1
                                 action_allowed = False
                             elif action_decision == "retry":
+                                if (
+                                    str(intent.get("state")) in {"created", "reserved", "retryable_pre_submission"}
+                                    and int(intent.get("broker_invocation_occurred") or 0) == 0
+                                ):
+                                    DurableExecutionStore(self.storage).transition(
+                                        str(intent["id"]),
+                                        OrderState.RETRYABLE_PRE_SUBMISSION,
+                                        event_type="recovery_deferred_before_broker_io",
+                                        safe_summary=action_reason or "pre-submission recovery deferred",
+                                        expected_state=OrderState(str(intent["state"])),
+                                    )
                                 self._audit(
                                     "approval_workflow_recovery_deferred",
                                     workflow_id,
@@ -749,12 +800,25 @@ class ApprovalWorkflowStore:
                             try:
                                 outcome = submitter(self.get(workflow_id), intent)
                             except Exception as exc:
-                                outcome = "unknown"
+                                current_intent = DurableExecutionStore(self.storage).get_intent(str(intent["id"]))
+                                if int(current_intent.get("broker_invocation_occurred") or 0) == 0:
+                                    if str(current_intent.get("state")) == OrderState.SUBMITTING.value:
+                                        DurableExecutionStore(self.storage).transition(
+                                            str(intent["id"]),
+                                            OrderState.RETRYABLE_PRE_SUBMISSION,
+                                            event_type="submission_callback_failed_before_broker_io",
+                                            safe_summary="callback failed before broker invocation",
+                                            expected_state=OrderState.SUBMITTING,
+                                        )
+                                    outcome = "retry"
+                                else:
+                                    outcome = "unknown"
                                 reason = type(exc).__name__
                             target = {
                                 "submitted": ApprovalWorkflowState.SUBMITTED,
                                 "terminal": ApprovalWorkflowState.TERMINAL,
                                 "unknown": ApprovalWorkflowState.UNKNOWN,
+                                "retry": ApprovalWorkflowState.SUBMISSION_PENDING,
                             }.get(str(outcome).lower())
                             if target is None:
                                 raise ValueError("submitter returned an unsupported recovery outcome")
@@ -766,6 +830,8 @@ class ApprovalWorkflowStore:
                             )
                             if target == ApprovalWorkflowState.UNKNOWN:
                                 counts["external_ambiguity"] += 1
+                            elif target == ApprovalWorkflowState.SUBMISSION_PENDING:
+                                counts["submission_pending"] += 1
                 elif state == ApprovalWorkflowState.UNKNOWN and lookup_reconciler is not None:
                     intent = intent_rows[0] if intent_rows else None
                     # Lookup-only callback: this path never calls submitter and runs

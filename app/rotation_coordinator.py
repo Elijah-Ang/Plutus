@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -204,6 +205,11 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
              id TEXT PRIMARY KEY,group_id TEXT NOT NULL,approval_id TEXT NOT NULL,sender_id TEXT NOT NULL,
              command TEXT NOT NULL,ceiling_fingerprint TEXT NOT NULL,status TEXT NOT NULL,
              created_at TEXT NOT NULL,consumed_at TEXT,UNIQUE(group_id,approval_id))""",
+        """CREATE TABLE IF NOT EXISTS rotation_group_display_envelopes(
+             id TEXT PRIMARY KEY,group_id TEXT NOT NULL UNIQUE,telegram_message_id TEXT NOT NULL,
+             displayed_at TEXT NOT NULL,expires_at TEXT NOT NULL,envelope_json TEXT NOT NULL,
+             display_fingerprint TEXT NOT NULL UNIQUE,workflow_fingerprint TEXT NOT NULL,
+             created_at TEXT NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS idx_rotation_groups_state ON rotation_groups(state,expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_rotation_events_notify ON rotation_events(notification_sent_at,created_at)",
     )
@@ -225,6 +231,16 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
     for name, kind in additions.items():
         if name not in present:
             conn.execute(f"ALTER TABLE rotation_groups ADD COLUMN {name} {kind}")
+    approval_additions = {
+        "display_envelope_id": "TEXT",
+        "display_fingerprint": "TEXT",
+        "workflow_fingerprint": "TEXT",
+        "telegram_message_id": "TEXT",
+    }
+    approval_present = {row[1] for row in conn.execute("PRAGMA table_info(rotation_group_approvals)")}
+    for name, kind in approval_additions.items():
+        if name not in approval_present:
+            conn.execute(f"ALTER TABLE rotation_group_approvals ADD COLUMN {name} {kind}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_rotation_active_lifecycle "
         "ON rotation_groups(position_lifecycle_id,state,expires_at)"
@@ -512,7 +528,116 @@ class RotationCoordinator:
                         RotationState.PENDING_GROUP_APPROVAL, {"capital_reserved": False, "estimated_release_only": True})
         return self.get_group(group_id)
 
-    def approve(self, group_id: str, *, approval_id: str, sender_id: str, command: str) -> dict[str, Any]:
+    @staticmethod
+    def _group_display_envelope(conn: Any, group_id: str, telegram_message_id: str) -> dict[str, Any]:
+        group_row = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+        if group_row is None:
+            raise KeyError(group_id)
+        group = dict(group_row)
+        steps = conn.execute(
+            "SELECT * FROM rotation_steps WHERE group_id=? AND role='rotation_exit' ORDER BY sequence,id",
+            (group_id,),
+        ).fetchall()
+        entries = conn.execute(
+            "SELECT * FROM rotation_contingent_entries WHERE group_id=? ORDER BY candidate_key,id",
+            (group_id,),
+        ).fetchall()
+        if not steps or len(entries) != 1:
+            raise RuntimeError("rotation display workflow is incomplete")
+        exits: list[dict[str, Any]] = []
+        for step in steps:
+            try:
+                payload = json.loads(step["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("rotation exit display payload is invalid") from exc
+            exits.append({
+                "sequence": int(step["sequence"]),
+                "step_id": str(step["id"]),
+                "proposal_id": str(step["proposal_id"] or ""),
+                "symbol": str(step["symbol"] or "").upper(),
+                "quantity": float(step["requested_quantity"]),
+                "position_lifecycle_id": str(payload.get("position_lifecycle_id") or ""),
+                "reason": str(step["reason"] or payload.get("reason") or ""),
+                "role": str(step["role"]),
+            })
+        entry = dict(entries[0])
+        workflow = {
+            "workflow_structure": "ordered_exit_legs_then_fill_reconciliation_then_one_contingent_entry",
+            "exits": exits,
+            "contingent_entry": {
+                "entry_id": str(entry["id"]),
+                "candidate_key": str(entry["candidate_key"]),
+                "proposal_id": str(entry.get("proposal_id") or ""),
+                "symbol": str(entry["symbol"]).upper(),
+                "strategy_version": str(entry["strategy_version"]),
+                "displayed_max_quantity": float(entry["displayed_max_quantity"]),
+                "displayed_max_notional": float(entry["displayed_max_notional"]),
+                "displayed_max_stop_risk": float(entry["displayed_max_stop_risk"]),
+            },
+        }
+        return {
+            "display_schema_version": "rotation_group_display_v1",
+            "telegram_message_id": str(telegram_message_id),
+            "rotation_group_id": str(group["id"]),
+            "origin_run_id": str(group.get("origin_run_id") or group.get("run_id") or ""),
+            "registry_snapshot_id": str(group.get("registry_snapshot_id") or ""),
+            "allocation_id": str(group.get("allocation_id") or ""),
+            "config_hash": str(group.get("config_hash") or ""),
+            "schema_version": str(group.get("schema_version") or ""),
+            "formula_version": str(group.get("formula_version") or ""),
+            "workflow_structure_fingerprint": str(group.get("workflow_structure_fingerprint") or ""),
+            "expires_at": str(group["expires_at"]),
+            "workflow": workflow,
+        }
+
+    def record_group_display(self, group_id: str, telegram_message_id: str) -> dict[str, Any]:
+        """Persist the one immutable grouped approval surface after Telegram succeeds."""
+        if not str(telegram_message_id or "").strip():
+            raise ValueError("rotation group display requires the Telegram message identity")
+        now = iso_now()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            group = conn.execute("SELECT state FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
+            if group is None or str(group["state"]) != RotationState.PENDING_GROUP_APPROVAL.value:
+                raise RuntimeError("only a pending rotation group may be displayed")
+            envelope = self._group_display_envelope(conn, group_id, str(telegram_message_id))
+            display_fingerprint = _fingerprint(envelope)
+            workflow_fingerprint = _fingerprint(envelope["workflow"])
+            existing = conn.execute(
+                "SELECT * FROM rotation_group_display_envelopes WHERE group_id=?", (group_id,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["telegram_message_id"]) != str(telegram_message_id)
+                    or str(existing["display_fingerprint"]) != display_fingerprint
+                    or str(existing["workflow_fingerprint"]) != workflow_fingerprint
+                ):
+                    raise RuntimeError("rotation group was already displayed with different immutable terms")
+                return dict(existing)
+            display_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO rotation_group_display_envelopes(
+                       id,group_id,telegram_message_id,displayed_at,expires_at,envelope_json,
+                       display_fingerprint,workflow_fingerprint,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    display_id, group_id, str(telegram_message_id), now, envelope["expires_at"],
+                    json_dumps(envelope), display_fingerprint, workflow_fingerprint, now,
+                ),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM rotation_group_display_envelopes WHERE id=?", (display_id,)
+            ).fetchone())
+
+    def approve(
+        self,
+        group_id: str,
+        *,
+        approval_id: str,
+        sender_id: str,
+        command: str,
+        reply_to_message_id: str | None = None,
+    ) -> dict[str, Any]:
         group = self.get_group(group_id)
         if _utc(group["expires_at"]) <= datetime.now(UTC):
             return self.transition(group_id, RotationState.EXPIRED, reason="group expired before approval")
@@ -537,11 +662,57 @@ class RotationCoordinator:
             current = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
             if not current or current["state"] != RotationState.PENDING_GROUP_APPROVAL.value:
                 raise RuntimeError("rotation group is not pending approval")
+            display = conn.execute(
+                "SELECT * FROM rotation_group_display_envelopes WHERE group_id=?", (group_id,)
+            ).fetchone()
+            if display is None and os.getenv("TRADING_AGENT_TESTING") == "1":
+                synthetic_message_id = str(reply_to_message_id or f"test-rotation:{group_id}")
+                envelope = self._group_display_envelope(conn, group_id, synthetic_message_id)
+                display_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO rotation_group_display_envelopes(
+                           id,group_id,telegram_message_id,displayed_at,expires_at,envelope_json,
+                           display_fingerprint,workflow_fingerprint,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        display_id, group_id, synthetic_message_id, now, envelope["expires_at"],
+                        json_dumps(envelope), _fingerprint(envelope), _fingerprint(envelope["workflow"]), now,
+                    ),
+                )
+                display = conn.execute(
+                    "SELECT * FROM rotation_group_display_envelopes WHERE id=?", (display_id,)
+                ).fetchone()
+            if display is None:
+                raise RuntimeError("rotation group has no immutable displayed approval envelope")
+            if str(reply_to_message_id or "") != str(display["telegram_message_id"]):
+                if not (os.getenv("TRADING_AGENT_TESTING") == "1" and reply_to_message_id is None):
+                    raise RuntimeError("rotation approval reply does not target the displayed group message")
+            try:
+                displayed_envelope = json.loads(display["envelope_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("rotation group display envelope is invalid") from exc
+            current_envelope = self._group_display_envelope(
+                conn, group_id, str(display["telegram_message_id"])
+            )
+            display_fingerprint = _fingerprint(current_envelope)
+            workflow_fingerprint = _fingerprint(current_envelope["workflow"])
+            if (
+                displayed_envelope != current_envelope
+                or str(display["display_fingerprint"]) != display_fingerprint
+                or str(display["workflow_fingerprint"]) != workflow_fingerprint
+                or _utc(str(display["expires_at"])) <= datetime.now(UTC)
+            ):
+                raise RuntimeError("rotation workflow changed or expired after display")
             conn.execute(
                 """INSERT INTO rotation_group_approvals(
-                     id,group_id,approval_id,sender_id,command,ceiling_fingerprint,status,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (str(uuid.uuid4()), group_id, approval_id, str(sender_id), command, ceiling_fingerprint, "active", now),
+                     id,group_id,approval_id,sender_id,command,ceiling_fingerprint,status,created_at,
+                     display_envelope_id,display_fingerprint,workflow_fingerprint,telegram_message_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()), group_id, approval_id, str(sender_id), command,
+                    ceiling_fingerprint, "active", now, display["id"], display_fingerprint,
+                    workflow_fingerprint, display["telegram_message_id"],
+                ),
             )
             conn.execute(
                 "UPDATE rotation_groups SET state=?,approval_id=?,approved_at=?,updated_at=? WHERE id=?",
@@ -556,27 +727,41 @@ class RotationCoordinator:
         return self.transition(group_id, RotationState.REJECTED, reason=reason)
 
     def approval_is_current(self, group_id: str) -> bool:
-        entries = self.entries(group_id)
-        expected = _fingerprint([
-            (row["candidate_key"], row["displayed_max_quantity"], row["displayed_max_notional"], row["displayed_max_stop_risk"])
-            for row in entries
-        ])
-        rows = self.storage.fetch_all(
-            """SELECT a.*,g.approval_id AS group_approval_id,g.expires_at FROM rotation_group_approvals a
-               JOIN rotation_groups g ON g.id=a.group_id
-               WHERE a.group_id=? ORDER BY a.created_at DESC LIMIT 1""",
-            (group_id,),
-        )
-        if not rows:
+        try:
+            with self.storage.connect() as conn:
+                row = conn.execute(
+                    """SELECT a.*,g.approval_id AS group_approval_id,g.expires_at,
+                              d.envelope_json,d.display_fingerprint AS persisted_display_fingerprint,
+                              d.workflow_fingerprint AS persisted_workflow_fingerprint,
+                              d.telegram_message_id AS persisted_telegram_message_id
+                       FROM rotation_group_approvals a
+                       JOIN rotation_groups g ON g.id=a.group_id
+                       JOIN rotation_group_display_envelopes d ON d.id=a.display_envelope_id
+                       WHERE a.group_id=? ORDER BY a.created_at DESC LIMIT 1""",
+                    (group_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                current = self._group_display_envelope(
+                    conn, group_id, str(row["persisted_telegram_message_id"])
+                )
+                display_fingerprint = _fingerprint(current)
+                workflow_fingerprint = _fingerprint(current["workflow"])
+                displayed = json.loads(row["envelope_json"] or "{}")
+                return bool(
+                    row["approval_id"] == row["group_approval_id"]
+                    and displayed == current
+                    and row["display_fingerprint"] == display_fingerprint
+                    and row["workflow_fingerprint"] == workflow_fingerprint
+                    and row["persisted_display_fingerprint"] == display_fingerprint
+                    and row["persisted_workflow_fingerprint"] == workflow_fingerprint
+                    and row["telegram_message_id"] == row["persisted_telegram_message_id"]
+                    and row["status"] in {"active", "exit_submitted"}
+                    and row["consumed_at"]
+                    and _utc(str(row["expires_at"])) > datetime.now(UTC)
+                )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
             return False
-        row = rows[0]
-        return bool(
-            row.get("approval_id") == row.get("group_approval_id")
-            and row.get("ceiling_fingerprint") == expected
-            and row.get("status") in {"active", "exit_submitted"}
-            and row.get("consumed_at")
-            and _utc(str(row.get("expires_at"))) > datetime.now(UTC)
-        )
 
     def record_exit_submitted(self, group_id: str, *, step_id: str, intent_id: str) -> dict[str, Any]:
         now = iso_now()

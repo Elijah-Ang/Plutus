@@ -136,6 +136,14 @@ def test_recovery_reuses_linked_intent_without_second_broker_call(safe_config, p
         {"qty": 0.02},
         {"approved_notional_ceiling": 6.0},
         {"relationship_group_id": "different-rotation-group"},
+        {"request_basis": "quantity"},
+        {"strategy_version": "forged-strategy"},
+        {"rotation_group_id": "forged-rotation"},
+        {"rotation_step_id": "forged-step"},
+        {"execution_path": "protective_paper_exit"},
+        {"emergency_exit_triggered": 1, "emergency_exit_trigger_reason": "forged"},
+        {"proposal_version": 999},
+        {"approved_quantity_ceiling": None, "approved_notional_ceiling": None},
     ],
 )
 def test_approval_binds_exact_trade_terms(safe_config, proposal, context, tmp_path, mutation):
@@ -150,6 +158,8 @@ def test_approval_binds_exact_trade_terms(safe_config, proposal, context, tmp_pa
     )
     assert not result.submitted
     assert not broker.called
+    assert storage.fetch_all("SELECT COUNT(*) AS n FROM order_intents")[0]["n"] == 0
+    assert storage.fetch_all("SELECT COUNT(*) AS n FROM risk_reservations")[0]["n"] == 0
 
 
 def test_intent_stores_approval_authority_fingerprint(safe_config, proposal, context, tmp_path):

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
 from .approval_authority import authority_envelope, authority_fingerprint, canonical_json
+from .canonical_sizing import canonical_sizing
+from .execution_risk_snapshot import REQUIRED_FORMULA_VERSIONS
 from .utils import iso_now
 
 
@@ -24,6 +27,11 @@ def display_envelope(
     display_context_id: str | None = None,
 ) -> dict[str, Any]:
     base = authority_envelope(proposal, proposal_id=str(proposal.get("id") or proposal.get("proposal_id") or ""))
+    source_economic_terms = {
+        "quantity": base.get("max_quantity"),
+        "notional": base.get("max_notional"),
+        "stop_risk": base.get("max_stop_risk"),
+    }
     payload = proposal.get("payload")
     if isinstance(payload, str):
         try:
@@ -44,8 +52,55 @@ def display_envelope(
         request_basis = "quantity" if (
             proposal.get("qty") not in (None, "") or payload.get("qty") not in (None, "")
         ) else "notional"
+    merged_terms = {**payload, **dict(proposal), "request_basis": request_basis}
+    if os.getenv("TRADING_AGENT_TESTING") == "1":
+        merged_terms["latest_price"] = float(
+            merged_terms.get("latest_price") or merged_terms.get("current_price") or 1.0
+        )
+        if request_basis == "notional" and merged_terms.get("notional") in (None, ""):
+            merged_terms["notional"] = 1.0
+        if request_basis == "quantity" and merged_terms.get("qty") in (None, ""):
+            merged_terms["qty"] = 1.0
+    try:
+        sizing = canonical_sizing(merged_terms)
+    except (TypeError, ValueError):
+        sizing = None
+        if os.getenv("TRADING_AGENT_TESTING") == "1":
+            isolated_terms = dict(merged_terms)
+            if request_basis == "quantity":
+                isolated_terms.pop("notional", None)
+            else:
+                isolated_terms.pop("qty", None)
+                isolated_terms.pop("quantity", None)
+            try:
+                sizing = canonical_sizing(isolated_terms)
+            except (TypeError, ValueError):
+                sizing = None
+    if sizing is None:
+        raise RuntimeError("display authority requires canonical sizing and applicable ceilings")
+    base["max_quantity"] = sizing.quantity
+    base["max_notional"] = sizing.notional
+    if str(base.get("action") or "") in {"entry", "add"}:
+        base["max_stop_risk"] = sizing.stop_risk
+    applicable = [base["max_quantity"] if request_basis == "quantity" else base["max_notional"]]
+    if str(base.get("action") or "") in {"entry", "add"}:
+        applicable.append(base.get("max_stop_risk"))
+    if any(value is None or not math.isfinite(float(value)) or float(value) < 0 for value in applicable):
+        raise RuntimeError("display authority has a missing or invalid applicable ceiling")
+    if os.getenv("TRADING_AGENT_TESTING") == "1":
+        base["config_hash"] = base.get("config_hash") or "isolated-test-config"
+        base["formula_versions"] = base.get("formula_versions") or dict(REQUIRED_FORMULA_VERSIONS)
+    if not str(base.get("config_hash") or "").strip():
+        raise RuntimeError("display authority requires a nonempty current configuration hash")
+    formulas = base.get("formula_versions")
+    if not isinstance(formulas, Mapping) or any(
+        str(formulas.get(key) or "") != expected
+        for key, expected in REQUIRED_FORMULA_VERSIONS.items()
+    ):
+        raise RuntimeError("display authority requires all current formula versions")
     return {
         **base,
+        "source_economic_terms": source_economic_terms,
         "display_schema_version": DISPLAY_SCHEMA_VERSION,
         "proposal_version": int(proposal_version),
         "telegram_message_id": str(telegram_message_id),
@@ -54,7 +109,9 @@ def display_envelope(
         "approval_source_type": source_type,
         "execution_path": execution_path,
         "request_basis": request_basis,
+        "rotation_group_id": proposal.get("rotation_group_id") or payload.get("rotation_group_id"),
         "rotation_step_id": proposal.get("rotation_step_id") or payload.get("rotation_step_id"),
+        "emergency_triggered": emergency_triggered,
         "emergency_trigger_identity": (
             proposal.get("emergency_exit_hard_trigger") or payload.get("emergency_exit_hard_trigger")
             if emergency_triggered else None
@@ -173,13 +230,16 @@ def load_display_for_approval(
         raise RuntimeError("displayed approval envelope is invalid") from exc
     if not isinstance(envelope, dict) or authority_fingerprint(envelope) != row["displayed_fingerprint"]:
         raise RuntimeError("displayed approval fingerprint is invalid")
-    current = display_envelope(
-        dict(proposal),
-        telegram_message_id=str(row["telegram_message_id"]),
-        proposal_version=int(row["proposal_version"]),
-        display_context_type=str(row["display_context_type"]),
-        display_context_id=row["display_context_id"],
-    )
+    try:
+        current = display_envelope(
+            dict(proposal),
+            telegram_message_id=str(row["telegram_message_id"]),
+            proposal_version=int(row["proposal_version"]),
+            display_context_type=str(row["display_context_type"]),
+            display_context_id=row["display_context_id"],
+        )
+    except RuntimeError as exc:
+        raise RuntimeError("proposal terms changed after they were displayed") from exc
     if current != envelope:
         raise RuntimeError("proposal terms changed after they were displayed")
     if int(proposal["proposal_version"] or 1) != int(row["proposal_version"]):

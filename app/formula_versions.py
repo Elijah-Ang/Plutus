@@ -33,6 +33,7 @@ ROTATION_FORMULA_VERSION = "actual_fill_reconciled_capacity_v2_lifecycle_bound"
 ROTATION_SCHEMA_VERSION = "exit_first_rotation_v2_lifecycle_bound"
 PLUTUS_AUDIT_SCHEMA_VERSION = "plutus_audit_hardening_v1"
 FINAL_HARDENING_SCHEMA_VERSION = "plutus_final_hardening_v1"
+FINAL_REVIEW_HARDENING_SCHEMA_VERSION = "plutus_final_review_hardening_v2"
 
 # Deployment must not start until all of these additive migrations have been
 # recorded and their required tables/columns are present.
@@ -54,5 +55,6 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         ROTATION_SCHEMA_VERSION,
         PLUTUS_AUDIT_SCHEMA_VERSION,
         FINAL_HARDENING_SCHEMA_VERSION,
+        FINAL_REVIEW_HARDENING_SCHEMA_VERSION,
     }
 )

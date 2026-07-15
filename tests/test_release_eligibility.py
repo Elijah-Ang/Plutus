@@ -167,10 +167,40 @@ def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> No
 
     monkeypatch.setattr(release_check, "_run", fake_run)
     monkeypatch.setattr(release_check, "_github_json", fake_github)
-    monkeypatch.setattr(release_check, "_release_attestation_asset", lambda _repo, _tag: manifest)
+    immutable_evidence = {
+        "manifest": manifest, "release_id": 8, "release_immutable": True,
+        "asset_id": 9, "asset_digest": "sha256:abc", "asset_size": 10,
+        "download_digest": "sha256:abc",
+    }
+    monkeypatch.setattr(release_check, "_release_attestation_asset", lambda _repo, _tag: immutable_evidence)
     result = release_check._release_reachability(
         "candidate", "owner/repo", config_hash="config",
         remote_ci={"passed": True, "run_id": 42, "head_sha": "candidate", "workflow_name": "CI"},
     )
     assert result["passed"] is True
     assert result["verified_release_manifest"] == ["immutable-release-good"]
+
+
+def test_replaced_attestation_asset_is_not_release_authority(monkeypatch) -> None:
+    manifest = {
+        "tag_name": "immutable-release-replaced", "release_commit": "candidate",
+        "configuration_hash": "config", "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
+        "formula_versions": RELEASE_FORMULA_VERSIONS,
+        "ci": {"workflow_name": "CI", "run_id": "42", "head_sha": "candidate"},
+    }
+    monkeypatch.setattr(
+        release_check,
+        "_github_json",
+        lambda url: ({"object": {"sha": "candidate", "type": "commit"}}, None, 200),
+    )
+    monkeypatch.setattr(release_check, "_release_attestation_asset", lambda *_: {
+        "manifest": manifest, "release_id": 8, "release_immutable": True,
+        "asset_id": 99, "asset_digest": "sha256:new", "asset_size": 10,
+        "download_digest": "sha256:old",
+    })
+    passed, reason = release_check._verify_release_manifest(
+        "owner/repo", "immutable-release-replaced", "tag-object", "candidate", "config",
+        {"passed": True, "run_id": 42, "head_sha": "candidate", "workflow_name": "CI"},
+    )
+    assert passed is False
+    assert "identity or digest" in reason

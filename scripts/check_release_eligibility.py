@@ -153,11 +153,23 @@ def _release_attestation_asset(repository: str, tag_name: str) -> dict[str, Any]
     release, error, _ = _github_json(
         f"https://api.github.com/repos/{repository}/releases/tags/{urllib.parse.quote(tag_name, safe='')}"
     )
-    if error or not isinstance(release, dict) or bool(release.get("draft")):
+    if (
+        error
+        or not isinstance(release, dict)
+        or bool(release.get("draft"))
+        or release.get("immutable") is not True
+        or not release.get("id")
+    ):
         return None
     assets = release.get("assets") if isinstance(release.get("assets"), list) else []
     matching = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == "release-attestation.json"]
-    if len(matching) != 1 or not matching[0].get("url"):
+    asset = matching[0] if len(matching) == 1 else None
+    if (
+        asset is None
+        or not asset.get("url")
+        or not asset.get("id")
+        or not str(asset.get("digest") or "").startswith("sha256:")
+    ):
         return None
     headers = {
         "Accept": "application/octet-stream",
@@ -168,12 +180,26 @@ def _release_attestation_asset(repository: str, tag_name: str) -> dict[str, Any]
         headers["Authorization"] = f"Bearer {token}"
     try:
         with urllib.request.urlopen(
-            urllib.request.Request(str(matching[0]["url"]), headers=headers), timeout=15
+            urllib.request.Request(str(asset["url"]), headers=headers), timeout=15
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read()
+        download_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if download_digest != str(asset["digest"]):
+            return None
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, urllib.error.URLError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "manifest": payload,
+        "release_id": int(release["id"]),
+        "release_immutable": True,
+        "asset_id": int(asset["id"]),
+        "asset_digest": str(asset["digest"]),
+        "asset_size": int(asset.get("size") or len(raw)),
+        "download_digest": download_digest,
+    }
 
 
 def _manifest_ci_identity(manifest: dict[str, Any]) -> tuple[str, str, str]:
@@ -201,9 +227,19 @@ def _verify_release_manifest(
     if str(tag_object.get("sha") or "") != sha:
         return False, f"{tag_name}: annotated tag does not point to the candidate commit"
 
-    manifest = _release_attestation_asset(repository, tag_name)
-    if manifest is None:
+    attestation = _release_attestation_asset(repository, tag_name)
+    if attestation is None:
         return False, f"{tag_name}: immutable GitHub release attestation asset is missing or invalid"
+    manifest = attestation.get("manifest") if isinstance(attestation, dict) else None
+    if not isinstance(manifest, dict):
+        return False, f"{tag_name}: immutable attestation evidence is incomplete"
+    if (
+        attestation.get("release_immutable") is not True
+        or not attestation.get("release_id")
+        or not attestation.get("asset_id")
+        or attestation.get("asset_digest") != attestation.get("download_digest")
+    ):
+        return False, f"{tag_name}: attestation asset identity or digest is not immutable and verified"
     if str(manifest.get("tag_name") or "") != tag_name:
         return False, f"{tag_name}: release attestation tag identity does not match"
     if str(manifest.get("release_commit") or manifest.get("commit_sha") or "") != sha:
@@ -272,6 +308,7 @@ def _release_reachability(
     approved_tags: list[str] = []
     tag_manifest_verified: list[str] = []
     tag_rejection_reasons: list[str] = []
+    release_attestation_evidence: dict[str, Any] = {}
     tags_payload, tags_error, tags_status = _github_json(
         f"https://api.github.com/repos/{repository}/git/matching-refs/tags/immutable-release-"
     )
@@ -303,6 +340,15 @@ def _release_reachability(
             if verified:
                 approved_tags.append(tag_name)
                 tag_manifest_verified.append(tag_name)
+                evidence = _release_attestation_asset(repository, tag_name)
+                if isinstance(evidence, dict):
+                    release_attestation_evidence[tag_name] = {
+                        key: evidence.get(key)
+                        for key in (
+                            "release_id", "release_immutable", "asset_id", "asset_digest",
+                            "asset_size", "download_digest",
+                        )
+                    }
             else:
                 tag_rejection_reasons.append(reason)
 
@@ -316,6 +362,7 @@ def _release_reachability(
         "approved_immutable_release_tags": approved_tags,
         "annotated_immutable_release_tags": sorted(set(tag_manifest_verified)),
         "verified_release_manifest": sorted(set(tag_manifest_verified)),
+        "release_attestation_evidence": release_attestation_evidence,
         "configuration_hash_checked": bool(on_main and config_hash) or bool(tag_manifest_verified),
         "tag_rejection_reasons": tag_rejection_reasons,
         "reason": None if on_main or tag_manifest_verified else "commit is not the exact GitHub main SHA or a verified immutable release attestation",

@@ -2,19 +2,39 @@
 set -euo pipefail
 
 SOURCE="${0:A:h:h}"
-RELEASE_ROOT="$HOME/TradingAgentReleases"
+RELEASE_ROOT="${RELEASE_ROOT:-$HOME/TradingAgentReleases}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+REQUIRED_PYTHON="3.13.9"
+PINNED_PIP="25.3"
+AUTHORITY="forward"
+TAG=""
+RELEASE_ID=""
+
+while (( $# )); do
+  case "$1" in
+    --authority) AUTHORITY="${2:?missing authority}"; shift 2 ;;
+    --tag) TAG="${2:?missing tag}"; shift 2 ;;
+    *) [[ -z "$RELEASE_ID" ]] || { print -u2 -- "unexpected argument: $1"; exit 2; }; RELEASE_ID="$1"; shift ;;
+  esac
+done
+[[ "$AUTHORITY" == "forward" || "$AUTHORITY" == "rollback" ]] || { print -u2 -- "authority must be forward or rollback"; exit 2; }
+[[ "$AUTHORITY" == "forward" || "$TAG" == immutable-release-* ]] || { print -u2 -- "rollback builds require --tag immutable-release-*"; exit 2; }
+[[ "$($PYTHON_BIN -c 'import platform; print(platform.python_version())')" == "$REQUIRED_PYTHON" ]] || {
+  print -u2 -- "release builds require Python $REQUIRED_PYTHON"; exit 2
+}
 DIRTY=$(git -C "$SOURCE" status --porcelain)
 [[ -z "$DIRTY" ]] || { print -u2 -- "refusing dirty source worktree"; exit 2; }
 COMMIT=$(git -C "$SOURCE" rev-parse HEAD)
 BRANCH=$(git -C "$SOURCE" branch --show-current)
 REMOTE_MAIN=$(git -C "$SOURCE" ls-remote origin refs/heads/main | awk '{print $1}')
-[[ -n "$REMOTE_MAIN" && "$COMMIT" == "$REMOTE_MAIN" ]] || {
-  print -u2 -- "release builds require HEAD to equal the current remote main SHA"; exit 2
-}
-RELEASE_ID="${1:-${COMMIT:0:12}}"
+[[ -n "$REMOTE_MAIN" ]] || { print -u2 -- "remote main identity unavailable"; exit 2; }
+if [[ "$AUTHORITY" == "forward" && "$COMMIT" != "$REMOTE_MAIN" ]]; then
+  print -u2 -- "forward release builds require HEAD to equal the exact current remote main SHA"; exit 2
+fi
+
+RELEASE_ID="${RELEASE_ID:-${COMMIT:0:12}}"
 DEST="$RELEASE_ROOT/$RELEASE_ID"
 [[ ! -e "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
-
 ELIGIBILITY=$(mktemp -t plutus-release-eligibility.XXXXXX)
 mkdir -p "$RELEASE_ROOT"
 mkdir "$DEST"
@@ -23,31 +43,54 @@ cleanup() { rm -f "$ELIGIBILITY"; [[ -d "$STAGING" ]] && rm -rf "$STAGING"; }
 trap cleanup EXIT
 
 cd "$SOURCE"
-python3 scripts/check_release_eligibility.py --repository Elijah-Ang/Plutus > "$ELIGIBILITY"
-python3 - "$ELIGIBILITY" "$COMMIT" <<'PY'
+# Remote CI and authority are checked before spending time on the build. Local
+# tests are intentionally supplied later by the fresh artifact interpreter.
+"$PYTHON_BIN" scripts/check_release_eligibility.py --skip-tests --repository Elijah-Ang/Plutus > "$ELIGIBILITY" || true
+"$PYTHON_BIN" - "$ELIGIBILITY" "$COMMIT" "$AUTHORITY" "$TAG" <<'PY'
 import json, sys
-report = json.load(open(sys.argv[1], encoding="utf-8"))
-if not report.get("release_eligible") or report.get("commit_sha") != sys.argv[2]:
-    raise SystemExit("exact-SHA release eligibility did not pass")
-if report.get("release_reachability", {}).get("remote_main_sha") != sys.argv[2]:
-    raise SystemExit("eligibility authority is not the exact remote main SHA")
+r=json.load(open(sys.argv[1], encoding="utf-8")); sha,mode,tag=sys.argv[2:]
+if r.get("commit_sha") != sha or not r.get("github_ci", {}).get("passed"):
+    raise SystemExit("exact-SHA GitHub CI did not pass")
+reach=r.get("release_reachability", {})
+if mode == "forward" and reach.get("remote_main_sha") != sha:
+    raise SystemExit("forward authority is not exact current main")
+if mode == "rollback" and tag not in set(reach.get("verified_release_manifest") or []):
+    raise SystemExit("rollback tag lacks verified immutable release authority")
 PY
 
 git -C "$SOURCE" archive --format=tar "$COMMIT" | tar -x -C "$STAGING" -f -
-python3 -m venv "$STAGING/.venv"
-"$STAGING/.venv/bin/python" -m pip install --upgrade pip
-"$STAGING/.venv/bin/python" -m pip install --requirement "$STAGING/requirements.lock"
-"$STAGING/.venv/bin/python" -m pip install --no-deps "$STAGING"
-
-LOCK_HASH=$(shasum -a 256 "$STAGING/requirements.lock" | awk '{print $1}')
-CI_RUN_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["run_id"])' "$ELIGIBILITY")
-CI_WORKFLOW=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["workflow_name"])' "$ELIGIBILITY")
-"$STAGING/.venv/bin/python" -m pip freeze --all | LC_ALL=C sort > "$STAGING/dependency-inventory.txt"
-INVENTORY_HASH=$(shasum -a 256 "$STAGING/dependency-inventory.txt" | awk '{print $1}')
+"$PYTHON_BIN" -m venv --copies "$STAGING/.venv"
+[[ "$("$STAGING/.venv/bin/python" -c 'import platform; print(platform.python_version())')" == "$REQUIRED_PYTHON" ]] || {
+  print -u2 -- "fresh release environment has the wrong Python"; exit 2
+}
+"$STAGING/.venv/bin/python" -m pip install "pip==$PINNED_PIP"
+"$STAGING/.venv/bin/python" -m pip install --require-hashes --requirement "$STAGING/requirements-hashes.lock"
+"$STAGING/.venv/bin/python" -m pip install --no-deps --no-build-isolation "$STAGING"
 
 cd "$STAGING"
+"$STAGING/.venv/bin/python" scripts/run_artifact_tests.py --output artifact-test-results.json
+"$STAGING/.venv/bin/python" -m pip freeze --all | LC_ALL=C sort > "$STAGING/dependency-inventory.txt"
+
+LOCK_HASH=$(shasum -a 256 "$STAGING/requirements.lock" | awk '{print $1}')
+HASH_LOCK_HASH=$(shasum -a 256 "$STAGING/requirements-hashes.lock" | awk '{print $1}')
+INVENTORY_HASH=$(shasum -a 256 "$STAGING/dependency-inventory.txt" | awk '{print $1}')
+TEST_RESULTS_HASH=$(shasum -a 256 "$STAGING/artifact-test-results.json" | awk '{print $1}')
+CI_RUN_ID=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["run_id"])' "$ELIGIBILITY")
+CI_WORKFLOW=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["workflow_name"])' "$ELIGIBILITY")
+AUTHORITY_EVIDENCE=$("$PYTHON_BIN" - "$ELIGIBILITY" "$AUTHORITY" "$TAG" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); mode,tag=sys.argv[2:]
+reach=r.get("release_reachability", {})
+value={"mode":mode,"remote_main_sha":reach.get("remote_main_sha")}
+if mode=="rollback":
+    value.update(tag_name=tag,attestation=(reach.get("release_attestation_evidence") or {}).get(tag))
+print(json.dumps(value,sort_keys=True,separators=(",",":")))
+PY
+)
+
 RELEASE_ID="$RELEASE_ID" COMMIT="$COMMIT" BRANCH="$BRANCH" LOCK_HASH="$LOCK_HASH" \
-INVENTORY_HASH="$INVENTORY_HASH" CI_RUN_ID="$CI_RUN_ID" CI_WORKFLOW="$CI_WORKFLOW" \
+HASH_LOCK_HASH="$HASH_LOCK_HASH" INVENTORY_HASH="$INVENTORY_HASH" TEST_RESULTS_HASH="$TEST_RESULTS_HASH" \
+CI_RUN_ID="$CI_RUN_ID" CI_WORKFLOW="$CI_WORKFLOW" AUTHORITY_EVIDENCE="$AUTHORITY_EVIDENCE" \
 "$STAGING/.venv/bin/python" - <<'PY'
 import json, os, platform
 from datetime import UTC, datetime
@@ -56,23 +99,29 @@ from app.formula_versions import REQUIRED_SCHEMA_VERSIONS
 from scripts.check_release_eligibility import RELEASE_FORMULA_VERSIONS
 from app.utils import load_config
 from app.runtime_guard import REQUIRED_SCHEMA_VERSION
-config = load_config()
-manifest = {
-  "release_id": os.environ["RELEASE_ID"], "release_commit": os.environ["COMMIT"],
-  "schema_version": REQUIRED_SCHEMA_VERSION, "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
-  "formula_versions": RELEASE_FORMULA_VERSIONS,
-  "configuration_hash": config.get("effective_config_hash"), "mode": "paper",
-  "manual_approval_only": True, "live_capability": False,
-  "authority_model": "exact_github_main_or_annotated_tag_with_release_attestation_asset",
-  "ci": {"workflow_name": os.environ["CI_WORKFLOW"], "run_id": os.environ["CI_RUN_ID"], "head_sha": os.environ["COMMIT"]},
-  "built_at_utc": datetime.now(UTC).isoformat(), "python_version": platform.python_version(),
-  "requirements_lock_sha256": os.environ["LOCK_HASH"],
-  "dependency_inventory_sha256": os.environ["INVENTORY_HASH"],
-  "source_branch": os.environ["BRANCH"], "tests_verified": True,
+tests=json.load(open("artifact-test-results.json",encoding="utf-8"))
+if tests.get("tests_verified") is not True: raise SystemExit("artifact tests are not verified")
+config=load_config()
+manifest={
+  "release_id":os.environ["RELEASE_ID"],"release_commit":os.environ["COMMIT"],
+  "schema_version":REQUIRED_SCHEMA_VERSION,"required_schema_versions":sorted(REQUIRED_SCHEMA_VERSIONS),
+  "formula_versions":RELEASE_FORMULA_VERSIONS,"configuration_hash":config.get("effective_config_hash"),
+  "mode":"paper","manual_approval_only":True,"live_capability":False,
+  "authority_model":"exact_current_main_or_verified_immutable_release_rollback",
+  "release_authority":json.loads(os.environ["AUTHORITY_EVIDENCE"]),
+  "ci":{"workflow_name":os.environ["CI_WORKFLOW"],"run_id":os.environ["CI_RUN_ID"],"head_sha":os.environ["COMMIT"]},
+  "built_at_utc":datetime.now(UTC).isoformat(),"python_version":platform.python_version(),
+  "requirements_lock_sha256":os.environ["LOCK_HASH"],
+  "requirements_hash_lock_sha256":os.environ["HASH_LOCK_HASH"],
+  "dependency_inventory_sha256":os.environ["INVENTORY_HASH"],
+  "artifact_test_results_sha256":os.environ["TEST_RESULTS_HASH"],
+  "artifact_test_results":tests["results"],
+  "source_branch":os.environ["BRANCH"],"tests_verified":True,
 }
-Path("release-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+Path("release-manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n",encoding="utf-8")
 PY
 
+"$STAGING/.venv/bin/python" scripts/verify_release_artifact.py "$STAGING"
 rm -rf "$STAGING/.git" "$STAGING/data" "$STAGING/logs" "$STAGING/scratch"
 find . -type f ! -name 'release-file-inventory.sha256' -print0 \
   | LC_ALL=C sort -z | xargs -0 shasum -a 256 > "$STAGING/release-file-inventory.sha256"

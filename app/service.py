@@ -73,6 +73,7 @@ from .quotes import (
     validated_quote,
 )
 from .reconciliation import BrokerReconciler
+from .rotation_coordinator import RotationCoordinator
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
 from .strategy_rule_based import STRATEGY_VERSION
@@ -286,8 +287,16 @@ class TradingService:
         ) -> tuple[str, dict[str, Any] | None, str | None]:
             if proposal is None:
                 return "blocked", None, "proposal record unavailable during recovery action"
+            expires = _dt(proposal.get("expires_at"))
+            if (
+                str(proposal.get("status")) in {"expired", "rejected", "superseded"}
+                or (expires is not None and expires <= datetime.now(UTC))
+            ):
+                return "blocked", proposal, "proposal expired or became ineligible before recovery submission"
             relationship = str(proposal.get("relationship_type") or "")
             if relationship not in {"rotation_exit", "rotation_entry"}:
+                if self.broker is None:
+                    return "retry", proposal, "broker client is unavailable before submission; no broker invocation occurred"
                 return "approved", proposal, "ordinary workflow retains its existing recovery authority"
             from .rotation_coordinator import RotationCoordinator, RotationState, TERMINAL_STATES
 
@@ -332,13 +341,13 @@ class TradingService:
                 ):
                     return "blocked", proposal, "rotation exit grouped approval is no longer current"
             if self.broker is None:
-                return "retry", proposal, "rotation recovery is deferred until the broker client is available"
+                return "retry", proposal, "rotation recovery is deferred until the broker client is available before submission"
             return "approved", proposal, "current rotation dependency and expiry revalidated"
 
         def recover_submission(workflow: dict[str, Any], intent: dict[str, Any]) -> str:
             def expire_reserved_intent(reason: str) -> None:
                 current_intent = DurableExecutionStore(self.storage).get_intent(str(intent["id"]))
-                if str(current_intent.get("state")) in {"created", "reserved"}:
+                if str(current_intent.get("state")) in {"created", "reserved", "retryable_pre_submission"}:
                     from .order_state import OrderState
 
                     DurableExecutionStore(self.storage).transition(
@@ -357,7 +366,7 @@ class TradingService:
                 expire_reserved_intent(_reason or "recovery submission authority is no longer current")
                 return "terminal"
             if self.broker is None:
-                return "unknown"
+                return "retry"
             executable = {
                 **proposal,
                 "status": "approved",
@@ -376,7 +385,15 @@ class TradingService:
                 exclude_intent_id=str(intent["id"]),
                 exclude_logical_action_key=str(intent.get("logical_action_key") or "") or None,
             )
-            result = Executor(self.broker, self._risk_engine(intent.get("proposal_id"), "recovery_final"), self.storage, self.run_id).execute(
+            result = Executor(
+                self.broker,
+                self._risk_engine(intent.get("proposal_id"), "recovery_final"),
+                self.storage,
+                self.run_id,
+                recovery_proven_no_submit=True,
+                trusted_evidence_providers=self._trusted_execution_evidence_providers(),
+                cluster_provider=self._get_symbol_cluster,
+            ).execute(
                 executable,
                 context,
                 source_type=str(intent.get("source_type") or "telegram"),
@@ -489,6 +506,16 @@ class TradingService:
                 config_hash=self.config.get("effective_config_hash"),
             ),
         )
+
+    def _trusted_execution_evidence_providers(self) -> dict[str, Any]:
+        """Measured providers used by the final execution trust boundary."""
+        telegram_health = getattr(getattr(self, "telegram", None), "is_available", None)
+        return {
+            "internet": internet_available,
+            "power": lambda: get_power_status().connected is True,
+            "telegram": lambda: bool(telegram_health(force=True)) if callable(telegram_health) else False,
+            "kill_switch": lambda: (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
+        }
 
     def _authoritative_runtime_state(self, force: bool = False) -> dict[str, Any]:
         now = time.monotonic()
@@ -664,7 +691,7 @@ class TradingService:
             })
 
         active_intent_states = (
-            "created", "reserved", "submitting", "submitted", "partially_filled",
+            "created", "reserved", "retryable_pre_submission", "submitting", "submitted", "partially_filled",
             "cancel_pending", "unknown", "reconciliation_required",
         )
         placeholders = ",".join("?" for _ in active_intent_states)
@@ -2392,7 +2419,7 @@ class TradingService:
         # durable intents that have not made it into that snapshot yet, while
         # avoiding a second count for an already-identified broker order.
         active_intent_states = (
-            "created", "reserved", "submitting", "submitted", "partially_filled",
+            "created", "reserved", "retryable_pre_submission", "submitting", "submitted", "partially_filled",
             "cancel_pending", "unknown", "reconciliation_required",
         )
         placeholders = ",".join("?" for _ in active_intent_states)
@@ -3241,7 +3268,9 @@ class TradingService:
         )
         return True, result.intent_id
 
-    def _handle_rotation_command(self, text: str, sender: str) -> bool:
+    def _handle_rotation_command(
+        self, text: str, sender: str, reply_to_message_id: str | None = None
+    ) -> bool:
         from .rotation_coordinator import RotationCoordinator, parse_rotation_approval
 
         normalized = " ".join(text.strip().lower().split())
@@ -3265,7 +3294,13 @@ class TradingService:
             self.telegram.send_message("Rotation rejected. No exit or contingent entry was submitted.")
             return True
         approval_id = str(uuid.uuid4())
-        coordinator.approve(parsed.group_id, approval_id=approval_id, sender_id=sender, command=text)
+        coordinator.approve(
+            parsed.group_id,
+            approval_id=approval_id,
+            sender_id=sender,
+            command=text,
+            reply_to_message_id=reply_to_message_id,
+        )
         self.telegram.send_message("Rotation approval received. Running final checks and submitting exit legs first; no contingent BUY is reserved yet.")
         for step in coordinator.steps(parsed.group_id):
             submitted, reason = self._approve_rotation_exit_step(
@@ -3906,13 +3941,17 @@ class TradingService:
                 self.telegram.send_message("Blocked for safety: live trading is disabled.")
                 continue
 
-            # Rotation commands are explicit group-targeted approvals and must
-            # never fall through to the generic YES/single-proposal parser.
-            if self._handle_rotation_command(text, sender):
-                continue
-
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
+
+            # Rotation commands are explicit group-targeted approvals and must
+            # never fall through to the generic YES/single-proposal parser.
+            if self._handle_rotation_command(
+                text,
+                sender,
+                str(reply_to_message_id) if reply_to_message_id is not None else None,
+            ):
+                continue
 
             route_context = self._approval_route_context(
                 text,
@@ -5240,6 +5279,8 @@ class TradingService:
             self._risk_engine(row.get("id"), "final"),
             self.storage,
             self.run_id,
+            trusted_evidence_providers=self._trusted_execution_evidence_providers(),
+            cluster_provider=self._get_symbol_cluster,
         ).execute(
             proposal,
             context,
@@ -5644,7 +5685,7 @@ class TradingService:
 
         existing_orders = self.storage.fetch_all(
             """SELECT id FROM order_intents WHERE symbol=? AND side='sell'
-               AND state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')""",
+               AND state IN ('created','reserved','retryable_pre_submission','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')""",
             (symbol,),
         )
         if existing_orders:
@@ -5711,6 +5752,8 @@ class TradingService:
             self._risk_engine(proposal["id"], "emergency_final"),
             self.storage,
             self.run_id,
+            trusted_evidence_providers=self._trusted_execution_evidence_providers(),
+            cluster_provider=self._get_symbol_cluster,
         ).execute(executable, context, source_type="emergency", approval_id=approval_id)
         if result.submitted:
             return True, result.status
@@ -7805,6 +7848,8 @@ class TradingService:
 
                 if proposal is not None:
                     proposal.update({
+                        "config_hash": self.config.get("effective_config_hash"),
+                        "formula_versions": dict(self.config.get("formula_versions") or {}),
                         "strategy_version": signal.strategy_version,
                         "performance_snapshot_id": res.get("performance_snapshot_id"),
                         "policy_decision_id": res.get("policy_decision_id"),
@@ -8011,6 +8056,10 @@ class TradingService:
                     if rotation_result and isinstance(rotation_result, dict) and "message_id" in rotation_result:
                         rotation_message_id = str(rotation_result["message_id"])
                         rotation_group_id = str(rotation_group.get("id") or rotation_group.get("group_id") or "")
+                        RotationCoordinator(
+                            self.storage,
+                            config_hash=self.config.get("effective_config_hash"),
+                        ).record_group_display(rotation_group_id, rotation_message_id)
                         for displayed_proposal in rotation_exit_proposals:
                             record_display(
                                 self.storage, displayed_proposal["id"], rotation_message_id,

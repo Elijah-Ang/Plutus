@@ -190,6 +190,14 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "canonical_quantity": "REAL", "canonical_notional": "REAL", "canonical_stop_risk": "REAL",
         "broker_invocation_started_at": "TEXT", "broker_invocation_occurred": "INTEGER NOT NULL DEFAULT 0",
     },
+    "execution_risk_snapshots": {
+        "snapshot_version": "TEXT", "position_fingerprint": "TEXT", "open_order_fingerprint": "TEXT",
+        "durable_state_json": "TEXT", "durable_state_fingerprint": "TEXT",
+        "risk_context_json": "TEXT", "risk_context_fingerprint": "TEXT",
+        "execution_candidate_json": "TEXT", "execution_candidate_fingerprint": "TEXT",
+        "market_open": "INTEGER", "control_evidence_json": "TEXT",
+        "control_evidence_fingerprint": "TEXT",
+    },
     "risk_reservations": {
         "strategy_version": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
         "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
@@ -277,12 +285,22 @@ def apply_final_hardening_schema(conn: sqlite3.Connection, *, record_migration: 
         (iso_now(), iso_now()),
     )
     if record_migration:
+        from .formula_versions import FINAL_REVIEW_HARDENING_SCHEMA_VERSION
+
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
             (
                 FINAL_HARDENING_SCHEMA_VERSION,
                 iso_now(),
                 "immutable displayed approval authority, authoritative risk snapshots, and durable exit blockers",
+            ),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
+            (
+                FINAL_REVIEW_HARDENING_SCHEMA_VERSION,
+                iso_now(),
+                "authoritative execution evidence, exact intent binding, grouped rotation display, and reproducible rollback authority",
             ),
         )
 

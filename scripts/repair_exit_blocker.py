@@ -41,7 +41,7 @@ def inspect(storage: Storage, symbol: str, expected_source_id: str) -> dict:
         return {"eligible": False, "already_clear": False, "reason": "proposal is not proven terminal"}
     ambiguous = storage.fetch_all(
         """SELECT id,state FROM order_intents WHERE proposal_id=? AND state IN (
-             'created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')""",
+             'created','reserved','retryable_pre_submission','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')""",
         (proposal_id,),
     )
     orders = storage.fetch_all(
