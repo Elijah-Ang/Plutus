@@ -89,15 +89,130 @@ def _remote_ci(sha: str, repository: str | None, *, skip: bool) -> dict[str, Any
     return {**result, "status": "passed", "passed": True, "required_jobs": sorted(REQUIRED_CI_JOBS)}
 
 
-def _release_reachability(sha: str) -> dict[str, Any]:
-    on_main = _run("git", "merge-base", "--is-ancestor", sha, "origin/main").returncode == 0
-    tags = _run("git", "tag", "--points-at", sha).stdout.splitlines()
-    approved_tags = sorted(tag for tag in tags if tag.startswith("immutable-release-"))
+def _github_json(url: str) -> tuple[dict[str, Any] | list[Any] | None, str | None, int | None]:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "plutus-release-eligibility"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as response:
+            getcode = getattr(response, "getcode", None)
+            status = getcode() if callable(getcode) else 200
+            payload = json.load(response)
+        if status and status >= 400:
+            return None, f"GitHub returned HTTP {status}", status
+        return payload, None, status
+    except urllib.error.HTTPError as exc:
+        return None, f"GitHub returned HTTP {exc.code}", exc.code
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return None, f"GitHub lookup failed: {type(exc).__name__}", None
+
+
+def _repository_from_remote(remote: str) -> str | None:
+    if "github.com" not in remote:
+        return None
+    tail = remote.removesuffix(".git").split("github.com", 1)[-1].lstrip(":/")
+    return tail if tail.count("/") == 1 else None
+
+
+def _release_reachability(
+    sha: str,
+    repository: str | None = None,
+    *,
+    config_hash: str | None = None,
+    skip: bool = False,
+) -> dict[str, Any]:
+    if skip:
+        return {"status": "unverified", "passed": False, "reason": "remote release reachability lookup skipped"}
+
+    fetched = _run("git", "fetch", "--prune", "origin")
+    if fetched.returncode != 0:
+        return {
+            "status": "unverified", "passed": False,
+            "reason": "remote fetch/prune failed; release ancestry is unverified",
+        }
+    if repository is None:
+        repository = _repository_from_remote(_run("git", "remote", "get-url", "origin").stdout.strip())
+    if not repository:
+        return {"status": "unverified", "passed": False, "reason": "GitHub repository cannot be resolved from origin"}
+
+    main_payload, main_error, main_status = _github_json(
+        f"https://api.github.com/repos/{repository}/git/ref/heads/main"
+    )
+    main_ref = main_payload.get("object") if isinstance(main_payload, dict) else None
+    remote_main_sha = str(main_ref.get("sha") or "") if isinstance(main_ref, dict) else ""
+    if main_error or not remote_main_sha:
+        return {
+            "status": "unverified", "passed": False,
+            "repository": repository, "github_main_status": main_status,
+            "reason": main_error or "GitHub main ref did not contain an exact SHA",
+        }
+
+    ancestry = _run("git", "merge-base", "--is-ancestor", sha, remote_main_sha)
+    if ancestry.returncode == 0:
+        on_main = True
+    elif ancestry.returncode == 1:
+        on_main = False
+    else:
+        return {
+            "status": "unverified", "passed": False, "repository": repository,
+            "remote_main_sha": remote_main_sha,
+            "reason": "local ancestry check against the fetched remote SHA failed",
+        }
+
+    approved_tags: list[str] = []
+    tag_manifest_verified: list[str] = []
+    tags_payload, tags_error, tags_status = _github_json(
+        f"https://api.github.com/repos/{repository}/git/matching-refs/tags/immutable-release-"
+    )
+    if tags_error and tags_status != 404:
+        if not on_main:
+            return {
+                "status": "unverified", "passed": False, "repository": repository,
+                "remote_main_sha": remote_main_sha, "reachable_from_github_main": on_main,
+                "reason": tags_error,
+            }
+    elif isinstance(tags_payload, list):
+        for ref in tags_payload:
+            if not isinstance(ref, dict):
+                continue
+            ref_name = str(ref.get("ref") or "")
+            tag_name = ref_name.removeprefix("refs/tags/")
+            if not tag_name.startswith("immutable-release-"):
+                continue
+            target = ref.get("object") or {}
+            target_sha = str(target.get("sha") or "") if isinstance(target, dict) else ""
+            target_type = str(target.get("type") or "") if isinstance(target, dict) else ""
+            exact = target_type == "commit" and target_sha == sha
+            annotated = False
+            if target_type == "tag" and target_sha:
+                tag_payload, tag_error, _tag_status = _github_json(
+                    f"https://api.github.com/repos/{repository}/git/tags/{target_sha}"
+                )
+                tag_object = tag_payload.get("object") if isinstance(tag_payload, dict) else None
+                exact = (
+                    not tag_error
+                    and isinstance(tag_object, dict)
+                    and str(tag_object.get("type") or "") == "commit"
+                    and str(tag_object.get("sha") or "") == sha
+                )
+                annotated = exact
+            if exact:
+                approved_tags.append(tag_name)
+                if annotated:
+                    tag_manifest_verified.append(tag_name)
+
+    approved_tags = sorted(set(approved_tags))
     return {
         "passed": on_main or bool(approved_tags),
-        "reachable_from_origin_main": on_main,
+        "status": "passed" if on_main or approved_tags else "failed",
+        "repository": repository,
+        "remote_main_sha": remote_main_sha,
+        "reachable_from_github_main": on_main,
         "approved_immutable_release_tags": approved_tags,
-        "reason": None if on_main or approved_tags else "commit is not on origin/main or an approved immutable release tag",
+        "annotated_immutable_release_tags": sorted(set(tag_manifest_verified)),
+        "configuration_hash_checked": bool(config_hash),
+        "reason": None if on_main or approved_tags else "commit is not reachable from GitHub main or an exact remote immutable release tag",
     }
 
 
@@ -155,10 +270,11 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
         local_tests = {"status": "unverified", "passed": False, "reason": "local tests were skipped"}
     remote = _run("git", "remote", "get-url", "origin").stdout.strip()
     if repository is None and remote:
-        tail = remote.removesuffix(".git").split("github.com")[-1].lstrip(":/")
-        repository = tail if "/" in tail else None
+        repository = _repository_from_remote(remote)
     remote_ci = _remote_ci(sha, repository, skip=not check_remote)
-    release_reachability = _release_reachability(sha)
+    release_reachability = _release_reachability(
+        sha, repository, config_hash=config_hash, skip=not check_remote
+    )
     report = {
         "commit_sha": sha,
         "branch": _run("git", "branch", "--show-current").stdout.strip(),

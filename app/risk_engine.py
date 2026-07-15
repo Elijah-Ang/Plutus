@@ -194,7 +194,36 @@ class RiskEngine:
                 for cap_name, cap_value in sizing_caps.items():
                     if isinstance(cap_value, (int, float)) and cap_value == cap_value and cap_value != float("inf"):
                         check(f"sizing_ceiling_{cap_name}", isinstance(notional, (int, float)) and float(notional) <= float(cap_value) + 1e-9, f"notional exceeds {cap_name} ceiling")
-        check("duplicate_order", not context.get("duplicate_order", False), "duplicate order is forbidden")
+        side = str(proposal.get("side") or "").lower()
+        if side == "buy" and is_entry:
+            check(
+                "conflicting_buy_order",
+                not context.get("conflicting_buy_order", False),
+                "an equivalent active BUY order already exists",
+            )
+        elif side == "sell" and not is_entry:
+            check(
+                "conflicting_sell_order",
+                not context.get("conflicting_sell_order", False),
+                "an active SELL order already exists for this symbol",
+            )
+            sellable_quantity = context.get("sellable_quantity")
+            sellable_quantity_supplied = "sellable_quantity" in context
+            if sellable_quantity is not None:
+                try:
+                    sellable_quantity = float(sellable_quantity)
+                except (TypeError, ValueError):
+                    sellable_quantity = None
+            check(
+                "sell_quantity_capacity",
+                not sellable_quantity_supplied
+                or (
+                    sellable_quantity is not None
+                    and isinstance(exit_quantity, (int, float))
+                    and float(exit_quantity) <= sellable_quantity + 1e-9
+                ),
+                "SELL quantity exceeds current holdings after open SELL quantity",
+            )
         check("duplicate_position", not (is_entry and not is_add and context.get("same_symbol_position", False)), "duplicate symbol position is forbidden")
 
         # Explicit Guardrails

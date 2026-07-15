@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.execution import DurableExecutionStore, Executor
 from app.order_state import ALLOWED_TRANSITIONS, InvalidOrderTransition, OrderState, validate_transition
 from app.position_lifecycle import PositionLifecycleManager
 from app.risk_engine import RiskDecision
+from app.service import TradingService
 from app.storage import Storage
 from types import SimpleNamespace
 
@@ -36,6 +38,27 @@ def _proposal(identifier: str = "p-state", side: str = "buy") -> dict:
         "quote_timestamp": datetime.now(UTC).isoformat(), "quote_spread_bps": 40.0,
         "limit_price": 50.23 if side == "buy" else 49.77,
     }
+
+
+def _authorize(storage: Storage, candidate: dict, approval_id: str = "approval-state") -> dict:
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (candidate["id"], candidate["symbol"], candidate["side"], 500.0, "pending", now,
+         (datetime.now(UTC) + timedelta(minutes=5)).isoformat(), "rule_based_v2", "{}"),
+    )
+    store = ApprovalWorkflowStore(storage)
+    workflow = store.accept_approval(
+        approval_id=approval_id, run_id="run", proposal_id=candidate["id"], sender_id="owner",
+        raw_message="approve", parsed_action="approve", telegram_update_id=None,
+        reply_to_message_id=None, targeting_method="test", acknowledgement_status="received",
+        approval_received_at=now,
+    )
+    assert storage.consume_approval(candidate["id"], approval_id)
+    store.transition(workflow["id"], ApprovalWorkflowState.VALIDATING,
+                     expected_state=ApprovalWorkflowState.TARGET_RESOLVED)
+    return candidate
 
 
 @pytest.mark.parametrize("source", list(OrderState))
@@ -216,7 +239,10 @@ def test_immediate_filled_broker_response_records_fill_lot_and_quantity(tmp_path
         def submit_order(self, *args):
             return SimpleNamespace(id="paper-filled", status="filled", filled_qty="10", filled_avg_price="50", execution_id="exec-immediate", filled_at=datetime.now(UTC).isoformat())
 
-    result = Executor(Broker(), Risk(), storage, "run").execute(_proposal(), {"approval_valid": True})
+    candidate = _authorize(storage, _proposal())
+    result = Executor(Broker(), Risk(), storage, "run").execute(
+        candidate, {"approval_valid": True}, approval_id="approval-state"
+    )
     assert result.submitted and result.status == "filled"
     assert storage.fetch_all("SELECT state,filled_quantity,average_fill_price FROM order_intents")[0] == {"state": "filled", "filled_quantity": 10.0, "average_fill_price": 50.0}
     assert storage.fetch_all("SELECT COUNT(*) n FROM broker_fill_events")[0]["n"] == 1
@@ -232,3 +258,42 @@ def test_new_broker_position_backfills_prospective_intent_and_lot_lifecycle(tmp_
     lifecycle = PositionLifecycleManager(storage).reconcile([SimpleNamespace(symbol="SPY", qty="10", avg_entry_price="50")])["SPY"]
     assert storage.fetch_all("SELECT position_lifecycle_id FROM order_intents")[0]["position_lifecycle_id"] == lifecycle
     assert storage.fetch_all("SELECT DISTINCT position_lifecycle_id FROM position_lots")[0]["position_lifecycle_id"] == lifecycle
+
+
+def test_opening_quantity_grows_with_original_entry_but_excludes_later_add(tmp_path):
+    storage = _db(tmp_path)
+    store = DurableExecutionStore(storage)
+    entry = store.create_or_get_intent(_proposal("entry-quantity"), run_id="run", source_type="proposal")
+    store.transition(entry["id"], OrderState.SUBMITTING, event_type="test")
+    store.record_fill(entry["id"], cumulative_quantity=5, fill_price=50, broker_event_key="entry-partial")
+
+    lifecycle = PositionLifecycleManager(storage).reconcile(
+        [SimpleNamespace(symbol="SPY", qty="5", avg_entry_price="50")]
+    )["SPY"]
+    assert storage.fetch_all("SELECT opening_quantity FROM position_lifecycles WHERE id=?", (lifecycle,))[0]["opening_quantity"] == 5
+
+    store.record_fill(entry["id"], cumulative_quantity=10, fill_price=50, broker_event_key="entry-final")
+    PositionLifecycleManager(storage).reconcile(
+        [SimpleNamespace(symbol="SPY", qty="10", avg_entry_price="50")]
+    )
+    assert storage.fetch_all("SELECT opening_quantity FROM position_lifecycles WHERE id=?", (lifecycle,))[0]["opening_quantity"] == 10
+
+    add = store.create_or_get_intent(
+        {**_proposal("later-add"), "action": "add", "qty": 2, "is_add": True},
+        run_id="run", source_type="proposal",
+    )
+    store.transition(add["id"], OrderState.SUBMITTING, event_type="test")
+    store.record_fill(add["id"], cumulative_quantity=2, fill_price=51, broker_event_key="add-fill")
+    PositionLifecycleManager(storage).reconcile(
+        [SimpleNamespace(symbol="SPY", qty="12", avg_entry_price="50.17")]
+    )
+
+    row = storage.fetch_all(
+        "SELECT opening_quantity,current_quantity,opening_quantity_frozen FROM position_lifecycles WHERE id=?",
+        (lifecycle,),
+    )[0]
+    assert row == {"opening_quantity": 10.0, "current_quantity": 12.0, "opening_quantity_frozen": 1}
+    service = TradingService.__new__(TradingService)
+    service.storage = storage
+    seed = service._initial_risk_seed_for_position("SPY")
+    assert seed["initial_risk_dollars"] == pytest.approx(50.0)

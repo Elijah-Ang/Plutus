@@ -921,3 +921,28 @@ def test_legacy_mode_still_enforces_fixed_position_and_daily_buy_count_caps():
     assert not decision.passed
     assert "open-position limit" in decision.reasons
     assert "daily buy order limit" in decision.reasons
+
+
+def test_duplicate_order_admission_is_side_aware_for_entries_and_exits():
+    cfg = config()
+    sell = {**risk_proposal(), "side": "sell", "action": "exit", "qty": 5.0, "notional": None}
+
+    buy_open = {**risk_context(), "conflicting_buy_order": True, "conflicting_sell_order": False,
+                "sellable_quantity": 10.0}
+    assert RiskEngine(cfg).evaluate(sell, buy_open).passed
+
+    sell_open = {**risk_context(), "conflicting_buy_order": False, "conflicting_sell_order": True,
+                 "sellable_quantity": 10.0}
+    blocked = RiskEngine(cfg).evaluate(sell, sell_open)
+    assert not blocked.passed and "active SELL order" in " ".join(blocked.reasons)
+
+    buy = risk_proposal()
+    buy_conflict = {**risk_context(), "conflicting_buy_order": True, "conflicting_sell_order": False}
+    blocked = RiskEngine(cfg).evaluate(buy, buy_conflict)
+    assert not blocked.passed and "active BUY order" in " ".join(blocked.reasons)
+
+    oversell = RiskEngine(cfg).evaluate(
+        sell, {**risk_context(), "conflicting_buy_order": False, "conflicting_sell_order": False,
+               "sellable_quantity": 4.0}
+    )
+    assert not oversell.passed and "holdings" in " ".join(oversell.reasons)

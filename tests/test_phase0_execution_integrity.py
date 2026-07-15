@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.configuration import ConfigurationError, validate_config
+from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.execution import DurableExecutionStore, Executor
 from app.health import HealthMonitor, record_heartbeat
 from app.order_state import InvalidOrderTransition, OrderState
@@ -43,6 +44,31 @@ def make_storage(tmp_path) -> Storage:
     return value
 
 
+def authorize(db: Storage, candidate: dict, approval_id: str = "approval-1", *, ready: bool = False) -> dict:
+    now = datetime.now(UTC).isoformat()
+    proposal_id = str(candidate.get("proposal_id") or candidate.get("id"))
+    db.execute(
+        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (proposal_id, candidate["symbol"], candidate["side"], candidate.get("notional"), "pending",
+         candidate["created_at"], candidate["expires_at"], "rule_based_v2", "{}"),
+    )
+    workflows = ApprovalWorkflowStore(db)
+    workflow = workflows.accept_approval(
+        approval_id=approval_id, run_id="run", proposal_id=proposal_id,
+        sender_id="owner", raw_message="approve", parsed_action="approve",
+        telegram_update_id=None, reply_to_message_id=None, targeting_method="test",
+        acknowledgement_status="received", approval_received_at=now,
+    )
+    assert db.consume_approval(proposal_id, approval_id)
+    workflow = workflows.transition(workflow["id"], ApprovalWorkflowState.VALIDATING,
+                                    expected_state=ApprovalWorkflowState.TARGET_RESOLVED)
+    if ready:
+        workflows.transition(workflow["id"], ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+                             expected_state=ApprovalWorkflowState.VALIDATING)
+    return {**candidate, "id": proposal_id, "proposal_id": proposal_id, "status": "approved"}
+
+
 class InspectingBroker:
     def __init__(self, store: Storage, failure: BaseException | None = None):
         self.storage, self.failure, self.calls = store, failure, 0
@@ -61,7 +87,8 @@ class InspectingBroker:
 def test_broker_submission_has_committed_intent_and_reservation_first(tmp_path):
     db = make_storage(tmp_path)
     broker = InspectingBroker(db)
-    result = Executor(broker, PassingRisk(), db, "run").execute(proposal(), {"approval_valid": True})
+    candidate = authorize(db, proposal())
+    result = Executor(broker, PassingRisk(), db, "run").execute(candidate, {"approval_valid": True}, approval_id="approval-1")
     assert result.submitted and result.status == "submitted" and broker.calls == 1
     assert db.fetch_all("SELECT submission_attempt_count FROM order_intents")[0]["submission_attempt_count"] == 1
 
@@ -70,8 +97,9 @@ def test_ambiguous_submission_retains_stable_id_and_reservation_without_duplicat
     db = make_storage(tmp_path)
     broker = InspectingBroker(db, TimeoutError("lost response"))
     executor = Executor(broker, PassingRisk(), db, "run")
-    first = executor.execute(proposal(), {"approval_valid": True})
-    second = executor.execute(proposal(), {"approval_valid": True})
+    candidate = authorize(db, proposal())
+    first = executor.execute(candidate, {"approval_valid": True}, approval_id="approval-1")
+    second = executor.execute(candidate, {"approval_valid": True}, approval_id="approval-1")
     assert first.status == second.status == "unknown"
     assert first.client_order_id == second.client_order_id and broker.calls == 1
     assert DurableExecutionStore(db).active_reservations()["active_reserved_notional"] == 100.0
@@ -79,9 +107,10 @@ def test_ambiguous_submission_retains_stable_id_and_reservation_without_duplicat
 
 def test_restart_resumes_reserved_intent_with_same_client_id(tmp_path):
     db = make_storage(tmp_path)
-    intent = DurableExecutionStore(db).create_or_get_intent(proposal(), run_id="run", source_type="proposal")
+    candidate = authorize(db, proposal(), ready=True)
+    intent = DurableExecutionStore(db).create_or_get_intent(candidate, run_id="run", source_type="proposal", approval_id="approval-1")
     broker = InspectingBroker(db)
-    result = Executor(broker, PassingRisk(), db, "restart").execute(proposal(), {"approval_valid": True})
+    result = Executor(broker, PassingRisk(), db, "restart").execute(candidate, {"approval_valid": True})
     assert result.client_order_id == intent["client_order_id"] and broker.calls == 1
 
 
@@ -118,8 +147,9 @@ def test_two_workers_create_one_intent_and_make_one_submission(tmp_path):
 
     def worker():
         barrier.wait()
-        results.append(Executor(broker, PassingRisk(), db, "run").execute(proposal(), {"approval_valid": True}))
+        results.append(Executor(broker, PassingRisk(), db, "run").execute(candidate, {"approval_valid": True}, approval_id="approval-1"))
 
+    candidate = authorize(db, proposal())
     threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
     for thread in threads: thread.start()
     for thread in threads: thread.join()

@@ -7,6 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.execution import DurableExecutionStore, _winner_add_reservation_risk
+from app.formula_versions import (
+    CONFIGURATION_SCHEMA_VERSION,
+    PHASE4_ALLOCATION_VERSION,
+    PHASE4_SCHEMA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+    STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+)
 from app.rotation_coordinator import RotationCoordinator, RotationState
 from app.service import TradingService, _hydrate_proposal_row, _validated_authoritative_stop
 from app.storage import Storage
@@ -485,10 +492,48 @@ def test_phase4_strategy_consumption_includes_pending_nonrotation_claims(tmp_pat
 
 
 def _rotation(storage: Storage) -> tuple[RotationCoordinator, dict]:
+    now = datetime.now(UTC).isoformat()
+    storage.execute(
+        """INSERT INTO strategy_registry_snapshots(
+             id,run_id,evaluated_at,registry_schema_version,registry_formula_version,
+             configuration_version,config_hash,authorized_strategies_json,rejected_strategies_json,
+             global_reasons_json,raw_inputs_json,evaluation_fingerprint,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("rotation-registry", "run", now, STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+         STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION, CONFIGURATION_SCHEMA_VERSION, "hash",
+         '["rule_based_v2"]', "[]", "[]", "{}", "rotation-registry-fingerprint", now),
+    )
+    storage.execute(
+        """INSERT INTO strategy_registry_decisions(
+             id,snapshot_id,run_id,strategy_name,strategy_version,authorized,policy_state,
+             reasons_json,reason,decision_json,raw_inputs_json,evidence_version,performance_version,
+             policy_version,policy_schema_version,configuration_version,config_hash,decision_fingerprint,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("rotation-decision", "rotation-registry", "run", "Rule", "rule_based_v2", 1, "ACTIVE",
+         "[]", "authorized", "{}", "{}", "evidence", "performance", "policy", "policy-schema",
+         CONFIGURATION_SCHEMA_VERSION, "hash", "rotation-decision-fingerprint", now),
+    )
+    storage.execute(
+        """INSERT INTO phase4_allocation_decisions(
+             id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
+             fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
+             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,formula_version,config_hash,payload)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("rotation-allocation", "run", now, "ACTIVE_ADAPTIVE_PAPER", "test", "{\"rule_based_v2\":1}", 0.0,
+         0.25, "{}", "{}", "normal", 0.0, 0.0, 1.0, "ALLOCATE", "test",
+         "rotation-allocation-fingerprint", PHASE4_ALLOCATION_VERSION, "hash", json.dumps({
+             "schema_version": PHASE4_SCHEMA_VERSION,
+             "formula_version": PHASE4_ALLOCATION_VERSION,
+             "config_hash": "hash",
+             "registry_snapshot_id": "rotation-registry",
+             "authorized_strategies": ["rule_based_v2"],
+         })),
+    )
     manager = RotationCoordinator(storage, config_hash="hash")
     evaluated_at = datetime.now(UTC)
     group = manager.create_group(
         run_id="run", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
+        registry_snapshot_id="rotation-registry", allocation_id="rotation-allocation",
         exit_legs=[{"proposal_id": "exit-1", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
         contingent_entries=[{"proposal_id": "buy-1", "candidate_key": "setup", "strategy_version": "rule_based_v2",
                              "symbol": "NEW", "side": "buy", "max_quantity": 1, "max_notional": 100,
@@ -504,6 +549,7 @@ def test_rotation_dedupes_logical_exit_and_enforces_group_ceiling_fingerprint(tm
         evaluated_at = datetime.now(UTC)
         manager.create_group(
             run_id="run-2", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
+            registry_snapshot_id="rotation-registry", allocation_id="rotation-allocation",
             exit_legs=[{"proposal_id": "exit-2", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
             contingent_entries=[{"proposal_id": "buy-2", "candidate_key": "other", "strategy_version": "rule_based_v2",
                                  "symbol": "NEW2", "side": "buy", "max_quantity": 1, "max_notional": 100,

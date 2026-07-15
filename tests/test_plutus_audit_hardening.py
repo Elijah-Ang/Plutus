@@ -242,11 +242,13 @@ def test_terminal_rotation_is_not_reused_and_active_conflict_is_blocked(tmp_path
     first = manager.create_group(
         run_id="run-1", exit_legs=exits, contingent_entries=entries,
         evaluation_time=AS_OF, expires_at="2026-07-14T08:15:00+00:00",
+        registry_snapshot_id="registry-1", allocation_id="allocation-1",
     )
     storage.execute("UPDATE rotation_groups SET state='completed' WHERE id=?", (first["id"],))
     second = manager.create_group(
         run_id="run-2", exit_legs=exits, contingent_entries=entries,
         evaluation_time="2026-07-14T08:01:00+00:00", expires_at="2026-07-14T08:16:00+00:00",
+        registry_snapshot_id="registry-1", allocation_id="allocation-1",
     )
     assert second["id"] != first["id"]
     with pytest.raises(RuntimeError, match="conflicting active rotation"):
@@ -254,6 +256,7 @@ def test_terminal_rotation_is_not_reused_and_active_conflict_is_blocked(tmp_path
             run_id="run-3", exit_legs=[{**exits[0], "proposal_id": "exit-2"}],
             contingent_entries=[{**entries[0], "proposal_id": "entry-2", "candidate_key": "candidate-2"}],
             evaluation_time="2026-07-14T08:02:00+00:00", expires_at="2026-07-14T08:17:00+00:00",
+            registry_snapshot_id="registry-1", allocation_id="allocation-1",
         )
 
 

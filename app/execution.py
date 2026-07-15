@@ -945,6 +945,105 @@ class Executor:
         if self.fault_hook is not None:
             self.fault_hook(boundary, detail)
 
+    def _load_approval_authority(
+        self,
+        proposal: dict[str, Any],
+        *,
+        approval_id: str | None,
+        source_type: str,
+        client_order_id: str,
+    ) -> tuple[Any, dict[str, Any] | None, str | None]:
+        """Load and verify the durable approval before any intent can submit.
+
+        A proposal's ``status`` and a caller-supplied boolean are only display
+        and validation hints.  Submission authority is the durable workflow,
+        its one-to-one proposal linkage, and the consumed approval record.  The
+        only approval-less path is recovery of an already-linked intent; it
+        cannot create a new intent or a new authority chain.
+        """
+        from .approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
+
+        if self.storage is None:
+            return None, None, "durable storage is required before broker submission"
+
+        workflow_store = ApprovalWorkflowStore(self.storage)
+        proposal_id = str(proposal.get("proposal_id") or proposal.get("id") or "")
+        if not proposal_id:
+            return workflow_store, None, "proposal identity is required for manual approval"
+
+        action_key = logical_action_key(proposal, source_type)
+        intent_rows = self.storage.fetch_all(
+            "SELECT * FROM order_intents WHERE logical_action_key=?",
+            (action_key,),
+        )
+        existing_intent = intent_rows[0] if intent_rows else None
+
+        # Recovery may reuse the approval already bound to a durable intent,
+        # but an approval-less new logical action is never executable.
+        effective_approval_id = str(approval_id or (existing_intent or {}).get("approval_id") or "")
+        if not effective_approval_id:
+            return workflow_store, existing_intent, "approval_id is required for every new execution intent"
+
+        workflow = workflow_store.get_by_approval(effective_approval_id)
+        if workflow is None:
+            return workflow_store, existing_intent, "durable approval workflow is required"
+        if str(workflow.get("proposal_id") or "") != proposal_id:
+            return workflow_store, existing_intent, "approval workflow is not linked to this proposal"
+
+        approval_rows = self.storage.fetch_all(
+            "SELECT id,proposal_id,authorized,status,consumed_at FROM approvals WHERE id=?",
+            (effective_approval_id,),
+        )
+        if len(approval_rows) != 1:
+            return workflow_store, existing_intent, "durable approval record is missing"
+        approval = approval_rows[0]
+        if str(approval.get("proposal_id") or "") != proposal_id:
+            return workflow_store, existing_intent, "approval record is not linked to this proposal"
+        if int(approval.get("authorized") or 0) != 1:
+            return workflow_store, existing_intent, "approval is not authorized"
+        if approval.get("consumed_at") is None or str(approval.get("status") or "").lower() != "consumed":
+            return workflow_store, existing_intent, "approval has not been consumed exactly once"
+
+        expires_at = proposal.get("expires_at")
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=UTC)
+                if expiry.astimezone(UTC) <= datetime.now(UTC):
+                    return workflow_store, existing_intent, "approval or proposal has expired"
+            except (TypeError, ValueError):
+                return workflow_store, existing_intent, "approval expiry is invalid"
+
+        try:
+            state = ApprovalWorkflowState(str(workflow.get("state")))
+        except ValueError:
+            return workflow_store, existing_intent, "approval workflow state is invalid"
+        if existing_intent is not None:
+            if str(existing_intent.get("approval_id") or "") != effective_approval_id:
+                return workflow_store, existing_intent, "existing intent is linked to a different approval"
+            if str(workflow.get("intent_id") or "") != str(existing_intent.get("id") or ""):
+                return workflow_store, existing_intent, "approval workflow is not linked to the existing intent"
+            if state in {
+                ApprovalWorkflowState.RECEIVED,
+                ApprovalWorkflowState.AUTHORIZED,
+                ApprovalWorkflowState.TARGET_RESOLVED,
+                ApprovalWorkflowState.VALIDATING,
+                ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+                ApprovalWorkflowState.BLOCKED,
+                ApprovalWorkflowState.MANUAL_REVIEW,
+            }:
+                return workflow_store, existing_intent, "approval workflow is not executable for the existing intent"
+        elif not approval_id:
+            return workflow_store, existing_intent, "approval_id is required for every new execution intent"
+        elif state not in {
+            ApprovalWorkflowState.VALIDATING,
+            ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+        }:
+            return workflow_store, existing_intent, "approval workflow is not executable"
+
+        return workflow_store, existing_intent, None
+
     def execute(
         self,
         proposal: dict[str, Any],
@@ -1001,31 +1100,60 @@ class Executor:
         action_key = logical_action_key(proposal, source_type)
         client_order_id = stable_client_order_id(action_key)
         candidate = {**proposal, "client_order_id": client_order_id, "trading_mode": "paper"}
+
+        workflow_store, existing_intent, authority_error = self._load_approval_authority(
+            candidate,
+            approval_id=approval_id,
+            source_type=source_type,
+            client_order_id=client_order_id,
+        )
+        if authority_error:
+            return ExecutionResult(False, "blocked", client_order_id, reason=authority_error)
         final_context = {**context, "final_revalidation": True}
         decision = self.risk_engine.evaluate(candidate, final_context, final=True)
         if not decision.passed:
             return ExecutionResult(False, "blocked", client_order_id, reason="; ".join(decision.reasons))
 
-        workflow_store = None
         workflow = None
-        if approval_id:
+        effective_approval_id = approval_id
+        if workflow_store is not None:
+            effective_approval_id = str(
+                approval_id or (existing_intent or {}).get("approval_id") or ""
+            ) or None
             # Persist the final local validation decision before intent creation.
             # create_or_get_intent then links this workflow in the same SQLite
             # transaction as the intent and reservation.
-            from .approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
+            from .approval_workflow import ApprovalWorkflowConflict, ApprovalWorkflowState, ApprovalWorkflowStore
 
-            workflow_store = ApprovalWorkflowStore(self.storage)
-            workflow = workflow_store.get_by_approval(approval_id)
+            workflow = workflow_store.get_by_approval(str(effective_approval_id)) if effective_approval_id else None
             if workflow is None:
                 return ExecutionResult(False, "blocked", client_order_id, reason="durable approval workflow is required")
-            if workflow["state"] == ApprovalWorkflowState.VALIDATING.value:
-                workflow_store.transition(
-                    workflow["id"],
-                    ApprovalWorkflowState.APPROVED_PENDING_INTENT,
-                    expected_state=ApprovalWorkflowState.VALIDATING,
-                    validation_status="passed",
-                    safe_detail="final local validation passed",
-                )
+            if workflow["state"] == ApprovalWorkflowState.VALIDATING.value and existing_intent is None:
+                try:
+                    workflow_store.transition(
+                        workflow["id"],
+                        ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+                        expected_state=ApprovalWorkflowState.VALIDATING,
+                        validation_status="passed",
+                        safe_detail="final local validation passed",
+                    )
+                except ApprovalWorkflowConflict:
+                    # Another worker may have advanced the same durable
+                    # approval between authority loading and this CAS. The
+                    # intent creation transaction below remains the single
+                    # winner; re-read the workflow and continue only if its
+                    # new state is still executable.
+                    workflow = workflow_store.get(workflow["id"])
+                    if workflow["state"] not in {
+                        ApprovalWorkflowState.APPROVED_PENDING_INTENT.value,
+                        ApprovalWorkflowState.INTENT_CREATED.value,
+                        ApprovalWorkflowState.SUBMISSION_PENDING.value,
+                        ApprovalWorkflowState.SUBMISSION_STARTED.value,
+                        ApprovalWorkflowState.SUBMITTED.value,
+                        ApprovalWorkflowState.UNKNOWN.value,
+                        ApprovalWorkflowState.TERMINAL.value,
+                    }:
+                        return ExecutionResult(False, "blocked", client_order_id, reason="approval workflow changed before execution")
             elif not workflow.get("intent_id") and workflow["state"] != ApprovalWorkflowState.APPROVED_PENDING_INTENT.value:
                 return ExecutionResult(False, "blocked", client_order_id, reason="approval workflow is not executable")
 
@@ -1077,7 +1205,7 @@ class Executor:
                 candidate,
                 run_id=self.run_id or proposal.get("run_id"),
                 source_type=source_type,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
             )
         except (ValueError, PermissionError, RuntimeError, sqlite3.Error) as exc:
             return ExecutionResult(False, "blocked", client_order_id, reason=f"intent persistence blocked: {type(exc).__name__}")
@@ -1207,5 +1335,8 @@ def execute_proposal(
     *,
     storage: Any | None = None,
     run_id: str | None = None,
+    approval_id: str,
 ) -> ExecutionResult:
-    return Executor(broker, risk_engine, storage, run_id).execute(proposal, context)
+    return Executor(broker, risk_engine, storage, run_id).execute(
+        proposal, context, approval_id=approval_id
+    )

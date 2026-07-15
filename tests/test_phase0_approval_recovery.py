@@ -498,6 +498,22 @@ def test_expired_approved_workflow_never_creates_intent(tmp_path):
 def test_submission_started_is_durable_before_broker_invocation(tmp_path):
     storage = _storage(tmp_path)
     workflow = _workflow(storage, state=ApprovalWorkflowState.VALIDATING)
+    candidate = _proposal()
+    now = datetime.now(UTC)
+    storage.execute(
+        """INSERT INTO trade_proposals(id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (candidate["id"], candidate["symbol"], candidate["side"], candidate["notional"], "pending",
+         now.isoformat(), candidate["expires_at"], "rule_based_v2", "{}"),
+    )
+    storage.execute(
+        """INSERT INTO approvals(
+             id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
+             acknowledgement_status,approval_received_at)
+           VALUES(?,?,?,?,?,?,1,'accepted',?,?,?)""",
+        ("approval-1", "run", candidate["id"], "owner", "approve", "approve", now.isoformat(), "received", now.isoformat()),
+    )
+    assert storage.consume_approval(candidate["id"], "approval-1")
 
     class Risk:
         config = {}
@@ -509,7 +525,7 @@ def test_submission_started_is_durable_before_broker_invocation(tmp_path):
             return {"id": "paper-1", "status": "submitted"}
 
     result = Executor(Broker(), Risk(), storage, "run").execute(
-        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+        candidate, {"approval_valid": True}, approval_id="approval-1"
     )
     assert result.submitted
     assert ApprovalWorkflowStore(storage).get(workflow["id"])["state"] == "submitted"

@@ -146,6 +146,9 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "stop_policy_version": "TEXT", "sizing_policy_version": "TEXT", "formula_version": "TEXT",
         "sizing_caps_json": "TEXT", "binding_caps_json": "TEXT", "evidence_version": "TEXT", "config_hash": "TEXT",
     },
+    "position_lifecycles": {
+        "opening_quantity_frozen": "INTEGER NOT NULL DEFAULT 0",
+    },
     "trade_proposals": {
         "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
         "strategy_registry_snapshot_id": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",

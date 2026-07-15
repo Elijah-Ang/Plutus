@@ -2295,11 +2295,93 @@ class TradingService:
         return "portfolio exit-first rule active"
 
     def _portfolio_context(self, proposal: dict[str, Any], approval_valid: bool = False) -> dict[str, Any]:
-        state = self._authoritative_runtime_state(force=approval_valid)
+        # Order-side conflicts and sell capacity are admission-critical broker
+        # state; do not let the general runtime cache turn a current holding or
+        # open-order change into a stale duplicate/oversell decision.
+        state = self._authoritative_runtime_state(force=True)
         positions = state["positions"]
         orders = state["orders"]
         account = state["account"]
         symbol = proposal["symbol"]
+
+        active_order_states = {
+            "pending_new", "new", "accepted", "submitted", "partially_filled",
+            "pending_cancel", "cancel_pending", "pending_replace", "replacing",
+            "unknown", "reconciliation_required", "open",
+        }
+
+        def is_active_order(order: Any) -> bool:
+            status = str(_value(order, "status", "open") or "open").lower()
+            return status in active_order_states or status not in {
+                "filled", "canceled", "cancelled", "expired", "rejected", "done",
+            }
+
+        def remaining_order_quantity(order: Any) -> float:
+            raw_remaining = _value(order, "remaining_qty")
+            try:
+                if raw_remaining is not None:
+                    return max(0.0, float(raw_remaining))
+                requested = float(_value(order, "qty", _value(order, "quantity", 0)) or 0)
+                filled = float(_value(order, "filled_qty", _value(order, "filled_quantity", 0)) or 0)
+                return max(0.0, requested - filled)
+            except (TypeError, ValueError):
+                return 0.0
+
+        symbol_upper = str(symbol).upper()
+        active_orders = [
+            order for order in orders
+            if is_active_order(order)
+            and str(_value(order, "symbol", "")).upper() == symbol_upper
+            and str(_value(order, "side", "")).lower() in {"buy", "sell"}
+        ]
+        known_order_keys = {
+            str(_value(order, field, ""))
+            for order in active_orders
+            for field in ("client_order_id", "id", "broker_order_id")
+            if _value(order, field)
+        }
+        # Broker open-order snapshots are authoritative when present. Include
+        # durable intents that have not made it into that snapshot yet, while
+        # avoiding a second count for an already-identified broker order.
+        active_intent_states = (
+            "created", "reserved", "submitting", "submitted", "partially_filled",
+            "cancel_pending", "unknown", "reconciliation_required",
+        )
+        placeholders = ",".join("?" for _ in active_intent_states)
+        active_intents = self.storage.fetch_all(
+            f"""SELECT * FROM order_intents
+                WHERE upper(symbol)=? AND state IN ({placeholders})
+                  AND lower(side) IN ('buy','sell')""",
+            (symbol_upper, *active_intent_states),
+        )
+        for intent in active_intents:
+            intent_keys = {
+                str(intent.get(field) or "")
+                for field in ("client_order_id", "id", "broker_order_id")
+                if intent.get(field)
+            }
+            if intent_keys & known_order_keys:
+                continue
+            active_orders.append(intent)
+            known_order_keys.update(intent_keys)
+
+        conflicting_buy_order = any(
+            str(_value(order, "side", "")).lower() == "buy" for order in active_orders
+        )
+        conflicting_sell_order = any(
+            str(_value(order, "side", "")).lower() == "sell" for order in active_orders
+        )
+        open_sell_quantity = sum(
+            remaining_order_quantity(order)
+            for order in active_orders
+            if str(_value(order, "side", "")).lower() == "sell"
+        )
+        current_holdings_quantity = sum(
+            max(0.0, float(_value(position, "qty", 0) or 0))
+            for position in positions
+            if str(_value(position, "symbol", "")).upper() == symbol_upper
+        )
+        sellable_quantity = max(0.0, current_holdings_quantity - open_sell_quantity)
 
         # Calculate exposure snapshot from current positions
         snapshot = self._get_exposure_snapshot(positions, account)
@@ -2415,8 +2497,19 @@ class TradingService:
             "market_open": state["market_open"],
             "kill_switch": (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
             "open_positions": len(positions), "trades_today": len(today_orders), "buy_trades_today": len(today_buy_orders),
-            "duplicate_order": any(str(_value(o, "symbol", "")).upper() == symbol for o in orders),
-            "same_symbol_position": any(str(_value(p, "symbol", "")).upper() == symbol for p in positions),
+            "conflicting_buy_order": conflicting_buy_order,
+            "conflicting_sell_order": conflicting_sell_order,
+            "open_sell_quantity": open_sell_quantity,
+            "current_holdings_quantity": current_holdings_quantity,
+            "sellable_quantity": sellable_quantity,
+            # Compatibility for reporting callers; risk admission uses the
+            # explicit side-aware fields above.
+            "duplicate_order": (
+                conflicting_sell_order
+                if str(proposal.get("side") or "").lower() == "sell"
+                else conflicting_buy_order
+            ),
+            "same_symbol_position": current_holdings_quantity > 0,
             "uses_margin": state["uses_margin"],
             **loss_metrics.as_context(),
             "daily_realized_pl": realized.daily_realized_pl,
@@ -3255,6 +3348,7 @@ class TradingService:
                 ),
                 minimum_notional=float((self.config.get("position_sizing", {}) or {}).get("minimum_executable_notional_usd", 1.0)),
                 registry_snapshot_id=registry_snapshot_id, allocation_id=allocation_id,
+                evaluation_time=iso_now(),
             )
         except Exception as exc:
             coordinator.transition(
@@ -5806,7 +5900,10 @@ class TradingService:
             score_vol, regime, gate = 0.0, "unknown", "fail-safe HOLD"
         port_context = self._portfolio_context({"symbol": symbol, "side": signal.side or "buy", "action": "entry"})
         risk_budgeted = self._ranked_batch_mode_enabled()
-        safety_ok = not port_context.get("duplicate_order")
+        signal_side = str(signal.side or "buy").lower()
+        safety_ok = not port_context.get(
+            "conflicting_sell_order" if signal_side == "sell" else "conflicting_buy_order"
+        )
         if not risk_budgeted and port_context.get("trades_today", 0) >= self.config["risk"].get("max_trades_per_day", 1):
             safety_ok = False
         if not risk_budgeted and signal.action == "ENTRY" and port_context.get("open_positions", 0) >= self.config["risk"].get("max_open_positions", 1):
@@ -9935,6 +10032,8 @@ class TradingService:
                 "strategy_state": resolved_policy.state if resolved_policy else ("SUSPENDED" if "profitability_engine" in self.config else None),
                 "strategy_risk_multiplier": resolved_strategy_risk_multiplier if resolved_policy else (0.0 if "profitability_engine" in self.config else None),
                 "permitted_stop_risk_pct": resolved_permitted_stop_risk_pct if resolved_policy else (0.0 if "profitability_engine" in self.config else None),
+                "risk_value": 0.0, "risk_unit": "stop_risk_dollars",
+                "sleeve_stop_risk_ceiling": 0.0, "sleeve_notional_ceiling": 0.0,
                 "strategy_policy_version": resolved_policy.policy_version if resolved_policy else None,
                 "binding_policy_reason": reason,
             }
@@ -10442,7 +10541,9 @@ class TradingService:
             "sleeve_stop_risk_ceiling": phase3_context.get("sleeve_risk_remaining_dollars"),
             "sleeve_notional_ceiling": phase3_context.get("sleeve_notional_remaining"),
             "strategy_sleeve_payload": phase3_context.get("strategy_sleeve_payload"),
-            "risk_value": phase3_context.get("sleeve_risk_remaining_dollars"),
+            # Candidate risk is the risk of this candidate's final quantity and
+            # stop. Sleeve capacity remains a separate authority ceiling.
+            "risk_value": final_notional / entry_price * stop_distance_dollars,
             "risk_unit": "stop_risk_dollars",
             "conversion_equity": (phase3_context.get("strategy_sleeve_payload") or {}).get("conversion_equity"),
             "conversion_equity_as_of": (phase3_context.get("strategy_sleeve_payload") or {}).get("conversion_equity_as_of"),
@@ -10463,8 +10564,15 @@ class TradingService:
             current_regime = phase4_policy.get("current_regime_performance") or {}
             if str(current_regime.get("regime") or "").lower() != str(c.get("volatility_regime") or "").lower():
                 current_regime = {}
-            risk_value = c.get("risk_value", c.get("stop_risk_dollars"))
+            # Ranking consumes the candidate's own final stop risk.  Sleeve
+            # capacity is an allocation ceiling and must never become the
+            # candidate's risk-efficiency input.
+            risk_value = c.get("stop_risk_dollars")
+            if risk_value is None:
+                risk_value = c.get("risk_value")
             risk_unit = c.get("risk_unit")
+            if risk_unit is None and c.get("stop_risk_dollars") is not None:
+                risk_unit = "stop_risk_dollars"
             if risk_value is None:
                 try:
                     risk_value = (
