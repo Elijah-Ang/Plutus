@@ -19,6 +19,7 @@ from scripts.build_isolated_wheel import (
     build_isolated_wheel,
     verify_wheel_evidence,
 )
+from scripts.prune_release_runtime_state import prune_runtime_state
 from scripts.verify_release_artifact import REQUIRED_PYTHON, installed_app_package_digests, verify
 from scripts.verify_source_tree import create_inventory, verify_inventory
 
@@ -288,7 +289,60 @@ def test_release_build_uses_external_verified_wheel_workspace_and_atomic_promoti
     assert 'scripts/build_isolated_wheel.py' in script
     assert 'pip install --no-deps --no-index "$WHEEL_PATH"' in script
     assert 'pip install --no-deps --no-build-isolation "$STAGING"' not in script
+    prune = "scripts/prune_release_runtime_state.py"
+    source_verify = "scripts/verify_source_tree.py"
+    artifact_verify = 'scripts/verify_release_artifact.py "$STAGING"'
+    final_inventory = "release-file-inventory.sha256"
+    assert prune in script
+    assert script.index(prune) < script.index(source_verify, script.index(prune))
+    assert script.rindex(source_verify) > script.index(artifact_verify)
+    assert script.rindex(source_verify) < script.index(final_inventory)
+    assert 'rm -rf "$STAGING/.git" "$STAGING/data" "$STAGING/logs" "$STAGING/scratch"' not in script
     assert script.index('mv "$STAGING" "$DEST"') > script.index('scripts/verify_release_artifact.py')
+
+
+def test_release_state_pruning_preserves_tracked_placeholders_and_removes_generated_state(tmp_path) -> None:
+    tracked = (
+        "data/exports/.gitkeep",
+        "data/market_cache/.gitkeep",
+        "data/models/.gitkeep",
+        "logs/audit/.gitkeep",
+        "logs/errors/.gitkeep",
+        "logs/runtime/.gitkeep",
+    )
+    for relative in tracked:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    generated = (
+        "data/trading_agent.db",
+        "data/exports/report.xlsx",
+        "logs/runtime/scanner_identity.json",
+        "logs/errors/error.log",
+        "scratch/nested/transient.json",
+    )
+    for relative in generated:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("generated", encoding="utf-8")
+
+    result = prune_runtime_state(
+        tmp_path,
+        {"files": [{"path": relative} for relative in tracked]},
+    )
+
+    assert result["removed_file_count"] == len(generated)
+    assert result["preserved_tracked_paths"] == sorted(tracked)
+    assert all((tmp_path / relative).is_file() for relative in tracked)
+    assert all(not (tmp_path / relative).exists() for relative in generated)
+
+
+def test_release_state_pruning_fails_closed_for_unsafe_root(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "data").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="runtime-state root is unsafe"):
+        prune_runtime_state(tmp_path, {"files": [{"path": "app.py"}]})
 
 
 def test_ci_pins_release_pip_before_installing_dependencies() -> None:

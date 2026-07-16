@@ -104,6 +104,8 @@ WHEEL_PATH=$(
 cd "$STAGING"
 export TRADING_AGENT_PROJECT_ROOT="$STAGING"
 "$STAGING/.venv/bin/python" scripts/run_artifact_tests.py --output artifact-test-results.json
+"$STAGING/.venv/bin/python" scripts/prune_release_runtime_state.py \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json"
 "$STAGING/.venv/bin/python" scripts/verify_source_tree.py \
   --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
   --repository Elijah-Ang/Plutus
@@ -183,7 +185,9 @@ Path("release-manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=
 PY
 
 "$STAGING/.venv/bin/python" scripts/verify_release_artifact.py "$STAGING"
-rm -rf "$STAGING/.git" "$STAGING/data" "$STAGING/logs" "$STAGING/scratch"
+"$STAGING/.venv/bin/python" scripts/verify_source_tree.py \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus
 find . -type f ! -name 'release-file-inventory.sha256' -print0 \
   | LC_ALL=C sort -z | xargs -0 shasum -a 256 > "$STAGING/release-file-inventory.sha256"
 chmod 755 "$STAGING/scripts/run_once.sh" "$STAGING/scripts/run_telegram_listener.sh"
