@@ -149,6 +149,8 @@ def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> No
         "configuration_hash": "config",
         "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
         "formula_versions": RELEASE_FORMULA_VERSIONS,
+        "git_tree_sha": "tree-candidate",
+        "tracked_source_inventory_digest": "inventory-candidate",
         "ci": {"workflow_name": "CI", "run_id": "42", "head_sha": "candidate"},
     }
     def fake_run(*args):
@@ -163,6 +165,8 @@ def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> No
             return [{"ref": "refs/tags/immutable-release-good", "object": {"sha": "tag-object", "type": "tag"}}], None, 200
         if url.endswith("/git/tags/tag-object"):
             return {"object": {"sha": "candidate", "type": "commit"}}, None, 200
+        if url.endswith("/git/commits/candidate"):
+            return {"sha": "candidate", "tree": {"sha": "tree-candidate"}}, None, 200
         raise AssertionError(url)
 
     monkeypatch.setattr(release_check, "_run", fake_run)

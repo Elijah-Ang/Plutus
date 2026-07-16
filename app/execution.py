@@ -1483,6 +1483,18 @@ class Executor:
         if authority_error:
             return ExecutionResult(False, "blocked", client_order_id, reason=authority_error)
         execution_run_id = str((existing_intent or {}).get("run_id") or self.run_id or proposal.get("run_id") or "") or None
+        recovery_exclusion_allowed = bool(existing_intent) and (
+            (
+                str((existing_intent or {}).get("state") or "")
+                == OrderState.RETRYABLE_PRE_SUBMISSION.value
+                and int((existing_intent or {}).get("broker_invocation_occurred") or 0) == 0
+            )
+            or (
+                str((existing_intent or {}).get("state") or "") == OrderState.SUBMITTING.value
+                and self.recovery_proven_no_submit
+                and int((existing_intent or {}).get("broker_invocation_occurred") or 0) == 0
+            )
+        )
         try:
             from .execution_risk_snapshot import capture_execution_risk_snapshot
 
@@ -1497,6 +1509,10 @@ class Executor:
                 candidate=candidate,
                 trusted_providers=self.trusted_evidence_providers,
                 cluster_provider=self.cluster_provider,
+                recovery_intent_id=(str(existing_intent["id"]) if recovery_exclusion_allowed else None),
+                recovery_logical_action_key=(action_key if recovery_exclusion_allowed else None),
+                recovery_proven_no_invocation=self.recovery_proven_no_submit,
+                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
             )
         except Exception as exc:
             return ExecutionResult(
@@ -1626,22 +1642,87 @@ class Executor:
             return ExecutionResult(False, current["state"], current["client_order_id"], reason="another worker owns submission", intent_id=intent_id)
 
         try:
-            verify_snapshot_immediately_before_broker(
+            # Deterministic crash injection happens before the complete final
+            # evidence refresh; nothing may intervene between that refresh,
+            # the atomic invocation marker, and adapter I/O.
+            self._fault("immediately_before_broker_submit", intent_id=intent_id)
+            refreshed_body = verify_snapshot_immediately_before_broker(
                 self.storage,
                 self.broker,
                 snapshot_id=str(intent.get("risk_snapshot_id") or ""),
+                intent_id=intent_id,
+                logical_action_key=str(intent.get("logical_action_key") or ""),
                 proposal_id=str(intent.get("proposal_id") or ""),
                 approval_id=str(intent.get("approval_id") or ""),
                 run_id=execution_run_id,
                 config=getattr(self.risk_engine, "config", {}) or {},
+                candidate=candidate,
+                source_type=source_type,
+                trusted_providers=self.trusted_evidence_providers,
+                cluster_provider=self.cluster_provider,
+                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
             )
+            refreshed_intent = store.get_intent(intent_id)
+            refreshed_context = {
+                **dict(refreshed_body["risk_context"]),
+                "approval_valid": True,
+                "final_revalidation": True,
+                "authoritative_risk_snapshot_id": refreshed_intent.get("risk_snapshot_id"),
+                "autonomous_entry_requested": candidate.get("autonomous_entry_requested") is True,
+                "autonomous_exit_requested": candidate.get("autonomous_exit_requested") is True,
+            }
+            refreshed_decision = self.risk_engine.evaluate(candidate, refreshed_context, final=True)
+            if not refreshed_decision.passed:
+                raise RuntimeError("final pre-broker risk controls failed: " + "; ".join(refreshed_decision.reasons))
+            from .approval_display import validate_consumed_display_authority
+
+            invocation_time = iso_now()
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
+                reservation_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM risk_reservations WHERE intent_id=? AND state='active'",
+                    (intent_id,),
+                ).fetchone()[0])
+                if (
+                    current is None
+                    or str(current["state"] or "") != OrderState.SUBMITTING.value
+                    or int(current["broker_invocation_occurred"] or 0) != 0
+                    or str(current["risk_snapshot_id"] or "") != str(refreshed_intent.get("risk_snapshot_id") or "")
+                    or reservation_count != 1
+                ):
+                    raise RuntimeError("intent or reservation changed at the final adapter boundary")
+                validate_consumed_display_authority(
+                    conn,
+                    approval_id=str(current["approval_id"] or ""),
+                    proposal_id=str(current["proposal_id"] or ""),
+                    source_type=source_type,
+                )
+                current_workflow = conn.execute(
+                    "SELECT state,intent_id FROM approval_workflows WHERE approval_id=?",
+                    (str(current["approval_id"] or ""),),
+                ).fetchone()
+                if (
+                    current_workflow is None
+                    or str(current_workflow["state"] or "") != ApprovalWorkflowState.SUBMISSION_STARTED.value
+                    or str(current_workflow["intent_id"] or "") != intent_id
+                ):
+                    raise RuntimeError("approval workflow changed at the final adapter boundary")
+                updated = conn.execute(
+                    """UPDATE order_intents
+                       SET broker_invocation_started_at=?,broker_invocation_occurred=1,updated_at=?
+                       WHERE id=? AND state=? AND COALESCE(broker_invocation_occurred,0)=0""",
+                    (invocation_time, invocation_time, intent_id, OrderState.SUBMITTING.value),
+                ).rowcount
+                if updated != 1:
+                    raise RuntimeError("broker invocation authority was concurrently consumed")
         except Exception as exc:
             store.transition(
                 intent_id,
                 OrderState.REJECTED,
                 event_type="authoritative_snapshot_changed_before_broker",
                 error_category=type(exc).__name__,
-                safe_summary="authoritative execution evidence changed or expired before broker invocation",
+                safe_summary=f"pre-broker control failure: {type(exc).__name__}: {str(exc)[:300]}",
                 expected_state=OrderState.SUBMITTING,
             )
             if workflow_store is not None and workflow is not None:
@@ -1662,13 +1743,6 @@ class Executor:
                 order_args = {"notional": float(intent["requested_notional"])}
             else:
                 order_args = {"qty": float(intent["requested_quantity"])}
-            # This is deliberately the final instruction before adapter I/O. The
-            # production hook is a no-op; deterministic tests may fail here.
-            self._fault("immediately_before_broker_submit", intent_id=intent_id)
-            self.storage.execute(
-                "UPDATE order_intents SET broker_invocation_started_at=?,broker_invocation_occurred=1,updated_at=? WHERE id=?",
-                (iso_now(), iso_now(), intent_id),
-            )
             response = self.broker.submit_order(
                 intent["symbol"],
                 intent["side"],

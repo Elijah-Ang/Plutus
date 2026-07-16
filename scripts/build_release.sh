@@ -59,6 +59,12 @@ if mode == "rollback" and tag not in set(reach.get("verified_release_manifest") 
 PY
 
 git -C "$SOURCE" archive --format=tar "$COMMIT" | tar -x -C "$STAGING" -f -
+"$PYTHON_BIN" "$STAGING/scripts/verify_source_tree.py" \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus --commit "$COMMIT" --create
+"$PYTHON_BIN" "$STAGING/scripts/verify_source_tree.py" \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus
 "$PYTHON_BIN" -m venv --copies "$STAGING/.venv"
 [[ "$("$STAGING/.venv/bin/python" -c 'import platform; print(platform.python_version())')" == "$REQUIRED_PYTHON" ]] || {
   print -u2 -- "fresh release environment has the wrong Python"; exit 2
@@ -66,22 +72,34 @@ git -C "$SOURCE" archive --format=tar "$COMMIT" | tar -x -C "$STAGING" -f -
 "$STAGING/.venv/bin/python" -m pip install "pip==$PINNED_PIP"
 "$STAGING/.venv/bin/python" -m pip install --require-hashes --requirement "$STAGING/requirements-hashes.lock"
 "$STAGING/.venv/bin/python" -m pip install --no-deps --no-build-isolation "$STAGING"
+"$STAGING/.venv/bin/python" "$STAGING/scripts/verify_source_tree.py" \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus
 
 cd "$STAGING"
 "$STAGING/.venv/bin/python" scripts/run_artifact_tests.py --output artifact-test-results.json
+"$STAGING/.venv/bin/python" scripts/verify_source_tree.py \
+  --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus
 "$STAGING/.venv/bin/python" -m pip freeze --all | LC_ALL=C sort > "$STAGING/dependency-inventory.txt"
 
 LOCK_HASH=$(shasum -a 256 "$STAGING/requirements.lock" | awk '{print $1}')
 HASH_LOCK_HASH=$(shasum -a 256 "$STAGING/requirements-hashes.lock" | awk '{print $1}')
 INVENTORY_HASH=$(shasum -a 256 "$STAGING/dependency-inventory.txt" | awk '{print $1}')
 TEST_RESULTS_HASH=$(shasum -a 256 "$STAGING/artifact-test-results.json" | awk '{print $1}')
+SOURCE_INVENTORY_HASH=$(shasum -a 256 "$STAGING/tracked-source-inventory.json" | awk '{print $1}')
+SOURCE_TREE_SHA=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("tracked-source-inventory.json"))["git_tree_sha"])')
+SOURCE_INVENTORY_DIGEST=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("tracked-source-inventory.json"))["inventory_digest"])')
 CI_RUN_ID=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["run_id"])' "$ELIGIBILITY")
 CI_WORKFLOW=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["workflow_name"])' "$ELIGIBILITY")
-AUTHORITY_EVIDENCE=$("$PYTHON_BIN" - "$ELIGIBILITY" "$AUTHORITY" "$TAG" <<'PY'
-import json,sys
+AUTHORITY_EVIDENCE=$(SOURCE_TREE_SHA="$SOURCE_TREE_SHA" SOURCE_INVENTORY_DIGEST="$SOURCE_INVENTORY_DIGEST" \
+"$PYTHON_BIN" - "$ELIGIBILITY" "$AUTHORITY" "$TAG" <<'PY'
+import json,os,sys
 r=json.load(open(sys.argv[1])); mode,tag=sys.argv[2:]
 reach=r.get("release_reachability", {})
-value={"mode":mode,"remote_main_sha":reach.get("remote_main_sha")}
+value={"mode":mode,"remote_main_sha":reach.get("remote_main_sha"),
+       "source_tree_sha":os.environ["SOURCE_TREE_SHA"],
+       "tracked_source_inventory_digest":os.environ["SOURCE_INVENTORY_DIGEST"]}
 if mode=="rollback":
     value.update(tag_name=tag,attestation=(reach.get("release_attestation_evidence") or {}).get(tag))
 print(json.dumps(value,sort_keys=True,separators=(",",":")))
@@ -90,6 +108,8 @@ PY
 
 RELEASE_ID="$RELEASE_ID" COMMIT="$COMMIT" BRANCH="$BRANCH" LOCK_HASH="$LOCK_HASH" \
 HASH_LOCK_HASH="$HASH_LOCK_HASH" INVENTORY_HASH="$INVENTORY_HASH" TEST_RESULTS_HASH="$TEST_RESULTS_HASH" \
+SOURCE_INVENTORY_HASH="$SOURCE_INVENTORY_HASH" SOURCE_TREE_SHA="$SOURCE_TREE_SHA" \
+SOURCE_INVENTORY_DIGEST="$SOURCE_INVENTORY_DIGEST" \
 CI_RUN_ID="$CI_RUN_ID" CI_WORKFLOW="$CI_WORKFLOW" AUTHORITY_EVIDENCE="$AUTHORITY_EVIDENCE" \
 "$STAGING/.venv/bin/python" - <<'PY'
 import json, os, platform
@@ -115,6 +135,9 @@ manifest={
   "requirements_hash_lock_sha256":os.environ["HASH_LOCK_HASH"],
   "dependency_inventory_sha256":os.environ["INVENTORY_HASH"],
   "artifact_test_results_sha256":os.environ["TEST_RESULTS_HASH"],
+  "git_tree_sha":os.environ["SOURCE_TREE_SHA"],
+  "tracked_source_inventory_sha256":os.environ["SOURCE_INVENTORY_HASH"],
+  "tracked_source_inventory_digest":os.environ["SOURCE_INVENTORY_DIGEST"],
   "artifact_test_results":tests["results"],
   "source_branch":os.environ["BRANCH"],"tests_verified":True,
 }

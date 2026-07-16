@@ -244,6 +244,15 @@ def _verify_release_manifest(
         return False, f"{tag_name}: release attestation tag identity does not match"
     if str(manifest.get("release_commit") or manifest.get("commit_sha") or "") != sha:
         return False, f"{tag_name}: release manifest commit does not match the candidate"
+    attested_tree = str(manifest.get("git_tree_sha") or manifest.get("source_tree_sha") or "")
+    if not attested_tree or not str(manifest.get("tracked_source_inventory_digest") or ""):
+        return False, f"{tag_name}: release attestation is not bound to a tracked source tree"
+    remote_commit, remote_error, _ = _github_json(
+        f"https://api.github.com/repos/{repository}/git/commits/{sha}"
+    )
+    remote_tree = str(((remote_commit or {}).get("tree") or {}).get("sha") or "") if isinstance(remote_commit, dict) else ""
+    if remote_error or not remote_tree or remote_tree != attested_tree:
+        return False, f"{tag_name}: attested source tree does not match the immutable GitHub commit"
     if not config_hash or str(manifest.get("configuration_hash") or manifest.get("config_hash") or "") != str(config_hash):
         return False, f"{tag_name}: release manifest configuration hash does not match"
     schema_versions = manifest.get("required_schema_versions") or manifest.get("schema_versions")

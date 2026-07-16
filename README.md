@@ -66,5 +66,31 @@ Whenever making meaningful changes to configs, scripts, or core application modu
 - Submitting a BUY supersedes only an equivalent or mutually exclusive BUY. Unrelated ranked-batch, `YES ALL`, position, and strategy-sleeve candidates remain pending and are independently revalidated.
 - SELL revalidation is directional: a further adverse downward move increases exit urgency but does not by itself invalidate a risk-reducing exit. Fresh quote, held quantity, conflicting orders, market state, expiry, and no-shorting checks remain mandatory.
 - `scripts/check_release_eligibility.py` reports local commit/config/schema/migration/paper/test evidence and only reports GitHub CI passed when a successful workflow run is linked to the exact commit.
+
+### Release source authority and rollback
+
+Release verification has two intentionally separate inventories. `tracked-source-inventory.json`
+is derived from the exact GitHub commit tree and records every tracked path, Git blob SHA, and
+content SHA-256. Its digest and Git tree SHA are bound into the release authority; changing a
+tracked file cannot be legitimized by regenerating local artifact hashes. The separate
+`release-file-inventory.sha256` covers generated artifact evidence such as the virtual environment,
+test results, dependency inventory, and manifest.
+
+Ordinary deployment accepts only the exact current GitHub `main` commit:
+
+```sh
+scripts/deploy_release.sh --mode forward /Users/elijahang/TradingAgentReleases/<release-id>
+```
+
+A rollback must name a previously built immutable release whose annotated
+`immutable-release-*` tag and immutable GitHub Release attestation bind the original commit,
+Git tree, tracked-source inventory digest, CI run, configuration, schema, and formula versions:
+
+```sh
+scripts/deploy_release.sh --mode rollback /Users/elijahang/TradingAgentReleases/<approved-release-id>
+```
+
+An arbitrary ancestor, lightweight tag, replaced/duplicated attestation asset, or locally
+regenerated inventory is not rollback authority.
 - Excel reports redact Telegram text, sender IDs, and sensitive payload fields by default.
 - The launchd lock records PID/time and only recovers a dead, sufficiently old lock.

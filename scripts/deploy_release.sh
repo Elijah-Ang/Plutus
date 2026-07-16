@@ -8,7 +8,7 @@ RELEASE="${1:?usage: deploy_release.sh [--mode forward|rollback] /absolute/relea
 STATE_ROOT="$HOME/Library/Application Support/TradingAgent"
 RUNTIME="$HOME/TradingAgentRuntime"
 [[ -f "$RELEASE/release-manifest.json" ]] || { print -u2 -- "missing release manifest"; exit 2; }
-[[ -f "$RELEASE/release-file-inventory.sha256" && -f "$RELEASE/dependency-inventory.txt" ]] || { print -u2 -- "release inventory is incomplete"; exit 2; }
+[[ -f "$RELEASE/release-file-inventory.sha256" && -f "$RELEASE/dependency-inventory.txt" && -f "$RELEASE/tracked-source-inventory.json" ]] || { print -u2 -- "release inventory is incomplete"; exit 2; }
 [[ -f "$RELEASE/artifact-test-results.json" && -f "$RELEASE/requirements-hashes.lock" ]] || { print -u2 -- "artifact test or hash-lock evidence is missing"; exit 2; }
 [[ "$RELEASE" == "$HOME/TradingAgentReleases/"* ]] || { print -u2 -- "release must be an immutable release path"; exit 2; }
 
@@ -16,6 +16,9 @@ cd "$RELEASE"
 # Every artifact byte, environment package, configuration hash, schema/formula
 # identity, test result and Python version is verified before any pointer write.
 shasum -a 256 -c release-file-inventory.sha256
+"$RELEASE/.venv/bin/python" scripts/verify_source_tree.py \
+  --root "$RELEASE" --inventory "$RELEASE/tracked-source-inventory.json" \
+  --repository Elijah-Ang/Plutus
 "$RELEASE/.venv/bin/python" scripts/verify_release_artifact.py "$RELEASE"
 "$RELEASE/.venv/bin/python" scripts/verify_deployment_authority.py \
   --manifest "$RELEASE/release-manifest.json" --mode "$MODE"

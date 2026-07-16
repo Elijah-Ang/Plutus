@@ -9,11 +9,23 @@ import urllib.parse
 from pathlib import Path
 
 from scripts.check_release_eligibility import _github_json, _release_attestation_asset
+from scripts.verify_source_tree import github_tree
 
 
 def verify(manifest: dict, *, mode: str, repository: str = "Elijah-Ang/Plutus") -> dict:
     commit = str(manifest.get("release_commit") or "")
     authority = manifest.get("release_authority") if isinstance(manifest.get("release_authority"), dict) else {}
+    remote_tree = github_tree(repository, commit)
+    tree_sha = str(manifest.get("git_tree_sha") or "")
+    inventory_digest = str(manifest.get("tracked_source_inventory_digest") or "")
+    if (
+        not tree_sha
+        or str(remote_tree.get("tree_sha") or "") != tree_sha
+        or str(authority.get("source_tree_sha") or "") != tree_sha
+        or not inventory_digest
+        or str(authority.get("tracked_source_inventory_digest") or "") != inventory_digest
+    ):
+        raise RuntimeError("release source-tree authority does not match the immutable remote commit")
     if mode == "forward":
         main, error, _ = _github_json(f"https://api.github.com/repos/{repository}/git/ref/heads/main")
         sha = str(((main or {}).get("object") or {}).get("sha") or "") if isinstance(main, dict) else ""
@@ -50,6 +62,11 @@ def verify(manifest: dict, *, mode: str, repository: str = "Elijah-Ang/Plutus") 
     attested = current.get("manifest") if isinstance(current.get("manifest"), dict) else {}
     if str(attested.get("release_commit") or attested.get("commit_sha") or "") != commit:
         raise RuntimeError("rollback attestation commit does not match the artifact")
+    if (
+        str(attested.get("git_tree_sha") or attested.get("source_tree_sha") or "") != tree_sha
+        or str(attested.get("tracked_source_inventory_digest") or "") != inventory_digest
+    ):
+        raise RuntimeError("rollback attestation source tree does not match the artifact")
     return {"mode": mode, "commit": commit, "tag_name": tag, **expected}
 
 

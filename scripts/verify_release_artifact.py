@@ -68,6 +68,23 @@ def verify(
         raise ValueError("requirements lock digest mismatch")
     if digest(root / "requirements-hashes.lock") != manifest.get("requirements_hash_lock_sha256"):
         raise ValueError("hashed requirements lock digest mismatch")
+    source_path = root / "tracked-source-inventory.json"
+    if not source_path.is_file():
+        raise ValueError("tracked source inventory is missing")
+    source_inventory = json.loads(source_path.read_text(encoding="utf-8"))
+    if digest(source_path) != manifest.get("tracked_source_inventory_sha256"):
+        raise ValueError("tracked source inventory file digest mismatch")
+    if str(source_inventory.get("git_tree_sha") or "") != str(manifest.get("git_tree_sha") or ""):
+        raise ValueError("artifact Git tree SHA changed")
+    if str(source_inventory.get("inventory_digest") or "") != str(manifest.get("tracked_source_inventory_digest") or ""):
+        raise ValueError("tracked source inventory authority digest changed")
+    authority = manifest.get("release_authority") if isinstance(manifest.get("release_authority"), dict) else {}
+    if (
+        str(authority.get("source_tree_sha") or "") != str(manifest.get("git_tree_sha") or "")
+        or str(authority.get("tracked_source_inventory_digest") or "")
+        != str(manifest.get("tracked_source_inventory_digest") or "")
+    ):
+        raise ValueError("release authority is not bound to the tracked source tree")
 
     frozen = list(frozen_lines) if frozen_lines is not None else subprocess.run(
         [str(root / ".venv" / "bin" / "python"), "-m", "pip", "freeze", "--all"],

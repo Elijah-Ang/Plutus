@@ -400,6 +400,7 @@ def _verified_context(
     open_order_fingerprint: str,
     cluster_provider: Callable[[str], Any] | None,
     config: Mapping[str, Any],
+    recovery_intent_id: str | None = None,
 ) -> dict[str, Any]:
     symbol = str(candidate.get("symbol") or "").upper()
     side = str(candidate.get("side") or "").lower()
@@ -416,7 +417,11 @@ def _verified_context(
         }
         known_order_keys.update(keys)
         active_orders.append(order)
-    for intent in durable_intents:
+    order_intents = [
+        intent for intent in durable_intents
+        if str(intent.get("id") or "") != str(recovery_intent_id or "")
+    ]
+    for intent in order_intents:
         keys = {
             str(intent.get(field) or "")
             for field in ("client_order_id", "id", "broker_order_id")
@@ -443,6 +448,14 @@ def _verified_context(
 
     active_notional = sum(float(row.get("active_notional") or 0) for row in reservations)
     active_stop_risk = sum(float(row.get("active_stop_risk") or 0) for row in reservations)
+    recovery_reservation = next(
+        (
+            row for row in reservations
+            if str(row.get("intent_id") or "") == str(recovery_intent_id or "")
+        ),
+        None,
+    )
+    candidate_already_reserved = recovery_reservation is not None
     proposed_notional = float(candidate.get("notional") or 0)
     if proposed_notional <= 0 and candidate.get("qty") is not None:
         proposed_notional = float(candidate.get("qty") or 0) * max(
@@ -456,14 +469,19 @@ def _verified_context(
         if key:
             position_values[key] = position_values.get(key, 0.0) + _position_value(position)
     current_total = sum(position_values.values())
-    proposed_total = current_total + active_notional + (proposed_notional if is_entry and side == "buy" else 0.0)
+    candidate_increment = (
+        proposed_notional
+        if is_entry and side == "buy" and not candidate_already_reserved
+        else 0.0
+    )
+    proposed_total = current_total + active_notional + candidate_increment
     symbol_reserved = sum(
         float(row.get("active_notional") or 0)
         for row in reservations
         if str(row.get("symbol") or "").upper() == symbol
     )
     proposed_symbol = position_values.get(symbol, 0.0) + symbol_reserved + (
-        proposed_notional if is_entry and side == "buy" else 0.0
+        candidate_increment
     )
 
     def cluster(value: str) -> str:
@@ -484,7 +502,7 @@ def _verified_context(
         for row in reservations
         if cluster(str(row.get("symbol") or "").upper()) == target_cluster
     )
-    if is_entry and side == "buy":
+    if is_entry and side == "buy" and not candidate_already_reserved:
         cluster_value += proposed_notional
 
     risk_budget = config.get("risk_budget", {}) or {}
@@ -516,14 +534,21 @@ def _verified_context(
     }
 
     today = datetime.now(UTC).date().isoformat()
-    trades_today = int(conn.execute("SELECT COUNT(*) FROM orders WHERE substr(created_at,1,10)=?", (today,)).fetchone()[0])
+    submitted_states = ("submitted", "partially_filled", "filled")
+    trades_today = int(conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE substr(created_at,1,10)=? AND lower(status) IN (?,?,?)",
+        (today, *submitted_states),
+    ).fetchone()[0])
     buy_trades_today = int(conn.execute(
-        "SELECT COUNT(*) FROM orders WHERE lower(side)='buy' AND substr(created_at,1,10)=?", (today,)
+        """SELECT COUNT(*) FROM orders
+           WHERE lower(side)='buy' AND substr(created_at,1,10)=?
+             AND lower(status) IN (?,?,?)""",
+        (today, *submitted_states),
     ).fetchone()[0])
     exit_blocker = conn.execute(
         "SELECT symbol,state,recovery_classification,user_action_required FROM exit_blocker_states WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
-    pending_unknown = [row for row in durable_intents if str(row.get("state")) in {"unknown", "reconciliation_required"} and str(row.get("side")).lower() == "buy"]
+    pending_unknown = [row for row in order_intents if str(row.get("state")) in {"unknown", "reconciliation_required"} and str(row.get("side")).lower() == "buy"]
     short_value = _finite(_value(account, "short_market_value", 0) or 0, "short market value", nonnegative=False)
     uses_margin = cash < -1e-9 or abs(short_value) > 1e-9
     universe_row = conn.execute(
@@ -570,7 +595,7 @@ def _verified_context(
         "pending_buy_exposure_unknown": bool(pending_unknown),
         "pending_buy_exposure_unknown_reason": "unresolved broker BUY exposure" if pending_unknown else None,
         "pending_buy_exposure_unknown_rows": [str(row.get("id") or "") for row in pending_unknown],
-        "exit_pending": bool(exit_blocker) or any(str(row.get("side")).lower() == "sell" for row in durable_intents),
+        "exit_pending": bool(exit_blocker) or any(str(row.get("side")).lower() == "sell" for row in order_intents),
         "exit_pending_symbol": str(exit_blocker["symbol"]) if exit_blocker else None,
         "exit_pending_reason": str(exit_blocker["user_action_required"] or "") if exit_blocker else None,
         "exit_pending_status": str(exit_blocker["state"] or "") if exit_blocker else None,
@@ -580,6 +605,11 @@ def _verified_context(
         "effective_config_hash": config_hash,
         "formula_versions": dict(formula_versions),
         "reservation_limits": reservation_limits,
+        "recovery_exclusion": {
+            "intent_id": recovery_intent_id,
+            "candidate_already_reserved": candidate_already_reserved,
+            "excluded_from_order_conflicts_only": bool(recovery_intent_id),
+        },
         "universe_symbol_info": dict(universe_row) if universe_row is not None else None,
         "active_dynamic_paper_tradable_symbols": active_dynamic_symbols,
         **dict(loss_controls),
@@ -622,6 +652,67 @@ def _snapshot_body_from_values(values: Mapping[str, Any]) -> dict[str, Any]:
         "captured_at": values["captured_at"],
         "expires_at": values["expires_at"],
     }
+
+
+def _validated_recovery_exclusion(
+    conn: Any,
+    *,
+    recovery_intent_id: str | None,
+    recovery_logical_action_key: str | None,
+    recovery_proven_no_invocation: bool,
+    proposal_id: str,
+    approval_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Authorize one exact pre-I/O intent exclusion, or fail closed.
+
+    The intent remains in the durable snapshot and its active reservation
+    remains fully counted.  Only its order-conflict/pending-order projection is
+    excluded, preventing a recovery from conflicting with itself.
+    """
+    intent_id = str(recovery_intent_id or "").strip()
+    action_key = str(recovery_logical_action_key or "").strip()
+    if not intent_id and not action_key:
+        return None, None
+    if not intent_id or not action_key:
+        raise RuntimeError("recovery exclusion authority is incomplete")
+    row = conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("recovery exclusion intent does not exist")
+    intent = dict(row)
+    if (
+        str(intent.get("proposal_id") or "") != proposal_id
+        or str(intent.get("approval_id") or "") != approval_id
+        or str(intent.get("logical_action_key") or "") != action_key
+    ):
+        raise RuntimeError("recovery exclusion authority does not match proposal, approval, and logical action")
+    state = str(intent.get("state") or "")
+    invocation = int(intent.get("broker_invocation_occurred") or 0)
+    permitted = state == "retryable_pre_submission" or (
+        state == "submitting" and recovery_proven_no_invocation
+    )
+    if not permitted or invocation != 0:
+        raise RuntimeError("recovery exclusion intent is not proven pre-invocation and retryable")
+    if state in {"unknown", "reconciliation_required"}:
+        raise RuntimeError("ambiguous intents can never receive recovery exclusion authority")
+    matching = [
+        dict(item) for item in conn.execute(
+            "SELECT * FROM risk_reservations WHERE intent_id=? AND state='active'",
+            (intent_id,),
+        ).fetchall()
+    ]
+    if len(matching) != 1:
+        raise RuntimeError("recovery exclusion requires exactly one active reservation")
+    evidence = {
+        "intent_id": intent_id,
+        "logical_action_key": action_key,
+        "proposal_id": proposal_id,
+        "approval_id": approval_id,
+        "state": state,
+        "broker_invocation_occurred": invocation,
+        "active_reservation_id": str(matching[0].get("id") or ""),
+        "scope": "exact_intent_order_conflicts_and_pending_quantity_only",
+    }
+    return intent, evidence
 
 
 def _json_column(row: Mapping[str, Any], name: str, *, items: bool = False) -> Any:
@@ -724,6 +815,10 @@ def capture_execution_risk_snapshot(
     candidate: Mapping[str, Any] | None = None,
     trusted_providers: Mapping[str, Provider] | None = None,
     cluster_provider: Callable[[str], Any] | None = None,
+    recovery_intent_id: str | None = None,
+    recovery_logical_action_key: str | None = None,
+    recovery_proven_no_invocation: bool = False,
+    telegram_required: bool = True,
 ) -> dict[str, Any]:
     caller_hint_keys = sorted(str(key) for key in (context or {}).keys())
     # Caller data is intentionally non-authoritative and never merged.
@@ -767,7 +862,18 @@ def capture_execution_risk_snapshot(
 
     with storage.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        _recovery_intent, recovery_exclusion = _validated_recovery_exclusion(
+            conn,
+            recovery_intent_id=recovery_intent_id,
+            recovery_logical_action_key=recovery_logical_action_key,
+            recovery_proven_no_invocation=recovery_proven_no_invocation,
+            proposal_id=proposal_id,
+            approval_id=approval_id,
+        )
+        database_probe = providers.get("database")
         database_ok = str(conn.execute("PRAGMA quick_check").fetchone()[0]).lower() == "ok"
+        if database_probe is not None:
+            database_ok = database_ok and _measured(database_probe)
         health = {
             "database": database_ok,
             "internet": _measured(internet_probe),
@@ -775,8 +881,12 @@ def capture_execution_risk_snapshot(
             "telegram": _measured(telegram_probe),
             "broker": not synthetic or testing,
         }
-        if not all(health.values()):
-            failed = ", ".join(sorted(key for key, value in health.items() if not value))
+        required_health = {"database", "internet", "power", "broker"}
+        if telegram_required:
+            required_health.add("telegram")
+        failed_health = sorted(key for key in required_health if not health[key])
+        if failed_health:
+            failed = ", ".join(failed_health)
             raise RuntimeError(f"trusted execution health evidence is not authoritative: {failed}")
         if kill_switch_active:
             raise RuntimeError("kill switch is active")
@@ -815,6 +925,11 @@ def capture_execution_risk_snapshot(
             open_order_fingerprint=open_order_fingerprint,
             cluster_provider=cluster_provider,
             config=config,
+            recovery_intent_id=(
+                str(recovery_exclusion["intent_id"])
+                if recovery_exclusion is not None
+                else None
+            ),
         )
         data_health = {"authoritative": True, "components": health, "measured_at": now.isoformat()}
         control_evidence = {
@@ -822,6 +937,8 @@ def capture_execution_risk_snapshot(
             "kill_switch_active": kill_switch_active,
             "loss_controls": loss_controls,
             "caller_hint_keys_ignored": caller_hint_keys,
+            "recovery_exclusion": recovery_exclusion,
+            "telegram_required": telegram_required,
         }
         values = {
             "snapshot_version": RISK_SNAPSHOT_VERSION,
@@ -903,15 +1020,22 @@ def verify_snapshot_immediately_before_broker(
     broker: Any,
     *,
     snapshot_id: str,
+    intent_id: str,
+    logical_action_key: str,
     proposal_id: str,
     approval_id: str,
     run_id: str | None,
     config: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    source_type: str,
+    trusted_providers: Mapping[str, Provider] | None = None,
+    cluster_provider: Callable[[str], Any] | None = None,
+    telegram_required: bool = True,
 ) -> dict[str, Any]:
-    """Repeat freshness and broker evidence checks before adapter invocation."""
+    """Refresh every critical control and durable authority before adapter I/O."""
     config_hash, formula_versions = _required_configuration(config)
     with storage.connect() as conn:
-        row, body = verify_execution_risk_snapshot(
+        prior_row, _prior_body = verify_execution_risk_snapshot(
             conn,
             snapshot_id,
             proposal_id=proposal_id,
@@ -922,18 +1046,87 @@ def verify_snapshot_immediately_before_broker(
         )
     if broker is None:
         raise RuntimeError("broker client unavailable before invocation")
-    identity, account, raw_positions, raw_orders, clock, _synthetic = _broker_evidence(broker)
-    if paper_account_identity_hash(identity, account) != str(row["account_id_hash"]):
+    identity, account, _positions, _orders, _clock, _synthetic = _broker_evidence(broker)
+    if paper_account_identity_hash(identity, account) != str(prior_row["account_id_hash"]):
         raise RuntimeError("paper account identity changed after risk capture")
-    if not bool(_value(clock, "is_open", False)):
-        raise RuntimeError("market closed after risk capture")
-    positions = _canonical_items(raw_positions, ("symbol", "asset_id", "id"))
-    orders = _canonical_items(raw_orders, ("symbol", "side", "client_order_id", "id"))
-    if _fingerprint({"items": positions}) != str(row["position_fingerprint"]):
-        raise RuntimeError("broker positions changed after risk capture")
-    if _fingerprint({"items": orders}) != str(row["open_order_fingerprint"]):
-        raise RuntimeError("broker open orders changed after risk capture")
-    return body
+
+    refreshed = capture_execution_risk_snapshot(
+        storage,
+        broker,
+        proposal_id=proposal_id,
+        approval_id=approval_id,
+        run_id=run_id,
+        context={},
+        config=config,
+        candidate=candidate,
+        trusted_providers=trusted_providers,
+        cluster_provider=cluster_provider,
+        recovery_intent_id=intent_id,
+        recovery_logical_action_key=logical_action_key,
+        recovery_proven_no_invocation=True,
+        telegram_required=telegram_required,
+    )
+    if str(refreshed.get("account_id_hash") or "") != str(prior_row["account_id_hash"]):
+        raise RuntimeError("paper account identity changed during final risk refresh")
+
+    # Re-read the complete local execution authority after the refreshed
+    # broker/control snapshot.  This transaction closes reservation revocation,
+    # approval supersession, and workflow mutation races before the invocation
+    # marker can be written.
+    from .approval_display import validate_consumed_display_authority
+
+    with storage.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
+        if intent_row is None:
+            raise RuntimeError("current execution intent disappeared before broker invocation")
+        intent = dict(intent_row)
+        if (
+            str(intent.get("proposal_id") or "") != proposal_id
+            or str(intent.get("approval_id") or "") != approval_id
+            or str(intent.get("run_id") or "") != str(run_id or "")
+            or str(intent.get("logical_action_key") or "") != logical_action_key
+            or str(intent.get("state") or "") != "submitting"
+            or int(intent.get("broker_invocation_occurred") or 0) != 0
+        ):
+            raise RuntimeError("current execution intent is no longer valid for pre-invocation submission")
+        reservation_count = int(conn.execute(
+            "SELECT COUNT(*) FROM risk_reservations WHERE intent_id=? AND state='active'",
+            (intent_id,),
+        ).fetchone()[0])
+        if reservation_count != 1:
+            raise RuntimeError("current execution reservation was revoked or duplicated")
+        _proposal, approval, envelope = validate_consumed_display_authority(
+            conn,
+            approval_id=approval_id,
+            proposal_id=proposal_id,
+            source_type=source_type,
+        )
+        workflow = conn.execute(
+            "SELECT * FROM approval_workflows WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if (
+            workflow is None
+            or str(workflow["intent_id"] or "") != intent_id
+            or str(workflow["proposal_id"] or "") != proposal_id
+            or str(workflow["state"] or "") != "submission_started"
+        ):
+            raise RuntimeError("approval workflow is no longer executable before broker invocation")
+        if str(approval.get("displayed_fingerprint") or "") != str(intent.get("displayed_fingerprint") or ""):
+            raise RuntimeError("display authority changed before broker invocation")
+        if str(envelope.get("config_hash") or "") != config_hash:
+            raise RuntimeError("configuration identity changed after approval")
+        envelope_formulas = envelope.get("formula_versions")
+        if not isinstance(envelope_formulas, Mapping) or {
+            str(key): str(envelope_formulas.get(key) or "") for key in sorted(REQUIRED_FORMULA_VERSIONS)
+        } != formula_versions:
+            raise RuntimeError("formula identity changed after approval")
+        conn.execute(
+            "UPDATE order_intents SET risk_snapshot_id=?,updated_at=? WHERE id=?",
+            (str(refreshed["id"]), datetime.now(UTC).isoformat(), intent_id),
+        )
+    return snapshot_body_from_row(refreshed)
 
 
 __all__ = [
