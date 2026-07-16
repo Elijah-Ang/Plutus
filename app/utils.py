@@ -411,6 +411,34 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         if sizing_section:
             sizing_section = f"Sizing & Risk:\n{sizing_section}\n"
 
+        profitability_section = ""
+        profitability_metrics = proposal.get("profitability_metrics") or {}
+        profitability_quality = proposal.get("profitability_quality_score")
+        if profitability_quality is not None and profitability_metrics:
+            expected_net_r = profitability_metrics.get("expected_net_r")
+            conservative_net_r = profitability_metrics.get(
+                "conservative_expected_net_r"
+            )
+            expected_cost = profitability_metrics.get("expected_total_cost")
+            break_even = profitability_metrics.get(
+                "break_even_win_probability_after_costs"
+            )
+            target_price = profitability_metrics.get("target_price")
+            expected_r_per_day = profitability_metrics.get("expected_r_per_day")
+            cost_ratio = profitability_metrics.get("cost_to_gross_edge_ratio")
+            profitability_section = (
+                "Profitability (verified, after costs):\n"
+                f"Quality score: {float(profitability_quality):.1f}/100\n"
+                f"Expected net R: {float(expected_net_r):+.3f}R\n"
+                f"Conservative net R: {float(conservative_net_r):+.3f}R\n"
+                f"Expected complete-trade costs: ${float(expected_cost):,.2f}\n"
+                f"After-cost break-even win rate: {float(break_even) * 100:.1f}%\n"
+                f"Evidence-derived target: ${float(target_price):,.2f}\n"
+                f"Holding efficiency: {float(expected_r_per_day):+.4f}R/day\n"
+                f"Cost / gross edge: {float(cost_ratio) * 100:.1f}%\n"
+                "The conservative estimate, not nominal dollar profit, controls ranking.\n\n"
+            )
+
         adaptive_section = ""
         adaptive = proposal.get("adaptive_conviction") or {}
         if adaptive:
@@ -457,7 +485,11 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 f"Reason: {proposal.get('winner_expansion_reason') or 'risk-neutral or bounded after persisted stop tightening'}.\n\n"
             )
 
-        scores_section = f"{confidence_line}{score_line}{policy_line}{rank_line}\n{account_section}{sizing_section}{adaptive_section}{winner_section}"
+        scores_section = (
+            f"{confidence_line}{score_line}{policy_line}{rank_line}\n"
+            f"{account_section}{sizing_section}{profitability_section}"
+            f"{adaptive_section}{winner_section}"
+        )
 
         raw_reason = proposal.get("reason", "")
         if "volatility normal" in raw_reason or "volatility_normal" in raw_reason or "normal" in raw_reason.lower():

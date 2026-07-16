@@ -80,6 +80,38 @@ def _r_values(rows: Sequence[PerformanceObservation | Mapping[str, Any]], key: s
     return [float(value) for row in _ordered(rows) if (value := _finite(_value(row, key))) is not None]
 
 
+def _paired_gross_net_r(
+    rows: Sequence[PerformanceObservation | Mapping[str, Any]],
+) -> list[tuple[float, float]]:
+    pairs: list[tuple[float, float]] = []
+    for row in _ordered(rows):
+        gross = _finite(_value(row, "gross_r"))
+        net = _finite(_value(row, "r_multiple"))
+        if gross is not None and net is not None:
+            pairs.append((float(gross), float(net)))
+    return pairs
+
+
+def _holding_period_days(
+    rows: Sequence[PerformanceObservation | Mapping[str, Any]],
+) -> list[float]:
+    durations: list[float] = []
+    for row in _ordered(rows):
+        entry = _value(row, "entry_session")
+        exit_ = _value(row, "exit_session")
+        if not entry or not exit_:
+            continue
+        try:
+            entry_at = _parse_datetime(str(entry))
+            exit_at = _parse_datetime(str(exit_))
+        except (TypeError, ValueError):
+            continue
+        duration = (exit_at - entry_at).total_seconds() / 86400.0
+        if math.isfinite(duration) and duration >= 0:
+            durations.append(duration)
+    return durations
+
+
 def expectancy_r(rows_or_values: Sequence[PerformanceObservation | Mapping[str, Any] | float]) -> float | None:
     """Arithmetic mean of completed, cost-adjusted trade-path R values."""
     values = []
@@ -483,6 +515,11 @@ def calculate_metrics(
     """Calculate all Build 1 metrics from already canonical observations."""
     ordered = _ordered(observations)
     values = _r_values(ordered)
+    gross_values = _r_values(ordered, key="gross_r")
+    gross_net_pairs = _paired_gross_net_r(ordered)
+    holding_days = _holding_period_days(ordered)
+    gross_wins = [value for value in gross_values if value > 0]
+    gross_losses = [value for value in gross_values if value < 0]
     shadow = [row for row in ordered if row.evidence_class == "shadow_oos"]
     actual = [row for row in ordered if row.evidence_class == "actual_paper"]
     regimes = regime_metrics(ordered)
@@ -508,6 +545,17 @@ def calculate_metrics(
         "trade_counts": {"shadow_oos": len(shadow), "actual_paper": len(actual), "total": len(values)},
         "net_expectancy_r": expectancy_r(values),
         "expectancy_r": expectancy_r(values),
+        "gross_expectancy_r": expectancy_r(gross_values),
+        "gross_sample_count": len(gross_values),
+        "gross_win_count": len(gross_wins),
+        "gross_loss_count": len(gross_losses),
+        "gross_flat_count": len(gross_values) - len(gross_wins) - len(gross_losses),
+        "gross_win_rate": win_rate(gross_values),
+        "average_gross_win_r": average_win_r(gross_values),
+        "average_gross_loss_r": average_loss_r(gross_values),
+        "average_cost_drag_r": _mean(
+            max(0.0, gross - net) for gross, net in gross_net_pairs
+        ),
         "profit_factor": profit_factor(values),
         "win_rate": win_rate(values),
         "average_win_r": average_win_r(values),
@@ -532,9 +580,18 @@ def calculate_metrics(
         "attribution_confidence": attribution,
         "version_completeness": version_complete,
         "latest_evidence_session": latest,
+        "average_holding_period_days": _mean(holding_days),
+        "median_holding_period_days": (
+            statistics.median(holding_days) if holding_days else None
+        ),
     }
     raw_inputs = {
         "ordered_r_curve": values,
+        "ordered_gross_r_curve": gross_values,
+        "paired_gross_net_r": [
+            {"gross_r": gross, "net_r": net} for gross, net in gross_net_pairs
+        ],
+        "holding_period_days": holding_days,
         "shadow_r": _r_values(shadow),
         "actual_r": _r_values(actual),
         "regimes": regimes,

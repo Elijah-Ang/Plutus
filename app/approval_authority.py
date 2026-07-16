@@ -20,6 +20,17 @@ AUTHORITY_FIELDS = (
     "max_quantity",
     "max_notional",
     "max_stop_risk",
+    "profitability_decision_id",
+    "trade_economics_id",
+    "trade_economics_input_fingerprint",
+    "trade_economics_record_fingerprint",
+    "profitability_decision_fingerprint",
+    "profitability_quality_score",
+    "target_price",
+    "expected_net_r",
+    "conservative_expected_net_r",
+    "expected_total_cost",
+    "break_even_win_probability_after_costs",
     "config_hash",
     "formula_versions",
 )
@@ -120,6 +131,33 @@ def authority_envelope(row: Mapping[str, Any], *, proposal_id: str | None = None
         "max_stop_risk": _number(_first(
             row, payload, "max_stop_risk", "approved_stop_risk_ceiling", "stop_risk_dollars", "initial_risk_dollars"
         )),
+        "profitability_decision_id": _first(
+            row, payload, "profitability_decision_id"
+        ),
+        "trade_economics_id": _first(
+            row, payload, "trade_economics_id", "shadow_trade_economics_id"
+        ),
+        "trade_economics_input_fingerprint": _first(
+            row, payload, "trade_economics_input_fingerprint"
+        ),
+        "trade_economics_record_fingerprint": _first(
+            row, payload, "trade_economics_record_fingerprint"
+        ),
+        "profitability_decision_fingerprint": _first(
+            row, payload, "profitability_decision_fingerprint"
+        ),
+        "profitability_quality_score": _first(
+            row, payload, "profitability_quality_score"
+        ),
+        "target_price": _first(row, payload, "target_price"),
+        "expected_net_r": _first(row, payload, "expected_net_r"),
+        "conservative_expected_net_r": _first(
+            row, payload, "conservative_expected_net_r"
+        ),
+        "expected_total_cost": _first(row, payload, "expected_total_cost"),
+        "break_even_win_probability_after_costs": _first(
+            row, payload, "break_even_win_probability_after_costs"
+        ),
         "config_hash": _first(row, payload, "config_hash", "effective_config_hash"),
         "formula_versions": _formula_versions(row, payload),
     }
@@ -131,4 +169,3 @@ def canonical_json(value: Mapping[str, Any]) -> str:
 
 def authority_fingerprint(envelope: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(envelope).encode("utf-8")).hexdigest()
-
