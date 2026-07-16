@@ -357,11 +357,16 @@ def test_telegram_update_redacts_by_default():
     assert redact_telegram_update(update, include_raw=True) is update
 
 
-def test_raw_telegram_dump_patterns_are_ignored():
+def test_raw_telegram_dump_patterns_are_ignored(tmp_path):
     import subprocess
+
     root = Path(__file__).resolve().parents[1]
+    repository = tmp_path / "ignore-policy"
+    repository.mkdir()
+    (repository / ".gitignore").write_bytes((root / ".gitignore").read_bytes())
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
     for name in ("raw_telegram_updates.json", "data/telegram_updates/private.json"):
-        result = subprocess.run(["git", "check-ignore", "-q", name], cwd=root)
+        result = subprocess.run(["git", "check-ignore", "-q", name], cwd=repository)
         assert result.returncode == 0
 
 
