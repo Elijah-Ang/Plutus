@@ -43,7 +43,7 @@ def _verify_no_unapproved_source_files(root: Path, tracked_paths: set[str]) -> N
     generated_files = {
         "tracked-source-inventory.json", "artifact-test-results.json",
         "dependency-inventory.txt", "release-manifest.json",
-        "release-file-inventory.sha256", ".coverage",
+        "release-file-inventory.sha256", "wheel-build-evidence.json", ".coverage",
     }
     pruned_roots = {".venv", ".git", ".pytest_cache", "data", "logs", "scratch"}
     for directory, names, files in os.walk(root, followlinks=False):
@@ -62,6 +62,10 @@ def _verify_no_unapproved_source_files(root: Path, tracked_paths: set[str]) -> N
                 relative = relative[2:]
             if relative in tracked_paths or relative in generated_files:
                 continue
+            if relative_directory == Path("release-wheel") and name.endswith(".whl"):
+                wheel = root / relative
+                if wheel.is_file() and not wheel.is_symlink():
+                    continue
             raise ValueError(f"unapproved file is outside the authoritative source tree: {relative}")
 
 

@@ -33,14 +33,28 @@ if [[ "$AUTHORITY" == "forward" && "$COMMIT" != "$REMOTE_MAIN" ]]; then
 fi
 
 RELEASE_ID="${RELEASE_ID:-${COMMIT:0:12}}"
+[[ -n "$RELEASE_ID" && "$RELEASE_ID" != *[^A-Za-z0-9._-]* ]] || {
+  print -u2 -- "release id contains unsafe characters"; exit 2
+}
 DEST="$RELEASE_ROOT/$RELEASE_ID"
 [[ ! -e "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
 ELIGIBILITY=$(mktemp -t plutus-release-eligibility.XXXXXX)
 mkdir -p "$RELEASE_ROOT"
-mkdir "$DEST"
-STAGING="$DEST"
-cleanup() { rm -f "$ELIGIBILITY"; [[ -d "$STAGING" ]] && rm -rf "$STAGING"; }
+LOCK="$DEST.building"
+LOCK_HELD=0
+STAGING=""
+cleanup() {
+  rm -f "$ELIGIBILITY"
+  if [[ -d "$STAGING" ]]; then
+    chmod -R u+w "$STAGING" 2>/dev/null || true
+    rm -rf "$STAGING"
+  fi
+  (( LOCK_HELD == 0 )) || rmdir "$LOCK"
+}
 trap cleanup EXIT
+mkdir "$LOCK" || { print -u2 -- "release build is already reserved: $LOCK"; exit 2; }
+LOCK_HELD=1
+STAGING=$(mktemp -d "$RELEASE_ROOT/.${RELEASE_ID}.staging.XXXXXX")
 
 cd "$SOURCE"
 # Remote CI and authority are checked before spending time on the build. Local
@@ -71,7 +85,18 @@ git -C "$SOURCE" archive --format=tar "$COMMIT" | tar -x -C "$STAGING" -f -
 }
 "$STAGING/.venv/bin/python" -m pip install "pip==$PINNED_PIP"
 "$STAGING/.venv/bin/python" -m pip install --require-hashes --requirement "$STAGING/requirements-hashes.lock"
-"$STAGING/.venv/bin/python" -m pip install --no-deps --no-build-isolation "$STAGING"
+"$STAGING/.venv/bin/python" "$STAGING/scripts/build_isolated_wheel.py" \
+  --repository-root "$SOURCE" --staging-root "$STAGING" \
+  --inventory "$STAGING/tracked-source-inventory.json" --commit "$COMMIT" \
+  --python "$STAGING/.venv/bin/python" --workspace-parent "$RELEASE_ROOT" \
+  --repository Elijah-Ang/Plutus
+WHEEL_PATH=$(
+  "$STAGING/.venv/bin/python" -c \
+  'import json,pathlib,sys; e=json.load(open(sys.argv[1],encoding="utf-8")); print(pathlib.Path(sys.argv[2],"release-wheel",e["wheel_filename"]))' \
+  "$STAGING/wheel-build-evidence.json" "$STAGING"
+)
+[[ -f "$WHEEL_PATH" ]] || { print -u2 -- "verified release wheel is missing"; exit 2; }
+"$STAGING/.venv/bin/python" -m pip install --no-deps --no-index "$WHEEL_PATH"
 "$STAGING/.venv/bin/python" "$STAGING/scripts/verify_source_tree.py" \
   --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
   --repository Elijah-Ang/Plutus
@@ -88,8 +113,13 @@ HASH_LOCK_HASH=$(shasum -a 256 "$STAGING/requirements-hashes.lock" | awk '{print
 INVENTORY_HASH=$(shasum -a 256 "$STAGING/dependency-inventory.txt" | awk '{print $1}')
 TEST_RESULTS_HASH=$(shasum -a 256 "$STAGING/artifact-test-results.json" | awk '{print $1}')
 SOURCE_INVENTORY_HASH=$(shasum -a 256 "$STAGING/tracked-source-inventory.json" | awk '{print $1}')
+WHEEL_EVIDENCE_HASH=$(shasum -a 256 "$STAGING/wheel-build-evidence.json" | awk '{print $1}')
 SOURCE_TREE_SHA=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("tracked-source-inventory.json"))["git_tree_sha"])')
 SOURCE_INVENTORY_DIGEST=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("tracked-source-inventory.json"))["inventory_digest"])')
+WHEEL_SHA=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("wheel-build-evidence.json"))["wheel_sha256"])')
+WHEEL_NAME=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("wheel-build-evidence.json"))["distribution_name"])')
+WHEEL_VERSION=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("wheel-build-evidence.json"))["distribution_version"])')
+WHEEL_FILE=$("$STAGING/.venv/bin/python" -c 'import json; print(json.load(open("wheel-build-evidence.json"))["wheel_filename"])')
 CI_RUN_ID=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["run_id"])' "$ELIGIBILITY")
 CI_WORKFLOW=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["github_ci"]["workflow_name"])' "$ELIGIBILITY")
 AUTHORITY_EVIDENCE=$(SOURCE_TREE_SHA="$SOURCE_TREE_SHA" SOURCE_INVENTORY_DIGEST="$SOURCE_INVENTORY_DIGEST" \
@@ -110,6 +140,8 @@ RELEASE_ID="$RELEASE_ID" COMMIT="$COMMIT" BRANCH="$BRANCH" LOCK_HASH="$LOCK_HASH
 HASH_LOCK_HASH="$HASH_LOCK_HASH" INVENTORY_HASH="$INVENTORY_HASH" TEST_RESULTS_HASH="$TEST_RESULTS_HASH" \
 SOURCE_INVENTORY_HASH="$SOURCE_INVENTORY_HASH" SOURCE_TREE_SHA="$SOURCE_TREE_SHA" \
 SOURCE_INVENTORY_DIGEST="$SOURCE_INVENTORY_DIGEST" \
+WHEEL_EVIDENCE_HASH="$WHEEL_EVIDENCE_HASH" WHEEL_SHA="$WHEEL_SHA" WHEEL_NAME="$WHEEL_NAME" \
+WHEEL_VERSION="$WHEEL_VERSION" WHEEL_FILE="$WHEEL_FILE" \
 CI_RUN_ID="$CI_RUN_ID" CI_WORKFLOW="$CI_WORKFLOW" AUTHORITY_EVIDENCE="$AUTHORITY_EVIDENCE" \
 "$STAGING/.venv/bin/python" - <<'PY'
 import json, os, platform
@@ -138,6 +170,11 @@ manifest={
   "git_tree_sha":os.environ["SOURCE_TREE_SHA"],
   "tracked_source_inventory_sha256":os.environ["SOURCE_INVENTORY_HASH"],
   "tracked_source_inventory_digest":os.environ["SOURCE_INVENTORY_DIGEST"],
+  "wheel_build_evidence_sha256":os.environ["WHEEL_EVIDENCE_HASH"],
+  "release_wheel_sha256":os.environ["WHEEL_SHA"],
+  "release_wheel_filename":os.environ["WHEEL_FILE"],
+  "distribution_name":os.environ["WHEEL_NAME"],
+  "distribution_version":os.environ["WHEEL_VERSION"],
   "artifact_test_results":tests["results"],
   "source_branch":os.environ["BRANCH"],"tests_verified":True,
 }
@@ -151,5 +188,9 @@ find . -type f ! -name 'release-file-inventory.sha256' -print0 \
 chmod 755 "$STAGING/scripts/run_once.sh" "$STAGING/scripts/run_telegram_listener.sh"
 find "$STAGING" -type d -exec chmod a-w {} +
 find "$STAGING" -type f -exec chmod a-w {} +
+[[ ! -e "$DEST" ]] || { print -u2 -- "release destination appeared during construction"; exit 2; }
+mv "$STAGING" "$DEST"
 STAGING=""
+rmdir "$LOCK"
+LOCK_HELD=0
 print -- "$DEST"

@@ -82,6 +82,20 @@ def main() -> int:
     test_env["TRADING_AGENT_TESTING"] = "1"
     results: list[dict[str, object]] = []
     results.append(run("compileall", [sys.executable, "-m", "compileall", "-q", "app", "scripts", "tests"]))
+    results.append(run(
+        "installed_wheel_import",
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import app,pathlib,sys; p=pathlib.Path(app.__file__).resolve(); "
+            "root=pathlib.Path(sys.argv[1]).resolve(); "
+            "source=(root/'app').resolve(); environment=pathlib.Path(sys.prefix).resolve(); "
+            "assert source not in p.parents and environment in p.parents, "
+            "f'package did not import from the release environment: {p}'; print(p)",
+            str(ROOT),
+        ],
+    ))
 
     with tempfile.TemporaryDirectory(prefix="plutus-artifact-migration-") as directory:
         database = Path(directory) / "fresh.sqlite3"
