@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v9_audit_hardened_paper
+configuration_schema_version: plutus_effective_config_v10_trade_economics_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v9_audit_hardened_paper
+  required_configuration_version: plutus_effective_config_v10_trade_economics_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_2_probe
   required_policy_version: strategy_policy_v2_2_probe
@@ -281,6 +281,12 @@ profitability_engine:
   target_losing_streak: 4
   target_shortfall_bps: 20
   target_divergence_r: 0.5
+  trade_economics_formula_version: candidate_trade_economics_v1
+  trade_economics_schema_version: candidate_trade_economics_schema_v1
+  maximum_cost_to_gross_edge_ratio: 0.50
+  maximum_break_even_win_probability: 0.75
+  minimum_expected_net_r: 0.0
+  minimum_conservative_net_r: 0.0
 execution_capabilities:
   live_execution_enabled: false
   autonomous_entries_enabled: false
@@ -316,6 +322,7 @@ formula_versions:
   evidence: phase1_outcome_v2_exit_session
   strategy_performance: strategy_performance_v2_2_probe
   strategy_policy: strategy_policy_v2_2_probe
+  trade_economics: candidate_trade_economics_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 

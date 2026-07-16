@@ -24,6 +24,8 @@ from .formula_versions import (
     STRATEGY_PERFORMANCE_VERSION,
     STRATEGY_POLICY_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+    TRADE_ECONOMICS_FORMULA_VERSION,
+    TRADE_ECONOMICS_SCHEMA_VERSION,
     POSITION_RISK_FORMULA_VERSION,
     ROTATION_FORMULA_VERSION,
     ROTATION_SCHEMA_VERSION,
@@ -130,7 +132,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -138,6 +140,9 @@ STRICT_SECTION_KEYS = {
         "score_exploration_threshold", "probe_min_shadow_oos_samples", "probe_max_concentration_penalty", "score_throttled_threshold",
         "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
         "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
+        "trade_economics_formula_version", "trade_economics_schema_version",
+        "maximum_cost_to_gross_edge_ratio", "maximum_break_even_win_probability",
+        "minimum_expected_net_r", "minimum_conservative_net_r",
     },
 }
 
@@ -219,6 +224,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "evidence": EVIDENCE_VERSION,
         "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
         "strategy_policy": STRATEGY_POLICY_VERSION,
+        "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -385,7 +391,31 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(profitability.get("performance_version") == STRATEGY_PERFORMANCE_VERSION, f"profitability_engine.performance_version must be {STRATEGY_PERFORMANCE_VERSION}")
     require(profitability.get("policy_version") == STRATEGY_POLICY_VERSION, f"profitability_engine.policy_version must be {STRATEGY_POLICY_VERSION}")
     require(profitability.get("schema_version") == STRATEGY_PERFORMANCE_SCHEMA_VERSION, f"profitability_engine.schema_version must be {STRATEGY_PERFORMANCE_SCHEMA_VERSION}")
+    require(
+        profitability.get("trade_economics_formula_version") == TRADE_ECONOMICS_FORMULA_VERSION,
+        f"profitability_engine.trade_economics_formula_version must be {TRADE_ECONOMICS_FORMULA_VERSION}",
+    )
+    require(
+        profitability.get("trade_economics_schema_version") == TRADE_ECONOMICS_SCHEMA_VERSION,
+        f"profitability_engine.trade_economics_schema_version must be {TRADE_ECONOMICS_SCHEMA_VERSION}",
+    )
     require(profitability.get("primary_horizon_sessions") == 20, "profitability_engine.primary_horizon_sessions must be 20")
+    require(
+        profitability.get("maximum_cost_to_gross_edge_ratio") == 0.50,
+        "profitability_engine.maximum_cost_to_gross_edge_ratio must remain 0.50",
+    )
+    require(
+        profitability.get("maximum_break_even_win_probability") == 0.75,
+        "profitability_engine.maximum_break_even_win_probability must remain 0.75",
+    )
+    require(
+        profitability.get("minimum_expected_net_r") == 0.0,
+        "profitability_engine.minimum_expected_net_r must remain 0.0",
+    )
+    require(
+        profitability.get("minimum_conservative_net_r") == 0.0,
+        "profitability_engine.minimum_conservative_net_r must remain 0.0",
+    )
     if profitability:
         score_thresholds = [profitability.get("score_exploration_threshold"), profitability.get("score_throttled_threshold"), profitability.get("score_active_threshold")]
         if all(value is not None for value in score_thresholds):

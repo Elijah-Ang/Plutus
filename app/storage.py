@@ -168,6 +168,7 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "trade_proposals": {
         "proposal_version": "INTEGER NOT NULL DEFAULT 1", "displayed_fingerprint": "TEXT",
         "sizing_caps_json": "TEXT", "formula_versions_json": "TEXT", "evidence_version": "TEXT",
+        "trade_economics_id": "TEXT",
         "strategy_registry_snapshot_id": "TEXT", "strategy_sleeve": "TEXT", "sleeve_allocation_id": "TEXT",
         "sleeve_notional_ceiling": "REAL", "sleeve_stop_risk_ceiling": "REAL",
         "winner_expansion_decision_id": "TEXT", "pyramiding_milestone_id": "TEXT",
@@ -372,6 +373,8 @@ class Storage:
             apply_profit_milestone_schema(conn)
             from .strategy_performance import apply_strategy_performance_schema
             apply_strategy_performance_schema(conn)
+            from .trade_economics import apply_trade_economics_schema
+            apply_trade_economics_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -435,6 +438,8 @@ class Storage:
                 apply_final_hardening_schema(conn, record_migration=False)
                 from .strategy_performance import apply_strategy_performance_schema
                 apply_strategy_performance_schema(conn, record_migration=False)
+                from .trade_economics import apply_trade_economics_schema
+                apply_trade_economics_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.
