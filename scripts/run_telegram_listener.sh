@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="${0:A:h:h}"
 cd "$ROOT"
+export TRADING_AGENT_PROJECT_ROOT="$ROOT"
 
 STATE_ROOT="${TRADING_AGENT_STATE_ROOT:-$HOME/Library/Application Support/TradingAgent}"
 RUNTIME="$STATE_ROOT/locks"

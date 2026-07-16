@@ -9,7 +9,25 @@ from typing import Any
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+def resolve_project_root(package_file: str | Path = __file__) -> Path:
+    """Resolve the authoritative source/release root for runtime resources.
+
+    A wheel installation places ``app`` below site-packages, while configuration,
+    manifests, and launch scripts remain in the immutable release root.  Release
+    entrypoints therefore provide that root explicitly.  Source-tree execution
+    retains the package-relative fallback used by development and tests.
+    """
+    configured = os.getenv("TRADING_AGENT_PROJECT_ROOT")
+    if configured:
+        root = Path(configured).expanduser().resolve()
+        if not (root / "config" / "config.yaml").is_file():
+            raise RuntimeError("TRADING_AGENT_PROJECT_ROOT does not contain config/config.yaml")
+        return root
+    return Path(package_file).resolve().parents[1]
+
+
+PROJECT_ROOT = resolve_project_root()
 
 
 def get_git_commit() -> str:
