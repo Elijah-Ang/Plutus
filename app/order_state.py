@@ -8,6 +8,7 @@ from typing import Any
 class OrderState(StrEnum):
     CREATED = "created"
     RESERVED = "reserved"
+    RETRYABLE_PRE_SUBMISSION = "retryable_pre_submission"
     SUBMITTING = "submitting"
     SUBMITTED = "submitted"
     PARTIALLY_FILLED = "partially_filled"
@@ -39,6 +40,7 @@ BROKER_RELEVANT_STATES = {
 ACTIVE_RESERVATION_STATES = {
     OrderState.CREATED,
     OrderState.RESERVED,
+    OrderState.RETRYABLE_PRE_SUBMISSION,
     OrderState.SUBMITTING,
     OrderState.SUBMITTED,
     OrderState.PARTIALLY_FILLED,
@@ -49,9 +51,25 @@ ACTIVE_RESERVATION_STATES = {
 
 
 ALLOWED_TRANSITIONS: dict[OrderState, set[OrderState]] = {
-    OrderState.CREATED: {OrderState.RESERVED, OrderState.REJECTED, OrderState.EXPIRED},
-    OrderState.RESERVED: {OrderState.SUBMITTING, OrderState.REJECTED, OrderState.EXPIRED},
+    OrderState.CREATED: {
+        OrderState.RESERVED,
+        OrderState.RETRYABLE_PRE_SUBMISSION,
+        OrderState.REJECTED,
+        OrderState.EXPIRED,
+    },
+    OrderState.RESERVED: {
+        OrderState.RETRYABLE_PRE_SUBMISSION,
+        OrderState.SUBMITTING,
+        OrderState.REJECTED,
+        OrderState.EXPIRED,
+    },
+    OrderState.RETRYABLE_PRE_SUBMISSION: {
+        OrderState.SUBMITTING,
+        OrderState.REJECTED,
+        OrderState.EXPIRED,
+    },
     OrderState.SUBMITTING: {
+        OrderState.RETRYABLE_PRE_SUBMISSION,
         OrderState.SUBMITTED,
         OrderState.PARTIALLY_FILLED,
         OrderState.FILLED,

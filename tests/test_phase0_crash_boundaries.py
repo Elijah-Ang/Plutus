@@ -15,6 +15,7 @@ from app.position_lifecycle import PositionLifecycleManager
 from app.reconciliation import BrokerReconciler
 from app.risk_engine import RiskDecision
 from app.run_lock import inspect_lock
+from app.service import TradingService
 from app.storage import Storage
 
 
@@ -256,6 +257,65 @@ def test_crash_07_intent_created_before_workflow_completion(tmp_path):
     assert summary.existing_intent_linked == 1
     assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 1
     assert ApprovalWorkflowStore(storage).get(workflow["id"])["intent_id"] == intent["id"]
+
+
+def test_broker_absent_restarts_are_deterministic_then_submit_once_when_broker_returns(tmp_path):
+    storage = _db(tmp_path, "broker-absent.sqlite3")
+    workflow = _workflow(storage, ApprovalWorkflowState.APPROVED_PENDING_INTENT)
+    workflow_store = ApprovalWorkflowStore(storage)
+    intent = workflow_store.ensure_intent(workflow["id"], _proposal(), run_id="run")
+    workflow_store.transition(
+        workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING,
+        expected_state=ApprovalWorkflowState.INTENT_CREATED,
+    )
+
+    first = Executor(None, PassingRisk(), storage, "restart-1").execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+    )
+    second = Executor(None, PassingRisk(), Storage(storage.path), "restart-2").execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+    )
+    current = DurableExecutionStore(storage).get_intent(intent["id"])
+    assert first.status == second.status == "retryable_pre_submission"
+    assert first.intent_id == second.intent_id == intent["id"]
+    assert current["broker_invocation_occurred"] == 0
+    assert current["state"] == "retryable_pre_submission"
+    assert DurableExecutionStore(storage).active_reservations()["count"] == 1
+
+    broker = FakeBroker()
+    resumed = Executor(broker, PassingRisk(), Storage(storage.path), "restart-3").execute(
+        _proposal(), {"approval_valid": True}, approval_id="approval-1"
+    )
+    assert resumed.submitted and resumed.status == "submitted"
+    assert broker.submit_calls == 1 and broker.lookup_calls == 0
+
+
+def test_approval_expiry_while_broker_absent_terminalises_and_releases_atomically(tmp_path):
+    storage = _db(tmp_path, "broker-absent-expiry.sqlite3")
+    workflow = _workflow(storage, ApprovalWorkflowState.APPROVED_PENDING_INTENT)
+    workflow_store = ApprovalWorkflowStore(storage)
+    intent = workflow_store.ensure_intent(workflow["id"], _proposal(), run_id="run")
+    workflow_store.transition(
+        workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING,
+        expected_state=ApprovalWorkflowState.INTENT_CREATED,
+    )
+    storage.execute(
+        "UPDATE trade_proposals SET expires_at=? WHERE id=?",
+        ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), "proposal-1"),
+    )
+
+    service = TradingService.__new__(TradingService)
+    service.config = {}
+    service.storage = storage
+    service.broker = None
+    service.run_id = "restart-expired"
+    service._recover_local_workflows()
+
+    current = DurableExecutionStore(storage).get_intent(intent["id"])
+    reservation = storage.fetch_all("SELECT state,release_reason FROM risk_reservations WHERE intent_id=?", (intent["id"],))[0]
+    assert current["state"] == "expired" and current["broker_invocation_occurred"] == 0
+    assert reservation["state"] == "released"
+    assert workflow_store.get(workflow["id"])["state"] == "terminal"
 
 
 def test_crash_08_partial_fill_precedes_submitted_status(tmp_path):

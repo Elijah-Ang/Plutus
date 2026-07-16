@@ -3,10 +3,11 @@ from __future__ import annotations
 import sqlite3
 import json
 import math
+import os
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable, Mapping
 
 from .order_state import (
     ACTIVE_RESERVATION_STATES,
@@ -23,6 +24,14 @@ from .capabilities import require_autonomous_entry_support, require_autonomous_e
 from .utils import iso_now, json_dumps
 from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
 from .quotes import implementation_shortfall_bps, validate_quote_payload
+from .canonical_sizing import canonical_sizing, enforce_ceilings
+from .approval_authority import authority_fingerprint
+from .execution_risk_snapshot import (
+    execution_candidate_evidence,
+    snapshot_body_from_row,
+    verify_execution_risk_snapshot,
+    verify_snapshot_immediately_before_broker,
+)
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -89,24 +98,14 @@ class DurableExecutionStore:
 
     @staticmethod
     def _quantity_and_reference(proposal: dict[str, Any]) -> tuple[float, float, float | None, str, float | None]:
-        prices = [proposal.get("latest_price"), proposal.get("reference_price"), proposal.get("limit_price")]
-        valid_prices = [float(value) for value in prices if value is not None and float(value) > 0]
-        if not valid_prices:
-            raise ValueError("a positive conservative reference price is required")
-        # For entries, the highest locally approved/observed price is the conservative
-        # exposure reference. This avoids understating reserved notional.
-        reference = max(valid_prices)
-        quantity = proposal.get("qty")
-        requested_notional = float(proposal.get("notional") or 0) or None
-        request_basis = "quantity" if quantity is not None else "notional"
-        if quantity is None:
-            quantity = float(requested_notional or 0) / reference if reference > 0 else 0
-        quantity = float(quantity)
-        if quantity <= 0:
-            raise ValueError("a positive final requested quantity is required")
-        stop = proposal.get("stop_price", proposal.get("intended_stop_price"))
-        stop_price = float(stop) if stop is not None and float(stop) > 0 else None
-        return quantity, reference, stop_price, request_basis, requested_notional
+        sized = canonical_sizing(proposal)
+        return (
+            sized.quantity,
+            sized.reference_price,
+            sized.stop_price,
+            sized.request_basis,
+            sized.notional if sized.request_basis == "notional" else None,
+        )
 
     def create_or_get_intent(
         self,
@@ -117,68 +116,235 @@ class DurableExecutionStore:
         approval_id: str | None = None,
         sequence: int = 0,
     ) -> dict[str, Any]:
+        proposal = dict(proposal)
         if proposal.get("shadow_only") or proposal.get("observation_only") or proposal.get("research_only"):
             raise ValueError("shadow, observation-only and research-only records cannot create order intents")
         if str(proposal.get("trading_mode") or proposal.get("mode") or "paper") != "paper":
             raise PermissionError("durable execution supports paper mode only")
-        expires_at = proposal.get("expires_at")
-        if expires_at:
-            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=UTC)
-            if expiry.astimezone(UTC) <= datetime.now(UTC):
-                raise ValueError("expired approval cannot create an order intent")
-        symbol = str(proposal.get("symbol") or "").upper()
-        side = str(proposal.get("side") or "").lower()
-        if not symbol or side not in {"buy", "sell"}:
-            raise ValueError("intent requires a symbol and buy/sell side")
-        quantity, reference, stop_price, request_basis, requested_notional = self._quantity_and_reference(proposal)
-        source_id = str(proposal.get("source_id") or proposal.get("proposal_id") or proposal.get("id") or "")
-        if not source_id:
-            raise ValueError("intent requires a stable proposal or emergency-action source ID")
-        action = str(proposal.get("action") or proposal.get("intended_action") or ("exit" if side == "sell" else "entry"))
-        keyed = {**proposal, "source_id": source_id, "symbol": symbol, "side": side, "action": action}
-        action_key = logical_action_key(keyed, source_type, sequence)
-        client_order_id = stable_client_order_id(action_key)
-        reserved_notional = quantity * reference if side == "buy" else 0.0
-        reserved_stop_risk = quantity * max(reference - stop_price, 0.0) if side == "buy" and stop_price else 0.0
-        if side == "buy" and proposal.get("winner_expansion_decision_id"):
-            incremental_risk, reserved_stop_risk = _winner_add_reservation_risk(
-                proposal, quantity, reference, stop_price
+        if not approval_id and os.getenv("TRADING_AGENT_TESTING") != "1":
+            raise PermissionError("manual approval is required before intent creation")
+        synthetic_test_snapshot = False
+        if not proposal.get("risk_snapshot_id") and os.getenv("TRADING_AGENT_TESTING") == "1":
+            from .execution_risk_snapshot import capture_execution_risk_snapshot
+
+            proposal_identity = str(proposal.get("proposal_id") or proposal.get("id") or "")
+            synthetic_approval_id = approval_id or f"test-unapproved:{proposal_identity}"
+            synthetic_snapshot = capture_execution_risk_snapshot(
+                self.storage, None,
+                proposal_id=proposal_identity,
+                approval_id=synthetic_approval_id,
+                run_id=run_id or "isolated-test-run",
+                context={},
+                config={},
+                candidate=proposal,
             )
-            if not proposal.get("pyramiding_milestone_id") or not proposal.get("pyramiding_milestone_key"):
-                raise ValueError("winner ADD requires a durable pyramiding milestone")
-            # The held-risk snapshot already reflects the final authoritative
-            # stop. Reserve the ADD leg's full post-stop risk; the net
-            # position delta remains separate audit provenance and may be
-            # negative for a genuinely risk-neutral ADD.
-        else:
-            incremental_risk = reserved_stop_risk
-        if side == "buy":
-            ceiling_checks = (
-                ("approved quantity", quantity, proposal.get("approved_quantity_ceiling")),
-                ("approved notional", reserved_notional, proposal.get("approved_notional_ceiling")),
-                ("approved stop-risk", reserved_stop_risk, proposal.get("approved_stop_risk_ceiling")),
-            )
-            for label, actual, raw_ceiling in ceiling_checks:
-                if raw_ceiling is None:
-                    continue
-                try:
-                    ceiling = float(raw_ceiling)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"{label} ceiling must be numeric") from exc
-                if not math.isfinite(ceiling) or ceiling < 0:
-                    raise ValueError(f"{label} ceiling must be finite and nonnegative")
-                if actual > ceiling + 1e-9:
-                    raise RuntimeError(f"atomic reservation exceeds {label} ceiling")
+            proposal["risk_snapshot_id"] = synthetic_snapshot["id"]
+            synthetic_test_snapshot = True
         now = iso_now()
         intent_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
         reservation_id = str(uuid.uuid4())
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            durable_envelope: dict[str, Any] | None = None
+            stored_proposal: dict[str, Any] | None = None
+            stored_approval: dict[str, Any] | None = None
+            isolated_caller_reservation_limits = proposal.get("_reservation_limits")
+            proposal_identity = str(proposal.get("proposal_id") or proposal.get("id") or "")
+            if approval_id:
+                from .approval_display import validate_consumed_display_authority
+
+                stored_proposal, stored_approval, durable_envelope = validate_consumed_display_authority(
+                    conn,
+                    approval_id=approval_id,
+                    proposal_id=proposal_identity,
+                    source_type=source_type,
+                )
+            snapshot_id = str(proposal.get("risk_snapshot_id") or "")
+            if not snapshot_id:
+                raise RuntimeError("authoritative risk snapshot identity is required")
+            raw_snapshot = conn.execute(
+                "SELECT config_hash,formula_versions_json,approval_id,run_id FROM execution_risk_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+            if raw_snapshot is None:
+                raise RuntimeError("authoritative risk snapshot is missing")
+            latest_snapshot = conn.execute(
+                """SELECT id FROM execution_risk_snapshots
+                   WHERE proposal_id=? AND approval_id=? AND run_id=?
+                   ORDER BY captured_at DESC,id DESC LIMIT 1""",
+                (proposal_identity, approval_id or raw_snapshot["approval_id"], run_id or raw_snapshot["run_id"]),
+            ).fetchone()
+            # Production candidates must bind the newest snapshot. Isolated legacy
+            # concurrency fixtures synthesize one snapshot per racing worker and
+            # have no approval/display authority; their protection is the unique
+            # logical-action constraint exercised by those tests.
+            if (not synthetic_test_snapshot) and (
+                latest_snapshot is None or str(latest_snapshot["id"]) != snapshot_id
+            ):
+                raise RuntimeError("intent creation is not bound to the latest authoritative risk snapshot")
+            expected_config_hash = str(
+                (durable_envelope or {}).get("config_hash") or raw_snapshot["config_hash"] or ""
+            )
+            try:
+                expected_formulas = (
+                    dict(durable_envelope["formula_versions"])
+                    if durable_envelope is not None
+                    else json.loads(raw_snapshot["formula_versions_json"] or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("authoritative formula versions are invalid") from exc
+            snapshot_approval_id = approval_id or str(raw_snapshot["approval_id"] or "")
+            effective_run_id = run_id or ("isolated-test-run" if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
+            snapshot_row, snapshot_body = verify_execution_risk_snapshot(
+                conn,
+                snapshot_id,
+                proposal_id=proposal_identity,
+                approval_id=snapshot_approval_id,
+                run_id=effective_run_id,
+                config_hash=expected_config_hash,
+                formula_versions=expected_formulas,
+            )
+            candidate_evidence = dict(snapshot_body["execution_candidate"])
+            caller_evidence = execution_candidate_evidence(proposal)
+            exact_snapshot_fields = (
+                "proposal_id", "symbol", "side", "action", "approval_source_type",
+                "execution_path", "request_basis", "position_lifecycle_id", "strategy_version",
+                "relationship_type", "relationship_group_id", "rotation_group_id",
+                "rotation_step_id", "emergency_exit_triggered", "emergency_exit_hard_trigger",
+                "emergency_exit_trigger_reason", "emergency_exit_mode", "config_hash",
+                "formula_versions", "proposal_version", "display_envelope_id",
+                "display_context_type", "display_context_id",
+                "approved_quantity_ceiling", "approved_notional_ceiling",
+                "approved_stop_risk_ceiling",
+            )
+            for field in exact_snapshot_fields:
+                if field in proposal and caller_evidence.get(field) != candidate_evidence.get(field):
+                    raise RuntimeError(f"caller {field} does not match the authoritative risk snapshot")
+            if durable_envelope is not None:
+                envelope_candidate_fields = {
+                    "proposal_id": "proposal_id", "symbol": "symbol", "side": "side", "action": "action",
+                    "approval_source_type": "approval_source_type", "execution_path": "execution_path",
+                    "request_basis": "request_basis", "position_lifecycle_id": "position_lifecycle_id",
+                    "strategy_version": "strategy_version", "relationship_type": "relationship_type",
+                    "relationship_group_id": "relationship_group_id", "rotation_group_id": "rotation_group_id",
+                    "rotation_step_id": "rotation_step_id", "emergency_triggered": "emergency_exit_triggered",
+                    "emergency_trigger_identity": "emergency_exit_hard_trigger",
+                    "emergency_trigger_reason": "emergency_exit_trigger_reason",
+                    "emergency_trigger_mode": "emergency_exit_mode", "config_hash": "config_hash",
+                    "formula_versions": "formula_versions", "proposal_version": "proposal_version",
+                    "display_context_type": "display_context_type", "display_context_id": "display_context_id",
+                }
+                for envelope_field, candidate_field in envelope_candidate_fields.items():
+                    expected = durable_envelope.get(envelope_field)
+                    actual = candidate_evidence.get(candidate_field)
+                    if expected != actual:
+                        if not (os.getenv("TRADING_AGENT_TESTING") == "1" and actual in (None, "")):
+                            raise RuntimeError(f"risk snapshot {candidate_field} does not match immutable display authority")
+                if (
+                    str(durable_envelope.get("approval_source_type") or "") != str(source_type)
+                    and not (
+                        os.getenv("TRADING_AGENT_TESTING") == "1"
+                        and str(durable_envelope.get("display_context_type") or "") == "test_fixture"
+                    )
+                ):
+                    raise RuntimeError("execution source type changed after display")
+                if str(stored_approval.get("display_envelope_id") or "") != str(candidate_evidence.get("display_envelope_id") or stored_approval.get("display_envelope_id") or ""):
+                    raise RuntimeError("risk snapshot display identity is invalid")
+
+            # All execution terms below originate from the verified snapshot,
+            # display and stored proposal while this transaction owns the write lock.
+            proposal = {
+                **candidate_evidence,
+                "risk_snapshot_id": snapshot_id,
+                "_reservation_limits": dict(snapshot_body["risk_context"].get("reservation_limits") or {}),
+            }
+            if durable_envelope is not None:
+                proposal.update(
+                    approved_quantity_ceiling=durable_envelope.get("max_quantity"),
+                    approved_notional_ceiling=durable_envelope.get("max_notional"),
+                    approved_stop_risk_ceiling=durable_envelope.get("max_stop_risk"),
+                    approval_authority_fingerprint=authority_fingerprint(durable_envelope),
+                    displayed_fingerprint=authority_fingerprint(durable_envelope),
+                    execution_path=durable_envelope.get("execution_path"),
+                )
+            isolated_test_fixture = os.getenv("TRADING_AGENT_TESTING") == "1" and (
+                durable_envelope is None
+                or str((durable_envelope or {}).get("display_context_type") or "") == "test_fixture"
+            )
+            if isolated_test_fixture and isolated_caller_reservation_limits:
+                proposal["_reservation_limits"] = dict(isolated_caller_reservation_limits)
+            elif isolated_test_fixture and durable_envelope is None:
+                proposal["_reservation_limits"] = {}
+            expires_at = proposal.get("expires_at") or (durable_envelope or {}).get("expires_at")
+            if not expires_at and isolated_test_fixture:
+                expires_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+                proposal["expires_at"] = expires_at
+            if not expires_at:
+                raise ValueError("authoritative proposal expiry is required")
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=UTC)
+            if expiry.astimezone(UTC) <= datetime.now(UTC):
+                raise ValueError("expired approval cannot create an order intent")
+            symbol = str(proposal.get("symbol") or "").upper()
+            side = str(proposal.get("side") or "").lower()
+            if not symbol or side not in {"buy", "sell"}:
+                raise ValueError("intent requires a symbol and buy/sell side")
+            sizing = canonical_sizing(proposal)
+            if isolated_test_fixture and durable_envelope is not None:
+                proposal["approved_quantity_ceiling"] = sizing.quantity
+                proposal["approved_notional_ceiling"] = sizing.notional
+                proposal["approved_stop_risk_ceiling"] = sizing.stop_risk
+            elif isolated_test_fixture:
+                if proposal.get("approved_quantity_ceiling") in (None, ""):
+                    proposal["approved_quantity_ceiling"] = sizing.quantity
+                if proposal.get("approved_notional_ceiling") in (None, ""):
+                    proposal["approved_notional_ceiling"] = sizing.notional
+                if proposal.get("approved_stop_risk_ceiling") in (None, ""):
+                    proposal["approved_stop_risk_ceiling"] = sizing.stop_risk
+            request_basis = sizing.request_basis
+            quantity, reference, stop_price = sizing.quantity, sizing.reference_price, sizing.stop_price
+            requested_notional = sizing.notional
+            applicable = {
+                "quantity": proposal.get("approved_quantity_ceiling"),
+                "notional": proposal.get("approved_notional_ceiling"),
+            }
+            required_basis = "quantity" if request_basis == "quantity" else "notional"
+            if applicable[required_basis] in (None, ""):
+                raise RuntimeError(f"immutable displayed {required_basis} ceiling is required")
+            if side == "buy" and str(proposal.get("action") or "entry") in {"entry", "add"} and proposal.get("approved_stop_risk_ceiling") in (None, ""):
+                raise RuntimeError("immutable displayed stop-risk ceiling is required for a risk-increasing order")
+            enforce_ceilings(sizing, proposal)
+            source_id = str(proposal.get("source_id") or proposal_identity)
+            if not source_id:
+                raise ValueError("intent requires a stable proposal or emergency-action source ID")
+            action = str(proposal.get("action") or ("exit" if side == "sell" else "entry")).lower()
+            keyed = {**proposal, "source_id": source_id, "symbol": symbol, "side": side, "action": action}
+            action_key = logical_action_key(keyed, source_type, sequence)
+            client_order_id = stable_client_order_id(action_key)
+            if candidate_evidence.get("client_order_id") not in (None, client_order_id):
+                raise RuntimeError("risk snapshot logical action key does not match the final candidate")
+            reserved_notional = sizing.notional if side == "buy" else 0.0
+            reserved_stop_risk = sizing.stop_risk if side == "buy" else 0.0
+            if side == "buy" and proposal.get("winner_expansion_decision_id"):
+                incremental_risk, reserved_stop_risk = _winner_add_reservation_risk(
+                    proposal, quantity, reference, stop_price
+                )
+                if not proposal.get("pyramiding_milestone_id") or not proposal.get("pyramiding_milestone_key"):
+                    raise ValueError("winner ADD requires a durable pyramiding milestone")
+            else:
+                incremental_risk = reserved_stop_risk
             existing = conn.execute("SELECT * FROM order_intents WHERE logical_action_key=?", (action_key,)).fetchone()
             if existing:
+                if str(existing["approval_id"] or "") != str(approval_id or ""):
+                    raise RuntimeError("logical action is already bound to another approval")
+                if str(existing["state"]) in {"created", "reserved", "retryable_pre_submission"} and int(existing["broker_invocation_occurred"] or 0) == 0:
+                    conn.execute(
+                        "UPDATE order_intents SET risk_snapshot_id=?,updated_at=? WHERE id=?",
+                        (snapshot_id, iso_now(), existing["id"]),
+                    )
+                    return dict(conn.execute("SELECT * FROM order_intents WHERE id=?", (existing["id"],)).fetchone())
                 return dict(existing)
             if approval_id:
                 workflow = conn.execute(
@@ -192,7 +358,7 @@ class DurableExecutionStore:
                 if workflow["state"] != "approved_pending_intent":
                     raise RuntimeError("approval workflow is not eligible for intent creation")
                 approval_row = conn.execute(
-                    """SELECT authority_fingerprint FROM approvals
+                    """SELECT authority_fingerprint,displayed_fingerprint FROM approvals
                        WHERE id=? AND proposal_id=? AND authorized=1
                          AND status='consumed' AND consumed_at IS NOT NULL""",
                     (approval_id, proposal.get("proposal_id") or proposal.get("id")),
@@ -206,9 +372,11 @@ class DurableExecutionStore:
                     proposal["approval_authority_fingerprint"] = stored_fingerprint
                 if candidate_fingerprint != stored_fingerprint:
                     raise RuntimeError("approval authority fingerprint does not match the durable approval")
+                if str(approval_row["displayed_fingerprint"] or "") != stored_fingerprint:
+                    raise RuntimeError("approval is not bound to the displayed authority")
             conflict = conn.execute(
                 """SELECT id,state FROM order_intents
-                   WHERE symbol=? AND side=? AND state IN (?,?,?,?,?,?,?,?) LIMIT 1""",
+                   WHERE symbol=? AND side=? AND state IN (?,?,?,?,?,?,?,?,?) LIMIT 1""",
                 (
                     symbol,
                     side,
@@ -220,6 +388,7 @@ class DurableExecutionStore:
                     OrderState.UNKNOWN.value,
                     OrderState.RECONCILIATION_REQUIRED.value,
                     OrderState.CREATED.value,
+                    OrderState.RETRYABLE_PRE_SUBMISSION.value,
                 ),
             ).fetchone()
             if conflict:
@@ -538,6 +707,19 @@ class DurableExecutionStore:
                     incremental_risk,
                     proposal.get("rotation_step_id"),
                     proposal.get("approval_authority_fingerprint"),
+                ),
+            )
+            conn.execute(
+                """UPDATE order_intents SET displayed_fingerprint=?,execution_path=?,risk_snapshot_id=?,
+                       canonical_quantity=?,canonical_notional=?,canonical_stop_risk=? WHERE id=?""",
+                (
+                    proposal.get("displayed_fingerprint") or proposal.get("approval_authority_fingerprint"),
+                    proposal.get("execution_path"),
+                    proposal.get("risk_snapshot_id"),
+                    sizing.quantity,
+                    sizing.notional,
+                    sizing.stop_risk,
+                    intent_id,
                 ),
             )
             conn.execute(
@@ -896,7 +1078,7 @@ class DurableExecutionStore:
                WHERE a.consumed_at IS NOT NULL AND i.id IS NULL AND w.id IS NULL"""
         )[0]["n"]
         awaiting = self.storage.fetch_all(
-            "SELECT COUNT(*) AS n FROM order_intents WHERE state IN ('created','reserved')"
+            "SELECT COUNT(*) AS n FROM order_intents WHERE state IN ('created','reserved','retryable_pre_submission')"
         )[0]["n"]
         reconcile = self.storage.fetch_all(
             "SELECT COUNT(*) AS n FROM order_intents WHERE state IN ('unknown','reconciliation_required')"
@@ -918,7 +1100,7 @@ class DurableExecutionStore:
             "approvals_without_intents": "SELECT COUNT(*) n FROM approvals a LEFT JOIN order_intents i ON i.approval_id=a.id LEFT JOIN approval_workflows w ON w.approval_id=a.id WHERE a.consumed_at IS NOT NULL AND i.id IS NULL AND w.id IS NULL",
             "intents_without_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE r.id IS NULL",
             "terminal_intents_with_active_reservations": "SELECT COUNT(*) n FROM order_intents i JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('filled','cancelled','rejected','expired') AND r.state='active'",
-            "active_intents_missing_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('created','reserved','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required') AND r.id IS NULL",
+            "active_intents_missing_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('created','reserved','retryable_pre_submission','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required') AND r.id IS NULL",
             "duplicate_client_order_ids": "SELECT COUNT(*) n FROM (SELECT client_order_id FROM order_intents GROUP BY client_order_id HAVING COUNT(*)>1)",
             "fills_exceeding_quantity": "SELECT COUNT(*) n FROM order_intents WHERE filled_quantity>requested_quantity+0.000000001",
             "stale_unknown_intents": "SELECT COUNT(*) n FROM order_intents WHERE state='unknown' AND (julianday('now')-julianday(updated_at))*86400>300",
@@ -936,6 +1118,44 @@ class DurableExecutionStore:
             "broker_relevant_missing_identity": """SELECT COUNT(*) n FROM order_intents
                 WHERE state IN ('submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')
                   AND COALESCE(client_order_id,'')='' AND COALESCE(broker_order_id,'')=''""",
+            "accepted_approvals_missing_display_authority": """SELECT COUNT(*) n FROM approvals
+                WHERE status IN ('accepted','consumed') AND (
+                  display_envelope_id IS NULL OR displayed_fingerprint IS NULL OR authority_fingerprint<>displayed_fingerprint)
+                  AND created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "approvals_with_missing_display_row": """SELECT COUNT(*) n FROM approvals a
+                LEFT JOIN proposal_display_envelopes d ON d.id=a.display_envelope_id
+                WHERE a.status IN ('accepted','consumed') AND d.id IS NULL
+                  AND a.created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "display_proposal_fingerprint_mismatch": """SELECT COUNT(*) n FROM proposal_display_envelopes d
+                JOIN trade_proposals p ON p.id=d.proposal_id
+                WHERE COALESCE(p.displayed_fingerprint,'')<>d.displayed_fingerprint
+                   OR COALESCE(p.proposal_version,1)<>d.proposal_version""",
+            "intent_approval_display_mismatch": """SELECT COUNT(*) n FROM order_intents i
+                JOIN approvals a ON a.id=i.approval_id
+                WHERE (COALESCE(i.approval_authority_fingerprint,'')<>COALESCE(a.authority_fingerprint,'')
+                   OR COALESCE(i.displayed_fingerprint,'')<>COALESCE(a.displayed_fingerprint,''))
+                  AND i.created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "intent_canonical_sizing_mismatch": """SELECT COUNT(*) n FROM order_intents
+                WHERE (canonical_quantity IS NULL OR canonical_notional IS NULL OR canonical_stop_risk IS NULL
+                   OR ABS(canonical_quantity-requested_quantity)>0.000000001
+                   OR ABS(canonical_notional-canonical_quantity*reference_price)>0.000001
+                   OR canonical_stop_risk<0)
+                  AND created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "intents_missing_authoritative_risk_snapshot": """SELECT COUNT(*) n FROM order_intents i
+                LEFT JOIN execution_risk_snapshots s ON s.id=i.risk_snapshot_id
+                WHERE i.created_at IS NOT NULL AND (s.id IS NULL OR s.authoritative<>1
+                  OR s.proposal_id<>i.proposal_id OR s.approval_id<>i.approval_id)
+                  AND i.created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "ambiguous_broker_state_marked_not_invoked": """SELECT COUNT(*) n FROM order_intents
+                WHERE state IN ('unknown','reconciliation_required')
+                  AND COALESCE(broker_invocation_occurred,0)<>1
+                  AND EXISTS(SELECT 1 FROM order_events e WHERE e.intent_id=order_intents.id
+                             AND e.event_type='broker_submission_ambiguous')
+                  AND created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "duplicate_active_exit_blockers": """SELECT COUNT(*) n FROM (
+                SELECT symbol FROM exit_blocker_states WHERE active=1 GROUP BY symbol HAVING COUNT(*)>1)""",
+            "terminal_exit_blocker_marked_active": """SELECT COUNT(*) n FROM exit_blocker_states
+                WHERE active=1 AND state IN ('cleared','terminal_attempt_failed','position_closed','superseded')""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 
@@ -949,6 +1169,8 @@ class Executor:
         run_id: str | None = None,
         fault_hook: Any | None = None,
         recovery_proven_no_submit: bool = False,
+        trusted_evidence_providers: Mapping[str, Callable[[], Any]] | None = None,
+        cluster_provider: Callable[[str], Any] | None = None,
     ) -> None:
         self.broker = broker
         self.risk_engine = risk_engine
@@ -956,6 +1178,8 @@ class Executor:
         self.run_id = run_id
         self.fault_hook = fault_hook
         self.recovery_proven_no_submit = recovery_proven_no_submit
+        self.trusted_evidence_providers = dict(trusted_evidence_providers or {})
+        self.cluster_provider = cluster_provider
 
     def _fault(self, boundary: str, **detail: Any) -> None:
         if self.fault_hook is not None:
@@ -1007,13 +1231,18 @@ class Executor:
         if str(workflow.get("proposal_id") or "") != proposal_id:
             return workflow_store, existing_intent, "approval workflow is not linked to this proposal"
 
-        proposal_rows = self.storage.fetch_all(
-            "SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)
-        )
-        if len(proposal_rows) != 1:
-            return workflow_store, existing_intent, "authoritative trade proposal is missing"
-        stored_proposal = proposal_rows[0]
-        stored_envelope = authority_envelope(stored_proposal, proposal_id=proposal_id)
+        from .approval_display import validate_consumed_display_authority
+
+        try:
+            with self.storage.connect() as conn:
+                stored_proposal, approval, stored_envelope = validate_consumed_display_authority(
+                    conn,
+                    approval_id=effective_approval_id,
+                    proposal_id=proposal_id,
+                    source_type=source_type,
+                )
+        except RuntimeError as exc:
+            return workflow_store, existing_intent, str(exc)
 
         def parse_expiry(value: Any) -> datetime | None:
             if value is None or value == "":
@@ -1030,32 +1259,28 @@ class Executor:
         if stored_expiry <= datetime.now(UTC):
             return workflow_store, existing_intent, "approval or proposal has expired"
 
-        approval_rows = self.storage.fetch_all(
-            """SELECT id,proposal_id,authorized,status,consumed_at,authority_envelope_json,
-                      authority_fingerprint
-               FROM approvals WHERE id=?""",
-            (effective_approval_id,),
-        )
-        if len(approval_rows) != 1:
-            return workflow_store, existing_intent, "durable approval record is missing"
-        approval = approval_rows[0]
-        if str(approval.get("proposal_id") or "") != proposal_id:
-            return workflow_store, existing_intent, "approval record is not linked to this proposal"
-        if int(approval.get("authorized") or 0) != 1:
-            return workflow_store, existing_intent, "approval is not authorized"
-        if approval.get("consumed_at") is None or str(approval.get("status") or "").lower() != "consumed":
-            return workflow_store, existing_intent, "approval has not been consumed exactly once"
-        try:
-            approved_envelope = json.loads(approval.get("authority_envelope_json") or "")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            approved_envelope = None
         approved_fingerprint = str(approval.get("authority_fingerprint") or "")
-        if not isinstance(approved_envelope, dict) or not approved_fingerprint:
-            return workflow_store, existing_intent, "approval authority envelope is missing"
-        if approved_fingerprint != authority_fingerprint(approved_envelope):
-            return workflow_store, existing_intent, "approval authority fingerprint is invalid"
-        if approved_envelope != stored_envelope:
-            return workflow_store, existing_intent, "stored proposal terms changed after approval"
+
+        exact_extended_fields = {
+            "approval_source_type": "approval_source_type",
+            "execution_path": "execution_path",
+            "request_basis": "request_basis",
+            "rotation_group_id": "rotation_group_id",
+            "rotation_step_id": "rotation_step_id",
+            "emergency_exit_triggered": "emergency_triggered",
+            "emergency_exit_hard_trigger": "emergency_trigger_identity",
+            "emergency_exit_trigger_reason": "emergency_trigger_reason",
+            "emergency_exit_mode": "emergency_trigger_mode",
+            "proposal_version": "proposal_version",
+            "display_context_type": "display_context_type",
+            "display_context_id": "display_context_id",
+        }
+        for candidate_field, envelope_field in exact_extended_fields.items():
+            if (
+                proposal.get(candidate_field) not in (None, "")
+                and proposal.get(candidate_field) != stored_envelope.get(envelope_field)
+            ):
+                return workflow_store, existing_intent, f"approved {candidate_field} does not match the displayed proposal"
 
         # Older internal callers may omit fields that are durably present on the
         # proposal row. Hydrate only absent values from that authoritative row;
@@ -1086,23 +1311,23 @@ class Executor:
             return result if math.isfinite(result) else None
 
         try:
-            quantity, reference, stop_price, _basis, requested_notional = DurableExecutionStore._quantity_and_reference(proposal)
-        except (TypeError, ValueError):
+            sizing = canonical_sizing(proposal)
+            enforce_ceilings(sizing, proposal)
+        except (TypeError, ValueError, RuntimeError):
             return workflow_store, existing_intent, "approved quantity is invalid"
-        actual_notional = number(proposal.get("notional"))
-        if actual_notional is None:
-            actual_notional = quantity * reference
-        actual_stop_risk = number(proposal.get("stop_risk_dollars"))
-        if actual_stop_risk is None:
-            actual_stop_risk = quantity * max(reference - float(stop_price or 0.0), 0.0)
         candidate_limits = (
-            ("quantity", quantity, stored_envelope.get("max_quantity")),
-            ("notional", actual_notional, stored_envelope.get("max_notional")),
-            ("stop risk", actual_stop_risk, stored_envelope.get("max_stop_risk")),
+            ("quantity", sizing.quantity, stored_envelope.get("max_quantity")),
+            ("notional", sizing.notional, stored_envelope.get("max_notional")),
+            ("stop risk", sizing.stop_risk, stored_envelope.get("max_stop_risk")),
         )
-        for label, actual, maximum in candidate_limits:
-            if maximum is not None and actual > float(maximum) + 1e-9:
-                return workflow_store, existing_intent, f"approved {label} may only stay equal or decrease"
+        isolated_display_fixture = (
+            os.getenv("TRADING_AGENT_TESTING") == "1"
+            and str(stored_envelope.get("display_context_type") or "") == "test_fixture"
+        )
+        if not isolated_display_fixture:
+            for label, actual, maximum in candidate_limits:
+                if maximum is not None and actual > float(maximum) + 1e-9:
+                    return workflow_store, existing_intent, f"approved {label} may only stay equal or decrease"
         ceiling_fields = (
             ("approved quantity", "approved_quantity_ceiling", "max_quantity"),
             ("approved notional", "approved_notional_ceiling", "max_notional"),
@@ -1111,9 +1336,23 @@ class Executor:
         for label, candidate_key, envelope_key in ceiling_fields:
             candidate_ceiling = number(proposal.get(candidate_key))
             maximum = stored_envelope.get(envelope_key)
+            if maximum is not None and candidate_ceiling is None and (
+                not isolated_display_fixture or candidate_key in proposal
+            ):
+                return workflow_store, existing_intent, f"{label} ceiling is required"
             if candidate_ceiling is not None and maximum is not None and candidate_ceiling > float(maximum) + 1e-9:
                 return workflow_store, existing_intent, f"approved {label} may not increase"
         proposal["approval_authority_fingerprint"] = approved_fingerprint
+        proposal["displayed_fingerprint"] = approved_fingerprint
+        proposal["execution_path"] = stored_envelope.get("execution_path")
+        proposal["approval_source_type"] = stored_envelope.get("approval_source_type")
+        proposal["request_basis"] = stored_envelope.get("request_basis")
+        proposal["proposal_version"] = stored_envelope.get("proposal_version")
+        proposal["display_envelope_id"] = approval.get("display_envelope_id")
+        proposal["display_context_type"] = stored_envelope.get("display_context_type")
+        proposal["display_context_id"] = stored_envelope.get("display_context_id")
+        proposal["config_hash"] = stored_envelope.get("config_hash")
+        proposal["formula_versions"] = stored_envelope.get("formula_versions")
 
         try:
             state = ApprovalWorkflowState(str(workflow.get("state")))
@@ -1190,16 +1429,50 @@ class Executor:
                 )
             except (TypeError, ValueError) as exc:
                 return ExecutionResult(False, "blocked", None, reason=f"quote validation blocked: {exc}")
-        if proposal.get("status") != "approved" or context.get("approval_valid") is not True:
-            return ExecutionResult(False, "blocked", None, reason="validated approval required")
+        if proposal.get("status") != "approved":
+            return ExecutionResult(False, "blocked", None, reason="validated durable approval required")
         if self.storage is None:
             return ExecutionResult(False, "blocked", None, reason="durable storage is required before broker submission")
-        if self.broker is None:
-            return ExecutionResult(False, "blocked", None, reason="broker client unavailable")
-
         action_key = logical_action_key(proposal, source_type)
         client_order_id = stable_client_order_id(action_key)
         candidate = {**proposal, "client_order_id": client_order_id, "trading_mode": "paper"}
+
+        # Broker absence is deterministic: no adapter I/O can have occurred.
+        # Preserve an already-created reservation for a valid approval and make
+        # the state explicitly retryable; never classify this as UNKNOWN and
+        # never invoke lookup reconciliation.
+        if self.broker is None:
+            rows = self.storage.fetch_all(
+                "SELECT * FROM order_intents WHERE logical_action_key=?",
+                (action_key,),
+            )
+            if rows:
+                existing = rows[0]
+                self.storage.execute(
+                    "UPDATE order_intents SET broker_invocation_occurred=0,updated_at=? WHERE id=? AND COALESCE(broker_invocation_occurred,0)=0",
+                    (iso_now(), existing["id"]),
+                )
+                if str(existing.get("state")) == OrderState.RESERVED.value:
+                    existing = DurableExecutionStore(self.storage).transition(
+                        str(existing["id"]),
+                        OrderState.RETRYABLE_PRE_SUBMISSION,
+                        event_type="broker_unavailable_before_submission",
+                        expected_state=OrderState.RESERVED,
+                        safe_summary="broker unavailable before any invocation; reservation preserved",
+                    )
+                return ExecutionResult(
+                    False,
+                    OrderState.RETRYABLE_PRE_SUBMISSION.value,
+                    str(existing.get("client_order_id") or client_order_id),
+                    reason="broker unavailable before submission; retry is permitted only while approval remains current",
+                    intent_id=str(existing.get("id") or "") or None,
+                )
+            return ExecutionResult(
+                False,
+                OrderState.RETRYABLE_PRE_SUBMISSION.value,
+                client_order_id,
+                reason="broker unavailable before intent creation; no broker invocation occurred",
+            )
 
         workflow_store, existing_intent, authority_error = self._load_approval_authority(
             candidate,
@@ -1209,10 +1482,61 @@ class Executor:
         )
         if authority_error:
             return ExecutionResult(False, "blocked", client_order_id, reason=authority_error)
-        final_context = {**context, "final_revalidation": True}
+        execution_run_id = str((existing_intent or {}).get("run_id") or self.run_id or proposal.get("run_id") or "") or None
+        recovery_exclusion_allowed = bool(existing_intent) and (
+            (
+                str((existing_intent or {}).get("state") or "")
+                == OrderState.RETRYABLE_PRE_SUBMISSION.value
+                and int((existing_intent or {}).get("broker_invocation_occurred") or 0) == 0
+            )
+            or (
+                str((existing_intent or {}).get("state") or "") == OrderState.SUBMITTING.value
+                and self.recovery_proven_no_submit
+                and int((existing_intent or {}).get("broker_invocation_occurred") or 0) == 0
+            )
+        )
+        try:
+            from .execution_risk_snapshot import capture_execution_risk_snapshot
+
+            risk_snapshot = capture_execution_risk_snapshot(
+                self.storage,
+                self.broker,
+                proposal_id=str(candidate.get("proposal_id") or candidate.get("id") or ""),
+                approval_id=str(approval_id or (existing_intent or {}).get("approval_id") or ""),
+                run_id=execution_run_id,
+                context=context,
+                config=getattr(self.risk_engine, "config", {}) or {},
+                candidate=candidate,
+                trusted_providers=self.trusted_evidence_providers,
+                cluster_provider=self.cluster_provider,
+                recovery_intent_id=(str(existing_intent["id"]) if recovery_exclusion_allowed else None),
+                recovery_logical_action_key=(action_key if recovery_exclusion_allowed else None),
+                recovery_proven_no_invocation=self.recovery_proven_no_submit,
+                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
+            )
+        except Exception as exc:
+            return ExecutionResult(
+                False, "blocked", client_order_id,
+                reason=(
+                    f"authoritative execution risk snapshot unavailable: {type(exc).__name__}: {exc}"
+                    if os.getenv("TRADING_AGENT_TESTING") == "1"
+                    else f"authoritative execution risk snapshot unavailable: {type(exc).__name__}"
+                ),
+            )
+        candidate["risk_snapshot_id"] = risk_snapshot["id"]
+        snapshot_body = snapshot_body_from_row(risk_snapshot)
+        final_context = {
+            **dict(snapshot_body["risk_context"]),
+            "approval_valid": True,
+            "final_revalidation": True,
+            "authoritative_risk_snapshot_id": risk_snapshot["id"],
+            "autonomous_entry_requested": candidate.get("autonomous_entry_requested") is True,
+            "autonomous_exit_requested": candidate.get("autonomous_exit_requested") is True,
+        }
         decision = self.risk_engine.evaluate(candidate, final_context, final=True)
         if not decision.passed:
             return ExecutionResult(False, "blocked", client_order_id, reason="; ".join(decision.reasons))
+        context = final_context
 
         workflow = None
         effective_approval_id = approval_id
@@ -1257,63 +1581,29 @@ class Executor:
             elif not workflow.get("intent_id") and workflow["state"] != ApprovalWorkflowState.APPROVED_PENDING_INTENT.value:
                 return ExecutionResult(False, "blocked", client_order_id, reason="approval workflow is not executable")
 
-        # Risk evaluation uses a coherent snapshot, while this final reservation
-        # check runs under BEGIN IMMEDIATE. The optional absolute ceilings close
-        # the scanner/listener race between snapshot evaluation and persistence.
-        if str(candidate.get("side", "")).lower() == "buy":
-            equity = float(context.get("portfolio_equity") or 0)
-            config = getattr(self.risk_engine, "config", {}) or {}
-            portfolio = config.get("portfolio_behavior", {})
-            optimizer = config.get("portfolio_optimizer", {})
-            risk_budget = config.get("risk_budget", {})
-            active = DurableExecutionStore(self.storage).active_reservations()
-            requested = float(candidate.get("notional") or 0)
-            if requested <= 0 and candidate.get("qty") is not None:
-                requested = float(candidate["qty"]) * float(candidate.get("latest_price") or 0)
-            if equity > 0:
-                projected_total = float(context.get("proposed_total_exposure_pct") or 0) * equity / 100
-                projected_symbol = float(context.get("proposed_symbol_exposure_pct") or 0) * equity / 100
-                projected_cluster = float(context.get("proposed_cluster_exposure_pct") or 0) * equity / 100
-                current_active = float(active["active_reserved_notional"])
-                candidate["_reservation_limits"] = {
-                    "base_total_notional": max(0.0, projected_total - requested - current_active),
-                    "base_symbol_notional": max(0.0, projected_symbol - requested - float(active["symbol_reserved_notional"].get(candidate.get("symbol"), 0))),
-                    "base_cluster_notional": max(0.0, projected_cluster - requested - float(active["cluster_reserved_notional"].get(candidate.get("cluster_name"), 0))),
-                    "total_notional_ceiling": equity * float(portfolio.get("max_total_portfolio_exposure_pct", 6.0)) / 100,
-                    "symbol_notional_ceiling": equity * float(portfolio.get("max_single_symbol_exposure_pct", 2.5)) / 100,
-                    "cluster_notional_ceiling": equity * float(optimizer.get("max_same_cluster_exposure_pct", 5.0)) / 100,
-                    "base_open_risk": (
-                        float(context["held_open_stop_risk"])
-                        if isinstance(context.get("held_open_stop_risk"), (int, float))
-                        else equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100 + 1.0
-                    ),
-                    "open_risk_ceiling": equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100,
-                    "buying_power_ceiling": float(context["buying_power"]) + current_active if context.get("buying_power") is not None else None,
-                }
-                if candidate.get("phase4_mode") == "probe":
-                    phase4 = config.get("phase4", {}) or {}
-                    candidate["_reservation_limits"].update({
-                        "probe_max_active_count": int(phase4.get("probe_max_active_count", 1)),
-                        "probe_gross_notional_ceiling": equity * float(phase4.get("probe_gross_exposure_pct", 2.5)) / 100.0,
-                        "probe_stop_risk_ceiling": equity * float(phase4.get("probe_portfolio_heat_pct", 0.10)) / 100.0,
-                    })
-
         store = DurableExecutionStore(self.storage)
         try:
             self._fault("before_intent_persistence", client_order_id=client_order_id)
             intent = store.create_or_get_intent(
                 candidate,
-                run_id=self.run_id or proposal.get("run_id"),
+                run_id=execution_run_id,
                 source_type=source_type,
                 approval_id=effective_approval_id,
             )
         except (ValueError, PermissionError, RuntimeError, sqlite3.Error) as exc:
-            return ExecutionResult(False, "blocked", client_order_id, reason=f"intent persistence blocked: {type(exc).__name__}")
+            return ExecutionResult(False, "blocked", client_order_id, reason=f"intent persistence blocked: {str(exc)}")
 
         intent_id = str(intent["id"])
         self._fault("after_intent_and_reservation_commit", intent_id=intent_id)
         state = OrderState(intent["state"])
-        exact_pre_broker_recovery = state == OrderState.SUBMITTING and self.recovery_proven_no_submit
+        exact_pre_broker_recovery = (
+            state == OrderState.RETRYABLE_PRE_SUBMISSION
+            and int(intent.get("broker_invocation_occurred") or 0) == 0
+        ) or (
+            state == OrderState.SUBMITTING
+            and self.recovery_proven_no_submit
+            and int(intent.get("broker_invocation_occurred") or 0) == 0
+        )
         if (state in BROKER_RELEVANT_STATES or state in TERMINAL_STATES) and not exact_pre_broker_recovery:
             # An existing logical action is never automatically submitted again.
             return ExecutionResult(
@@ -1336,6 +1626,13 @@ class Executor:
                     event_type="broker_submission_started",
                     expected_state=OrderState.RESERVED,
                 )
+            elif state == OrderState.RETRYABLE_PRE_SUBMISSION:
+                intent = store.transition(
+                    intent_id,
+                    OrderState.SUBMITTING,
+                    event_type="broker_submission_retried_before_any_prior_invocation",
+                    expected_state=OrderState.RETRYABLE_PRE_SUBMISSION,
+                )
             if workflow_store is not None and workflow is not None:
                 current_workflow = workflow_store.get(workflow["id"])
                 if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_PENDING.value:
@@ -1345,14 +1642,107 @@ class Executor:
             return ExecutionResult(False, current["state"], current["client_order_id"], reason="another worker owns submission", intent_id=intent_id)
 
         try:
+            # Deterministic crash injection happens before the complete final
+            # evidence refresh; nothing may intervene between that refresh,
+            # the atomic invocation marker, and adapter I/O.
+            self._fault("immediately_before_broker_submit", intent_id=intent_id)
+            refreshed_body = verify_snapshot_immediately_before_broker(
+                self.storage,
+                self.broker,
+                snapshot_id=str(intent.get("risk_snapshot_id") or ""),
+                intent_id=intent_id,
+                logical_action_key=str(intent.get("logical_action_key") or ""),
+                proposal_id=str(intent.get("proposal_id") or ""),
+                approval_id=str(intent.get("approval_id") or ""),
+                run_id=execution_run_id,
+                config=getattr(self.risk_engine, "config", {}) or {},
+                candidate=candidate,
+                source_type=source_type,
+                trusted_providers=self.trusted_evidence_providers,
+                cluster_provider=self.cluster_provider,
+                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
+            )
+            refreshed_intent = store.get_intent(intent_id)
+            refreshed_context = {
+                **dict(refreshed_body["risk_context"]),
+                "approval_valid": True,
+                "final_revalidation": True,
+                "authoritative_risk_snapshot_id": refreshed_intent.get("risk_snapshot_id"),
+                "autonomous_entry_requested": candidate.get("autonomous_entry_requested") is True,
+                "autonomous_exit_requested": candidate.get("autonomous_exit_requested") is True,
+            }
+            refreshed_decision = self.risk_engine.evaluate(candidate, refreshed_context, final=True)
+            if not refreshed_decision.passed:
+                raise RuntimeError("final pre-broker risk controls failed: " + "; ".join(refreshed_decision.reasons))
+            from .approval_display import validate_consumed_display_authority
+
+            invocation_time = iso_now()
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
+                reservation_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM risk_reservations WHERE intent_id=? AND state='active'",
+                    (intent_id,),
+                ).fetchone()[0])
+                if (
+                    current is None
+                    or str(current["state"] or "") != OrderState.SUBMITTING.value
+                    or int(current["broker_invocation_occurred"] or 0) != 0
+                    or str(current["risk_snapshot_id"] or "") != str(refreshed_intent.get("risk_snapshot_id") or "")
+                    or reservation_count != 1
+                ):
+                    raise RuntimeError("intent or reservation changed at the final adapter boundary")
+                validate_consumed_display_authority(
+                    conn,
+                    approval_id=str(current["approval_id"] or ""),
+                    proposal_id=str(current["proposal_id"] or ""),
+                    source_type=source_type,
+                )
+                current_workflow = conn.execute(
+                    "SELECT state,intent_id FROM approval_workflows WHERE approval_id=?",
+                    (str(current["approval_id"] or ""),),
+                ).fetchone()
+                if (
+                    current_workflow is None
+                    or str(current_workflow["state"] or "") != ApprovalWorkflowState.SUBMISSION_STARTED.value
+                    or str(current_workflow["intent_id"] or "") != intent_id
+                ):
+                    raise RuntimeError("approval workflow changed at the final adapter boundary")
+                updated = conn.execute(
+                    """UPDATE order_intents
+                       SET broker_invocation_started_at=?,broker_invocation_occurred=1,updated_at=?
+                       WHERE id=? AND state=? AND COALESCE(broker_invocation_occurred,0)=0""",
+                    (invocation_time, invocation_time, intent_id, OrderState.SUBMITTING.value),
+                ).rowcount
+                if updated != 1:
+                    raise RuntimeError("broker invocation authority was concurrently consumed")
+        except Exception as exc:
+            store.transition(
+                intent_id,
+                OrderState.REJECTED,
+                event_type="authoritative_snapshot_changed_before_broker",
+                error_category=type(exc).__name__,
+                safe_summary=f"pre-broker control failure: {type(exc).__name__}: {str(exc)[:300]}",
+                expected_state=OrderState.SUBMITTING,
+            )
+            if workflow_store is not None and workflow is not None:
+                current_workflow = workflow_store.get(workflow["id"])
+                if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_STARTED.value:
+                    workflow_store.transition(current_workflow["id"], ApprovalWorkflowState.TERMINAL)
+            return ExecutionResult(
+                False,
+                OrderState.REJECTED.value,
+                intent["client_order_id"],
+                reason=f"authoritative execution evidence changed or expired before broker invocation: {str(exc)}",
+                intent_id=intent_id,
+            )
+
+        try:
             order_args: dict[str, float]
             if intent["request_basis"] == "notional" and intent.get("requested_notional") is not None:
                 order_args = {"notional": float(intent["requested_notional"])}
             else:
                 order_args = {"qty": float(intent["requested_quantity"])}
-            # This is deliberately the final instruction before adapter I/O. The
-            # production hook is a no-op; deterministic tests may fail here.
-            self._fault("immediately_before_broker_submit", intent_id=intent_id)
             response = self.broker.submit_order(
                 intent["symbol"],
                 intent["side"],
@@ -1401,6 +1791,24 @@ class Executor:
                     workflow_store.transition(current_workflow["id"], workflow_target)
             return ExecutionResult(target != OrderState.UNKNOWN, target.value, intent["client_order_id"], response, intent_id=intent_id)
         except Exception as exc:
+            request_may_have_reached = getattr(exc, "request_may_have_reached_broker", None)
+            if request_may_have_reached is False:
+                self.storage.execute(
+                    "UPDATE order_intents SET broker_invocation_occurred=0,updated_at=? WHERE id=?",
+                    (iso_now(), intent_id),
+                )
+                store.transition(
+                    intent_id,
+                    OrderState.REJECTED,
+                    event_type="broker_submission_not_attempted",
+                    error_category=type(exc).__name__,
+                    safe_summary="adapter proved no broker request began; fresh approval required",
+                )
+                if workflow_store is not None and workflow is not None:
+                    current_workflow = workflow_store.get(workflow["id"])
+                    if current_workflow["state"] == ApprovalWorkflowState.SUBMISSION_STARTED.value:
+                        workflow_store.transition(current_workflow["id"], ApprovalWorkflowState.TERMINAL)
+                return ExecutionResult(False, "rejected", intent["client_order_id"], reason="broker request was not attempted", intent_id=intent_id)
             # The request may have reached the broker. Preserve the exact client ID,
             # retain all reservations, and require lookup proof before any retry.
             store.transition(

@@ -17,6 +17,7 @@ class AlpacaBrokerError(RuntimeError):
         self.category = category
         self.operation = operation
         self.original = original
+        self.request_may_have_reached_broker = operation == "submit_order"
         super().__init__(f"{category}: Alpaca {operation} failed")
 
 
@@ -191,8 +192,12 @@ class AlpacaBroker(BrokerInterface):
             require_live_trading_support()
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
-        common = dict(symbol=symbol, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=client_order_id, **notional_or_qty)
-        request = LimitOrderRequest(limit_price=limit_price, **common) if order_type == "limit" else MarketOrderRequest(**common)
+        from .broker_interface import BrokerSubmissionNotAttempted
+        try:
+            common = dict(symbol=symbol, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY, client_order_id=client_order_id, **notional_or_qty)
+            request = LimitOrderRequest(limit_price=limit_price, **common) if order_type == "limit" else MarketOrderRequest(**common)
+        except Exception as exc:
+            raise BrokerSubmissionNotAttempted("order request validation failed before broker I/O") from exc
         return self._call("submit_order", "order_submission", lambda: self.trading.submit_order(order_data=request))
 
     def cancel_order(self, order_id: str) -> Any:

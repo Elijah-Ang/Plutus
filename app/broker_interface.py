@@ -4,6 +4,12 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+class BrokerSubmissionNotAttempted(RuntimeError):
+    """Adapter proof that validation failed before any broker request began."""
+
+    request_may_have_reached_broker = False
+
+
 class BrokerInterface(ABC):
     @abstractmethod
     def get_account(self) -> Any: ...

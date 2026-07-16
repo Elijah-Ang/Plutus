@@ -73,16 +73,21 @@ def _workflow(
             telegram_update_id=update_id,
             initial_state=state,
         )
-        from app.approval_authority import authority_envelope, authority_fingerprint, canonical_json
-        envelope = authority_envelope(proposal, proposal_id=proposal_id)
+        from app.approval_authority import canonical_json
+        from app.approval_display import record_display
+        display = record_display(storage, proposal_id, str(update_id))
+        envelope = json.loads(display["displayed_envelope_json"])
         storage.execute(
             """INSERT INTO approvals(
                  id,run_id,proposal_id,sender_id,raw_message,parsed_action,authorized,status,created_at,
-                 consumed_at,authority_envelope_json,authority_fingerprint)
-               VALUES(?,?,?,?,?,?,1,'consumed',?,?,?,?)""",
+                 consumed_at,authority_envelope_json,authority_fingerprint,display_envelope_id,
+                 displayed_fingerprint,approval_source_type,execution_path)
+               VALUES(?,?,?,?,?,?,1,'consumed',?,?,?,?,?,?,?,?)""",
             (approval_id, "run", proposal_id, "owner", "approve", "approve", now.isoformat(), now.isoformat(),
-             canonical_json(envelope), authority_fingerprint(envelope)),
+             canonical_json(envelope), display["displayed_fingerprint"], display["id"],
+             display["displayed_fingerprint"], "proposal", "manual_paper_order"),
         )
+        storage.execute("UPDATE trade_proposals SET status='approved' WHERE id=?", (proposal_id,))
         return workflow
     store = ApprovalWorkflowStore(storage)
     accepted = store.accept_approval(
@@ -119,6 +124,16 @@ def test_duplicate_telegram_update_has_one_stable_workflow(tmp_path):
 def test_approval_acceptance_and_workflow_are_one_transaction(tmp_path):
     storage = _storage(tmp_path)
     store = ApprovalWorkflowStore(storage)
+    proposal = _proposal("proposal-atomic", status="pending")
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,telegram_message_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            proposal["id"], proposal["symbol"], proposal["side"], proposal["notional"], "pending",
+            datetime.now(UTC).isoformat(), proposal["expires_at"], "rule_based_v2", json.dumps(proposal), "10",
+        ),
+    )
     workflow = store.accept_approval(
         approval_id="approval-atomic",
         run_id="run-1",
@@ -144,7 +159,18 @@ def test_approval_acceptance_and_workflow_are_one_transaction(tmp_path):
     storage.execute(
         """CREATE TRIGGER fail_atomic_workflow BEFORE INSERT ON approval_workflows
            WHEN NEW.approval_id='approval-fault'
-           BEGIN SELECT RAISE(ABORT, 'injected workflow persistence failure'); END"""
+               BEGIN SELECT RAISE(ABORT, 'injected workflow persistence failure'); END"""
+    )
+    fault_proposal = _proposal("different-proposal", status="pending")
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            fault_proposal["id"], fault_proposal["symbol"], fault_proposal["side"], fault_proposal["notional"],
+            "pending", datetime.now(UTC).isoformat(), fault_proposal["expires_at"], "rule_based_v2",
+            json.dumps(fault_proposal),
+        ),
     )
     with pytest.raises(sqlite3.IntegrityError):
         store.accept_approval(

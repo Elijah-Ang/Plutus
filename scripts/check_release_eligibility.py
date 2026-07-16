@@ -149,6 +149,59 @@ def _decode_release_manifest(payload: Any) -> dict[str, Any] | None:
     return manifest if isinstance(manifest, dict) else None
 
 
+def _release_attestation_asset(repository: str, tag_name: str) -> dict[str, Any] | None:
+    release, error, _ = _github_json(
+        f"https://api.github.com/repos/{repository}/releases/tags/{urllib.parse.quote(tag_name, safe='')}"
+    )
+    if (
+        error
+        or not isinstance(release, dict)
+        or bool(release.get("draft"))
+        or release.get("immutable") is not True
+        or not release.get("id")
+    ):
+        return None
+    assets = release.get("assets") if isinstance(release.get("assets"), list) else []
+    matching = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == "release-attestation.json"]
+    asset = matching[0] if len(matching) == 1 else None
+    if (
+        asset is None
+        or not asset.get("url")
+        or not asset.get("id")
+        or not str(asset.get("digest") or "").startswith("sha256:")
+    ):
+        return None
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "plutus-release-eligibility",
+    }
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(str(asset["url"]), headers=headers), timeout=15
+        ) as response:
+            raw = response.read()
+        download_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if download_digest != str(asset["digest"]):
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "manifest": payload,
+        "release_id": int(release["id"]),
+        "release_immutable": True,
+        "asset_id": int(asset["id"]),
+        "asset_digest": str(asset["digest"]),
+        "asset_size": int(asset.get("size") or len(raw)),
+        "download_digest": download_digest,
+    }
+
+
 def _manifest_ci_identity(manifest: dict[str, Any]) -> tuple[str, str, str]:
     ci = manifest.get("ci") if isinstance(manifest.get("ci"), dict) else {}
     workflow = str(ci.get("workflow_name") or manifest.get("ci_workflow_name") or "")
@@ -174,14 +227,32 @@ def _verify_release_manifest(
     if str(tag_object.get("sha") or "") != sha:
         return False, f"{tag_name}: annotated tag does not point to the candidate commit"
 
-    manifest_payload, manifest_error, _ = _github_json(
-        f"https://api.github.com/repos/{repository}/contents/release-manifest.json?ref={urllib.parse.quote(sha, safe='')}"
-    )
-    manifest = _decode_release_manifest(manifest_payload)
-    if manifest_error or manifest is None:
-        return False, f"{tag_name}: immutable release manifest is missing or invalid"
+    attestation = _release_attestation_asset(repository, tag_name)
+    if attestation is None:
+        return False, f"{tag_name}: immutable GitHub release attestation asset is missing or invalid"
+    manifest = attestation.get("manifest") if isinstance(attestation, dict) else None
+    if not isinstance(manifest, dict):
+        return False, f"{tag_name}: immutable attestation evidence is incomplete"
+    if (
+        attestation.get("release_immutable") is not True
+        or not attestation.get("release_id")
+        or not attestation.get("asset_id")
+        or attestation.get("asset_digest") != attestation.get("download_digest")
+    ):
+        return False, f"{tag_name}: attestation asset identity or digest is not immutable and verified"
+    if str(manifest.get("tag_name") or "") != tag_name:
+        return False, f"{tag_name}: release attestation tag identity does not match"
     if str(manifest.get("release_commit") or manifest.get("commit_sha") or "") != sha:
         return False, f"{tag_name}: release manifest commit does not match the candidate"
+    attested_tree = str(manifest.get("git_tree_sha") or manifest.get("source_tree_sha") or "")
+    if not attested_tree or not str(manifest.get("tracked_source_inventory_digest") or ""):
+        return False, f"{tag_name}: release attestation is not bound to a tracked source tree"
+    remote_commit, remote_error, _ = _github_json(
+        f"https://api.github.com/repos/{repository}/git/commits/{sha}"
+    )
+    remote_tree = str(((remote_commit or {}).get("tree") or {}).get("sha") or "") if isinstance(remote_commit, dict) else ""
+    if remote_error or not remote_tree or remote_tree != attested_tree:
+        return False, f"{tag_name}: attested source tree does not match the immutable GitHub commit"
     if not config_hash or str(manifest.get("configuration_hash") or manifest.get("config_hash") or "") != str(config_hash):
         return False, f"{tag_name}: release manifest configuration hash does not match"
     schema_versions = manifest.get("required_schema_versions") or manifest.get("schema_versions")
@@ -202,7 +273,7 @@ def _verify_release_manifest(
         return False, f"{tag_name}: release manifest CI run does not match the remote exact-SHA run"
     if str(remote_ci.get("workflow_name") or "CI") != workflow:
         return False, f"{tag_name}: release manifest workflow identity does not match remote CI"
-    return True, f"{tag_name}: verified immutable release manifest"
+    return True, f"{tag_name}: verified immutable GitHub release attestation"
 
 
 def _release_reachability(
@@ -239,21 +310,14 @@ def _release_reachability(
             "reason": main_error or "GitHub main ref did not contain an exact SHA",
         }
 
-    ancestry = _run("git", "merge-base", "--is-ancestor", sha, remote_main_sha)
-    if ancestry.returncode == 0:
-        on_main = True
-    elif ancestry.returncode == 1:
-        on_main = False
-    else:
-        return {
-            "status": "unverified", "passed": False, "repository": repository,
-            "remote_main_sha": remote_main_sha,
-            "reason": "local ancestry check against the fetched remote SHA failed",
-        }
+    # Main authority is exact identity, never ancestry. Otherwise every old
+    # vulnerable ancestor of main remains deployable forever.
+    on_main = sha == remote_main_sha
 
     approved_tags: list[str] = []
     tag_manifest_verified: list[str] = []
     tag_rejection_reasons: list[str] = []
+    release_attestation_evidence: dict[str, Any] = {}
     tags_payload, tags_error, tags_status = _github_json(
         f"https://api.github.com/repos/{repository}/git/matching-refs/tags/immutable-release-"
     )
@@ -285,6 +349,15 @@ def _release_reachability(
             if verified:
                 approved_tags.append(tag_name)
                 tag_manifest_verified.append(tag_name)
+                evidence = _release_attestation_asset(repository, tag_name)
+                if isinstance(evidence, dict):
+                    release_attestation_evidence[tag_name] = {
+                        key: evidence.get(key)
+                        for key in (
+                            "release_id", "release_immutable", "asset_id", "asset_digest",
+                            "asset_size", "download_digest",
+                        )
+                    }
             else:
                 tag_rejection_reasons.append(reason)
 
@@ -294,13 +367,14 @@ def _release_reachability(
         "status": "passed" if on_main or tag_manifest_verified else "failed",
         "repository": repository,
         "remote_main_sha": remote_main_sha,
-        "reachable_from_github_main": on_main,
+        "exact_github_main_sha": on_main,
         "approved_immutable_release_tags": approved_tags,
         "annotated_immutable_release_tags": sorted(set(tag_manifest_verified)),
         "verified_release_manifest": sorted(set(tag_manifest_verified)),
+        "release_attestation_evidence": release_attestation_evidence,
         "configuration_hash_checked": bool(on_main and config_hash) or bool(tag_manifest_verified),
         "tag_rejection_reasons": tag_rejection_reasons,
-        "reason": None if on_main or tag_manifest_verified else "commit is not reachable from GitHub main or a verified remote immutable release manifest",
+        "reason": None if on_main or tag_manifest_verified else "commit is not the exact GitHub main SHA or a verified immutable release attestation",
     }
 
 

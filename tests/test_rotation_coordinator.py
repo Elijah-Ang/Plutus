@@ -133,6 +133,51 @@ def test_rotation_command_requires_explicit_group_target(coordinator):
     assert parsed.group_id == group["id"]
 
 
+@pytest.mark.parametrize("mutation", [
+    "exit_quantity", "exit_symbol", "exit_proposal", "exit_ordering", "lifecycle",
+    "contingent_entry", "authority_ids", "expiry", "reply_target",
+])
+def test_group_display_binds_complete_workflow_before_any_exit_intent(coordinator, mutation):
+    storage, manager = coordinator
+    exits = [
+        {"proposal_id": "exit-1", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD",
+         "side": "sell", "quantity": 3, "estimated_notional": 300, "reason": "risk one"},
+        {"proposal_id": "exit-2", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD2",
+         "side": "sell", "quantity": 2, "estimated_notional": 200, "reason": "risk two"},
+    ]
+    group = _create(coordinator, exits=exits)
+    manager.record_group_display(group["id"], "telegram-900")
+    if mutation == "exit_quantity":
+        storage.execute("UPDATE rotation_steps SET requested_quantity=requested_quantity+1 WHERE group_id=? AND sequence=0", (group["id"],))
+    elif mutation == "exit_symbol":
+        storage.execute("UPDATE rotation_steps SET symbol='MUTATED' WHERE group_id=? AND sequence=0", (group["id"],))
+    elif mutation == "exit_proposal":
+        storage.execute("UPDATE rotation_steps SET proposal_id='other' WHERE group_id=? AND sequence=0", (group["id"],))
+    elif mutation == "exit_ordering":
+        storage.execute("UPDATE rotation_steps SET sequence=99 WHERE group_id=? AND sequence=0", (group["id"],))
+    elif mutation == "lifecycle":
+        row = storage.fetch_all("SELECT id,payload FROM rotation_steps WHERE group_id=? ORDER BY sequence LIMIT 1", (group["id"],))[0]
+        payload = json.loads(row["payload"]); payload["position_lifecycle_id"] = "other-lifecycle"
+        storage.execute("UPDATE rotation_steps SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+    elif mutation == "contingent_entry":
+        storage.execute("UPDATE rotation_contingent_entries SET candidate_key='other-entry' WHERE group_id=?", (group["id"],))
+    elif mutation == "authority_ids":
+        storage.execute("UPDATE rotation_groups SET allocation_id='other-allocation' WHERE id=?", (group["id"],))
+    elif mutation == "expiry":
+        storage.execute("UPDATE rotation_groups SET expires_at=? WHERE id=?", ((datetime.now(UTC)-timedelta(seconds=1)).isoformat(), group["id"]))
+    reply = "wrong-message" if mutation == "reply_target" else "telegram-900"
+    try:
+        result = manager.approve(
+            group["id"], approval_id=f"approval-{mutation}", sender_id="owner",
+            command=f"APPROVE ROTATION {group['id'][:8]}", reply_to_message_id=reply,
+        )
+        assert result["state"] != RotationState.APPROVED_EXIT_PENDING.value
+    except RuntimeError:
+        pass
+    assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
+    assert storage.fetch_all("SELECT COUNT(*) n FROM risk_reservations")[0]["n"] == 0
+
+
 def test_rotation_creation_requires_both_authority_ids(coordinator):
     with pytest.raises(ValueError, match="registry_snapshot_id and allocation_id"):
         _create(coordinator, registry_snapshot_id="")
@@ -633,7 +678,7 @@ def test_service_rotation_recovery_defers_when_broker_unavailable_then_resumes(c
 
     service._recover_local_workflows()
     assert workflow_store.get(workflow["id"])["state"] == "submission_pending"
-    assert DurableExecutionStore(storage).get_intent(intent["id"])["state"] == "reserved"
+    assert DurableExecutionStore(storage).get_intent(intent["id"])["state"] == "retryable_pre_submission"
 
     service.broker = object()
     with (

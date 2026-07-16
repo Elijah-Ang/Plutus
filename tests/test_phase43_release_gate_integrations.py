@@ -104,20 +104,21 @@ def test_atomic_reservation_uses_limit_reference_and_never_exceeds_approval_ceil
     proposal = {
         "id": "ceiling-bound", "proposal_id": "ceiling-bound", "symbol": "SPY",
         "side": "buy", "action": "entry", "trading_mode": "paper",
-        "qty": 10.0, "notional": 1_000.0, "latest_price": 100.0,
+        "qty": 10.0, "notional": 1_002.5, "latest_price": 100.0,
         "limit_price": 100.25, "stop_price": 99.0,
         "approved_quantity_ceiling": 10.0,
         "approved_notional_ceiling": 1_000.0,
         "approved_stop_risk_ceiling": 12.5,
     }
 
-    with pytest.raises(RuntimeError, match="approved notional ceiling"):
+    with pytest.raises(RuntimeError, match="notional.*approved ceiling"):
         DurableExecutionStore(storage).create_or_get_intent(
             proposal, run_id="run", source_type="proposal"
         )
 
     proposal["id"] = proposal["proposal_id"] = "ceiling-reduced"
     proposal["qty"] = 1_000.0 / 100.25
+    proposal["notional"] = 1_000.0
     intent = DurableExecutionStore(storage).create_or_get_intent(
         proposal, run_id="run", source_type="proposal"
     )

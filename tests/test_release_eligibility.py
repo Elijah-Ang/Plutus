@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import base64
 from types import SimpleNamespace
 
 import scripts.check_release_eligibility as release_check
@@ -64,14 +63,11 @@ def test_release_reachability_uses_exact_github_main_sha(monkeypatch) -> None:
     def fake_run(*args):
         if args[:3] == ("git", "fetch", "--prune"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args[:3] == ("git", "merge-base", "--is-ancestor"):
-            assert args[3:] == ("candidate", "github-main")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(args)
 
     def fake_github(url):
         if url.endswith("/git/ref/heads/main"):
-            return {"object": {"sha": "github-main"}}, None, 200
+            return {"object": {"sha": "candidate"}}, None, 200
         if "/git/matching-refs/tags/" in url:
             return [], None, 200
         raise AssertionError(url)
@@ -80,7 +76,7 @@ def test_release_reachability_uses_exact_github_main_sha(monkeypatch) -> None:
     monkeypatch.setattr(release_check, "_github_json", fake_github)
     result = release_check._release_reachability("candidate", "owner/repo")
     assert result["passed"] is True
-    assert result["remote_main_sha"] == "github-main"
+    assert result["remote_main_sha"] == "candidate"
 
 
 def test_unpushed_local_tag_and_stale_local_main_do_not_pass_release_check(monkeypatch) -> None:
@@ -148,19 +144,18 @@ def test_lightweight_tag_is_not_release_authority(monkeypatch) -> None:
 
 def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> None:
     manifest = {
+        "tag_name": "immutable-release-good",
         "release_commit": "candidate",
         "configuration_hash": "config",
         "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
         "formula_versions": RELEASE_FORMULA_VERSIONS,
+        "git_tree_sha": "tree-candidate",
+        "tracked_source_inventory_digest": "inventory-candidate",
         "ci": {"workflow_name": "CI", "run_id": "42", "head_sha": "candidate"},
     }
-    encoded = base64.b64encode(json.dumps(manifest).encode()).decode()
-
     def fake_run(*args):
         if args[:3] == ("git", "fetch", "--prune"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args[:3] == ("git", "merge-base", "--is-ancestor"):
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
         raise AssertionError(args)
 
     def fake_github(url):
@@ -170,15 +165,46 @@ def test_valid_remote_annotated_manifest_is_release_authority(monkeypatch) -> No
             return [{"ref": "refs/tags/immutable-release-good", "object": {"sha": "tag-object", "type": "tag"}}], None, 200
         if url.endswith("/git/tags/tag-object"):
             return {"object": {"sha": "candidate", "type": "commit"}}, None, 200
-        if "/contents/release-manifest.json?ref=candidate" in url:
-            return {"content": encoded}, None, 200
+        if url.endswith("/git/commits/candidate"):
+            return {"sha": "candidate", "tree": {"sha": "tree-candidate"}}, None, 200
         raise AssertionError(url)
 
     monkeypatch.setattr(release_check, "_run", fake_run)
     monkeypatch.setattr(release_check, "_github_json", fake_github)
+    immutable_evidence = {
+        "manifest": manifest, "release_id": 8, "release_immutable": True,
+        "asset_id": 9, "asset_digest": "sha256:abc", "asset_size": 10,
+        "download_digest": "sha256:abc",
+    }
+    monkeypatch.setattr(release_check, "_release_attestation_asset", lambda _repo, _tag: immutable_evidence)
     result = release_check._release_reachability(
         "candidate", "owner/repo", config_hash="config",
         remote_ci={"passed": True, "run_id": 42, "head_sha": "candidate", "workflow_name": "CI"},
     )
     assert result["passed"] is True
     assert result["verified_release_manifest"] == ["immutable-release-good"]
+
+
+def test_replaced_attestation_asset_is_not_release_authority(monkeypatch) -> None:
+    manifest = {
+        "tag_name": "immutable-release-replaced", "release_commit": "candidate",
+        "configuration_hash": "config", "required_schema_versions": sorted(REQUIRED_SCHEMA_VERSIONS),
+        "formula_versions": RELEASE_FORMULA_VERSIONS,
+        "ci": {"workflow_name": "CI", "run_id": "42", "head_sha": "candidate"},
+    }
+    monkeypatch.setattr(
+        release_check,
+        "_github_json",
+        lambda url: ({"object": {"sha": "candidate", "type": "commit"}}, None, 200),
+    )
+    monkeypatch.setattr(release_check, "_release_attestation_asset", lambda *_: {
+        "manifest": manifest, "release_id": 8, "release_immutable": True,
+        "asset_id": 99, "asset_digest": "sha256:new", "asset_size": 10,
+        "download_digest": "sha256:old",
+    })
+    passed, reason = release_check._verify_release_manifest(
+        "owner/repo", "immutable-release-replaced", "tag-object", "candidate", "config",
+        {"passed": True, "run_id": 42, "head_sha": "candidate", "workflow_name": "CI"},
+    )
+    assert passed is False
+    assert "identity or digest" in reason

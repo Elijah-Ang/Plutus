@@ -95,6 +95,7 @@ def run_proof(source: Path, workdir: Path) -> dict[str, object]:
     repeat_start = time.monotonic()
     Storage(migrated).apply_explicit_migrations(production_paper=False)
     repeat_seconds = time.monotonic() - repeat_start
+    Storage(migrated).require_runtime_schema()
     repeated_meta = _schema_metadata(migrated)
     # Restoration uses SQLite backup too, then verifies schema and every table count.
     restore_seconds = _backup(pre, restored)
@@ -117,6 +118,7 @@ def run_proof(source: Path, workdir: Path) -> dict[str, object]:
         "source": {k: v for k, v in source_meta.items() if k != "row_counts"},
         "migrated": {k: v for k, v in migrated_meta.items() if k != "row_counts"},
         "migration_repeat_identical": migrated_meta == repeated_meta,
+        "runtime_schema_compatible": True,
         "restoration_schema_exact": source_meta["schema_sha256"] == restored_meta["schema_sha256"],
         "restoration_counts_exact": source_meta["row_counts"] == restored_meta["row_counts"],
         "phase0_integrity": integrity,
