@@ -18,6 +18,8 @@ from .formula_versions import (
     PHASE3_DECISION_VERSION,
     PHASE4_ALLOCATION_VERSION,
     PHASE4_ALLOCATOR_VERSION,
+    PROFITABILITY_RANKING_FORMULA_VERSION,
+    PROFITABILITY_RANKING_SCHEMA_VERSION,
     RISK_DECISION_VERSION,
     SIZING_POLICY_VERSION,
     STOP_POLICY_VERSION,
@@ -132,7 +134,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -141,12 +143,27 @@ STRICT_SECTION_KEYS = {
         "score_active_threshold", "hard_max_drawdown_r", "hard_max_losing_streak", "hard_max_divergence_r",
         "target_expectancy_r", "target_profit_factor", "target_drawdown_r", "target_losing_streak", "target_shortfall_bps", "target_divergence_r",
         "trade_economics_formula_version", "trade_economics_schema_version",
+        "candidate_ranking_formula_version", "candidate_ranking_schema_version",
         "maximum_cost_to_gross_edge_ratio", "maximum_break_even_win_probability",
-        "minimum_expected_net_r", "minimum_conservative_net_r",
+        "minimum_expected_net_r", "minimum_conservative_net_r", "candidate_model",
     },
 }
 
 STRICT_NESTED_KEYS = {
+    "profitability_engine.candidate_model": {
+        "cost_model_version", "estimation_model_version",
+        "neutral_win_probability", "prior_win_samples", "prior_payoff_samples",
+        "posterior_z", "prior_average_win_r", "prior_average_loss_r",
+        "maximum_target_r", "annualization_days", "quote_max_age_seconds",
+        "expected_slippage_bps", "default_implementation_shortfall_bps",
+        "market_impact_floor_bps", "market_impact_coefficient_bps",
+        "adverse_selection_bps", "missed_fill_cost_bps", "opportunity_cost_bps",
+        "approval_delay_seconds", "approval_delay_volatility_multiplier",
+        "holding_opportunity_rate_annual", "model_uncertainty_bps",
+        "estimation_uncertainty_bps", "worst_additional_cost_bps",
+        "sec_sell_fee_rate", "finra_taf_per_share", "finra_taf_max",
+        "cat_fee_per_share_per_side",
+    },
     "phase3.promotion": {"minimum_completed_oos", "minimum_regimes", "require_positive_cost_adjusted_expectancy"},
     "phase3.risk_profile": {
         "base_stop_risk_pct", "add_stop_risk_pct", "max_trade_stop_risk_pct", "max_portfolio_heat_pct",
@@ -225,6 +242,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
         "strategy_policy": STRATEGY_POLICY_VERSION,
         "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
+        "profitability_ranking": PROFITABILITY_RANKING_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -399,6 +417,18 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         profitability.get("trade_economics_schema_version") == TRADE_ECONOMICS_SCHEMA_VERSION,
         f"profitability_engine.trade_economics_schema_version must be {TRADE_ECONOMICS_SCHEMA_VERSION}",
     )
+    require(
+        profitability.get("candidate_ranking_formula_version")
+        == PROFITABILITY_RANKING_FORMULA_VERSION,
+        "profitability_engine.candidate_ranking_formula_version must be "
+        f"{PROFITABILITY_RANKING_FORMULA_VERSION}",
+    )
+    require(
+        profitability.get("candidate_ranking_schema_version")
+        == PROFITABILITY_RANKING_SCHEMA_VERSION,
+        "profitability_engine.candidate_ranking_schema_version must be "
+        f"{PROFITABILITY_RANKING_SCHEMA_VERSION}",
+    )
     require(profitability.get("primary_horizon_sessions") == 20, "profitability_engine.primary_horizon_sessions must be 20")
     require(
         profitability.get("maximum_cost_to_gross_edge_ratio") == 0.50,
@@ -416,6 +446,52 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         profitability.get("minimum_conservative_net_r") == 0.0,
         "profitability_engine.minimum_conservative_net_r must remain 0.0",
     )
+    candidate_model = profitability.get("candidate_model") or {}
+    require(
+        candidate_model.get("cost_model_version")
+        == "alpaca_equity_cost_model_2026_07_01_v1",
+        "profitability_engine.candidate_model.cost_model_version is not current",
+    )
+    require(
+        candidate_model.get("estimation_model_version")
+        == "beta_shrinkage_gross_r_v1",
+        "profitability_engine.candidate_model.estimation_model_version is not current",
+    )
+    required_candidate_model_values = {
+        "neutral_win_probability": 0.50,
+        "prior_win_samples": 20,
+        "prior_payoff_samples": 10,
+        "posterior_z": 1.96,
+        "prior_average_win_r": 1.0,
+        "prior_average_loss_r": 1.0,
+        "maximum_target_r": 4.0,
+        "annualization_days": 252,
+        "quote_max_age_seconds": 15,
+        "sec_sell_fee_rate": 0.0000206,
+        "finra_taf_per_share": 0.000195,
+        "finra_taf_max": 9.79,
+        "cat_fee_per_share_per_side": 0.000003,
+    }
+    for key, expected in required_candidate_model_values.items():
+        require(
+            candidate_model.get(key) == expected,
+            f"profitability_engine.candidate_model.{key} must be {expected}",
+        )
+    for key in (
+        "expected_slippage_bps", "default_implementation_shortfall_bps",
+        "market_impact_floor_bps", "market_impact_coefficient_bps",
+        "adverse_selection_bps", "missed_fill_cost_bps", "opportunity_cost_bps",
+        "approval_delay_seconds", "approval_delay_volatility_multiplier",
+        "holding_opportunity_rate_annual", "model_uncertainty_bps",
+        "estimation_uncertainty_bps", "worst_additional_cost_bps",
+    ):
+        _bounded(
+            candidate_model.get(key),
+            f"profitability_engine.candidate_model.{key}",
+            errors,
+            0,
+            1000,
+        )
     if profitability:
         score_thresholds = [profitability.get("score_exploration_threshold"), profitability.get("score_throttled_threshold"), profitability.get("score_active_threshold")]
         if all(value is not None for value in score_thresholds):

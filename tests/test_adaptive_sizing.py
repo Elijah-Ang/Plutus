@@ -237,7 +237,7 @@ def test_service_persistence_hook_does_not_mutate_operational_proposal(tmp_path)
         "id": "proposal-1", "run_id": "run-1", "signal_id": "candidate-1", "setup_key": "setup-1",
         "strategy_version": "rule_based_v2", "policy_decision_id": "policy-1", "side": "buy", "action": "entry",
         "notional": 80.0, "qty": 0.8, "latest_price": 100.0, "stop_price": 95.0, "stop_distance_dollars": 5.0,
-        "strategy_state": "ACTIVE", "strategy_policy_version": "strategy_policy_v2_2_probe",
+        "strategy_state": "ACTIVE", "strategy_policy_version": "strategy_policy_v2_3_gross_edge",
     }
     sizing = _inputs()["operational_sizing"] | {"stop_distance_dollars": 5.0, "stop_price": 95.0, "strategy_state": "ACTIVE"}
     portfolio = {

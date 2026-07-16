@@ -11,6 +11,7 @@ import dataclasses
 import uuid
 import pandas as pd
 from datetime import UTC, datetime, time as dt_time, timedelta
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -78,7 +79,15 @@ from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
 from .strategy_rule_based import STRATEGY_VERSION
 from .telegram_bot import TelegramBot
-from .utils import PROJECT_ROOT, iso_now, json_dumps, format_proposal_message, translate_reason, format_sgt
+from .utils import (
+    PROJECT_ROOT,
+    format_proposal_message,
+    format_sgt,
+    iso_now,
+    json_dumps,
+    redact_exception,
+    translate_reason,
+)
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -7311,6 +7320,7 @@ class TradingService:
                 proposal_id = None
                 decision = None
                 proposal = None
+                exact_profitability_decision = None
                 review = None
                 dedupe_status = res.get("dedupe_status", "skipped")
                 dedupe_reason = res.get("dedupe_reason", "not eligible for proposal")
@@ -7438,6 +7448,12 @@ class TradingService:
                                     selection_reason = "Selected because higher-scoring candidates were recently proposed and are still cooling down."
                                 elif higher_rank_suppressed_pending:
                                     selection_reason = "Selected because it was the best candidate that passed cooldown and pending-proposal checks."
+                                elif res.get("profitability_decision_id"):
+                                    selection_reason = (
+                                        "Selected by uncertainty-adjusted after-cost "
+                                        "profitability, capital/time efficiency, and "
+                                        "portfolio contribution among eligible candidates."
+                                    )
                                 else:
                                     selection_reason = "Selected because it was the strongest eligible candidate."
 
@@ -7486,6 +7502,7 @@ class TradingService:
                                 "id": proposal_id,
                                 "run_id": self.run_id,
                                 "signal_id": signal_id,
+                                "candidate_id": signal_id,
                                 "symbol": symbol,
                                 "universe_source": res.get("universe_source"),
                                 "approved_dynamic_paper_tradable": res.get("approved_dynamic_paper_tradable", False),
@@ -7619,6 +7636,10 @@ class TradingService:
                                 "sleep_mode_started_at": sleep_mode_started_at,
                                 "sleep_mode_ended_at": sleep_mode_ended_at,
                             }
+                            if is_buy and res.get("profitability_decision_id"):
+                                self._apply_profitability_summary_to_proposal(
+                                    proposal, res
+                                )
 
                             if self._operational_adaptive_enabled() and is_buy and proposal_action in {"entry", "add"}:
                                 self._should_auto_execute(proposal)
@@ -7709,6 +7730,84 @@ class TradingService:
                                 if not decision.passed:
                                     no_action_reason = f"blocked by risk checks: {'; '.join(decision.reasons)}"
                                     proposal_allowed = False
+
+                            if (
+                                proposal_allowed
+                                and is_buy
+                                and self._profitability_operational_enforced()
+                            ):
+                                try:
+                                    self._canonicalize_profitability_display_terms(
+                                        proposal
+                                    )
+                                    notional = float(proposal["notional"])
+                                    qty_val = float(proposal["qty"])
+                                    risk_budget = float(
+                                        proposal.get("stop_risk_dollars") or 0.0
+                                    )
+                                    exact_candidate = {
+                                        **res,
+                                        "price": proposal.get("proposal_price"),
+                                        "final_notional": proposal.get("notional"),
+                                        "suggested_shares": proposal.get("qty"),
+                                        "stop_price": proposal.get("stop_price"),
+                                    }
+                                    exact_profitability_decision = (
+                                        self._calculate_candidate_profitability_decision(
+                                            exact_candidate,
+                                            snapshot,
+                                            proposal_id=proposal_id,
+                                            record_class="proposal_candidate",
+                                        )
+                                    )
+                                    exact_profitability = (
+                                        exact_profitability_decision.summary()
+                                    )
+                                except Exception as exc:
+                                    safe_reason = redact_exception(exc)[:1000]
+                                    no_action_reason = (
+                                        "blocked by final candidate profitability: "
+                                        f"{safe_reason}"
+                                    )
+                                    proposal_allowed = False
+                                    self.storage.audit(
+                                        self.run_id,
+                                        "final_candidate_profitability_rejected",
+                                        {
+                                            "symbol": symbol,
+                                            "error_type": type(exc).__name__,
+                                            "reason": safe_reason,
+                                            "broker_calls": 0,
+                                        },
+                                    )
+                                else:
+                                    if (
+                                        exact_profitability.get(
+                                            "profitability_eligible"
+                                        )
+                                        is not True
+                                    ):
+                                        no_action_reason = (
+                                            "blocked by final candidate profitability: "
+                                            + "; ".join(
+                                                exact_profitability.get(
+                                                    "profitability_rejection_reasons"
+                                                )
+                                                or []
+                                            )
+                                        )
+                                        proposal_allowed = False
+                                    else:
+                                        res.update(exact_profitability)
+                                        self._apply_profitability_summary_to_proposal(
+                                            proposal, exact_profitability
+                                        )
+                                        proposal[
+                                            "profitability_display_quantity"
+                                        ] = str(proposal.get("qty"))
+                                        proposal[
+                                            "profitability_display_notional"
+                                        ] = str(proposal.get("notional"))
 
                             if proposal_allowed:
                                 if is_buy:
@@ -7892,14 +7991,6 @@ class TradingService:
                     "INSERT INTO market_memory(run_id,market_profile,symbol,price,prev_price,price_change,price_change_pct,session_start_price,session_change,volatility,signal,score,classification,reason,proposal_allowed,gpt_called,created_at,asset_score,asset_classification,symbol_rank,proposal_generated,no_action_reason,asset_selection_score,trade_decision_score,system_confidence,gpt_confidence,gpt_caution,expiry_minutes,expires_at_sgt,main_risk,volatility_regime,volatility_score_contribution,volatility_gate_result,dedupe_status,dedupe_reason,paper_size_adjustment,candidate_suppression_reason,deferred_ai_review_reason,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (self.run_id, profile_key, symbol, price, prev_price, price_change, price_change_pct, session_start_price, session_change, vol_20 or 0.0, signal.action, score, classification, signal.reason, int(proposal_allowed), int(gpt_called), now.isoformat(), asset_score, asset_classification, watchlist_order, int(proposal_generated), no_action_reason, asset_score, score, system_confidence, g_conf, g_caut, expiry_minutes, exp_sgt, m_risk, volatility_regime, score_vol, volatility_gate_result, dedupe_status, dedupe_reason, paper_size_adjustment, candidate_suppression_reason, deferred_ai_review_reason, true_score_rank, watchlist_order, setup_key, int(cooldown_applied), cooldown_remaining_minutes, cooldown_reason, revival_reason, last_proposal_status, score_delta, volatility_regime_change, int(exit_priority_applied), exit_trigger_reason, position_drawdown_pct, average_entry_price, latest_position_price, gpt_exit_explanation_status, gpt_exit_confidence, gpt_exit_caution, final_proposal_message_category, emergency_exit_score, emergency_exit_triggered, emergency_exit_trigger_reason, emergency_exit_hard_trigger, emergency_exit_mode, emergency_exit_wait_seconds, None, emergency_exit_auto_execute_due_at, None, emergency_exit_final_decision, emergency_exit_block_reason, price, atr_value, adverse_move_atr, minutes_to_close, 1 if sleep_mode_active else 0, suppressed_by_sleep_mode, sleep_mode_reason, sleep_mode_suppressed_candidate, sleep_mode_started_at, sleep_mode_ended_at)
                 )
-                self.storage.execute(
-                    """UPDATE trade_proposals SET performance_snapshot_id=?,policy_decision_id=?,strategy_quality_score=?,
-                       strategy_state=?,strategy_risk_multiplier=?,permitted_stop_risk_pct=?,strategy_policy_version=?,binding_policy_reason=? WHERE id=?""",
-                    (res.get("performance_snapshot_id"), res.get("policy_decision_id"), res.get("strategy_quality_score"),
-                     res.get("strategy_state"), res.get("strategy_risk_multiplier"), res.get("permitted_stop_risk_pct"),
-                     res.get("strategy_policy_version"), res.get("binding_policy_reason"), proposal_id),
-                )
-
                 logger.info(
                     "Symbol: %s | Profile: %s | Asset Score: %.2f (%s) | Trade Score: %.2f (%s) | Watchlist Order: #%d | True Score Rank: %s | Previous-observation change: %.2f%% | UTC-day first-observation change: %.2f | Proposal Allowed: %s | GPT Called: %s | Proposal Generated: %s | No-Action Reason: %s",
                     symbol, profile_key, asset_score, asset_classification, score, classification, watchlist_order, true_score_rank, price_change_pct, session_change, proposal_allowed, gpt_called, proposal_generated, no_action_reason or "N/A"
@@ -7910,9 +8001,38 @@ class TradingService:
                         self.storage.audit(self.run_id, "proposal_blocked", {"symbol": symbol, "reasons": decision.reasons})
                     continue
 
-                self.storage.execute(
-                    "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload,proposal_market_rank,proposal_eligible_rank,selection_reason,ai_review_status,ai_confidence,ai_caution,true_score_rank,watchlist_order,setup_key,cooldown_applied,cooldown_remaining_minutes,cooldown_reason,revival_reason,last_proposal_status,score_delta,volatility_regime_change,exit_priority_applied,exit_trigger_reason,position_drawdown_pct,average_entry_price,latest_position_price,gpt_exit_explanation_status,gpt_exit_confidence,gpt_exit_caution,final_proposal_message_category,emergency_exit_score,emergency_exit_triggered,emergency_exit_trigger_reason,emergency_exit_hard_trigger,emergency_exit_mode,emergency_exit_wait_seconds,emergency_exit_user_response,emergency_exit_auto_execute_due_at,emergency_exit_auto_execute_attempted_at,emergency_exit_final_decision,emergency_exit_block_reason,current_price,atr_value,adverse_move_atr,minutes_to_close,sleep_mode_active,suppressed_by_sleep_mode,sleep_mode_reason,sleep_mode_suppressed_candidate,sleep_mode_started_at,sleep_mode_ended_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
+                proposal_columns = (
+                    "id", "run_id", "signal_id", "symbol", "side", "notional",
+                    "status", "created_at", "expires_at", "strategy_version",
+                    "payload", "proposal_market_rank", "proposal_eligible_rank",
+                    "selection_reason", "ai_review_status", "ai_confidence",
+                    "ai_caution", "true_score_rank", "watchlist_order",
+                    "setup_key", "cooldown_applied",
+                    "cooldown_remaining_minutes", "cooldown_reason",
+                    "revival_reason", "last_proposal_status", "score_delta",
+                    "volatility_regime_change", "exit_priority_applied",
+                    "exit_trigger_reason", "position_drawdown_pct",
+                    "average_entry_price", "latest_position_price",
+                    "gpt_exit_explanation_status", "gpt_exit_confidence",
+                    "gpt_exit_caution", "final_proposal_message_category",
+                    "emergency_exit_score", "emergency_exit_triggered",
+                    "emergency_exit_trigger_reason", "emergency_exit_hard_trigger",
+                    "emergency_exit_mode", "emergency_exit_wait_seconds",
+                    "emergency_exit_user_response",
+                    "emergency_exit_auto_execute_due_at",
+                    "emergency_exit_auto_execute_attempted_at",
+                    "emergency_exit_final_decision",
+                    "emergency_exit_block_reason", "current_price", "atr_value",
+                    "adverse_move_atr", "minutes_to_close", "sleep_mode_active",
+                    "suppressed_by_sleep_mode", "sleep_mode_reason",
+                    "sleep_mode_suppressed_candidate", "sleep_mode_started_at",
+                    "sleep_mode_ended_at", "performance_snapshot_id",
+                    "policy_decision_id", "strategy_quality_score",
+                    "strategy_state", "strategy_risk_multiplier",
+                    "permitted_stop_risk_pct", "strategy_policy_version",
+                    "binding_policy_reason",
+                )
+                proposal_values = (
                         proposal_id,
                         self.run_id,
                         signal_id,
@@ -7969,9 +8089,36 @@ class TradingService:
                         sleep_mode_reason,
                         sleep_mode_suppressed_candidate,
                         sleep_mode_started_at,
-                        sleep_mode_ended_at
-                    )
+                        sleep_mode_ended_at,
+                        res.get("performance_snapshot_id"),
+                        res.get("policy_decision_id"),
+                        res.get("strategy_quality_score"),
+                        res.get("strategy_state"),
+                        res.get("strategy_risk_multiplier"),
+                        res.get("permitted_stop_risk_pct"),
+                        res.get("strategy_policy_version"),
+                        res.get("binding_policy_reason"),
                 )
+                proposal_insert = (
+                    f"INSERT INTO trade_proposals({','.join(proposal_columns)}) "
+                    f"VALUES({','.join('?' for _ in proposal_columns)})"
+                )
+                if (
+                    is_buy
+                    and self._profitability_operational_enforced()
+                    and exact_profitability_decision is None
+                ):
+                    raise RuntimeError(
+                        "executable BUY lacks exact proposal profitability authority"
+                    )
+                if exact_profitability_decision is None:
+                    self.storage.execute(proposal_insert, proposal_values)
+                else:
+                    self._persist_proposal_with_profitability(
+                        proposal_insert,
+                        proposal_values,
+                        exact_profitability_decision,
+                    )
                 if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
                     self.storage.execute(
                         "UPDATE profit_exit_events SET proposal_id=?, status='proposal_created' WHERE run_id=? AND symbol=? AND event_type=? AND proposal_id IS NULL",
@@ -7985,7 +8132,12 @@ class TradingService:
                 if is_buy or (proposal_is_add and proposal_generated):
                     self.storage.execute(
                         "UPDATE trade_proposals SET sizing_caps_json=?,formula_versions_json=?,evidence_version=? WHERE id=?",
-                        (json_dumps(proposal.get("sizing_caps") or {}), json_dumps({"stop_policy": STOP_POLICY_VERSION, "sizing_policy": SIZING_POLICY_VERSION, "risk_decision": RISK_DECISION_VERSION, "accounting": ACCOUNTING_VERSION, "evidence": EVIDENCE_VERSION}), EVIDENCE_VERSION, proposal_id),
+                        (
+                            json_dumps(proposal.get("sizing_caps") or {}),
+                            json_dumps(self.config.get("formula_versions") or {}),
+                            EVIDENCE_VERSION,
+                            proposal_id,
+                        ),
                     )
 
                 if is_buy or (proposal_is_add and proposal_generated):
@@ -10688,10 +10840,388 @@ class TradingService:
             "risk_formula_version": (phase3_context.get("strategy_sleeve_payload") or {}).get("risk_formula_version"),
         }
 
+    def _profitability_operational_enforced(self) -> bool:
+        return bool(
+            (self.config.get("profitability_engine") or {}).get(
+                "enforcement_enabled"
+            )
+            and (self.config.get("phase3") or {}).get("enabled")
+            and (self.config.get("phase3") or {}).get("active")
+        )
+
+    def _persist_proposal_with_profitability(
+        self,
+        statement: str,
+        values: tuple[Any, ...],
+        decision: Any,
+    ) -> None:
+        """Atomically insert one proposal and its exact profitability authority."""
+        from .profitability_ranking import CandidateProfitabilityStore
+
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(statement, values)
+            CandidateProfitabilityStore(self.storage).persist(
+                decision,
+                conn=conn,
+            )
+
+    @staticmethod
+    def _canonicalize_profitability_display_terms(
+        proposal: dict[str, Any],
+    ) -> None:
+        """Reduce BUY display terms to one exact 8-decimal quantity basis."""
+        if (
+            str(proposal.get("side") or "").lower() != "buy"
+            or str(proposal.get("action") or "").lower()
+            not in {"entry", "add", "rotation_entry"}
+        ):
+            return
+        try:
+            entry = Decimal(
+                str(
+                    proposal.get("proposal_price")
+                    or proposal.get("latest_price")
+                )
+            )
+            quantity = Decimal(str(proposal.get("qty")))
+            notional_ceiling = Decimal(str(proposal.get("notional")))
+        except Exception as exc:
+            raise ValueError(
+                "BUY display terms are not valid decimals"
+            ) from exc
+        if (
+            not entry.is_finite()
+            or not quantity.is_finite()
+            or not notional_ceiling.is_finite()
+            or entry <= 0
+            or quantity <= 0
+            or notional_ceiling <= 0
+        ):
+            raise ValueError(
+                "BUY display terms must be finite and positive"
+            )
+        quantum = Decimal("0.00000001")
+        quantity = quantity.quantize(quantum, rounding=ROUND_DOWN)
+        if quantity * entry > notional_ceiling:
+            quantity = (notional_ceiling / entry).quantize(
+                quantum, rounding=ROUND_DOWN
+            )
+        if quantity <= 0:
+            raise ValueError(
+                "BUY display quantity becomes nonpositive after canonicalization"
+            )
+        exact_notional = quantity * entry
+        proposal["qty"] = float(quantity)
+        proposal["notional"] = float(exact_notional)
+        if proposal.get("approved_quantity_ceiling") not in (None, ""):
+            proposal["approved_quantity_ceiling"] = min(
+                float(proposal["approved_quantity_ceiling"]),
+                float(quantity),
+            )
+        if proposal.get("displayed_adaptive_ceiling") not in (None, ""):
+            proposal["displayed_adaptive_ceiling"] = min(
+                float(proposal["displayed_adaptive_ceiling"]),
+                float(exact_notional),
+            )
+        stop_distance = proposal.get("stop_distance_dollars")
+        if stop_distance not in (None, ""):
+            distance = Decimal(str(stop_distance))
+            if not distance.is_finite() or distance <= 0:
+                raise ValueError(
+                    "BUY stop distance must be finite and positive"
+                )
+            exact_stop_risk = quantity * distance
+            proposal["stop_risk_dollars"] = float(exact_stop_risk)
+            proposal["initial_risk_dollars"] = float(exact_stop_risk)
+            proposal["risk_budget"] = float(exact_stop_risk)
+            proposal["risk_budget_dollars"] = float(exact_stop_risk)
+            if proposal.get("approved_stop_risk_ceiling") not in (None, ""):
+                proposal["approved_stop_risk_ceiling"] = min(
+                    float(proposal["approved_stop_risk_ceiling"]),
+                    float(exact_stop_risk),
+                )
+
+    @staticmethod
+    def _apply_profitability_summary_to_proposal(
+        proposal: dict[str, Any], summary: dict[str, Any]
+    ) -> None:
+        metrics = dict(summary.get("profitability_metrics") or {})
+        economics_id = summary.get("trade_economics_id")
+        record_class = summary.get("trade_economics_record_class")
+        if record_class == "proposal_candidate":
+            proposal["trade_economics_id"] = economics_id
+        else:
+            proposal["shadow_trade_economics_id"] = economics_id
+        proposal.update({
+            "profitability_decision_id": summary.get(
+                "profitability_decision_id"
+            ),
+            "trade_economics_record_class": record_class,
+            "trade_economics_input_fingerprint": summary.get(
+                "trade_economics_input_fingerprint"
+            ),
+            "trade_economics_record_fingerprint": summary.get(
+                "trade_economics_record_fingerprint"
+            ),
+            "profitability_eligible": summary.get("profitability_eligible"),
+            "profitability_quality_score": summary.get(
+                "profitability_quality_score"
+            ),
+            "profitability_quality_components": summary.get(
+                "profitability_quality_components"
+            ),
+            "profitability_ranking_score": summary.get(
+                "profitability_ranking_score"
+            ),
+            "profitability_ranking_key": summary.get(
+                "profitability_ranking_key"
+            ),
+            "profitability_metrics": metrics,
+            "profitability_formula_version": summary.get(
+                "profitability_formula_version"
+            ),
+            "profitability_schema_version": summary.get(
+                "profitability_schema_version"
+            ),
+            "profitability_input_fingerprint": summary.get(
+                "profitability_input_fingerprint"
+            ),
+            "profitability_decision_fingerprint": summary.get(
+                "profitability_decision_fingerprint"
+            ),
+            "target_price": metrics.get("target_price"),
+            "expected_net_r": metrics.get("expected_net_r"),
+            "conservative_expected_net_r": metrics.get(
+                "conservative_expected_net_r"
+            ),
+            "expected_total_cost": metrics.get("expected_total_cost"),
+            "break_even_win_probability_after_costs": metrics.get(
+                "break_even_win_probability_after_costs"
+            ),
+        })
+        proposal["indicators"] = {
+            **dict(proposal.get("indicators") or {}),
+            "target_price": metrics.get("target_price"),
+        }
+
+    def _calculate_candidate_profitability_decision(
+        self,
+        candidate: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        proposal_id: str | None = None,
+        record_class: str = "shadow_candidate",
+    ) -> Any:
+        from .profitability_ranking import (
+            ProfitabilityCandidateInput,
+            ProfitabilityRankingError,
+            calculate_candidate_profitability,
+        )
+
+        def decimal(value: Any, name: str) -> Decimal:
+            if value is None or isinstance(value, bool):
+                raise ProfitabilityRankingError(f"{name} is unavailable")
+            try:
+                result = Decimal(str(value))
+            except Exception as exc:
+                raise ProfitabilityRankingError(f"{name} is invalid") from exc
+            if not result.is_finite():
+                raise ProfitabilityRankingError(f"{name} must be finite")
+            return result
+
+        symbol = str(candidate.get("symbol") or "").upper()
+        strategy = str(
+            getattr(candidate.get("signal"), "strategy_version", None)
+            or candidate.get("strategy_version")
+            or STRATEGY_VERSION
+        )
+        policy = self._cycle_strategy_policy(strategy)
+        if policy is None:
+            raise ProfitabilityRankingError(
+                "current strategy profitability policy is unavailable"
+            )
+        from .strategy_performance import StrategyPerformanceEngine
+
+        durable_policy = StrategyPerformanceEngine(
+            self.storage, self.config
+        ).policy_by_id(policy.id)
+        if durable_policy is None or durable_policy != policy:
+            raise ProfitabilityRankingError(
+                "cycle profitability policy differs from durable authority"
+            )
+        policy = durable_policy
+        if (
+            candidate.get("performance_snapshot_id")
+            != policy.performance_snapshot_id
+            or candidate.get("policy_decision_id") != policy.id
+            or candidate.get("strategy_state") != policy.state
+        ):
+            raise ProfitabilityRankingError(
+                "candidate sizing and profitability policy authority differ"
+            )
+        quote = candidate.get("profitability_quote")
+        if quote is None:
+            quote = self.broker.get_latest_quote(symbol)
+        bid = _value(quote, "bid_price", _value(quote, "bid"))
+        ask = _value(quote, "ask_price", _value(quote, "ask"))
+        quote_at = _value(quote, "timestamp")
+        candidate["profitability_quote"] = {
+            "bid_price": bid,
+            "ask_price": ask,
+            "timestamp": quote_at.isoformat()
+            if hasattr(quote_at, "isoformat")
+            else str(quote_at or ""),
+        }
+        entry = decimal(candidate.get("price"), "candidate price")
+        quantity = decimal(candidate.get("suggested_shares"), "candidate quantity")
+        stop = decimal(candidate.get("stop_price"), "candidate stop")
+        average_dollar_volume = decimal(
+            candidate.get("average_dollar_volume"),
+            "candidate average dollar volume",
+        )
+        volatility = decimal(
+            candidate.get("vol_20"),
+            "candidate annualized volatility",
+        )
+        signal = candidate.get("signal")
+        indicators = getattr(signal, "indicators", None) or {}
+        close = indicators.get("close")
+        ma_50 = indicators.get("ma_50")
+        ma_200 = indicators.get("ma_200")
+        trend_regime = "unavailable"
+        try:
+            if close is not None and ma_50 is not None and ma_200 is not None:
+                if float(close) > float(ma_50) > float(ma_200):
+                    trend_regime = "strong_uptrend"
+                elif float(close) > float(ma_50) and float(close) > float(ma_200):
+                    trend_regime = "uptrend"
+                else:
+                    trend_regime = "mixed"
+        except (TypeError, ValueError):
+            trend_regime = "unavailable"
+        minimum_liquidity = float(
+            ((self.config.get("phase3") or {}).get("risk_profile") or {}).get(
+                "minimum_average_dollar_volume", 10_000_000.0
+            )
+        )
+        liquidity_regime = (
+            "liquid"
+            if float(average_dollar_volume) >= minimum_liquidity
+            else "below_operational_liquidity_floor"
+        )
+        cluster = self._get_symbol_cluster(symbol)
+        portfolio_equity = decimal(
+            snapshot.get("portfolio_equity"),
+            "portfolio equity",
+        )
+        if portfolio_equity <= 0:
+            raise ProfitabilityRankingError(
+                "portfolio equity must be positive"
+            )
+        candidate_exposure_pct = quantity * entry / portfolio_equity * Decimal(
+            "100"
+        )
+        current_symbol_exposure_pct = decimal(
+            (snapshot.get("single_exposures") or {}).get(symbol, 0),
+            "current symbol exposure",
+        )
+        current_cluster_exposure_pct = decimal(
+            (snapshot.get("cluster_exposures") or {}).get(cluster or "", 0),
+            "current cluster exposure",
+        )
+        estimated_at = iso_now()
+        action = "add" if candidate.get("is_add") else "entry"
+        profitability_input = ProfitabilityCandidateInput(
+            candidate_id=str(
+                candidate.get("signal_id")
+                or candidate.get("candidate_id")
+                or f"{self.run_id}:{symbol}"
+            ),
+            run_id=self.run_id,
+            asset_class="etf" if symbol in {"SPY", "QQQ", "DIA", "IWM"} else "equity",
+            symbol=symbol,
+            action=action,
+            strategy_version=strategy,
+            strategy_state=str(candidate.get("strategy_state") or ""),
+            setup_type=str(
+                candidate.get("setup_key")
+                or getattr(signal, "reason", None)
+                or "rule_based_entry"
+            ),
+            market_regime=f"us_equities_{candidate.get('volatility_regime') or 'unknown'}",
+            volatility_regime=str(candidate.get("volatility_regime") or "unknown"),
+            liquidity_regime=liquidity_regime,
+            trend_regime=trend_regime,
+            breadth_regime="not_available",
+            estimated_at=estimated_at,
+            quote_at=quote_at.isoformat()
+            if hasattr(quote_at, "isoformat")
+            else str(quote_at or ""),
+            quantity=quantity,
+            entry_estimate=entry,
+            stop_price=stop,
+            bid_price=decimal(bid, "quote bid"),
+            ask_price=decimal(ask, "quote ask"),
+            average_dollar_volume=average_dollar_volume,
+            annualized_volatility=volatility,
+            setup_score=decimal(candidate.get("score"), "candidate setup score"),
+            symbol_exposure_pct=(
+                current_symbol_exposure_pct + candidate_exposure_pct
+            ),
+            cluster_exposure_pct=(
+                current_cluster_exposure_pct + candidate_exposure_pct
+            ),
+            maximum_symbol_exposure_pct=decimal(
+                (self.config.get("portfolio_behavior") or {}).get(
+                    "max_single_symbol_exposure_pct",
+                    (self.config.get("adaptive_conviction") or {}).get(
+                        "maximum_symbol_exposure_pct"
+                    ),
+                ),
+                "maximum symbol exposure",
+            ),
+            maximum_cluster_exposure_pct=decimal(
+                (self.config.get("portfolio_behavior") or {}).get(
+                    "max_correlated_us_equity_exposure_pct",
+                    (self.config.get("adaptive_conviction") or {}).get(
+                        "maximum_cluster_exposure_pct"
+                    ),
+                ),
+                "maximum cluster exposure",
+            ),
+            performance_snapshot_id=str(candidate.get("performance_snapshot_id") or ""),
+            policy_decision_id=str(candidate.get("policy_decision_id") or ""),
+            configuration_version=str(
+                self.config.get("configuration_schema_version") or ""
+            ),
+            config_hash=str(self.config.get("effective_config_hash") or ""),
+            formula_versions=dict(self.config.get("formula_versions") or {}),
+            proposal_id=proposal_id,
+            record_class=record_class,
+        )
+        return calculate_candidate_profitability(
+            profitability_input, policy, self.config
+        )
+
+    def _candidate_profitability_decision(
+        self,
+        candidate: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        from .profitability_ranking import CandidateProfitabilityStore
+
+        decision = self._calculate_candidate_profitability_decision(
+            candidate, snapshot
+        )
+        CandidateProfitabilityStore(self.storage).persist(decision)
+        return decision.summary()
+
     def _rank_candidates(self, buy_candidates: list[dict[str, Any]], snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         from .phase4_allocator import candidate_allocation_rank
 
         ranked = []
+        profitability_enforced = self._profitability_operational_enforced()
         for c in buy_candidates:
             symbol = c["symbol"]
             c_name = self._get_symbol_cluster(symbol)
@@ -10747,7 +11277,46 @@ class TradingService:
                 # conversion evidence rejects the candidate rather than assigning
                 # a synthetic worst-risk score that could later become actionable.
                 continue
-            ranking_score = rank["ranking_score"]
+            profitability: dict[str, Any] = {}
+            if profitability_enforced:
+                try:
+                    profitability = self._candidate_profitability_decision(
+                        c, snapshot
+                    )
+                except Exception as exc:
+                    safe_reason = redact_exception(exc)[:1000]
+                    self.storage.audit(
+                        self.run_id,
+                        "candidate_profitability_rejected",
+                        {
+                            "symbol": symbol,
+                            "error_type": type(exc).__name__,
+                            "reason": safe_reason,
+                            "exit_behavior_unchanged": True,
+                        },
+                    )
+                    continue
+                if profitability.get("profitability_eligible") is not True:
+                    self.storage.audit(
+                        self.run_id,
+                        "candidate_profitability_rejected",
+                        {
+                            "symbol": symbol,
+                            "reasons": profitability.get(
+                                "profitability_rejection_reasons"
+                            ),
+                            "trade_economics_id": profitability.get(
+                                "trade_economics_id"
+                            ),
+                            "exit_behavior_unchanged": True,
+                        },
+                    )
+                    continue
+            ranking_score = (
+                float(profitability["profitability_ranking_score"])
+                if profitability_enforced
+                else rank["ranking_score"]
+            )
 
             if c.get("is_observation"):
                 ranking_score -= 50.0
@@ -10757,10 +11326,38 @@ class TradingService:
             ranked.append({
                 **c,
                 **rank,
+                **profitability,
+                "phase4_ranking_score": rank["ranking_score"],
                 "ranking_score": ranking_score,
             })
 
-        ranked.sort(key=lambda x: (-x["ranking_score"], x["symbol"]))
+        if profitability_enforced:
+            ranked.sort(
+                key=lambda x: (
+                    -Decimal(
+                        x["profitability_metrics"][
+                            "conservative_expected_net_r"
+                        ]
+                    ),
+                    -Decimal(x["profitability_metrics"]["expected_net_r"]),
+                    -Decimal(x["profitability_metrics"]["expected_r_per_day"]),
+                    -Decimal(
+                        x["profitability_metrics"][
+                            "expected_capital_efficiency"
+                        ]
+                    ),
+                    -Decimal(
+                        x["profitability_metrics"][
+                            "marginal_portfolio_contribution_r"
+                        ]
+                    ),
+                    -Decimal(x["profitability_quality_score"]),
+                    -Decimal(str(x.get("score") or 0)),
+                    x["symbol"],
+                )
+            )
+        else:
+            ranked.sort(key=lambda x: (-x["ranking_score"], x["symbol"]))
 
         for idx, c in enumerate(ranked):
             c["final_candidate_rank"] = idx + 1
@@ -11542,7 +12139,11 @@ class TradingService:
                 "INSERT INTO ranked_opportunity_sets(id,run_id,batch_id,timestamp,symbol,rank,actionable,reason,score,suggested_notional,suggested_shares,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(uuid.uuid4()), self.run_id, None, now.isoformat(), symbol, rank, int(passed),
-                    reasons[symbol], candidate.get("score"), final_notional,
+                    reasons[symbol],
+                    candidate.get(
+                        "profitability_ranking_score", candidate.get("score")
+                    ),
+                    final_notional,
                     final_notional / price if price > 0 else 0.0, json_dumps(candidate)
                 ),
             )
@@ -11623,6 +12224,14 @@ class TradingService:
                     lines.append(f"   Sizing Basis: {', '.join(sizing_basis_parts)}")
                 if caps and caps != "none":
                     lines.append(f"   Caps Applied: {caps}")
+                profitability = proposal.get("profitability_metrics") or {}
+                if proposal.get("profitability_quality_score") is not None and profitability:
+                    lines.extend([
+                        f"   Profitability quality: {float(proposal['profitability_quality_score']):.1f}/100",
+                        f"   Expected / conservative net R: {float(profitability['expected_net_r']):+.3f}R / {float(profitability['conservative_expected_net_r']):+.3f}R",
+                        f"   Expected costs: ${float(profitability['expected_total_cost']):,.2f}; break-even win rate {float(profitability['break_even_win_probability_after_costs']) * 100:.1f}%",
+                        f"   Target / efficiency: ${float(profitability['target_price']):,.2f} / {float(profitability['expected_r_per_day']):+.4f}R per day",
+                    ])
             else:
                 lines.extend([
                     "   Risk: normal",

@@ -62,7 +62,7 @@ configuration hash, fingerprints and formula/schema/evidence versions.
 
 Configuration/schema/formula versions:
 
-- `plutus_effective_config_v10_trade_economics_paper`
+- `plutus_effective_config_v11_profitability_ranking_paper`
 
 Every ordinary or protective paper order requires manual approval. Extreme and
 sleep-mode exit detection can prioritise an urgent SELL proposal, but it cannot

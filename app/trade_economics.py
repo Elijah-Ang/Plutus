@@ -1016,29 +1016,47 @@ class TradeEconomicsStore:
             )
         return recomputed
 
-    def persist(self, record: TradeEconomicsRecord) -> str:
+    def _persist_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        record: TradeEconomicsRecord,
+    ) -> str:
         values = _record_columns(record)
         values["created_at"] = iso_now()
+        self._verify_authority(conn, record, link_proposal=False)
+        columns = tuple(values)
+        placeholders = ",".join("?" for _ in columns)
+        conn.execute(
+            f"""INSERT OR IGNORE INTO trade_economics_records(
+                   {",".join(columns)}) VALUES({placeholders})""",
+            tuple(values[name] for name in columns),
+        )
+        row = conn.execute(
+            "SELECT * FROM trade_economics_records WHERE id=?", (record.id,)
+        ).fetchone()
+        if row is None:
+            raise TradeEconomicsError("trade economics persistence failed")
+        self._verified_record_from_row(
+            conn, dict(row), verify_authority=True
+        )
+        self._verify_authority(conn, record, link_proposal=True)
+        return record.id
+
+    def persist(
+        self,
+        record: TradeEconomicsRecord,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        if conn is not None:
+            if not conn.in_transaction:
+                raise TradeEconomicsError(
+                    "external trade economics persistence requires an active transaction"
+                )
+            return self._persist_in_connection(conn, record)
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            self._verify_authority(conn, record, link_proposal=False)
-            columns = tuple(values)
-            placeholders = ",".join("?" for _ in columns)
-            conn.execute(
-                f"""INSERT OR IGNORE INTO trade_economics_records(
-                       {",".join(columns)}) VALUES({placeholders})""",
-                tuple(values[name] for name in columns),
-            )
-            row = conn.execute(
-                "SELECT * FROM trade_economics_records WHERE id=?", (record.id,)
-            ).fetchone()
-            if row is None:
-                raise TradeEconomicsError("trade economics persistence failed")
-            self._verified_record_from_row(
-                conn, dict(row), verify_authority=True
-            )
-            self._verify_authority(conn, record, link_proposal=True)
-        return record.id
+            return self._persist_in_connection(conn, record)
 
     def load_verified(
         self, record_id: str, *, verify_authority: bool = True

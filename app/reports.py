@@ -95,6 +95,7 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Position Sizing Decisions", "position_sizing_decisions"),
     ("Candidate Ranking Decisions", "candidate_rankings"),
     ("Ranked Opportunity Sets", "ranked_opportunity_sets"),
+    ("Profitability Decisions", "candidate_profitability_decisions"),
     ("Proposal Batches", "proposal_batches"),
     ("Batch Candidates", "proposal_batch_candidates"),
     ("Risk Budget Decisions", "candidate_risk_budget_decisions"),
