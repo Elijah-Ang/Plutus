@@ -31,6 +31,8 @@ from app.formula_versions import (  # noqa: E402
     ROTATION_SCHEMA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+    TRADE_ECONOMICS_FORMULA_VERSION,
+    TRADE_ECONOMICS_SCHEMA_VERSION,
 )
 from app.storage import Storage  # noqa: E402
 from app.utils import load_config  # noqa: E402
@@ -44,6 +46,8 @@ RELEASE_FORMULA_VERSIONS = {
     "rotation_schema": ROTATION_SCHEMA_VERSION,
     "strategy_registry": STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     "strategy_registry_schema": STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+    "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
+    "trade_economics_schema": TRADE_ECONOMICS_SCHEMA_VERSION,
 }
 
 
