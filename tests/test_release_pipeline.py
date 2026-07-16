@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import scripts.run_artifact_tests as artifact_tests
+from app.utils import resolve_project_root
 import scripts.verify_deployment_authority as deployment_authority
 from scripts.build_isolated_wheel import (
     REQUIRED_PIP,
@@ -246,6 +247,36 @@ def test_build_records_tests_verified_only_after_fresh_environment_tests() -> No
     test_call = '"$STAGING/.venv/bin/python" scripts/run_artifact_tests.py'
     assert test_call in script
     assert script.index(test_call) < script.index('"tests_verified":True')
+
+
+def test_installed_wheel_uses_explicit_immutable_release_root(tmp_path, monkeypatch) -> None:
+    release = tmp_path / "immutable-release"
+    (release / "config").mkdir(parents=True)
+    (release / "config" / "config.yaml").write_text("mode: paper\n", encoding="utf-8")
+    monkeypatch.setenv("TRADING_AGENT_PROJECT_ROOT", str(release))
+
+    installed_module = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages" / "app" / "utils.py"
+    assert resolve_project_root(installed_module) == release.resolve()
+
+
+def test_explicit_release_root_without_configuration_fails_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TRADING_AGENT_PROJECT_ROOT", str(tmp_path / "incomplete-release"))
+    with pytest.raises(RuntimeError, match="does not contain config/config.yaml"):
+        resolve_project_root(tmp_path / "site-packages" / "app" / "utils.py")
+
+
+def test_release_entrypoints_export_project_root_before_artifact_imports() -> None:
+    root = Path(__file__).parents[1]
+    build = (root / "scripts" / "build_release.sh").read_text()
+    artifact_gate = '"$STAGING/.venv/bin/python" scripts/run_artifact_tests.py'
+    assert 'export TRADING_AGENT_PROJECT_ROOT="$STAGING"' in build
+    assert build.index('export TRADING_AGENT_PROJECT_ROOT="$STAGING"') < build.index(artifact_gate)
+
+    for name in ("run_once.sh", "run_telegram_listener.sh"):
+        script = (root / "scripts" / name).read_text()
+        export = 'export TRADING_AGENT_PROJECT_ROOT="$ROOT"'
+        assert export in script
+        assert script.index(export) < script.index('"$ROOT/.venv/bin/python" -m app.')
 
 
 def test_release_build_uses_external_verified_wheel_workspace_and_atomic_promotion() -> None:

@@ -102,6 +102,7 @@ WHEEL_PATH=$(
   --repository Elijah-Ang/Plutus
 
 cd "$STAGING"
+export TRADING_AGENT_PROJECT_ROOT="$STAGING"
 "$STAGING/.venv/bin/python" scripts/run_artifact_tests.py --output artifact-test-results.json
 "$STAGING/.venv/bin/python" scripts/verify_source_tree.py \
   --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
