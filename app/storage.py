@@ -123,8 +123,8 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "performance_outcomes": "id TEXT PRIMARY KEY, setup_id TEXT UNIQUE, run_id TEXT, symbol TEXT, proposal_id TEXT, batch_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, actual_or_shadow TEXT, entry_time TEXT, entry_price REAL, entry_notional REAL, entry_qty REAL, status TEXT, actual_proposal_execution_helped INTEGER, add_to_winner_improved_position INTEGER, exit_signal_avoided_loss INTEGER, created_at TEXT, updated_at TEXT",
     "performance_forward_returns": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, horizon_days INTEGER, due_at TEXT, eligible_to_update INTEGER DEFAULT 0, updated_at TEXT, forward_return REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, hypothetical_stop_hit INTEGER, hypothetical_target_hit INTEGER, status TEXT, reason TEXT",
     "performance_counterfactuals": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, counterfactual_type TEXT, would_enter INTEGER DEFAULT 0, would_add INTEGER DEFAULT 0, would_exit INTEGER DEFAULT 0, hypothetical_entry_price REAL, hypothetical_notional REAL, reason TEXT, comparison_status TEXT, created_at TEXT, updated_at TEXT",
-    "crypto_research_runs": "id TEXT PRIMARY KEY, run_id TEXT, status TEXT, started_at TEXT, ended_at TEXT, symbols TEXT, provider TEXT, error TEXT, payload TEXT",
-    "crypto_research_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, symbol TEXT, lane TEXT, price REAL, price_timestamp TEXT, data_freshness TEXT, return_1h REAL, return_4h REAL, return_1d REAL, return_7d REAL, return_20d REAL, realized_volatility REAL, atr_like_volatility REAL, trend_metrics TEXT, volume REAL, spread REAL, score REAL, score_components TEXT, risk_metrics TEXT, provider TEXT, created_at TEXT, payload TEXT",
+    "crypto_research_runs": "id TEXT PRIMARY KEY, run_id TEXT, status TEXT, started_at TEXT, ended_at TEXT, symbols TEXT, provider TEXT, error TEXT, capability_snapshot_id TEXT, capability_snapshot_fingerprint TEXT, capability_authoritative INTEGER, payload TEXT",
+    "crypto_research_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, symbol TEXT, lane TEXT, price REAL, price_timestamp TEXT, data_freshness TEXT, return_1h REAL, return_4h REAL, return_1d REAL, return_7d REAL, return_20d REAL, realized_volatility REAL, atr_like_volatility REAL, trend_metrics TEXT, volume REAL, spread REAL, score REAL, score_components TEXT, risk_metrics TEXT, provider TEXT, capability_snapshot_id TEXT, capability_snapshot_fingerprint TEXT, capability_authoritative INTEGER, market_evidence_id TEXT, market_evidence_fingerprint TEXT, market_evidence_authoritative INTEGER, market_execution_eligible INTEGER, created_at TEXT, payload TEXT",
     "crypto_observation_state": "symbol TEXT PRIMARY KEY, lane TEXT, score REAL, status TEXT, last_price REAL, last_price_timestamp TEXT, data_freshness TEXT, last_research_at TEXT, observation_since TEXT, updated_at TEXT, payload TEXT",
     "crypto_counterfactual_outcomes": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, setup_id TEXT, symbol TEXT, score REAL, would_propose INTEGER DEFAULT 0, reason TEXT, forward_return_1d REAL, forward_return_7d REAL, status TEXT, created_at TEXT, updated_at TEXT",
     "crypto_paper_watch_candidates": "id TEXT PRIMARY KEY, run_id TEXT, research_run_id TEXT, setup_id TEXT, proposal_id TEXT, symbol TEXT, mode TEXT, status TEXT, score REAL, entry_price REAL, stop_price REAL, take_profit_price REAL, risk_reward_ratio REAL, spread_bps REAL, volatility_regime TEXT, position_notional REAL, max_loss_estimate REAL, blockers TEXT, candidate_metadata TEXT, created_at TEXT, updated_at TEXT",
@@ -358,6 +358,8 @@ class Storage:
             from .winner_expansion import apply_winner_expansion_schema
             from .rotation_coordinator import apply_rotation_schema
             from .profit_milestones import apply_profit_milestone_schema
+            from .crypto_capabilities import apply_crypto_capability_schema
+            from .crypto_market_data import apply_crypto_market_data_schema
             apply_p1_execution_schema(conn)
             apply_final_hardening_schema(conn)
 
@@ -381,6 +383,8 @@ class Storage:
             apply_profitability_validation_schema(conn)
             from .profit_attribution import apply_profit_attribution_schema
             apply_profit_attribution_schema(conn)
+            apply_crypto_capability_schema(conn)
+            apply_crypto_market_data_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -452,6 +456,10 @@ class Storage:
                 apply_profitability_validation_schema(conn, record_migration=False)
                 from .profit_attribution import apply_profit_attribution_schema
                 apply_profit_attribution_schema(conn, record_migration=False)
+                from .crypto_capabilities import apply_crypto_capability_schema
+                apply_crypto_capability_schema(conn, record_migration=False)
+                from .crypto_market_data import apply_crypto_market_data_schema
+                apply_crypto_market_data_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

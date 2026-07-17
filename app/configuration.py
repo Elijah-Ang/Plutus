@@ -14,9 +14,9 @@ from .formula_versions import (
     ADAPTIVE_SIZING_FORMULA_VERSION,
     ADAPTIVE_SIZING_SCHEMA_VERSION,
     CONFIGURATION_SCHEMA_VERSION,
+    CRYPTO_CAPABILITY_FORMULA_VERSION,
+    CRYPTO_MARKET_DATA_FORMULA_VERSION,
     EVIDENCE_VERSION,
-    PHASE3_DECISION_VERSION,
-    PHASE4_ALLOCATION_VERSION,
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
     PROFITABILITY_RANKING_SCHEMA_VERSION,
@@ -76,6 +76,20 @@ STRICT_TOP_LEVEL_KEYS = {
 STRICT_SECTION_KEYS = {
     "execution_capabilities": {"live_execution_enabled", "autonomous_entries_enabled", "autonomous_exits_enabled", "protective_paper_exit_enabled"},
     "quotes": {"max_age_seconds", "max_spread_bps", "max_limit_slippage_bps", "price_increment_usd"},
+    "crypto": {
+        "enabled", "mode", "paper_trading_enabled", "proposals_enabled", "live_enabled",
+        "symbols", "optional_symbols", "max_symbols", "broker", "market_profile", "data_feed",
+        "quote_currency", "capability_contract", "allow_margin", "allow_shorting",
+        "max_notional_per_trade", "max_crypto_exposure_pct", "require_fresh_price",
+        "max_price_age_seconds", "min_score_for_paper_watch", "min_score_for_proposal",
+        "min_risk_reward_ratio", "min_stop_distance_pct", "max_stop_distance_pct",
+        "max_spread_bps", "minimum_top_of_book_notional_usd", "max_realized_volatility", "max_account_risk_per_trade",
+        "proposal_expiry_minutes", "approval_max_price_age_seconds",
+        "approval_max_price_move_bps_base", "approval_max_price_move_bps_hard_cap",
+        "default_order_type", "limit_price_source", "fallback_market_orders",
+        "allow_new_entries", "allow_add_to_winner", "allow_exits", "eodhd_research_enabled",
+        "data_source", "stage_transition_governance", "runtime_evidence_gate", "schedule",
+    },
     "risk": {
         "max_trade_notional_paper", "max_trade_notional_live", "max_trades_per_day", "max_open_positions",
         "allow_add_to_existing_position", "block_new_buys_when_any_position_open", "block_new_buys_after_buy_order_submitted_today",
@@ -137,7 +151,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -161,6 +175,11 @@ STRICT_SECTION_KEYS = {
 }
 
 STRICT_NESTED_KEYS = {
+    "crypto.capability_contract": {
+        "order_types", "time_in_force", "request_bases", "default_time_in_force",
+        "require_asset_api_verification", "require_paper_account_identity",
+        "snapshot_ttl_minutes", "maintenance_policy", "weekend_policy", "stablecoin_policy",
+    },
     "profitability_engine.candidate_model": {
         "cost_model_version", "estimation_model_version",
         "neutral_win_probability", "prior_win_samples", "prior_payoff_samples",
@@ -256,6 +275,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "profitability_ranking": PROFITABILITY_RANKING_FORMULA_VERSION,
         "profitability_validation": PROFITABILITY_VALIDATION_FORMULA_VERSION,
         "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
+        "crypto_capability": CRYPTO_CAPABILITY_FORMULA_VERSION,
+        "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -630,8 +651,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     # before a runtime object or database is opened.
     for section_name in (
         "risk", "risk_budget", "phase3", "phase4", "adaptive_conviction", "profitability_engine",
-        "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight",
-        "winner_expansion", "trend_management", "rotation",
+            "position_sizing", "portfolio_behavior", "portfolio_optimizer", "quotes", "alpaca", "preflight",
+            "winner_expansion", "trend_management", "rotation", "crypto",
     ):
         _validate_units(config.get(section_name), section_name, errors)
 
@@ -648,6 +669,35 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(crypto.get("paper_trading_enabled", False) is False, "crypto.paper_trading_enabled must remain false in Phase 0")
     require(crypto.get("proposals_enabled", False) is False, "crypto.proposals_enabled must remain false in Phase 0")
     require(crypto.get("mode", "research_only") == "research_only", "crypto.mode must remain research_only in Phase 0")
+    require(crypto.get("broker") == "alpaca_paper_spot", "crypto.broker must be alpaca_paper_spot")
+    require(crypto.get("data_source") == "alpaca", "crypto.data_source must be alpaca")
+    require(crypto.get("market_profile") == "continuous_24_7", "crypto.market_profile must be continuous_24_7")
+    require(crypto.get("data_feed") == "us", "crypto.data_feed must be the Alpaca US feed")
+    require(crypto.get("quote_currency") == "USD", "crypto.quote_currency must be USD")
+    require(crypto.get("symbols") == ["BTC/USD", "ETH/USD"], "crypto.symbols must begin with exactly BTC/USD and ETH/USD")
+    require(crypto.get("max_symbols") == 2, "crypto.max_symbols must be 2 in the initial lane")
+    require(crypto.get("allow_margin") is False, "crypto margin must remain disabled")
+    require(crypto.get("allow_shorting") is False, "crypto shorting must remain disabled")
+    contract = crypto.get("capability_contract") or {}
+    require(sorted(contract.get("order_types") or []) == ["limit", "market", "stop_limit"],
+            "crypto capability order types must be market, limit and stop_limit")
+    require(sorted(contract.get("time_in_force") or []) == ["gtc", "ioc"],
+            "crypto capability time-in-force values must be gtc and ioc")
+    require(sorted(contract.get("request_bases") or []) == ["notional", "quantity"],
+            "crypto capability request bases must be quantity and notional")
+    require(contract.get("default_time_in_force") == "gtc", "crypto default time-in-force must be gtc")
+    require(contract.get("require_asset_api_verification") is True,
+            "crypto pair precision must be verified from the current Assets API")
+    require(contract.get("require_paper_account_identity") is True,
+            "crypto capability requires verified paper account identity")
+    require(contract.get("maintenance_policy") == "fail_closed", "crypto maintenance policy must fail closed")
+    require(contract.get("weekend_policy") == "continuous_same_controls",
+            "crypto weekend operation must retain the same controls")
+    require(contract.get("stablecoin_policy") == "reject_stablecoin_base_and_non_usd_quote",
+            "crypto stablecoin policy must reject stablecoin bases and non-USD quotes")
+    ttl = _bounded(contract.get("snapshot_ttl_minutes"), "crypto capability snapshot TTL", errors, 1, 1440)
+    require(ttl is not None, "crypto capability snapshot TTL is required")
+    _bounded(crypto.get("minimum_top_of_book_notional_usd"), "crypto minimum top-of-book notional", errors, 0.01, 100000000)
 
     expiry_default = _number(config, "proposal_expiry_default_minutes", errors, minimum=1, maximum=1440)
     expiry_min = _number(config, "proposal_expiry_min_minutes", errors, minimum=1, maximum=1440)

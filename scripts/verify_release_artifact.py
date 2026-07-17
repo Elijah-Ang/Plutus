@@ -97,7 +97,8 @@ def verify(
         str(item.get("name")): item for item in results if isinstance(item, dict)
     }
     required_gates = {
-        "compileall", "installed_wheel_import", "targeted_safety_suites", "full_pytest"
+        "compileall", "installed_wheel_import", "alpaca_crypto_sdk_contract",
+        "targeted_safety_suites", "full_pytest",
     }
     if (
         not required_gates.issubset(result_by_name)

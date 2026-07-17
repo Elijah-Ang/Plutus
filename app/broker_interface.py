@@ -29,6 +29,21 @@ class BrokerInterface(ABC):
     @abstractmethod
     def get_historical_bars(self, symbol: str, timeframe: str, limit: int) -> Any: ...
 
+    def get_crypto_assets(self) -> list[Any]:
+        raise NotImplementedError("current crypto asset capability support is required")
+
+    def get_crypto_historical_bars(self, symbol: str, timeframe: str, limit: int) -> Any:
+        raise NotImplementedError("separate crypto historical data support is required")
+
+    def get_crypto_latest_quote(self, symbol: str) -> Any:
+        raise NotImplementedError("separate crypto quote support is required")
+
+    def get_crypto_latest_trade(self, symbol: str) -> Any:
+        raise NotImplementedError("separate crypto trade support is required")
+
+    def get_crypto_latest_orderbook(self, symbol: str) -> Any:
+        raise NotImplementedError("separate crypto orderbook support is required")
+
     @abstractmethod
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str, limit_price: float | None = None, client_order_id: str | None = None) -> Any: ...
 

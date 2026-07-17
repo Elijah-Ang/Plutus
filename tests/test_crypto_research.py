@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -15,6 +16,7 @@ from app.reports import SHEETS
 from app.risk_engine import RiskEngine
 from app.service import TradingService
 from app.storage import Storage
+from app.formula_versions import CRYPTO_CAPABILITY_FORMULA_VERSION, CRYPTO_MARKET_DATA_FORMULA_VERSION
 
 
 class CryptoBroker:
@@ -46,7 +48,45 @@ class CryptoBroker:
         return pd.DataFrame(rows).set_index(["symbol", "timestamp"])
 
     def get_crypto_latest_quote(self, symbol: str):
-        return type("Quote", (), {"bid_price": 100.0, "ask_price": 100.1})()
+        return SimpleNamespace(
+            bid_price=100.0, ask_price=100.1, bid_size=20.0, ask_size=20.0,
+            timestamp=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        )
+
+    def get_crypto_latest_trade(self, symbol: str):
+        return SimpleNamespace(
+            price=100.05, size=0.5, timestamp=datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
+        )
+
+    def get_crypto_latest_orderbook(self, symbol: str):
+        return SimpleNamespace(
+            bids=[SimpleNamespace(price=100.0, size=20.0)],
+            asks=[SimpleNamespace(price=100.1, size=20.0)],
+            timestamp=datetime(2026, 7, 3, 10, 0, tzinfo=UTC),
+        )
+
+    def paper_account_identity(self):
+        return {
+            "verified": True,
+            "mode": "paper",
+            "endpoint_class": "paper",
+            "account_status": "active",
+            "account_currency": "USD",
+            "account_id_hash": "a" * 64,
+        }
+
+    def get_crypto_assets(self):
+        return [
+            SimpleNamespace(
+                id=f"asset-{symbol}", asset_class="crypto", exchange="CRYPTO", symbol=symbol,
+                status="active", tradable=True, marginable=False, shortable=False,
+                easy_to_borrow=False, fractionable=True,
+                min_order_size="0.0001" if symbol == "BTC/USD" else "0.001",
+                min_trade_increment="0.0001" if symbol == "BTC/USD" else "0.001",
+                price_increment="1" if symbol == "BTC/USD" else "0.1",
+            )
+            for symbol in ("BTC/USD", "ETH/USD")
+        ]
 
     def is_market_open(self):
         return False
@@ -75,6 +115,13 @@ class MissingSpreadCryptoBroker(CryptoBroker):
         return None
 
 
+class UntradableCryptoBroker(CryptoBroker):
+    def get_crypto_assets(self):
+        assets = super().get_crypto_assets()
+        assets[0].tradable = False
+        return assets
+
+
 class TelegramSink:
     def __init__(self) -> None:
         self.messages = []
@@ -89,6 +136,11 @@ def _config(**overrides):
         "live_enabled": False,
         "auto_execution_enabled": False,
         "auto_execution_mode": "manual_only",
+        "effective_config_hash": "a" * 64,
+        "formula_versions": {
+            "crypto_capability": CRYPTO_CAPABILITY_FORMULA_VERSION,
+            "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
+        },
         "watchlist": ["SPY", "QQQ", "DIA", "IWM"],
         "risk_budget": {"max_total_portfolio_exposure_pct": 6.0},
         "crypto": {
@@ -100,6 +152,22 @@ def _config(**overrides):
             "symbols": ["BTC/USD", "ETH/USD"],
             "optional_symbols": ["SOL/USD"],
             "max_symbols": 2,
+            "broker": "alpaca_paper_spot",
+            "market_profile": "continuous_24_7",
+            "data_feed": "us",
+            "quote_currency": "USD",
+            "capability_contract": {
+                "order_types": ["market", "limit", "stop_limit"],
+                "time_in_force": ["gtc", "ioc"],
+                "request_bases": ["quantity", "notional"],
+                "default_time_in_force": "gtc",
+                "require_asset_api_verification": True,
+                "require_paper_account_identity": True,
+                "snapshot_ttl_minutes": 60,
+                "maintenance_policy": "fail_closed",
+                "weekend_policy": "continuous_same_controls",
+                "stablecoin_policy": "reject_stablecoin_base_and_non_usd_quote",
+            },
             "allow_margin": False,
             "allow_shorting": False,
             "max_notional_per_trade": 5.0,
@@ -112,6 +180,7 @@ def _config(**overrides):
             "min_stop_distance_pct": 0.01,
             "max_stop_distance_pct": 0.08,
             "max_spread_bps": 50,
+            "minimum_top_of_book_notional_usd": 1000.0,
             "max_realized_volatility": 1.5,
             "max_account_risk_per_trade": 0.05,
             "proposal_expiry_minutes": 3,
@@ -156,6 +225,17 @@ def test_btc_and_eth_enter_crypto_research_lane_sol_optional_by_default(tmp_path
     assert {result.symbol for result in results} == {"BTC/USD", "ETH/USD"}
     assert "SOL/USD" not in {result.symbol for result in results}
     assert all(result.lane in {"crypto_research_candidate", "crypto_observation"} for result in results)
+    assert all(result.capability_authoritative for result in results)
+    assert len({result.capability_snapshot_id for result in results}) == 1
+    assert all(result.market_evidence_authoritative for result in results)
+    assert all(result.market_execution_eligible for result in results)
+    assert len({result.market_evidence_id for result in results}) == 2
+    run = storage.fetch_all("SELECT * FROM crypto_research_runs")[0]
+    assert int(run["capability_authoritative"]) == 1
+    assert run["capability_snapshot_id"] == results[0].capability_snapshot_id
+    snapshots = storage.fetch_all("SELECT * FROM crypto_research_snapshots ORDER BY symbol")
+    assert all(row["market_evidence_id"] for row in snapshots)
+    assert all(int(row["market_evidence_authoritative"]) == 1 for row in snapshots)
 
 
 def test_crypto_symbols_are_normalized_consistently():
@@ -256,6 +336,21 @@ def test_crypto_provider_failure_records_data_unavailable_blocker_and_no_orders(
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
     assert storage.fetch_all("SELECT * FROM orders") == []
     assert broker.submitted_orders == []
+
+
+def test_unverified_current_pair_capability_is_linked_and_blocks_future_stages(tmp_path):
+    storage = _storage(tmp_path)
+    results = CryptoResearchEngine(
+        _config(), storage, UntradableCryptoBroker(), TelegramSink(), "run-untradable"
+    ).run_research(now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC))
+
+    assert all(not result.capability_authoritative for result in results)
+    rows = storage.fetch_all(
+        "SELECT DISTINCT blocker FROM performance_blockers WHERE blocker='crypto_capability_unverified'"
+    )
+    assert len(rows) == 1
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
 
 
 def test_crypto_stage_1_creates_only_research_rows(tmp_path):
@@ -453,6 +548,9 @@ def test_crypto_report_sheets_are_registered():
         "Crypto Counterfactual Outcomes",
         "Crypto Data Coverage",
         "Crypto Risk Metrics",
+        "Crypto Capability",
+        "Crypto Pair Precision",
+        "Crypto Market Evidence",
     }.issubset(sheet_names)
 
 

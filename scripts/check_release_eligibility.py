@@ -24,6 +24,10 @@ sys.path.insert(0, str(ROOT))
 from app.configuration import validate_config  # noqa: E402
 from app.formula_versions import (  # noqa: E402
     CONFIGURATION_SCHEMA_VERSION,
+    CRYPTO_CAPABILITY_FORMULA_VERSION,
+    CRYPTO_CAPABILITY_SCHEMA_VERSION,
+    CRYPTO_MARKET_DATA_FORMULA_VERSION,
+    CRYPTO_MARKET_DATA_SCHEMA_VERSION,
     PHASE4_ALLOCATION_VERSION,
     PHASE4_SCHEMA_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
@@ -60,6 +64,10 @@ RELEASE_FORMULA_VERSIONS = {
     "profitability_validation_schema": PROFITABILITY_VALIDATION_SCHEMA_VERSION,
     "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
     "profit_attribution_schema": PROFIT_ATTRIBUTION_SCHEMA_VERSION,
+    "crypto_capability": CRYPTO_CAPABILITY_FORMULA_VERSION,
+    "crypto_capability_schema": CRYPTO_CAPABILITY_SCHEMA_VERSION,
+    "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
+    "crypto_market_data_schema": CRYPTO_MARKET_DATA_SCHEMA_VERSION,
 }
 
 

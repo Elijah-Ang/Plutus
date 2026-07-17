@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta, timezone
 from typing import Any
 
+from .crypto_capabilities import CryptoCapabilitySnapshot, CryptoCapabilityStore
+from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
 from .storage import Storage
 from .utils import json_dumps
 
@@ -41,6 +43,8 @@ CRYPTO_BLOCKER_REASONS = {
     "crypto_alpaca_final_price_unavailable",
     "crypto_runtime_evidence_gate_failed",
     "crypto_stage3_enablement_requires_separate_approval",
+    "crypto_capability_unverified",
+    "crypto_market_data_unverified",
 }
 
 
@@ -64,6 +68,15 @@ class CryptoResearchResult:
     status: str
     reason: str
     setup_id: str | None = None
+    capability_snapshot_id: str | None = None
+    capability_snapshot_fingerprint: str | None = None
+    capability_authoritative: bool = False
+    capability_failure_reasons: tuple[str, ...] = ()
+    market_evidence_id: str | None = None
+    market_evidence_fingerprint: str | None = None
+    market_evidence_authoritative: bool = False
+    market_execution_eligible: bool = False
+    market_evidence_failure_reasons: tuple[str, ...] = ()
 
 
 def normalize_crypto_symbol(symbol: str) -> str | None:
@@ -151,8 +164,18 @@ class CryptoResearchEngine:
         enabled_symbols = symbols or configured_crypto_symbols(self.config)
         provider = str(cfg.get("data_source") or "alpaca")
         research_run_id = str(uuid.uuid4())
+        capability = CryptoCapabilityStore(self.storage).capture(
+            self.config,
+            self.broker,
+            self.run_id,
+            now=now,
+        )
         self.storage.execute(
-            "INSERT INTO crypto_research_runs(id,run_id,status,started_at,symbols,provider,payload) VALUES(?,?,?,?,?,?,?)",
+            """INSERT INTO crypto_research_runs(
+                   id,run_id,status,started_at,symbols,provider,
+                   capability_snapshot_id,capability_snapshot_fingerprint,
+                   capability_authoritative,payload
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (
                 research_run_id,
                 self.run_id,
@@ -160,14 +183,22 @@ class CryptoResearchEngine:
                 now.isoformat(),
                 json_dumps(enabled_symbols),
                 provider,
-                json_dumps({"mode": mode, "paper_trading_enabled": cfg.get("paper_trading_enabled", False), "proposals_enabled": cfg.get("proposals_enabled", False)}),
+                capability.id,
+                capability.snapshot_fingerprint,
+                int(capability.authoritative),
+                json_dumps({
+                    "mode": mode,
+                    "paper_trading_enabled": cfg.get("paper_trading_enabled", False),
+                    "proposals_enabled": cfg.get("proposals_enabled", False),
+                    "capability_failure_reasons": capability.failure_reasons,
+                }),
             ),
         )
         results: list[CryptoResearchResult] = []
         status = "completed"
         error = None
         for symbol in enabled_symbols:
-            result = self._research_symbol(symbol, research_run_id, now, provider)
+            result = self._research_symbol(symbol, research_run_id, now, provider, capability)
             results.append(result)
             self._persist_result(result, research_run_id, now)
         self.storage.execute(
@@ -177,17 +208,39 @@ class CryptoResearchEngine:
         self._set_state("crypto_last_research_at", now.isoformat())
         return results
 
-    def _research_symbol(self, symbol: str, research_run_id: str, now: datetime, provider: str) -> CryptoResearchResult:
+    def _research_symbol(
+        self,
+        symbol: str,
+        research_run_id: str,
+        now: datetime,
+        provider: str,
+        capability: CryptoCapabilitySnapshot,
+    ) -> CryptoResearchResult:
         normalized = normalize_crypto_symbol(symbol)
         if not normalized:
-            return self._missing_result(symbol, provider, "unsupported_crypto_symbol")
+            return self._with_capability(
+                self._missing_result(symbol, provider, "unsupported_crypto_symbol"), capability
+            )
+        market_evidence = CryptoMarketDataStore(self.storage).capture(
+            self.config,
+            self.broker,
+            capability,
+            self.run_id,
+            research_run_id,
+            normalized,
+            now=now,
+        )
         try:
             bars = self._get_crypto_bars(normalized)
         except Exception as exc:
-            return self._missing_result(normalized, provider, f"provider_unavailable:{type(exc).__name__}")
+            result = self._missing_result(normalized, provider, f"provider_unavailable:{type(exc).__name__}")
+            self._with_market_evidence(result, market_evidence)
+            return self._with_capability(result, capability)
         rows = _bar_rows(bars, normalized)
         if not rows:
-            return self._missing_result(normalized, provider, "missing_crypto_bars")
+            result = self._missing_result(normalized, provider, "missing_crypto_bars")
+            self._with_market_evidence(result, market_evidence)
+            return self._with_capability(result, capability)
 
         closes = [float(row["close"]) for row in rows if _is_number(row.get("close"))]
         price = closes[-1] if closes else None
@@ -207,7 +260,11 @@ class CryptoResearchEngine:
         atr_like = _atr_like(rows, price)
         trend_metrics = _trend_metrics(closes)
         volume = _last_number(rows, "volume")
-        spread = self._safe_spread(normalized)
+        spread = (
+            float(market_evidence.spread_bps) / 10000.0
+            if market_evidence.spread_bps is not None
+            else None
+        )
         score, components, risk_metrics = _score_crypto(
             data_freshness=data_freshness,
             returns=returns,
@@ -222,7 +279,7 @@ class CryptoResearchEngine:
         reason = "research_only_no_proposals" if mode == "research_only" else f"{mode}_no_actionable_proposal"
         if data_freshness != "fresh":
             reason = "stale_crypto_data_no_proposals"
-        return CryptoResearchResult(
+        result = CryptoResearchResult(
             symbol=normalized,
             lane=lane,
             price=price,
@@ -241,25 +298,55 @@ class CryptoResearchEngine:
             status=mode,
             reason=reason,
         )
+        self._with_market_evidence(result, market_evidence)
+        return self._with_capability(result, capability)
+
+    def _with_capability(
+        self,
+        result: CryptoResearchResult,
+        capability: CryptoCapabilitySnapshot,
+    ) -> CryptoResearchResult:
+        asset = capability.asset(result.symbol)
+        result.capability_snapshot_id = capability.id
+        result.capability_snapshot_fingerprint = capability.snapshot_fingerprint
+        result.capability_authoritative = bool(
+            capability.authoritative and asset is not None and asset.authoritative
+        )
+        reasons = list(capability.failure_reasons)
+        if asset is None:
+            reasons.append(f"{result.symbol}:asset_capability_missing")
+        elif not asset.authoritative:
+            reasons.extend(f"{result.symbol}:{reason}" for reason in asset.failure_reasons)
+        result.capability_failure_reasons = tuple(sorted(set(reasons)))
+        return result
+
+    def _with_market_evidence(
+        self,
+        result: CryptoResearchResult,
+        evidence: CryptoMarketEvidence,
+    ) -> CryptoResearchResult:
+        result.market_evidence_id = evidence.id
+        result.market_evidence_fingerprint = evidence.evidence_fingerprint
+        result.market_evidence_authoritative = evidence.authoritative
+        result.market_execution_eligible = evidence.execution_eligible
+        result.market_evidence_failure_reasons = evidence.failure_reasons
+        result.risk_metrics.update({
+            "market_evidence_id": evidence.id,
+            "market_evidence_fingerprint": evidence.evidence_fingerprint,
+            "market_evidence_authoritative": evidence.authoritative,
+            "market_execution_eligible": evidence.execution_eligible,
+            "top_of_book_notional": evidence.top_of_book_notional,
+            "quote_timestamp": evidence.quote_timestamp,
+            "orderbook_timestamp": evidence.orderbook_timestamp,
+            "market_evidence_failure_reasons": list(evidence.failure_reasons),
+            "market_evidence_warnings": list(evidence.warnings),
+        })
+        return result
 
     def _get_crypto_bars(self, symbol: str) -> Any:
         if self.broker is None or not hasattr(self.broker, "get_crypto_historical_bars"):
             raise RuntimeError("crypto data provider unavailable")
         return self.broker.get_crypto_historical_bars(symbol, "1Hour", 500)
-
-    def _safe_spread(self, symbol: str) -> float | None:
-        if self.broker is None or not hasattr(self.broker, "get_crypto_latest_quote"):
-            return None
-        try:
-            quote = self.broker.get_crypto_latest_quote(symbol)
-            bid = getattr(quote, "bid_price", None) or getattr(quote, "bp", None)
-            ask = getattr(quote, "ask_price", None) or getattr(quote, "ap", None)
-            if _is_number(bid) and _is_number(ask) and float(ask) > 0:
-                mid = (float(bid) + float(ask)) / 2
-                return (float(ask) - float(bid)) / mid if mid > 0 else None
-        except Exception:
-            return None
-        return None
 
     def _persist_result(self, result: CryptoResearchResult, research_run_id: str, now: datetime) -> None:
         setup_id = self._record_performance_lab(result, now)
@@ -269,8 +356,11 @@ class CryptoResearchEngine:
             INSERT INTO crypto_research_snapshots(
                 id,run_id,research_run_id,symbol,lane,price,price_timestamp,data_freshness,return_1h,return_4h,
                 return_1d,return_7d,return_20d,realized_volatility,atr_like_volatility,trend_metrics,volume,spread,
-                score,score_components,risk_metrics,provider,created_at,payload
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                score,score_components,risk_metrics,provider,capability_snapshot_id,
+                capability_snapshot_fingerprint,capability_authoritative,market_evidence_id,
+                market_evidence_fingerprint,market_evidence_authoritative,market_execution_eligible,
+                created_at,payload
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), self.run_id, research_run_id, result.symbol, result.lane, result.price,
@@ -278,8 +368,21 @@ class CryptoResearchEngine:
                 result.returns.get("1d"), result.returns.get("7d"), result.returns.get("20d"),
                 result.realized_volatility, result.atr_like_volatility, json_dumps(result.trend_metrics),
                 result.volume, result.spread, result.score, json_dumps(result.score_components),
-                json_dumps(result.risk_metrics), result.provider, now.isoformat(),
-                json_dumps({"status": result.status, "reason": result.reason, "setup_id": setup_id}),
+                json_dumps(result.risk_metrics), result.provider, result.capability_snapshot_id,
+                result.capability_snapshot_fingerprint, int(result.capability_authoritative),
+                result.market_evidence_id, result.market_evidence_fingerprint,
+                int(result.market_evidence_authoritative), int(result.market_execution_eligible), now.isoformat(),
+                json_dumps({
+                    "status": result.status,
+                    "reason": result.reason,
+                    "setup_id": setup_id,
+                    "capability_failure_reasons": result.capability_failure_reasons,
+                    "market_evidence_id": result.market_evidence_id,
+                    "market_evidence_fingerprint": result.market_evidence_fingerprint,
+                    "market_evidence_authoritative": result.market_evidence_authoritative,
+                    "market_execution_eligible": result.market_execution_eligible,
+                    "market_evidence_failure_reasons": result.market_evidence_failure_reasons,
+                }),
             ),
         )
         existing = self.storage.fetch_all("SELECT observation_since FROM crypto_observation_state WHERE symbol=?", (result.symbol,))
@@ -505,6 +608,18 @@ class CryptoResearchEngine:
         blockers: list[tuple[str, str]] = []
         if result.symbol not in configured_crypto_symbols(self.config):
             blockers.append(("crypto_pair_unsupported", f"{result.symbol} is not in configured crypto symbols"))
+        if not result.capability_authoritative:
+            blockers.append((
+                "crypto_capability_unverified",
+                "current Alpaca paper account/pair capability is not authoritative: "
+                + ",".join(result.capability_failure_reasons),
+            ))
+        if not result.market_evidence_authoritative:
+            blockers.append((
+                "crypto_market_data_unverified",
+                "current Alpaca quote/order-book evidence is not authoritative: "
+                + ",".join(result.market_evidence_failure_reasons),
+            ))
         if mode == "research_only":
             blockers.append(("crypto_research_only", "crypto.mode=research_only"))
         if not cfg.get("paper_trading_enabled", False):
@@ -660,6 +775,15 @@ def _build_candidate_metadata(result: CryptoResearchResult, config: dict[str, An
         "position_size": position_size,
         "max_loss_estimate": max_loss_estimate,
         "provider_coverage": provider_coverage,
+        "capability_snapshot_id": result.capability_snapshot_id,
+        "capability_snapshot_fingerprint": result.capability_snapshot_fingerprint,
+        "capability_authoritative": result.capability_authoritative,
+        "capability_failure_reasons": list(result.capability_failure_reasons),
+        "market_evidence_id": result.market_evidence_id,
+        "market_evidence_fingerprint": result.market_evidence_fingerprint,
+        "market_evidence_authoritative": result.market_evidence_authoritative,
+        "market_execution_eligible": result.market_execution_eligible,
+        "market_evidence_failure_reasons": list(result.market_evidence_failure_reasons),
         "alpaca_final_price_timestamp": result.price_timestamp,
         "long_only_spot": True,
         "allow_margin": False,
