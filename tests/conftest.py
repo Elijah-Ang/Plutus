@@ -31,7 +31,10 @@ os.environ.update({
 if "alpaca" not in sys.modules:
     alpaca = types.ModuleType("alpaca")
     alpaca_data = types.ModuleType("alpaca.data")
+    alpaca_data_enums = types.ModuleType("alpaca.data.enums")
     alpaca_data_historical = types.ModuleType("alpaca.data.historical")
+    alpaca_data_requests = types.ModuleType("alpaca.data.requests")
+    alpaca_data_timeframe = types.ModuleType("alpaca.data.timeframe")
     alpaca_trading = types.ModuleType("alpaca.trading")
     alpaca_trading_client = types.ModuleType("alpaca.trading.client")
     alpaca_trading_enums = types.ModuleType("alpaca.trading.enums")
@@ -58,22 +61,57 @@ if "alpaca" not in sys.modules:
         def get_stock_latest_trade(self, *args, **kwargs): return SimpleNamespace(price=100.0, timestamp=datetime.now(UTC))
         def get_stock_latest_quote(self, *args, **kwargs): return SimpleNamespace(bid_price=99.99, ask_price=100.01, timestamp=datetime.now(UTC))
 
+    class _FakeCryptoHistoricalDataClient:
+        def __init__(self, key=None, secret=None): pass
+        def get_crypto_bars(self, *args, **kwargs): return SimpleNamespace(df=[])
+        def get_crypto_latest_quote(self, *args, **kwargs): return {}
+        def get_crypto_latest_trade(self, *args, **kwargs): return {}
+        def get_crypto_latest_orderbook(self, *args, **kwargs): return {}
+
     class _Enum:
         BUY = "buy"
         SELL = "sell"
         DAY = "day"
+
+    class _EnumValue:
+        def __init__(self, value): self.value = value
+
+    class _AssetClass:
+        CRYPTO = _EnumValue("crypto")
+
+    class _AssetStatus:
+        ACTIVE = _EnumValue("active")
+
+    class _CryptoFeed:
+        US = _EnumValue("us")
+
+    class _TimeFrame:
+        Day = _EnumValue("1Day")
+        Hour = _EnumValue("1Hour")
 
     class _Request:
         def __init__(self, **kwargs): self.__dict__.update(kwargs)
 
     alpaca_trading_client.TradingClient = _FakeTradingClient
     alpaca_data_historical.StockHistoricalDataClient = _FakeStockHistoricalDataClient
+    alpaca_data_historical.CryptoHistoricalDataClient = _FakeCryptoHistoricalDataClient
+    alpaca_data_enums.CryptoFeed = _CryptoFeed
+    alpaca_data_requests.CryptoBarsRequest = _Request
+    alpaca_data_requests.CryptoLatestQuoteRequest = _Request
+    alpaca_data_requests.CryptoLatestTradeRequest = _Request
+    alpaca_data_requests.CryptoLatestOrderbookRequest = _Request
+    alpaca_data_timeframe.TimeFrame = _TimeFrame
     alpaca_trading_enums.OrderSide = _Enum
     alpaca_trading_enums.TimeInForce = _Enum
+    alpaca_trading_enums.AssetClass = _AssetClass
+    alpaca_trading_enums.AssetStatus = _AssetStatus
+    alpaca_trading_requests.GetAssetsRequest = _Request
     alpaca_trading_requests.LimitOrderRequest = _Request
     alpaca_trading_requests.MarketOrderRequest = _Request
     sys.modules.update({
-        "alpaca": alpaca, "alpaca.data": alpaca_data, "alpaca.data.historical": alpaca_data_historical,
+        "alpaca": alpaca, "alpaca.data": alpaca_data, "alpaca.data.enums": alpaca_data_enums,
+        "alpaca.data.historical": alpaca_data_historical, "alpaca.data.requests": alpaca_data_requests,
+        "alpaca.data.timeframe": alpaca_data_timeframe,
         "alpaca.trading": alpaca_trading, "alpaca.trading.client": alpaca_trading_client,
         "alpaca.trading.enums": alpaca_trading_enums, "alpaca.trading.requests": alpaca_trading_requests,
     })

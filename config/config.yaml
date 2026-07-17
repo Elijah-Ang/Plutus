@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v12_profitability_validation_attribution_paper
+configuration_schema_version: plutus_effective_config_v13_crypto_data_capability_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v12_profitability_validation_attribution_paper
+  required_configuration_version: plutus_effective_config_v13_crypto_data_capability_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -373,6 +373,8 @@ formula_versions:
   profitability_ranking: candidate_profitability_ranking_v1
   profitability_validation: profitability_validation_v1
   profit_attribution: profit_attribution_v1
+  crypto_capability: alpaca_spot_crypto_capability_v1
+  crypto_market_data: alpaca_crypto_market_evidence_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 
@@ -390,6 +392,21 @@ crypto:
   optional_symbols:
     - SOL/USD
   max_symbols: 2
+  broker: alpaca_paper_spot
+  market_profile: continuous_24_7
+  data_feed: us
+  quote_currency: USD
+  capability_contract:
+    order_types: [market, limit, stop_limit]
+    time_in_force: [gtc, ioc]
+    request_bases: [quantity, notional]
+    default_time_in_force: gtc
+    require_asset_api_verification: true
+    require_paper_account_identity: true
+    snapshot_ttl_minutes: 60
+    maintenance_policy: fail_closed
+    weekend_policy: continuous_same_controls
+    stablecoin_policy: reject_stablecoin_base_and_non_usd_quote
   allow_margin: false
   allow_shorting: false
   max_notional_per_trade: 5.00
@@ -402,6 +419,7 @@ crypto:
   min_stop_distance_pct: 0.01
   max_stop_distance_pct: 0.08
   max_spread_bps: 50
+  minimum_top_of_book_notional_usd: 1000.00
   max_realized_volatility: 1.5
   max_account_risk_per_trade: 0.05
   proposal_expiry_minutes: 3

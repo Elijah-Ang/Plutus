@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
+import hashlib
 import socket
 import ssl
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .broker_interface import BrokerInterface
@@ -43,7 +43,7 @@ class AlpacaBroker(BrokerInterface):
             raise RuntimeError("Alpaca credentials are not configured")
         self.timeout_cfg = config.get("alpaca", {}).get("timeouts", {})
         try:
-            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
             from alpaca.trading.client import TradingClient
         except ImportError as exc:
             raise RuntimeError("Install alpaca-py before using AlpacaBroker") from exc
@@ -52,7 +52,11 @@ class AlpacaBroker(BrokerInterface):
         # supplemental evidence in paper_account_identity().
         self.trading = TradingClient(key, secret, paper=self.paper_requested)
         self.data = StockHistoricalDataClient(key, secret)
-        self._crypto_data = None
+        # Authentication is optional for Alpaca crypto data, but the official
+        # SDK documents a higher rate limit when keys are supplied.  Use the
+        # same paper credentials while keeping the data and equity clients
+        # separate by asset class.
+        self._crypto_data = CryptoHistoricalDataClient(key, secret)
 
     def _timeout_seconds(self, kind: str) -> float:
         defaults = {
@@ -101,7 +105,8 @@ class AlpacaBroker(BrokerInterface):
     def paper_account_identity(self) -> dict[str, Any]:
         account = self.get_account()
         account_id = getattr(account, "id", None) or getattr(account, "account_number", None)
-        account_status = str(getattr(account, "status", "unknown")).lower()
+        raw_status = getattr(account, "status", "")
+        account_status = str(getattr(raw_status, "value", raw_status) or "").lower()
         currency = str(getattr(account, "currency", "USD") or "").upper()
         account_blocked = bool(getattr(account, "account_blocked", False))
         trading_blocked = bool(getattr(account, "trading_blocked", False))
@@ -114,13 +119,14 @@ class AlpacaBroker(BrokerInterface):
         return {
             "verified": bool(
                 public_constructor_identity and configured_paper_endpoint and endpoint_consistent
-                and account_id and account_status not in {"blocked", "disabled", "account_blocked"}
+                and account_id and account_status == "active"
                 and not account_blocked and not trading_blocked and currency == "USD"
             ),
             "mode": self.mode,
             "endpoint_class": "paper" if configured_paper_endpoint and endpoint_consistent else "ambiguous",
             "account_status": account_status,
             "account_id_present": bool(account_id),
+            "account_id_hash": hashlib.sha256(str(account_id).encode("utf-8")).hexdigest() if account_id else "",
             "account_currency": currency,
             "paper_constructor_requested": public_constructor_identity,
             "configured_endpoint_paper": configured_paper_endpoint,
@@ -152,14 +158,24 @@ class AlpacaBroker(BrokerInterface):
 
     def _get_crypto_data_client(self) -> Any:
         if self._crypto_data is None:
-            try:
-                from alpaca.data.historical import CryptoHistoricalDataClient
-            except ImportError as exc:
-                raise RuntimeError("alpaca-py crypto data client is unavailable") from exc
-            self._crypto_data = CryptoHistoricalDataClient()
+            raise RuntimeError("authenticated alpaca-py crypto data client is unavailable")
         return self._crypto_data
 
+    def get_crypto_assets(self) -> list[Any]:
+        """Read active crypto pairs and their current broker precision fields."""
+
+        from alpaca.trading.enums import AssetClass, AssetStatus
+        from alpaca.trading.requests import GetAssetsRequest
+
+        request = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.CRYPTO)
+        return list(self._call(
+            "get_crypto_assets",
+            "read",
+            lambda: self.trading.get_all_assets(request),
+        ))
+
     def get_crypto_historical_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 500) -> Any:
+        from alpaca.data.enums import CryptoFeed
         from alpaca.data.requests import CryptoBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
@@ -168,28 +184,77 @@ class AlpacaBroker(BrokerInterface):
         request = CryptoBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
-            start=datetime.now().astimezone() - timedelta(days=lookback_days),
+            start=datetime.now(UTC) - timedelta(days=lookback_days),
             limit=limit,
         )
         return self._call(
             "get_crypto_historical_bars",
             "market_data",
-            lambda: self._get_crypto_data_client().get_crypto_bars(request).df,
+            lambda: self._get_crypto_data_client().get_crypto_bars(request, feed=CryptoFeed.US).df,
         )
 
     def get_crypto_latest_quote(self, symbol: str) -> Any:
+        from alpaca.data.enums import CryptoFeed
         from alpaca.data.requests import CryptoLatestQuoteRequest
 
         request = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
         return self._call(
             "get_crypto_latest_quote",
             "market_data",
-            lambda: self._get_crypto_data_client().get_crypto_latest_quote(request)[symbol],
+            lambda: self._get_crypto_data_client().get_crypto_latest_quote(request, feed=CryptoFeed.US)[symbol],
         )
+
+    def get_crypto_latest_trade(self, symbol: str) -> Any:
+        from alpaca.data.enums import CryptoFeed
+        from alpaca.data.requests import CryptoLatestTradeRequest
+
+        request = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+        return self._call(
+            "get_crypto_latest_trade",
+            "market_data",
+            lambda: self._get_crypto_data_client().get_crypto_latest_trade(request, feed=CryptoFeed.US)[symbol],
+        )
+
+    def get_crypto_latest_orderbook(self, symbol: str) -> Any:
+        from alpaca.data.enums import CryptoFeed
+        from alpaca.data.requests import CryptoLatestOrderbookRequest
+
+        request = CryptoLatestOrderbookRequest(symbol_or_symbols=symbol)
+        return self._call(
+            "get_crypto_latest_orderbook",
+            "market_data",
+            lambda: self._get_crypto_data_client().get_crypto_latest_orderbook(request, feed=CryptoFeed.US)[symbol],
+        )
+
+    def _looks_like_crypto_symbol(self, symbol: str) -> bool:
+        raw = str(symbol or "").strip().upper()
+        crypto_config = self.config.get("crypto") or {}
+        configured_pairs = {
+            str(value or "").strip().upper().replace("-", "/")
+            for value in (
+                list(crypto_config.get("symbols") or ("BTC/USD", "ETH/USD"))
+                + list(crypto_config.get("optional_symbols") or ("SOL/USD",))
+            )
+        }
+        configured_legacy = {value.replace("/", "") for value in configured_pairs}
+        bases = {value.split("/", 1)[0] for value in configured_pairs if "/" in value}
+        compact = raw.replace("/", "").replace("-", "")
+        legacy_pair = any(
+            compact.startswith(base) and compact[len(base):] in {"BTC", "USD", "USDC", "USDT"}
+            for base in bases
+        )
+        return "/" in raw or "-" in raw or compact in configured_legacy or legacy_pair
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":
             require_live_trading_support()
+        if self._looks_like_crypto_symbol(symbol):
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted(
+                "crypto submission is disabled in the data/capability stage; "
+                "the equity DAY-order adapter cannot be used for crypto"
+            )
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         from .broker_interface import BrokerSubmissionNotAttempted

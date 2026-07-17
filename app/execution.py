@@ -1232,6 +1232,73 @@ class DurableExecutionStore:
                     THEN json_extract(o.value,'$.evidence_class')
                     ELSE 'invalid' END
                   NOT IN ('shadow_oos','actual_paper')""",
+            "orphaned_crypto_asset_capabilities": """SELECT COUNT(*) n
+                FROM crypto_asset_capabilities a
+                LEFT JOIN crypto_capability_snapshots s ON s.id=a.snapshot_id
+                WHERE s.id IS NULL""",
+            "incomplete_authoritative_crypto_capabilities": """SELECT COUNT(*) n
+                FROM crypto_capability_snapshots s
+                WHERE s.authoritative=1 AND (
+                  COALESCE(s.paper_account_id_hash,'')=''
+                  OR COALESCE(s.config_hash,'')=''
+                  OR COALESCE(s.official_contract_fingerprint,'')=''
+                  OR json_valid(s.failure_reasons_json)<>1
+                  OR json_valid(s.evidence_json)<>1
+                  OR CASE WHEN json_valid(s.failure_reasons_json)=1
+                    THEN json_array_length(s.failure_reasons_json)<>0 ELSE 1 END
+                  OR s.asset_count<>(SELECT COUNT(*) FROM crypto_asset_capabilities a WHERE a.snapshot_id=s.id)
+                  OR EXISTS(SELECT 1 FROM crypto_asset_capabilities a
+                            WHERE a.snapshot_id=s.id AND (
+                              a.authoritative<>1 OR a.asset_class<>'crypto'
+                              OR a.exchange<>'CRYPTO' OR a.status<>'active'
+                              OR a.tradable<>1 OR a.fractionable<>1
+                              OR a.marginable<>0 OR a.shortable<>0 OR a.easy_to_borrow<>0
+                              OR COALESCE(a.min_order_size,'')=''
+                              OR COALESCE(a.min_trade_increment,'')=''
+                              OR COALESCE(a.price_increment,'')=''))
+                )""",
+            "orphaned_crypto_market_evidence": """SELECT COUNT(*) n
+                FROM crypto_market_data_evidence e
+                LEFT JOIN crypto_capability_snapshots s ON s.id=e.capability_snapshot_id
+                WHERE s.id IS NULL
+                   OR s.snapshot_fingerprint<>e.capability_snapshot_fingerprint
+                   OR s.config_hash<>e.config_hash""",
+            "incomplete_authoritative_crypto_market_evidence": """SELECT COUNT(*) n
+                FROM crypto_market_data_evidence e
+                LEFT JOIN crypto_capability_snapshots s ON s.id=e.capability_snapshot_id
+                WHERE (e.execution_eligible=1 AND e.authoritative<>1)
+                   OR (e.authoritative=1 AND (
+                  s.id IS NULL OR s.authoritative<>1
+                  OR s.snapshot_fingerprint<>e.capability_snapshot_fingerprint
+                  OR s.config_hash<>e.config_hash
+                  OR COALESCE(e.capability_snapshot_fingerprint,'')=''
+                  OR COALESCE(e.config_hash,'')=''
+                  OR COALESCE(e.bid_price,'')=''
+                  OR COALESCE(e.ask_price,'')=''
+                  OR COALESCE(e.quote_timestamp,'')=''
+                  OR COALESCE(e.orderbook_bid_price,'')=''
+                  OR COALESCE(e.orderbook_ask_price,'')=''
+                  OR COALESCE(e.orderbook_timestamp,'')=''
+                  OR json_valid(e.failure_reasons_json)<>1
+                  OR json_valid(e.warnings_json)<>1
+                  OR json_valid(e.evidence_json)<>1
+                  OR (e.execution_eligible=1 AND CASE
+                    WHEN json_valid(e.failure_reasons_json)=1
+                    THEN json_array_length(e.failure_reasons_json)<>0 ELSE 1 END)
+                ))""",
+            "crypto_research_evidence_binding_mismatch": """SELECT COUNT(*) n
+                FROM crypto_research_snapshots r
+                LEFT JOIN crypto_capability_snapshots c ON c.id=r.capability_snapshot_id
+                LEFT JOIN crypto_market_data_evidence m ON m.id=r.market_evidence_id
+                WHERE (r.capability_authoritative=1 AND (
+                         c.id IS NULL OR c.authoritative<>1
+                         OR c.snapshot_fingerprint<>r.capability_snapshot_fingerprint))
+                   OR (r.market_evidence_authoritative=1 AND (
+                         m.id IS NULL OR m.authoritative<>1
+                         OR m.evidence_fingerprint<>r.market_evidence_fingerprint
+                         OR m.symbol<>r.symbol
+                         OR m.research_run_id<>r.research_run_id
+                         OR m.capability_snapshot_id<>r.capability_snapshot_id))""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

@@ -28,6 +28,9 @@ TARGETED_SUITES = (
     "tests/test_release_eligibility.py",
     "tests/test_release_pipeline.py",
     "tests/test_profitability_validation_attribution.py",
+    "tests/test_crypto_capabilities.py",
+    "tests/test_crypto_market_data.py",
+    "tests/test_crypto_research.py",
 )
 
 
@@ -96,6 +99,10 @@ def main() -> int:
             "f'package did not import from the release environment: {p}'; print(p)",
             str(ROOT),
         ],
+    ))
+    results.append(run(
+        "alpaca_crypto_sdk_contract",
+        [sys.executable, "scripts/verify_alpaca_crypto_sdk.py"],
     ))
 
     with tempfile.TemporaryDirectory(prefix="plutus-artifact-migration-") as directory:

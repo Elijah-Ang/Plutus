@@ -48,6 +48,7 @@ def _artifact(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     results = [
         {"name": "compileall", "exit_code": 0},
         {"name": "installed_wheel_import", "exit_code": 0},
+        {"name": "alpaca_crypto_sdk_contract", "exit_code": 0},
         {"name": "targeted_safety_suites", "exit_code": 0},
         {"name": "full_pytest", "exit_code": 0},
     ]
@@ -248,6 +249,30 @@ def test_build_records_tests_verified_only_after_fresh_environment_tests() -> No
     test_call = '"$STAGING/.venv/bin/python" scripts/run_artifact_tests.py'
     assert test_call in script
     assert script.index(test_call) < script.index('"tests_verified":True')
+
+
+def test_fresh_artifact_runner_verifies_pinned_crypto_sdk_before_pytest() -> None:
+    script = (Path(__file__).parents[1] / "scripts" / "run_artifact_tests.py").read_text()
+    sdk_gate = '"alpaca_crypto_sdk_contract"'
+    full_gate = '"full_pytest"'
+    assert "scripts/verify_alpaca_crypto_sdk.py" in script
+    assert script.index(sdk_gate) < script.index(full_gate)
+
+
+def test_release_artifact_requires_successful_crypto_sdk_contract_gate(tmp_path) -> None:
+    root, manifest = _artifact(tmp_path)
+    tests = json.loads((root / "artifact-test-results.json").read_text(encoding="utf-8"))
+    tests["results"] = [
+        result for result in tests["results"]
+        if result["name"] != "alpaca_crypto_sdk_contract"
+    ]
+    (root / "artifact-test-results.json").write_text(json.dumps(tests), encoding="utf-8")
+    manifest["artifact_test_results"] = tests["results"]
+    manifest["artifact_test_results_sha256"] = _digest(root / "artifact-test-results.json")
+    (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact gate results"):
+        _verify(root)
 
 
 def test_installed_wheel_uses_explicit_immutable_release_root(tmp_path, monkeypatch) -> None:
