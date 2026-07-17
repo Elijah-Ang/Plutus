@@ -25,7 +25,7 @@ def _db(tmp_path) -> Storage:
 
 
 def _observation(index: int, value: float = 0.5) -> PerformanceObservation:
-    exit_session = datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=index)
+    exit_session = datetime(2026, 3, 1, tzinfo=UTC) + timedelta(days=index)
     return PerformanceObservation(
         observation_id=f"probe-{index}", source_id=f"probe-source-{index}",
         strategy_version="rule_based_v2", symbol="SPY", evidence_class="shadow_oos",
@@ -45,8 +45,14 @@ def _refresh_with(
     *,
     concentration=0.0,
     actual_observations=None,
-    as_of="2026-07-13T00:00:00+00:00",
+    as_of=None,
 ):
+    if as_of is None:
+        all_rows = [*observations, *list(actual_observations or [])]
+        as_of = (
+            max(datetime.fromisoformat(row.exit_session) for row in all_rows)
+            + timedelta(days=1)
+        ).isoformat()
     engine = StrategyPerformanceEngine(storage, load_config(), as_of=as_of)
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
     monkeypatch.setattr(engine, "_actual_observations", lambda: list(actual_observations or []))
@@ -122,9 +128,13 @@ def test_probe_preliminary_gate_passes_at_10_and_99_without_quality_dependency(m
 
 def test_probe_uses_real_preliminary_math_while_persisting_sub_85_quality(monkeypatch, tmp_path):
     storage = _db(tmp_path)
-    engine = StrategyPerformanceEngine(storage, load_config(), as_of="2026-07-13T00:00:00+00:00")
     values = [0.65, -0.30, 0.65, 0.65, -0.30] * 2
     observations = [dataclasses.replace(_observation(i, value), symbol=f"S{i}") for i, value in enumerate(values)]
+    engine = StrategyPerformanceEngine(
+        storage,
+        load_config(),
+        as_of=(datetime.fromisoformat(observations[-1].exit_session) + timedelta(days=1)).isoformat(),
+    )
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
     monkeypatch.setattr(engine, "_actual_observations", lambda: [])
     snapshot = engine.refresh_strategy("rule_based_v2")

@@ -157,6 +157,28 @@ The clone-only evidence cut imported 3,114 duplicate-free opportunities and clas
 
 Phase 1 gate `P1-GATE-001`: no score-based risk increase or broader profile until completed outcomes show positive out-of-sample expectancy after realistic costs.
 
+### Profitability authority checkpoint (2026-07-17)
+
+The operational paper policy now persists and independently recomputes one
+complete predeclared family across every known strategy version. It uses exact
+label-overlap purging, an explicit embargo, deterministic circular block
+bootstrap bounds, Benjamini-Hochberg family FDR, parameter stability groups,
+and immutable fold/decision/family fingerprints. Mature failed or unvalidated
+strategies are suspended; insufficient authority is limited to
+`RESEARCH_ONLY`/`PROBE`. Candidate economics cannot bypass this boundary.
+
+Closed actual-paper FIFO lifecycles now receive immutable expected-versus-
+realized attribution. Complete records reconcile market outcome, entry timing,
+fill/exit execution, fees, holding/opportunity, and uncertainty exactly;
+actual-only evidence is labeled partial and structural gaps remain unavailable.
+Counterfactual records never enter operational validation.
+
+`P1-VAL-001..008` remains **partial**, not complete: Deflated Sharpe and PBO are
+explicitly unavailable until honest multi-configuration trial history and a
+suitable result matrix exist. The evidence gate is not weakened and no risk
+profile is broadened by this checkpoint. See
+[PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md](PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md).
+
 ## Phase 2 — shadow strategy and market-context expansion
 
 Common metadata: rationale = measure independent alpha sleeves without opaque score blending; dependencies = P1 gate and point-in-time data; acceptance = standardized insight, shadow-only isolation, sleeve-level cost-aware OOS report across multiple regimes; status pending; commit/evidence none; rollout `L-R` plus Phase 2 gate; rollback `L-B`; unresolved questions = calibration horizon and sleeve correlation budget.

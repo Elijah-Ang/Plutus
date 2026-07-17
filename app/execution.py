@@ -1156,6 +1156,82 @@ class DurableExecutionStore:
                 SELECT symbol FROM exit_blocker_states WHERE active=1 GROUP BY symbol HAVING COUNT(*)>1)""",
             "terminal_exit_blocker_marked_active": """SELECT COUNT(*) n FROM exit_blocker_states
                 WHERE active=1 AND state IN ('cleared','terminal_attempt_failed','position_closed','superseded')""",
+            "orphaned_profitability_validation_decisions": """SELECT COUNT(*) n
+                FROM profitability_validation_decisions d
+                LEFT JOIN profitability_validation_families f ON f.id=d.family_id
+                WHERE f.id IS NULL""",
+            "orphaned_profitability_validation_folds": """SELECT COUNT(*) n
+                FROM profitability_validation_folds vf
+                LEFT JOIN profitability_validation_decisions d ON d.id=vf.decision_id
+                WHERE d.id IS NULL""",
+            "incomplete_profitability_validation_families": """SELECT COUNT(*) n
+                FROM profitability_validation_families f
+                WHERE json_valid(f.hypotheses_json)<>1
+                  OR json_valid(f.observations_json)<>1
+                  OR CASE WHEN json_valid(f.hypotheses_json)=1 THEN
+                    json_type(f.hypotheses_json)<>'array'
+                    OR json_array_length(f.hypotheses_json)<>(
+                      SELECT COUNT(*)
+                      FROM profitability_validation_decisions d
+                      WHERE d.family_id=f.id)
+                    ELSE 0 END
+                  OR CASE WHEN json_valid(f.observations_json)=1 THEN
+                    json_type(f.observations_json)<>'array'
+                    ELSE 0 END""",
+            "strategy_validation_authority_mismatch": """SELECT COUNT(*) n
+                FROM strategy_policy_decisions p
+                LEFT JOIN strategy_performance_snapshots s
+                  ON s.id=p.performance_snapshot_id
+                LEFT JOIN profitability_validation_decisions d
+                  ON d.id=p.validation_decision_id
+                LEFT JOIN profitability_validation_families f
+                  ON f.id=p.validation_family_id
+                WHERE COALESCE(p.validation_status,'disabled')<>'disabled'
+                  AND (s.id IS NULL OR d.id IS NULL OR f.id IS NULL
+                    OR p.validation_family_id<>d.family_id
+                    OR p.strategy_version<>d.strategy_version
+                    OR p.validation_status<>d.status
+                    OR p.validation_fingerprint<>d.decision_fingerprint
+                    OR s.validation_family_id<>p.validation_family_id
+                    OR s.validation_decision_id<>p.validation_decision_id
+                    OR s.validation_status<>p.validation_status
+                    OR s.validation_fingerprint<>p.validation_fingerprint)""",
+            "orphaned_profit_attribution_records": """SELECT COUNT(*) n
+                FROM profit_attribution_records a
+                LEFT JOIN position_lifecycles l ON l.id=a.position_lifecycle_id
+                WHERE l.id IS NULL""",
+            "profit_attribution_reconciliation_mismatch": """SELECT COUNT(*) n
+                FROM profit_attribution_records
+                WHERE status IN ('complete','partial') AND (
+                  reconciliation_residual IS NULL
+                  OR typeof(reconciliation_residual)<>'text'
+                  OR reconciliation_residual<>'0'
+                  OR CASE WHEN json_valid(components_json)=1 THEN
+                    status='complete' AND (
+                      json_extract(components_json,'$.variance_reconciliation_residual') IS NULL
+                      OR json_type(components_json,'$.variance_reconciliation_residual')<>'text'
+                      OR json_extract(components_json,'$.variance_reconciliation_residual')<>'0')
+                    ELSE 1 END)""",
+            "strategy_trade_attribution_mismatch": """SELECT COUNT(*) n
+                FROM strategy_trade_records t
+                LEFT JOIN profit_attribution_records a ON a.id=t.profit_attribution_id
+                WHERE t.evidence_class='actual_paper'
+                  AND t.attribution_status IN ('complete','partial')
+                  AND t.updated_at>=COALESCE((
+                    SELECT applied_at FROM schema_migrations
+                    WHERE version='profit_attribution_records_v1'), '9999')
+                  AND (a.id IS NULL
+                    OR t.position_lifecycle_id IS NULL
+                    OR a.position_lifecycle_id<>t.position_lifecycle_id
+                    OR a.status<>t.attribution_status)""",
+            "counterfactual_profitability_evidence": """SELECT COUNT(*) n
+                FROM profitability_validation_families f,
+                  json_each(CASE WHEN json_valid(f.observations_json)=1
+                    THEN f.observations_json ELSE '[]' END) o
+                WHERE CASE WHEN json_valid(o.value)=1
+                    THEN json_extract(o.value,'$.evidence_class')
+                    ELSE 'invalid' END
+                  NOT IN ('shadow_oos','actual_paper')""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

@@ -377,6 +377,10 @@ class Storage:
             apply_trade_economics_schema(conn)
             from .profitability_ranking import apply_profitability_ranking_schema
             apply_profitability_ranking_schema(conn)
+            from .profitability_validation import apply_profitability_validation_schema
+            apply_profitability_validation_schema(conn)
+            from .profit_attribution import apply_profit_attribution_schema
+            apply_profit_attribution_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -444,6 +448,10 @@ class Storage:
                 apply_trade_economics_schema(conn, record_migration=False)
                 from .profitability_ranking import apply_profitability_ranking_schema
                 apply_profitability_ranking_schema(conn, record_migration=False)
+                from .profitability_validation import apply_profitability_validation_schema
+                apply_profitability_validation_schema(conn, record_migration=False)
+                from .profit_attribution import apply_profit_attribution_schema
+                apply_profit_attribution_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

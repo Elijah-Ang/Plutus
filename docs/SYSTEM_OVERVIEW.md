@@ -69,6 +69,10 @@ The project follows a modular design with clear separation between:
 - [data_providers/](../app/data_providers): Research-provider abstraction and EODHD implementation. EODHD is used only for discovery/research data; Alpaca remains the paper broker/execution/reconciliation authority.
 - [broker_alpaca.py](../app/broker_alpaca.py): Integrates Alpaca Paper, exposes read-only clock/loss/order lookup methods, optional read-only Alpaca crypto market-data methods, and rejects all live clients in this build.
 - [execution.py](../app/execution.py): Handler final revalidation and broker submission.
+- [trade_economics.py](../app/trade_economics.py): Immutable Decimal candidate economics bound to exact strategy, configuration, validation, policy, and proposal authority.
+- [profitability_validation.py](../app/profitability_validation.py): Complete-family purged walk-forward, block-bootstrap, parameter-stability, and FDR validation used by operational paper strategy policy.
+- [profit_attribution.py](../app/profit_attribution.py): Closed-lifecycle FIFO expected-versus-realized attribution with exact reconciliation and explicit actual-only/unavailable states.
+- [strategy_performance.py](../app/strategy_performance.py): Current-version shadow/actual evidence scorecards and conservative strategy state policy.
 - [profit_milestones.py](../app/profit_milestones.py): Fill-authoritative partial-profit milestone ledger keyed by active position lifecycle, take-profit level, proposal, intent, and unique broker fill event.
 - [phase4_allocator.py](../app/phase4_allocator.py): Deterministic multi-strategy paper allocator. All operational risk values carry a unit and normalize to stop-risk dollars using fresh authoritative equity.
 - [trend_management.py](../app/trend_management.py): Lifecycle-bound trend mode and monotonic protective-stop decisions with a final-mode contradiction validator.
@@ -375,6 +379,11 @@ Stored at `data/trading_agent.db`. The schema contains the following tables:
 - `dynamic_universe_performance`: Scanner/Performance Lab metrics for dynamic symbols and tier outcomes.
 - `dynamic_universe_schedule_state`: Due, skipped, missed, catch-up, provider health, internet, power, battery, freshness, and promotion/demotion permission state for each research schedule.
 - `performance_lab_summaries`: Per-run counts of qualified setup events, shadow-only/counterfactual rows, and proposed/actual rows.
+- `trade_economics_records`: Immutable candidate-level after-cost economics and exact strategy/config/policy/validation authority.
+- `strategy_trade_records`: Canonical current-version `shadow_oos` and `actual_paper` evidence, including attribution status and lifecycle link.
+- `strategy_performance_snapshots` / `strategy_policy_decisions`: Versioned scorecards and executable state decisions bound to a validation family.
+- `profitability_validation_families` / `profitability_validation_decisions` / `profitability_validation_folds`: Complete tested families, decisions, and exact purged chronological fold membership.
+- `profit_attribution_records`: Immutable FIFO expected-versus-realized lifecycle attribution with exact reconciliation residuals.
 
 ## 14. Excel Reporting Flow
 Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. The sheets map to the database as follows:
@@ -385,6 +394,9 @@ Excel exports are compiled by `app/reports.py` and exported to `data/exports/`. 
 - **Orders**: Directly database-backed (`orders`).
 - **Fills**: Directly database-backed (`fills`).
 - **Positions**: Directly database-backed (`positions`).
+- **Trade Economics / Strategy Trade Records / Strategy Scorecards / Strategy Policies**: Exact expected-economics and policy evidence.
+- **Validation Families / Validation Decisions / Validation Folds**: Immutable profitability-validation authority and chronological membership.
+- **Profit Attribution**: Realized FIFO and expected-versus-realized component reconciliation.
 - **Signals**: Directly database-backed (`signals`).
 - **Risk Checks**: Directly database-backed (`risk_checks`).
 - **AI Reviews**: Directly database-backed (`ai_reviews`).
