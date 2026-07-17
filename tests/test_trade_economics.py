@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import random
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 
 import pytest
 
 from app.formula_versions import (
+    ACCOUNTING_VERSION,
     CONFIGURATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
+    PROFITABILITY_VALIDATION_FORMULA_VERSION,
+    PROFIT_ATTRIBUTION_FORMULA_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
     STRATEGY_PERFORMANCE_VERSION,
     STRATEGY_POLICY_VERSION,
@@ -16,6 +20,21 @@ from app.formula_versions import (
     TRADE_ECONOMICS_SCHEMA_VERSION,
 )
 from app.storage import Storage
+from app.profitability_validation import (
+    ProfitabilityValidationPolicy,
+    ProfitabilityValidationStore,
+    ValidationHypothesis,
+    ValidationObservation,
+    validate_profitability_family,
+)
+from app.profit_attribution import (
+    ProfitAttributionEngine,
+    ProfitAttributionError,
+    ProfitAttributionStore,
+)
+from app.lot_ledger import LotLedger
+from app.shadow_strategies import STRATEGY_VERSIONS
+from app.strategy_rule_based import STRATEGY_VERSION
 from app.trade_economics import (
     TradeEconomicsCosts,
     TradeEconomicsError,
@@ -33,6 +52,8 @@ FORMULAS = {
     "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
     "strategy_policy": STRATEGY_POLICY_VERSION,
     "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
+    "profitability_validation": PROFITABILITY_VALIDATION_FORMULA_VERSION,
+    "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
 }
 
 
@@ -112,13 +133,61 @@ def _database(tmp_path) -> Storage:
 
 
 def _install_authority(storage: Storage, *, config_hash: str = CONFIG_HASH) -> None:
+    versions = sorted({*STRATEGY_VERSIONS.values(), STRATEGY_VERSION})
+    observations = []
+    for index in range(25):
+        observed = datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=index)
+        observations.append(
+            ValidationObservation(
+                id=f"rule-{index}",
+                hypothesis_id=STRATEGY_VERSION,
+                strategy_version=STRATEGY_VERSION,
+                observed_at=observed.isoformat(),
+                outcome_end_at=(observed + timedelta(days=2)).isoformat(),
+                net_r="0.5",
+                evidence_class="shadow_oos",
+                source_id=f"source-{index}",
+            )
+        )
+    family = validate_profitability_family(
+        family_key="operational_strategy_versions",
+        as_of=NOW,
+        hypotheses=tuple(
+            ValidationHypothesis(version, version, version)
+            for version in versions
+        ),
+        observations=tuple(observations),
+        policy=ProfitabilityValidationPolicy(
+            minimum_samples=20,
+            minimum_folds=2,
+            minimum_train_observations=8,
+            test_observations=4,
+            embargo_periods=1,
+            block_length=4,
+            bootstrap_draws=200,
+            fdr_alpha=D("0.10"),
+            minimum_positive_fold_ratio=D("0.60"),
+            minimum_parameter_stability_ratio=D("0.60"),
+        ),
+        configuration_version=CONFIGURATION_SCHEMA_VERSION,
+        config_hash=config_hash,
+        formula_versions=FORMULAS,
+    )
+    ProfitabilityValidationStore(storage).persist(family)
+    validation = next(
+        decision
+        for decision in family.decisions
+        if decision.strategy_version == STRATEGY_VERSION
+    )
     storage.execute(
         """INSERT INTO strategy_performance_snapshots(
              id,strategy_version,as_of,performance_version,policy_version,
              schema_version,quality_score,recommendation_state,trade_counts_json,
              metrics_json,components_json,raw_inputs_json,evidence_recency_days,
-             attribution_confidence,version_completeness,input_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             attribution_confidence,version_completeness,validation_family_id,
+             validation_decision_id,validation_status,validation_fingerprint,
+             input_fingerprint,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             "snapshot-1",
             "rule_based_v2",
@@ -135,6 +204,10 @@ def _install_authority(storage: Storage, *, config_hash: str = CONFIG_HASH) -> N
             0,
             1,
             1,
+            family.id,
+            validation.id,
+            validation.status,
+            validation.decision_fingerprint,
             "snapshot-fingerprint",
             NOW,
         ),
@@ -145,8 +218,9 @@ def _install_authority(storage: Storage, *, config_hash: str = CONFIG_HASH) -> N
              quality_score,reason,hard_gates_json,maturity_json,components_json,
              raw_inputs_json,enforcement_enabled,performance_version,policy_version,
              schema_version,input_fingerprint,evidence_version,
-             configuration_version,config_hash)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             configuration_version,config_hash,validation_family_id,
+             validation_decision_id,validation_status,validation_fingerprint)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             "policy-1",
             "rule_based_v2",
@@ -167,6 +241,10 @@ def _install_authority(storage: Storage, *, config_hash: str = CONFIG_HASH) -> N
             EVIDENCE_VERSION,
             CONFIGURATION_SCHEMA_VERSION,
             config_hash,
+            family.id,
+            validation.id,
+            validation.status,
+            validation.decision_fingerprint,
         ),
     )
 
@@ -529,6 +607,61 @@ def test_stale_policy_authority_inserts_nothing(tmp_path) -> None:
     assert storage.fetch_all("SELECT * FROM trade_economics_records") == []
 
 
+def test_singleton_validation_family_cannot_bypass_complete_family_authority(
+    tmp_path,
+) -> None:
+    storage = _database(tmp_path)
+    _install_authority(storage)
+    family_id = storage.fetch_all(
+        "SELECT validation_family_id FROM strategy_policy_decisions WHERE id='policy-1'"
+    )[0]["validation_family_id"]
+    full = ProfitabilityValidationStore(storage).load_verified(family_id)
+    singleton = validate_profitability_family(
+        family_key="post-hoc-singleton",
+        as_of=full.as_of,
+        hypotheses=(
+            ValidationHypothesis(
+                STRATEGY_VERSION,
+                STRATEGY_VERSION,
+                STRATEGY_VERSION,
+            ),
+        ),
+        observations=tuple(
+            ValidationObservation(**row)
+            for row in full.observations
+            if row["strategy_version"] == STRATEGY_VERSION
+        ),
+        policy=ProfitabilityValidationPolicy(**full.policy),
+        configuration_version=full.configuration_version,
+        config_hash=full.config_hash,
+        formula_versions=full.formula_versions,
+    )
+    ProfitabilityValidationStore(storage).persist(singleton)
+    decision = singleton.decisions[0]
+    for table in (
+        "strategy_performance_snapshots",
+        "strategy_policy_decisions",
+    ):
+        storage.execute(
+            f"""UPDATE {table} SET validation_family_id=?,
+                   validation_decision_id=?,validation_status=?,
+                   validation_fingerprint=?""",
+            (
+                singleton.id,
+                decision.id,
+                decision.status,
+                decision.decision_fingerprint,
+            ),
+        )
+    record = calculate_trade_economics(_candidate(), _costs())
+    with pytest.raises(
+        TradeEconomicsError,
+        match="profitability validation authority",
+    ):
+        TradeEconomicsStore(storage).persist(record)
+    assert storage.fetch_all("SELECT * FROM trade_economics_records") == []
+
+
 def test_future_strategy_evidence_cannot_be_attached_to_earlier_candidate(
     tmp_path,
 ) -> None:
@@ -542,6 +675,146 @@ def test_future_strategy_evidence_cannot_be_attached_to_earlier_candidate(
     with pytest.raises(TradeEconomicsError, match="future information"):
         TradeEconomicsStore(storage).persist(record)
     assert storage.fetch_all("SELECT * FROM trade_economics_records") == []
+
+
+def test_closed_fifo_lifecycle_links_verified_expected_economics(tmp_path) -> None:
+    storage = _database(tmp_path)
+    _install_authority(storage)
+    record = calculate_trade_economics(
+        _candidate(
+            proposal_id="proposal-1",
+            record_class="proposal_candidate",
+        ),
+        _costs(),
+    )
+    _install_proposal(storage, record=record)
+    TradeEconomicsStore(storage).persist(record)
+    storage.execute(
+        """INSERT INTO position_lifecycles(
+             id,symbol,side,state,opened_at,closed_at,opening_quantity,
+             current_quantity,source,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "lifecycle-1",
+            "SPY",
+            "long",
+            "closed",
+            "2026-07-16T00:02:00+00:00",
+            "2026-07-20T00:00:00+00:00",
+            10,
+            0,
+            "test",
+            NOW,
+            "2026-07-20T00:00:00+00:00",
+        ),
+    )
+    LotLedger(storage).set_coverage(
+        effective_from="2026-07-01T00:00:00+00:00",
+        confidence="verified",
+        provenance="prospective broker fill test",
+    )
+    buy = {
+        "id": "buy-1",
+        "proposal_id": "proposal-1",
+        "symbol": "SPY",
+        "side": "buy",
+        "position_lifecycle_id": "lifecycle-1",
+        "requested_quantity": 10,
+        "strategy_version": "rule_based_v2",
+        "initial_risk_dollars": 50,
+        "evidence_version": EVIDENCE_VERSION,
+        "formula_version": ACCOUNTING_VERSION,
+    }
+    sell = {
+        "id": "sell-1",
+        "symbol": "SPY",
+        "side": "sell",
+        "position_lifecycle_id": "lifecycle-1",
+    }
+    with storage.connect() as conn:
+        LotLedger.apply_fill_in_transaction(
+            conn,
+            intent=buy,
+            broker_event_key="buy-fill",
+            delta_quantity=10,
+            fill_price=101,
+            occurred_at="2026-07-16T00:02:00+00:00",
+            fees=1,
+        )
+        LotLedger.apply_fill_in_transaction(
+            conn,
+            intent=sell,
+            broker_event_key="sell-fill",
+            delta_quantity=10,
+            fill_price=112,
+            occurred_at="2026-07-20T00:00:00+00:00",
+            fees=1,
+            adjustments=2,
+        )
+    storage.execute(
+        "INSERT INTO orders(id,quote_ask) VALUES('buy-1',100.5)"
+    )
+    storage.execute(
+        "INSERT INTO orders(id,quote_bid) VALUES('sell-1',112.5)"
+    )
+    storage.execute(
+        """INSERT INTO approvals(
+             id,proposal_id,status,created_at,consumed_at)
+           VALUES(?,?,?,?,?)""",
+        (
+            "approval-1",
+            "proposal-1",
+            "consumed",
+            "2026-07-16T00:01:00+00:00",
+            "2026-07-16T00:01:00+00:00",
+        ),
+    )
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,run_id,symbol,side,status,created_at,strategy_version,payload)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            "later-proposal",
+            "later-run",
+            "QQQ",
+            "buy",
+            "expired",
+            "2026-07-19T00:00:00+00:00",
+            "later_strategy_v1",
+            "{}",
+        ),
+    )
+    with pytest.raises(
+        TradeEconomicsError,
+        match="profitability validation authority",
+    ):
+        TradeEconomicsStore(storage).load_verified(record.id)
+    lifecycle = storage.fetch_all(
+        "SELECT * FROM position_lifecycles WHERE id='lifecycle-1'"
+    )[0]
+    attribution = ProfitAttributionEngine(storage).refresh_lifecycle(lifecycle)
+    assert attribution.status == "complete"
+    assert attribution.confidence == "verified"
+    assert attribution.input["legs"][0]["trade_economics_id"] == record.id
+    assert attribution.components["expected_net_profit"] == "27"
+    assert attribution.components["realized_adjustments"] == "2"
+    assert attribution.components["realized_net_pnl"] == "110"
+    assert attribution.components["reconciliation_residual"] == "0"
+    assert attribution.components["variance_reconciliation_residual"] == "0"
+    attribution_store = ProfitAttributionStore(storage)
+    assert (
+        attribution_store.load_verified(attribution.id).record_fingerprint
+        == attribution.record_fingerprint
+    )
+    storage.execute(
+        """UPDATE profit_attribution_records
+           SET expected_net_profit='999' WHERE id=?""",
+        (attribution.id,),
+    )
+    with pytest.raises(
+        ProfitAttributionError, match="expected_net_profit"
+    ):
+        attribution_store.load_verified(attribution.id)
 
 
 def test_trade_economics_migration_is_additive_idempotent_and_runtime_required(

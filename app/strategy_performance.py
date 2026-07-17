@@ -27,6 +27,16 @@ from .formula_versions import (
     STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
     STRATEGY_POLICY_VERSION,
 )
+from .profit_attribution import ProfitAttributionEngine
+from .profitability_validation import (
+    ProfitabilityValidationDecision,
+    ProfitabilityValidationError,
+    ProfitabilityValidationStore,
+    ValidationHypothesis,
+    observations_from_strategy_records,
+    policy_from_config,
+    validate_profitability_family,
+)
 from .utils import iso_now, json_dumps
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_rule_based import STRATEGY_VERSION
@@ -271,7 +281,15 @@ def shadow_paper_expectancy_divergence(rows: Sequence[PerformanceObservation | M
 
 
 def _confidence_score(values: Sequence[str]) -> float:
-    scale = {"verified": 1.0, "reconstructed": 0.75, "partially_reconstructed": 0.5, "shadow_deterministic": 1.0, "unavailable": 0.0}
+    scale = {
+        "verified": 1.0,
+        "verified_combined_execution": 0.9,
+        "verified_actual_only": 0.75,
+        "reconstructed": 0.75,
+        "partially_reconstructed": 0.5,
+        "shadow_deterministic": 1.0,
+        "unavailable": 0.0,
+    }
     return _mean(scale.get(str(value), 0.0) for value in values) or 0.0
 
 
@@ -298,6 +316,7 @@ class PerformanceObservation:
     formula_version: str | None = None
     source_id: str | None = None
     attribution_status: str = "complete"
+    profit_attribution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +337,10 @@ class StrategyPerformanceSnapshot:
     attribution_confidence: float = 0.0
     version_completeness: float = 0.0
     id: str | None = None
+    validation_family_id: str | None = None
+    validation_decision_id: str | None = None
+    validation_status: str = "disabled"
+    validation_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -341,6 +364,10 @@ class StrategyRiskPolicy:
     evidence_version: str = ""
     configuration_version: str = ""
     config_hash: str = ""
+    validation_family_id: str = ""
+    validation_decision_id: str = ""
+    validation_status: str = "disabled"
+    validation_fingerprint: str = ""
 
 
 def state_rank(state: str) -> int:
@@ -640,6 +667,16 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
         "research_opportunities": {"strategy_performance_version": "TEXT"},
         "performance_setups": {"strategy_version": "TEXT", "evidence_version": "TEXT", "formula_version": "TEXT"},
         "trade_outcomes": {"strategy_version": "TEXT", "evidence_version": "TEXT", "formula_version": "TEXT"},
+        "lot_consumptions": {"allocated_adjustments": "REAL"},
+        "strategy_trade_records": {"profit_attribution_id": "TEXT"},
+        "strategy_performance_snapshots": {
+            "validation_family_id": "TEXT", "validation_decision_id": "TEXT",
+            "validation_status": "TEXT", "validation_fingerprint": "TEXT",
+        },
+        "strategy_policy_decisions": {
+            "validation_family_id": "TEXT", "validation_decision_id": "TEXT",
+            "validation_status": "TEXT", "validation_fingerprint": "TEXT",
+        },
         "trade_proposals": {
             "performance_snapshot_id": "TEXT", "policy_decision_id": "TEXT", "strategy_quality_score": "REAL",
             "strategy_state": "TEXT", "strategy_risk_multiplier": "REAL", "permitted_stop_risk_pct": "REAL",
@@ -677,7 +714,7 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
           position_lifecycle_id TEXT, lot_id TEXT NOT NULL, strategy_version TEXT,
           quantity REAL NOT NULL CHECK(quantity>0), allocated_proceeds REAL,
           allocated_cost_basis REAL, allocated_buy_fees REAL, allocated_sell_fees REAL,
-          realized_pnl REAL, occurred_at TEXT NOT NULL, confidence TEXT NOT NULL,
+          allocated_adjustments REAL, realized_pnl REAL, occurred_at TEXT NOT NULL, confidence TEXT NOT NULL,
           accounting_version TEXT NOT NULL, UNIQUE(broker_event_key,lot_id));
         CREATE TABLE IF NOT EXISTS strategy_trade_records(
           id TEXT PRIMARY KEY, source_key TEXT NOT NULL UNIQUE, strategy_version TEXT,
@@ -687,6 +724,7 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
           net_pnl REAL, initial_risk_dollars REAL, gross_r_multiple REAL,
           r_multiple REAL, attribution_status TEXT NOT NULL, attribution_confidence TEXT,
           evidence_version TEXT, formula_version TEXT, reason TEXT, details_json TEXT NOT NULL,
+          profit_attribution_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS strategy_performance_snapshots(
           id TEXT PRIMARY KEY, strategy_version TEXT NOT NULL, as_of TEXT NOT NULL,
@@ -696,6 +734,8 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
           metrics_json TEXT NOT NULL, components_json TEXT NOT NULL,
           raw_inputs_json TEXT NOT NULL, evidence_recency_days REAL,
           attribution_confidence REAL NOT NULL, version_completeness REAL NOT NULL,
+          validation_family_id TEXT, validation_decision_id TEXT,
+          validation_status TEXT, validation_fingerprint TEXT,
           input_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
           UNIQUE(strategy_version,input_fingerprint));
         CREATE TABLE IF NOT EXISTS strategy_policy_decisions(
@@ -706,6 +746,8 @@ def apply_strategy_performance_schema(conn: sqlite3.Connection, *, record_migrat
           enforcement_enabled INTEGER NOT NULL CHECK(enforcement_enabled IN (0,1)),
           performance_version TEXT NOT NULL, policy_version TEXT NOT NULL,
           schema_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL,
+          validation_family_id TEXT, validation_decision_id TEXT,
+          validation_status TEXT, validation_fingerprint TEXT,
           UNIQUE(strategy_version,performance_snapshot_id));
         CREATE INDEX IF NOT EXISTS idx_lot_consumptions_lifecycle ON lot_consumptions(position_lifecycle_id,occurred_at);
         CREATE INDEX IF NOT EXISTS idx_strategy_trade_records_strategy ON strategy_trade_records(strategy_version,evidence_class,exit_session);
@@ -807,46 +849,75 @@ class StrategyPerformanceEngine:
         return result
 
     def _actual_observations(self) -> list[PerformanceObservation]:
-        lifecycles = self.storage.fetch_all("SELECT * FROM position_lifecycles WHERE state='closed' AND closed_at IS NOT NULL ORDER BY closed_at,id")
+        attributions = ProfitAttributionEngine(self.storage).refresh_closed()
+        lifecycles = self.storage.fetch_all(
+            """SELECT * FROM position_lifecycles
+               WHERE state='closed' AND closed_at IS NOT NULL
+               ORDER BY closed_at,id"""
+        )
         result: list[PerformanceObservation] = []
         for lifecycle in lifecycles:
             lifecycle_id = str(lifecycle["id"])
-            lots = self.storage.fetch_all("SELECT * FROM position_lots WHERE position_lifecycle_id=? ORDER BY opened_at,id", (lifecycle_id,))
-            if not lots:
-                self._persist_actual_unavailable(lifecycle, "no_attributed_entry_lots")
+            attribution = attributions.get(lifecycle_id)
+            if attribution is None:
+                self._persist_actual_unavailable(
+                    lifecycle, "profit_attribution_record_unavailable"
+                )
                 continue
-            lot_ids = [str(row["id"]) for row in lots]
-            placeholders = ",".join("?" for _ in lot_ids)
-            consumptions = self.storage.fetch_all(
-                f"SELECT * FROM lot_consumptions WHERE position_lifecycle_id=? OR lot_id IN ({placeholders}) ORDER BY occurred_at,id",
-                (lifecycle_id, *lot_ids),
+            payload = attribution.input
+            components = attribution.components
+            strategy_version = payload.get("strategy_version")
+            net_pnl = _finite(components.get("realized_net_pnl"))
+            gross_pnl = _finite(components.get("realized_gross_pnl"))
+            risk = _finite(components.get("initial_risk_dollars"))
+            cost_basis = _finite(components.get("actual_cost_basis"))
+            r_multiple = _finite(components.get("actual_r_multiple"))
+            if (
+                attribution.status == "unavailable"
+                or not strategy_version
+                or net_pnl is None
+                or gross_pnl is None
+                or risk is None
+                or risk <= 0
+                or cost_basis is None
+                or cost_basis <= 0
+                or r_multiple is None
+            ):
+                self._persist_actual_unavailable(
+                    lifecycle,
+                    attribution.reason,
+                    strategy_version=(
+                        str(strategy_version) if strategy_version else None
+                    ),
+                    confidence=attribution.confidence,
+                    profit_attribution_id=attribution.id,
+                )
+                continue
+            lots = self.storage.fetch_all(
+                """SELECT * FROM position_lots
+                   WHERE position_lifecycle_id=? ORDER BY opened_at,id""",
+                (lifecycle_id,),
             )
-            versions = {str(row.get("strategy_version")) for row in lots if row.get("strategy_version")}
-            all_strategy = all(row.get("strategy_version") for row in lots)
-            all_versioned = all(row.get("evidence_version") == EVIDENCE_VERSION and row.get("formula_version") == ACCOUNTING_VERSION for row in lots)
-            all_numeric = bool(consumptions) and all(_finite(row.get("realized_pnl")) is not None for row in consumptions)
-            closed_qty = sum(float(row.get("quantity") or 0) for row in consumptions)
-            remaining_qty = sum(float(row.get("remaining_quantity") or 0) for row in lots)
-            risk = sum(float(row.get("initial_risk_dollars")) for row in lots if _finite(row.get("initial_risk_dollars")) is not None)
-            complete = all_strategy and len(versions) == 1 and all_versioned and all_numeric and risk > 0 and remaining_qty <= 1e-8 and closed_qty > 0
-            reason = None
-            if not complete:
-                reason = "mixed_or_missing_strategy_attribution" if len(versions) != 1 or not all_strategy else "incomplete_lifecycle_accounting"
-                self._persist_actual_unavailable(lifecycle, reason, strategy_version=next(iter(versions)) if len(versions) == 1 else None, confidence=self._aggregate_confidence(lots, consumptions))
-                continue
-            strategy_version = next(iter(versions))
-            gross_pnl = sum(float(row.get("allocated_proceeds") or 0) - float(row.get("allocated_cost_basis") or 0) for row in consumptions)
-            net_pnl = sum(float(row["realized_pnl"]) for row in consumptions)
-            gross_return = gross_pnl / max(sum(float(row.get("allocated_cost_basis") or 0) for row in consumptions), 1e-12)
-            net_return = net_pnl / max(sum(float(row.get("allocated_cost_basis") or 0) for row in consumptions), 1e-12)
-            first = lots[0]
+            first = lots[0] if lots else {}
             result.append(PerformanceObservation(
-                observation_id=f"actual:{lifecycle_id}", source_id=lifecycle_id, strategy_version=strategy_version,
-                symbol=str(lifecycle["symbol"]), evidence_class="actual_paper", entry_session=str(first["opened_at"]),
-                exit_session=str(lifecycle["closed_at"]), regime=_text(first.get("entry_regime")), score=_finite(first.get("entry_score")),
-                gross_return=gross_return, net_return=net_return, gross_r=gross_pnl / risk, r_multiple=net_pnl / risk,
+                observation_id=f"actual:{lifecycle_id}",
+                source_id=lifecycle_id,
+                strategy_version=str(strategy_version),
+                symbol=str(lifecycle["symbol"]),
+                evidence_class="actual_paper",
+                entry_session=str(payload["opened_at"]),
+                exit_session=str(payload["closed_at"]),
+                regime=_text(first.get("entry_regime")),
+                score=_finite(first.get("entry_score")),
+                gross_return=gross_pnl / cost_basis,
+                net_return=net_pnl / cost_basis,
+                gross_r=gross_pnl / risk,
+                r_multiple=r_multiple,
                 gross_pnl=gross_pnl, net_pnl=net_pnl, initial_risk_dollars=risk,
-                attribution_confidence=self._aggregate_confidence(lots, consumptions), evidence_version=EVIDENCE_VERSION,
+                attribution_confidence=attribution.confidence,
+                attribution_status=attribution.status,
+                profit_attribution_id=attribution.id,
+                evidence_version=EVIDENCE_VERSION,
                 formula_version=ACCOUNTING_VERSION,
             ))
         return result
@@ -860,7 +931,15 @@ class StrategyPerformanceEngine:
             return "reconstructed"
         return "verified"
 
-    def _persist_actual_unavailable(self, lifecycle: Mapping[str, Any], reason: str, *, strategy_version: str | None = None, confidence: str = "unavailable") -> None:
+    def _persist_actual_unavailable(
+        self,
+        lifecycle: Mapping[str, Any],
+        reason: str,
+        *,
+        strategy_version: str | None = None,
+        confidence: str = "unavailable",
+        profit_attribution_id: str | None = None,
+    ) -> None:
         now = iso_now()
         source_id = str(lifecycle["id"])
         source_key = f"actual_paper:{source_id}"
@@ -869,14 +948,16 @@ class StrategyPerformanceEngine:
             """INSERT INTO strategy_trade_records(
                  id,source_key,strategy_version,symbol,evidence_class,position_lifecycle_id,source_id,
                  entry_session,exit_session,attribution_status,attribution_confidence,evidence_version,
-                 formula_version,reason,details_json,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 formula_version,reason,details_json,profit_attribution_id,
+                 created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_key) DO UPDATE SET strategy_version=excluded.strategy_version,
                  attribution_status=excluded.attribution_status,attribution_confidence=excluded.attribution_confidence,
-                 reason=excluded.reason,updated_at=excluded.updated_at""",
+                 reason=excluded.reason,profit_attribution_id=excluded.profit_attribution_id,
+                 updated_at=excluded.updated_at""",
             (record_id, source_key, strategy_version, lifecycle.get("symbol"), "actual_paper", source_id, source_id,
              lifecycle.get("opened_at"), lifecycle.get("closed_at"), "unavailable", confidence, None, None, reason,
-             json_dumps({"report_only": True}), now, now),
+             json_dumps({"report_only": True}), profit_attribution_id, now, now),
         )
 
     def _persist_observation(self, row: PerformanceObservation) -> None:
@@ -887,20 +968,31 @@ class StrategyPerformanceEngine:
                  id,source_key,strategy_version,symbol,evidence_class,position_lifecycle_id,source_id,
                  entry_session,exit_session,regime,score,quantity,gross_return,net_return,gross_pnl,net_pnl,
                  initial_risk_dollars,gross_r_multiple,r_multiple,attribution_status,attribution_confidence,
-                 evidence_version,formula_version,reason,details_json,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 evidence_version,formula_version,reason,details_json,profit_attribution_id,
+                 created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_key) DO UPDATE SET strategy_version=excluded.strategy_version,
-                 symbol=excluded.symbol,entry_session=excluded.entry_session,exit_session=excluded.exit_session,
+                 symbol=excluded.symbol,evidence_class=excluded.evidence_class,
+                 position_lifecycle_id=excluded.position_lifecycle_id,
+                 source_id=excluded.source_id,
+                 entry_session=excluded.entry_session,exit_session=excluded.exit_session,
                  regime=excluded.regime,score=excluded.score,gross_return=excluded.gross_return,net_return=excluded.net_return,
                  gross_pnl=excluded.gross_pnl,net_pnl=excluded.net_pnl,initial_risk_dollars=excluded.initial_risk_dollars,
                  gross_r_multiple=excluded.gross_r_multiple,r_multiple=excluded.r_multiple,
                  attribution_status=excluded.attribution_status,attribution_confidence=excluded.attribution_confidence,
                  evidence_version=excluded.evidence_version,formula_version=excluded.formula_version,
-                 details_json=excluded.details_json,updated_at=excluded.updated_at""",
-            (_fingerprint(source_key)[:32], source_key, row.strategy_version, row.symbol, row.evidence_class, None, row.source_id or row.observation_id,
+                 details_json=excluded.details_json,
+                 reason=excluded.reason,
+                 profit_attribution_id=excluded.profit_attribution_id,
+                 updated_at=excluded.updated_at""",
+            (_fingerprint(source_key)[:32], source_key, row.strategy_version, row.symbol, row.evidence_class,
+             (row.source_id if row.evidence_class == "actual_paper" else None),
+             row.source_id or row.observation_id,
              row.entry_session, row.exit_session, row.regime, row.score, None, row.gross_return, row.net_return, row.gross_pnl, row.net_pnl,
              row.initial_risk_dollars, row.gross_r, row.r_multiple, row.attribution_status, row.attribution_confidence,
-             row.evidence_version, row.formula_version, None, json_dumps(_json_safe(asdict(row))), now, now),
+             row.evidence_version, row.formula_version, None,
+             json_dumps(_json_safe(asdict(row))), row.profit_attribution_id,
+             now, now),
         )
 
     def _execution_rows(self, strategy_version: str) -> list[dict[str, Any]]:
@@ -935,19 +1027,150 @@ class StrategyPerformanceEngine:
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM trade_proposals WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         return sorted(versions)
 
+    def _validation_enforced(self) -> bool:
+        settings = self.config.get("profitability_validation", {}) or {}
+        return bool(
+            settings.get("enabled") is True
+            and settings.get("enforcement_enabled") is True
+        )
+
+    def _refresh_validation_family(
+        self, strategy_versions: Sequence[str]
+    ) -> dict[str, ProfitabilityValidationDecision]:
+        if not self._validation_enforced():
+            return {}
+        if self.as_of is None:
+            raise ValueError(
+                "profitability validation requires explicit as_of"
+            )
+        config_hash = str(
+            self.config.get("effective_config_hash") or ""
+        ).strip()
+        configuration_version = str(
+            self.config.get("configuration_schema_version") or ""
+        ).strip()
+        formula_versions = self.config.get("formula_versions")
+        if (
+            not config_hash
+            or not configuration_version
+            or not isinstance(formula_versions, Mapping)
+        ):
+            raise ValueError(
+                "profitability validation requires current configuration authority"
+            )
+        rows = self.storage.fetch_all(
+            """SELECT source_key,source_id,strategy_version,evidence_class,
+                      entry_session,exit_session,r_multiple,attribution_status,
+                      evidence_version,formula_version
+               FROM strategy_trade_records
+               WHERE evidence_class IN ('shadow_oos','actual_paper')
+                 AND attribution_status IN ('complete','partial')
+                 AND r_multiple IS NOT NULL
+                 AND (evidence_class='shadow_oos'
+                   OR profit_attribution_id IS NOT NULL)
+                 AND evidence_version=? AND formula_version=?
+               ORDER BY strategy_version,exit_session,source_key""",
+            (EVIDENCE_VERSION, ACCOUNTING_VERSION),
+        )
+        versions = tuple(sorted({str(version) for version in strategy_versions}))
+        hypotheses = tuple(
+            ValidationHypothesis(
+                hypothesis_id=version,
+                strategy_version=version,
+                # A singleton explicitly means no parameter search was
+                # performed inside this operational strategy version.
+                stability_group=version,
+            )
+            for version in versions
+        )
+        family = validate_profitability_family(
+            family_key="operational_strategy_versions",
+            as_of=self.as_of,
+            hypotheses=hypotheses,
+            observations=tuple(observations_from_strategy_records(rows)),
+            policy=policy_from_config(self.config),
+            configuration_version=configuration_version,
+            config_hash=config_hash,
+            formula_versions=formula_versions,
+        )
+        store = ProfitabilityValidationStore(self.storage)
+        store.persist(family)
+        verified = store.load_verified(family.id)
+        return {
+            decision.strategy_version: decision
+            for decision in verified.decisions
+        }
+
     def refresh_strategy(self, strategy_version: str) -> StrategyPerformanceSnapshot:
         if not strategy_version:
             raise ValueError("strategy_version is required")
         if self.as_of is None:
             raise ValueError("strategy performance refresh requires explicit as_of")
-        shadow = [row for row in self._shadow_observations() if row.strategy_version == strategy_version]
-        actual = [row for row in self._actual_observations() if row.strategy_version == strategy_version]
+        cached_observations = getattr(self, "_prepared_observations", None)
+        cached_validation = getattr(self, "_prepared_validation", None)
+        if cached_observations is None:
+            all_observations = _ordered(
+                [*self._shadow_observations(), *self._actual_observations()]
+            )
+            for row in all_observations:
+                self._persist_observation(row)
+            validation_map = self._refresh_validation_family(
+                self._strategy_versions()
+            )
+        else:
+            all_observations = cached_observations
+            validation_map = cached_validation or {}
+        shadow = [
+            row
+            for row in all_observations
+            if row.strategy_version == strategy_version
+            and row.evidence_class == "shadow_oos"
+        ]
+        actual = [
+            row
+            for row in all_observations
+            if row.strategy_version == strategy_version
+            and row.evidence_class == "actual_paper"
+        ]
         observations = _ordered([*shadow, *actual])
-        for row in observations:
-            self._persist_observation(row)
+        validation_decision = validation_map.get(strategy_version)
+        validation_enforced = self._validation_enforced()
+        if validation_enforced and validation_decision is None:
+            raise ValueError(
+                "current profitability validation decision is unavailable"
+            )
+        validation_status = (
+            validation_decision.status
+            if validation_decision is not None
+            else "disabled"
+        )
         settings = self._settings()
         execution = self._execution_rows(strategy_version)
         metrics, raw_inputs = calculate_metrics(observations, execution_rows=execution, as_of=self.as_of, settings=settings)
+        metrics = {
+            **metrics,
+            "profitability_validation_status": validation_status,
+            "profitability_validation_sample_count": (
+                validation_decision.sample_count
+                if validation_decision is not None
+                else None
+            ),
+            "profitability_validation_fold_count": (
+                validation_decision.fold_count
+                if validation_decision is not None
+                else None
+            ),
+            "profitability_validation_lower_net_r": (
+                validation_decision.bootstrap_lower_net_r
+                if validation_decision is not None
+                else None
+            ),
+            "profitability_validation_fdr_q_value": (
+                validation_decision.fdr_q_value
+                if validation_decision is not None
+                else None
+            ),
+        }
         components, quality, penalties = score_components(metrics, settings)
         sample_count = int(metrics["sample_count"])
         shadow_count = int(metrics["trade_counts"]["shadow_oos"])
@@ -964,6 +1187,12 @@ class StrategyPerformanceEngine:
             "drawdown_within_hard_limit": (metrics["maximum_drawdown_r"] or 0.0) <= settings["hard_max_drawdown_r"],
             "losing_streak_within_hard_limit": int(metrics["worst_losing_streak"] or 0) <= settings["hard_max_losing_streak"],
             "divergence_within_hard_limit": (actual_count < settings["minimum_actual_paper_for_divergence_penalty"] or metrics["shadow_paper_expectancy_divergence_r"] is None or metrics["shadow_paper_expectancy_divergence_r"] <= settings["hard_max_divergence_r"]),
+            "profitability_validation_not_failed": (
+                not validation_enforced or validation_status != "failed"
+            ),
+            "profitability_validation_validated": (
+                not validation_enforced or validation_status == "validated"
+            ),
         }
         preliminary_inputs = _probe_preliminary_inputs(strategy_version, metrics, penalties, settings)
         preliminary_results = _probe_preliminary_results(preliminary_inputs)
@@ -989,6 +1218,25 @@ class StrategyPerformanceEngine:
             "sample_count": sample_count, "shadow_oos_count": shadow_count, "actual_paper_count": actual_count,
             "minimum_shadow_oos_samples": settings["minimum_shadow_oos_samples"], "minimum_actual_paper_for_throttled": settings["minimum_actual_paper_for_throttled"], "minimum_actual_paper_for_active": settings["minimum_actual_paper_for_active"],
             "regime_count": regime_count, "minimum_regimes": settings["minimum_regimes"], "ceiling": ceiling, "binding_maturity_reason": maturity_reason,
+            "profitability_validation": {
+                "enforced": validation_enforced,
+                "family_id": (
+                    validation_decision.family_id
+                    if validation_decision is not None
+                    else None
+                ),
+                "decision_id": (
+                    validation_decision.id
+                    if validation_decision is not None
+                    else None
+                ),
+                "status": validation_status,
+                "reason": (
+                    validation_decision.reason
+                    if validation_decision is not None
+                    else "validation enforcement disabled"
+                ),
+            },
             "probe": {
                 "evidence_eligible": probe_evidence_eligible,
                 "required_gates": list(probe_gate_names),
@@ -1003,11 +1251,22 @@ class StrategyPerformanceEngine:
                 },
             },
         }
-        if shadow_count < settings["minimum_shadow_oos_samples"]:
+        if validation_enforced and validation_status == "failed":
+            state, reason = (
+                "SUSPENDED",
+                "profitability validation failed: "
+                + str(validation_decision.reason),
+            )
+        elif shadow_count < settings["minimum_shadow_oos_samples"]:
             state = "PROBE" if probe_evidence_eligible else "RESEARCH_ONLY"
             reason = maturity_reason
         elif not gates["evidence_present"]:
             state, reason = "RESEARCH_ONLY", "no complete current-version evidence"
+        elif validation_enforced and validation_status != "validated":
+            state, reason = (
+                "SUSPENDED",
+                "mature strategy lacks validated profitability authority",
+            )
         else:
             failed_hard = [name for name in ("evidence_fresh", "version_complete", "drawdown_within_hard_limit", "losing_streak_within_hard_limit", "divergence_within_hard_limit") if not gates[name]]
             if failed_hard and shadow_count >= settings["minimum_shadow_oos_samples"]:
@@ -1040,6 +1299,25 @@ class StrategyPerformanceEngine:
             "hard_gates": gates,
             "maturity": maturity,
             "settings": settings,
+            "profitability_validation": (
+                {
+                    "family_id": validation_decision.family_id,
+                    "decision_id": validation_decision.id,
+                    "status": validation_decision.status,
+                    "reason": validation_decision.reason,
+                    "sample_count": validation_decision.sample_count,
+                    "fold_count": validation_decision.fold_count,
+                    "bootstrap_lower_net_r": validation_decision.bootstrap_lower_net_r,
+                    "bootstrap_p_value": validation_decision.bootstrap_p_value,
+                    "fdr_q_value": validation_decision.fdr_q_value,
+                    "fdr_accepted": validation_decision.fdr_accepted,
+                    "decision_fingerprint": validation_decision.decision_fingerprint,
+                    "formula_version": validation_decision.formula_version,
+                    "schema_version": validation_decision.schema_version,
+                }
+                if validation_decision is not None
+                else {"status": "disabled"}
+            ),
         }
         metrics = {**metrics, "quality_score": quality, "component_weights": {"profitability": 30, "downside": 20, "stability": 15, "regime": 15, "execution": 10, "evidence": 10}, "penalties": penalties}
         fingerprint = _fingerprint({"strategy_version": strategy_version, "observations": [asdict(row) for row in observations], "metrics": metrics, "components": components, "raw_inputs": raw_inputs, "performance_version": STRATEGY_PERFORMANCE_VERSION, "policy_version": STRATEGY_POLICY_VERSION})
@@ -1049,38 +1327,95 @@ class StrategyPerformanceEngine:
             """INSERT INTO strategy_performance_snapshots(
                  id,strategy_version,as_of,performance_version,policy_version,schema_version,quality_score,
                  recommendation_state,trade_counts_json,metrics_json,components_json,raw_inputs_json,
-                 evidence_recency_days,attribution_confidence,version_completeness,input_fingerprint,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,input_fingerprint) DO UPDATE SET
+                 evidence_recency_days,attribution_confidence,version_completeness,
+                 validation_family_id,validation_decision_id,validation_status,
+                 validation_fingerprint,input_fingerprint,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,input_fingerprint) DO UPDATE SET
                  as_of=excluded.as_of,quality_score=excluded.quality_score,recommendation_state=excluded.recommendation_state,
                  trade_counts_json=excluded.trade_counts_json,metrics_json=excluded.metrics_json,components_json=excluded.components_json,
                  raw_inputs_json=excluded.raw_inputs_json,evidence_recency_days=excluded.evidence_recency_days,
-                 attribution_confidence=excluded.attribution_confidence,version_completeness=excluded.version_completeness""",
+                 attribution_confidence=excluded.attribution_confidence,version_completeness=excluded.version_completeness,
+                 validation_family_id=excluded.validation_family_id,
+                 validation_decision_id=excluded.validation_decision_id,
+                 validation_status=excluded.validation_status,
+                 validation_fingerprint=excluded.validation_fingerprint""",
             (snapshot_id, strategy_version, self.as_of, STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION,
              quality, state, json_dumps(metrics["trade_counts"]), json_dumps(_json_safe(metrics)), json_dumps(_json_safe({**components, "penalties": penalties})),
-             json_dumps(_json_safe(raw_inputs)), metrics.get("evidence_recency_days"), metrics.get("attribution_confidence", 0.0), metrics.get("version_completeness", 0.0), fingerprint, now),
+             json_dumps(_json_safe(raw_inputs)), metrics.get("evidence_recency_days"), metrics.get("attribution_confidence", 0.0), metrics.get("version_completeness", 0.0),
+             validation_decision.family_id if validation_decision else None,
+             validation_decision.id if validation_decision else None,
+             validation_status,
+             validation_decision.decision_fingerprint if validation_decision else None,
+             fingerprint, now),
         )
         self.storage.execute(
             """INSERT INTO strategy_policy_decisions(
                  id,strategy_version,decided_at,performance_snapshot_id,state,quality_score,reason,
                  hard_gates_json,maturity_json,components_json,raw_inputs_json,enforcement_enabled,
                  performance_version,policy_version,schema_version,input_fingerprint,evidence_version,
-                 configuration_version,config_hash)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,performance_snapshot_id) DO UPDATE SET
+                 configuration_version,config_hash,validation_family_id,
+                 validation_decision_id,validation_status,validation_fingerprint)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(strategy_version,performance_snapshot_id) DO UPDATE SET
                  decided_at=excluded.decided_at,state=excluded.state,quality_score=excluded.quality_score,reason=excluded.reason,
                  hard_gates_json=excluded.hard_gates_json,maturity_json=excluded.maturity_json,components_json=excluded.components_json,
                  raw_inputs_json=excluded.raw_inputs_json,evidence_version=excluded.evidence_version,
-                 configuration_version=excluded.configuration_version,config_hash=excluded.config_hash""",
+                 configuration_version=excluded.configuration_version,config_hash=excluded.config_hash,
+                 validation_family_id=excluded.validation_family_id,
+                 validation_decision_id=excluded.validation_decision_id,
+                 validation_status=excluded.validation_status,
+                 validation_fingerprint=excluded.validation_fingerprint""",
             (_fingerprint({"policy": fingerprint, "state": state})[:32], strategy_version, now, snapshot_id, state, quality, reason,
              json_dumps(gates), json_dumps(maturity), json_dumps(_json_safe({**components, "penalties": penalties})), json_dumps(_json_safe(raw_inputs)), int(bool(self.cfg.get("enforcement_enabled", False))),
              STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION, fingerprint,
-             EVIDENCE_VERSION, self.config.get("configuration_schema_version"), self.config.get("effective_config_hash")),
+             EVIDENCE_VERSION, self.config.get("configuration_schema_version"), self.config.get("effective_config_hash"),
+             validation_decision.family_id if validation_decision else None,
+             validation_decision.id if validation_decision else None,
+             validation_status,
+             validation_decision.decision_fingerprint if validation_decision else None),
         )
-        return StrategyPerformanceSnapshot(strategy_version, self.as_of, STRATEGY_PERFORMANCE_VERSION, STRATEGY_POLICY_VERSION, STRATEGY_PERFORMANCE_SCHEMA_VERSION, metrics, {**components, "concentration_penalty": penalties["concentration"], "divergence_penalty": penalties["divergence"]}, raw_inputs, quality, state, fingerprint, metrics["trade_counts"], metrics.get("evidence_recency_days"), metrics.get("attribution_confidence", 0.0), metrics.get("version_completeness", 0.0), snapshot_id)
+        return StrategyPerformanceSnapshot(
+            strategy_version=strategy_version,
+            as_of=self.as_of,
+            performance_version=STRATEGY_PERFORMANCE_VERSION,
+            policy_version=STRATEGY_POLICY_VERSION,
+            schema_version=STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+            metrics=metrics,
+            components={**components, "concentration_penalty": penalties["concentration"], "divergence_penalty": penalties["divergence"]},
+            raw_inputs=raw_inputs,
+            quality_score=quality,
+            recommendation_state=state,
+            fingerprint=fingerprint,
+            trade_counts=metrics["trade_counts"],
+            evidence_recency_days=metrics.get("evidence_recency_days"),
+            attribution_confidence=metrics.get("attribution_confidence", 0.0),
+            version_completeness=metrics.get("version_completeness", 0.0),
+            id=snapshot_id,
+            validation_family_id=(validation_decision.family_id if validation_decision else None),
+            validation_decision_id=(validation_decision.id if validation_decision else None),
+            validation_status=validation_status,
+            validation_fingerprint=(validation_decision.decision_fingerprint if validation_decision else ""),
+        )
 
     def refresh_all(self) -> dict[str, StrategyPerformanceSnapshot]:
         if self.cfg.get("enabled", True) is False:
             return {}
-        return {version: self.refresh_strategy(version) for version in self._strategy_versions()}
+        versions = self._strategy_versions()
+        observations = _ordered(
+            [*self._shadow_observations(), *self._actual_observations()]
+        )
+        for row in observations:
+            self._persist_observation(row)
+        validation = self._refresh_validation_family(versions)
+        self._prepared_observations = observations
+        self._prepared_validation = validation
+        try:
+            return {
+                version: self.refresh_strategy(version)
+                for version in versions
+            }
+        finally:
+            del self._prepared_observations
+            del self._prepared_validation
 
     def latest_policy(self, strategy_version: str | None = None) -> StrategyRiskPolicy | dict[str, StrategyRiskPolicy] | None:
         params: tuple[Any, ...] = () if strategy_version is None else (strategy_version,)
@@ -1100,6 +1435,10 @@ class StrategyPerformanceEngine:
                 evidence_version=row.get("evidence_version") or "",
                 configuration_version=row.get("configuration_version") or "",
                 config_hash=row.get("config_hash") or "",
+                validation_family_id=row.get("validation_family_id") or "",
+                validation_decision_id=row.get("validation_decision_id") or "",
+                validation_status=row.get("validation_status") or "disabled",
+                validation_fingerprint=row.get("validation_fingerprint") or "",
             )
         if strategy_version is not None:
             return policies.get(strategy_version)
@@ -1123,6 +1462,10 @@ class StrategyPerformanceEngine:
             evidence_version=str(row.get("evidence_version") or ""),
             configuration_version=str(row.get("configuration_version") or ""),
             config_hash=str(row.get("config_hash") or ""),
+            validation_family_id=str(row.get("validation_family_id") or ""),
+            validation_decision_id=str(row.get("validation_decision_id") or ""),
+            validation_status=str(row.get("validation_status") or "disabled"),
+            validation_fingerprint=str(row.get("validation_fingerprint") or ""),
         )
 
     def _probe_policy_valid(
@@ -1168,6 +1511,85 @@ class StrategyPerformanceEngine:
             and limits == expected_limits
             and row.get("reason") == "preliminary PROBE evidence gates passed"
         )
+
+    def _validation_authority_valid(
+        self,
+        row: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+    ) -> bool:
+        if not self._validation_enforced():
+            return (
+                str(row.get("validation_status") or "disabled") == "disabled"
+                and str(snapshot.get("validation_status") or "disabled")
+                == "disabled"
+                and not row.get("validation_family_id")
+                and not row.get("validation_decision_id")
+                and not row.get("validation_fingerprint")
+                and not snapshot.get("validation_family_id")
+                and not snapshot.get("validation_decision_id")
+                and not snapshot.get("validation_fingerprint")
+            )
+        family_id = str(row.get("validation_family_id") or "")
+        decision_id = str(row.get("validation_decision_id") or "")
+        fingerprint = str(row.get("validation_fingerprint") or "")
+        status = str(row.get("validation_status") or "")
+        if (
+            not family_id
+            or not decision_id
+            or not fingerprint
+            or status not in {"validated", "failed", "insufficient"}
+            or snapshot.get("validation_family_id") != family_id
+            or snapshot.get("validation_decision_id") != decision_id
+            or snapshot.get("validation_status") != status
+            or snapshot.get("validation_fingerprint") != fingerprint
+        ):
+            return False
+        try:
+            family = ProfitabilityValidationStore(self.storage).load_verified(
+                family_id
+            )
+        except (ProfitabilityValidationError, sqlite3.Error):
+            return False
+        decisions = {
+            decision.id: decision for decision in family.decisions
+        }
+        expected_versions = set(self._strategy_versions())
+        family_versions = {
+            str(item.get("strategy_version") or "")
+            for item in family.hypotheses
+        }
+        decision = decisions.get(decision_id)
+        try:
+            family_precedes_snapshot = _parse_datetime(
+                family.as_of
+            ) <= _parse_datetime(str(snapshot.get("as_of") or ""))
+        except (TypeError, ValueError):
+            return False
+        if (
+            decision is None
+            or family.family_key != "operational_strategy_versions"
+            or family_versions != expected_versions
+            or not family_precedes_snapshot
+            or decision.strategy_version != row.get("strategy_version")
+            or decision.status != status
+            or decision.decision_fingerprint != fingerprint
+            or family.configuration_version
+            != self.config.get("configuration_schema_version")
+            or family.config_hash != self.config.get("effective_config_hash")
+            or family.evidence_version != EVIDENCE_VERSION
+            or dict(family.formula_versions)
+            != dict(self.config.get("formula_versions") or {})
+        ):
+            return False
+        state = str(row.get("state") or "")
+        if status == "failed" and state != "SUSPENDED":
+            return False
+        if status == "insufficient" and state not in {
+            "RESEARCH_ONLY",
+            "PROBE",
+        }:
+            return False
+        return True
 
     def latest_valid_policy(self, strategy_version: str | None = None) -> StrategyRiskPolicy | dict[str, StrategyRiskPolicy] | None:
         """Return only a current, internally linked, enforceable policy.
@@ -1220,6 +1642,7 @@ class StrategyPerformanceEngine:
                 or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
                 or not isinstance(raw_inputs, dict)
                 or not self._probe_policy_valid(row, metrics, raw_inputs, hard_gates, maturity)
+                or not self._validation_authority_valid(row, snapshot)
                 or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             ):
                 continue
@@ -1283,6 +1706,7 @@ class StrategyPerformanceEngine:
             or not isinstance(hard_gates, dict) or not isinstance(maturity, dict)
             or not isinstance(raw_inputs, dict)
             or not self._probe_policy_valid(row, metrics, raw_inputs, hard_gates, maturity)
+            or not self._validation_authority_valid(row, snapshot)
             or (float(snapshot.get("version_completeness") or 0.0) < 1.0 and not (not hard_gates.get("evidence_present") and row.get("state") == "RESEARCH_ONLY"))
             or (bool(hard_gates.get("evidence_present")) and (recency is None or float(recency) > float(self.cfg.get("evidence_stale_after_days", 90)) or not hard_gates.get("evidence_fresh")))
         ):
@@ -1310,6 +1734,8 @@ class StrategyPerformanceEngine:
                 f"Trades: shadow_oos={metrics.get('trade_counts', {}).get('shadow_oos', 0)}, actual_paper={metrics.get('trade_counts', {}).get('actual_paper', 0)}",
                 f"Expectancy R: {metrics.get('expectancy_r') if metrics.get('expectancy_r') is not None else 'unavailable'} | PF: {metrics.get('profit_factor') if metrics.get('profit_factor') is not None else 'unavailable'} | Win rate: {metrics.get('win_rate') if metrics.get('win_rate') is not None else 'unavailable'}",
                 f"Max drawdown R: {metrics.get('maximum_drawdown_r') if metrics.get('maximum_drawdown_r') is not None else 'unavailable'} | Losing streak: {metrics.get('worst_losing_streak', 0)}",
+                f"Validation: {row.get('validation_status') or 'disabled'} | bootstrap lower net R: {metrics.get('profitability_validation_lower_net_r') if metrics.get('profitability_validation_lower_net_r') is not None else 'unavailable'} | FDR q: {metrics.get('profitability_validation_fdr_q_value') if metrics.get('profitability_validation_fdr_q_value') is not None else 'unavailable'}",
+                f"Attribution confidence: {metrics.get('attribution_confidence', 0.0)} | current-version completeness: {metrics.get('version_completeness', 0.0)}",
                 f"Fingerprint: {row['input_fingerprint'][:16]}",
             ])
             if row["recommendation_state"] == "PROBE":

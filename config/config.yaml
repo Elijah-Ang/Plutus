@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v11_profitability_ranking_paper
+configuration_schema_version: plutus_effective_config_v12_profitability_validation_attribution_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,10 +106,10 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v11_profitability_ranking_paper
+  required_configuration_version: plutus_effective_config_v12_profitability_validation_attribution_paper
   required_evidence_version: phase1_outcome_v2_exit_session
-  required_performance_version: strategy_performance_v2_3_gross_edge
-  required_policy_version: strategy_policy_v2_3_gross_edge
+  required_performance_version: strategy_performance_v2_4_validation_attribution
+  required_policy_version: strategy_policy_v2_4_validation_attribution
   required_policy_schema_version: strategy_profitability_engine_v1
   entries:
     rule_based_v2:
@@ -256,8 +256,8 @@ rotation:
 profitability_engine:
   enabled: true
   enforcement_enabled: true
-  performance_version: strategy_performance_v2_3_gross_edge
-  policy_version: strategy_policy_v2_3_gross_edge
+  performance_version: strategy_performance_v2_4_validation_attribution
+  policy_version: strategy_policy_v2_4_validation_attribution
   schema_version: strategy_profitability_engine_v1
   primary_horizon_sessions: 20
   minimum_shadow_oos_samples: 100
@@ -318,6 +318,22 @@ profitability_engine:
     finra_taf_per_share: 0.000195
     finra_taf_max: 9.79
     cat_fee_per_share_per_side: 0.000003
+profitability_validation:
+  enabled: true
+  enforcement_enabled: true
+  mode: operational_paper
+  formula_version: profitability_validation_v1
+  schema_version: profitability_validation_authority_v1
+  minimum_samples: 50
+  minimum_folds: 2
+  minimum_train_observations: 30
+  test_observations: 10
+  embargo_periods: 1
+  block_length: 5
+  bootstrap_draws: 2000
+  fdr_alpha: 0.10
+  minimum_positive_fold_ratio: 0.60
+  minimum_parameter_stability_ratio: 0.60
 execution_capabilities:
   live_execution_enabled: false
   autonomous_entries_enabled: false
@@ -351,10 +367,12 @@ formula_versions:
   risk_decision: risk_engine_position_risk_rotation_sleeve_v5
   accounting: fifo_equity_unrealized_cashflow_v1
   evidence: phase1_outcome_v2_exit_session
-  strategy_performance: strategy_performance_v2_3_gross_edge
-  strategy_policy: strategy_policy_v2_3_gross_edge
+  strategy_performance: strategy_performance_v2_4_validation_attribution
+  strategy_policy: strategy_policy_v2_4_validation_attribution
   trade_economics: candidate_trade_economics_v1
   profitability_ranking: candidate_profitability_ranking_v1
+  profitability_validation: profitability_validation_v1
+  profit_attribution: profit_attribution_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 

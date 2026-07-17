@@ -27,6 +27,7 @@ TARGETED_SUITES = (
     "tests/test_execution_authority_final.py",
     "tests/test_release_eligibility.py",
     "tests/test_release_pipeline.py",
+    "tests/test_profitability_validation_attribution.py",
 )
 
 

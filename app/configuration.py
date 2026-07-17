@@ -20,6 +20,9 @@ from .formula_versions import (
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
     PROFITABILITY_RANKING_SCHEMA_VERSION,
+    PROFITABILITY_VALIDATION_FORMULA_VERSION,
+    PROFITABILITY_VALIDATION_SCHEMA_VERSION,
+    PROFIT_ATTRIBUTION_FORMULA_VERSION,
     RISK_DECISION_VERSION,
     SIZING_POLICY_VERSION,
     STOP_POLICY_VERSION,
@@ -58,7 +61,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
-    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "execution_capabilities", "broker",
+    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "profitability_validation", "execution_capabilities", "broker",
     "strategy_execution_registry", "winner_expansion", "trend_management", "rotation",
     "require_power", "require_market_open", "preflight", "watchlist", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
@@ -134,7 +137,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -146,6 +149,14 @@ STRICT_SECTION_KEYS = {
         "candidate_ranking_formula_version", "candidate_ranking_schema_version",
         "maximum_cost_to_gross_edge_ratio", "maximum_break_even_win_probability",
         "minimum_expected_net_r", "minimum_conservative_net_r", "candidate_model",
+    },
+    "profitability_validation": {
+        "enabled", "enforcement_enabled", "mode", "formula_version",
+        "schema_version", "minimum_samples", "minimum_folds",
+        "minimum_train_observations", "test_observations",
+        "embargo_periods", "block_length", "bootstrap_draws",
+        "fdr_alpha", "minimum_positive_fold_ratio",
+        "minimum_parameter_stability_ratio",
     },
 }
 
@@ -243,11 +254,51 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "strategy_policy": STRATEGY_POLICY_VERSION,
         "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
         "profitability_ranking": PROFITABILITY_RANKING_FORMULA_VERSION,
+        "profitability_validation": PROFITABILITY_VALIDATION_FORMULA_VERSION,
+        "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
     for key, expected in expected_formulas.items():
         require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")
+
+    validation = config.get("profitability_validation", {}) or {}
+    require(validation.get("enabled") is True,
+            "profitability_validation.enabled must be true")
+    require(validation.get("enforcement_enabled") is True,
+            "profitability validation must be operational in paper mode")
+    require(validation.get("mode") == "operational_paper",
+            "profitability validation mode must be operational_paper")
+    require(validation.get("formula_version") == PROFITABILITY_VALIDATION_FORMULA_VERSION,
+            f"profitability_validation.formula_version must be {PROFITABILITY_VALIDATION_FORMULA_VERSION}")
+    require(validation.get("schema_version") == PROFITABILITY_VALIDATION_SCHEMA_VERSION,
+            f"profitability_validation.schema_version must be {PROFITABILITY_VALIDATION_SCHEMA_VERSION}")
+    for key in (
+        "minimum_samples", "minimum_folds", "minimum_train_observations",
+        "test_observations", "block_length", "bootstrap_draws",
+    ):
+        require(isinstance(validation.get(key), int) and validation.get(key) > 0,
+                f"profitability_validation.{key} must be a positive integer")
+    require(isinstance(validation.get("embargo_periods"), int) and validation.get("embargo_periods") >= 0,
+            "profitability_validation.embargo_periods must be a nonnegative integer")
+    require((validation.get("minimum_samples") or 0) >= (validation.get("minimum_train_observations") or 0),
+            "profitability_validation.minimum_samples must cover the training minimum")
+    require((validation.get("bootstrap_draws") or 0) >= 100,
+            "profitability_validation.bootstrap_draws must be at least 100")
+    require((validation.get("block_length") or 0) <= (validation.get("minimum_samples") or 0),
+            "profitability_validation.block_length cannot exceed minimum_samples")
+    for key in (
+        "fdr_alpha", "minimum_positive_fold_ratio",
+        "minimum_parameter_stability_ratio",
+    ):
+        value = validation.get(key)
+        require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and 0 <= float(value) <= 1,
+            f"profitability_validation.{key} must be between 0 and 1",
+        )
 
     conviction = config.get("adaptive_conviction", {}) or {}
     require(conviction.get("enabled") is True, "adaptive_conviction.enabled must be true")

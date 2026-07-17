@@ -29,6 +29,14 @@ decisions and evidence:
 - `fifo_equity_unrealized_cashflow_v1`: realized FIFO P&L, account-equity
   change, unrealized change, and external cash-flow separation.
 - `phase1_outcome_v2_exit_session`: corrected early-exit attribution.
+- `profitability_validation_v1`: immutable purged walk-forward folds, circular
+  block-bootstrap uncertainty, complete-family Benjamini-Hochberg FDR, and
+  parameter-neighborhood stability.
+- `profit_attribution_v1`: exact Decimal expected-versus-realized FIFO lifecycle
+  reconciliation without invented expected values.
+- `candidate_trade_economics_v1` and `candidate_profitability_ranking_v1`:
+  immutable candidate economics and conservative ranking inputs bound to exact
+  strategy policy and validation authority.
 
 ## Effective paper sizing
 
@@ -59,6 +67,18 @@ equity and a persisted formula version. Kelly is a ceiling diagnostic; covarianc
 constraint. Actual before/after heat, gross/symbol/cluster exposure, pending
 risk, reserved risk, binding caps, evidence versions, formula version, and
 configuration hash are persisted.
+
+Operational profitability validation is configured in
+`profitability_validation`. The current minimums are 50 observations, two
+purged chronological folds, 30 training observations, 10 test observations,
+one embargo group, five-observation circular blocks, 2,000 bootstrap draws, a
+10% family FDR, 60% positive folds, and 60% parameter-neighborhood support.
+These are evidence gates, not sizing multipliers. Insufficient evidence cannot
+be converted into ACTIVE/THROTTLED authority by a caller hint.
+
+See [PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md](PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md)
+for exact evidence admission, formulas, state transitions, attribution
+reconciliation, and known statistical limits.
 
 ## Schema and execution compatibility
 

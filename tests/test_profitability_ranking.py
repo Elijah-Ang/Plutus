@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,10 +24,19 @@ from app.profitability_ranking import (
     ProfitabilityRankingError,
     calculate_candidate_profitability,
 )
+from app.profitability_validation import (
+    ProfitabilityValidationStore,
+    ValidationHypothesis,
+    ValidationObservation,
+    policy_from_config,
+    validate_profitability_family,
+)
 from app.approval_authority import authority_envelope
 from app.storage import Storage
 from app.service import TradingService
 from app.strategy_rule_based import Signal
+from app.shadow_strategies import STRATEGY_VERSIONS
+from app.strategy_rule_based import STRATEGY_VERSION
 from app.strategy_performance import StrategyRiskPolicy, calculate_metrics
 from app.utils import format_proposal_message, load_config
 
@@ -36,7 +46,46 @@ CONFIG = load_config("config/config.yaml")
 CONFIG_HASH = CONFIG["effective_config_hash"]
 
 
+@functools.lru_cache(maxsize=1)
+def validation_family():
+    versions = sorted({*STRATEGY_VERSIONS.values(), STRATEGY_VERSION})
+    hypotheses = tuple(
+        ValidationHypothesis(version, version, version)
+        for version in versions
+    )
+    observations = []
+    for index in range(70):
+        observed = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=index)
+        observations.append(
+            ValidationObservation(
+                id=f"rule-{index}",
+                hypothesis_id="rule_based_v2",
+                strategy_version="rule_based_v2",
+                observed_at=observed.isoformat(),
+                outcome_end_at=(observed + timedelta(days=5)).isoformat(),
+                net_r="0.5",
+                evidence_class="shadow_oos",
+                source_id=f"source-{index}",
+            )
+        )
+    return validate_profitability_family(
+        family_key="operational_strategy_versions",
+        as_of="2026-07-15T23:57:00+00:00",
+        hypotheses=hypotheses,
+        observations=tuple(observations),
+        policy=policy_from_config(CONFIG),
+        configuration_version=CONFIGURATION_SCHEMA_VERSION,
+        config_hash=CONFIG_HASH,
+        formula_versions=CONFIG["formula_versions"],
+    )
+
+
 def policy(**overrides) -> StrategyRiskPolicy:
+    validation = next(
+        decision
+        for decision in validation_family().decisions
+        if decision.strategy_version == "rule_based_v2"
+    )
     metrics = {
         "gross_sample_count": 100,
         "gross_win_count": 55,
@@ -69,6 +118,10 @@ def policy(**overrides) -> StrategyRiskPolicy:
         "evidence_version": EVIDENCE_VERSION,
         "configuration_version": CONFIGURATION_SCHEMA_VERSION,
         "config_hash": CONFIG_HASH,
+        "validation_family_id": validation.family_id,
+        "validation_decision_id": validation.id,
+        "validation_status": validation.status,
+        "validation_fingerprint": validation.decision_fingerprint,
     }
     values.update(overrides)
     return StrategyRiskPolicy(**values)
@@ -116,13 +169,17 @@ def candidate(**overrides) -> ProfitabilityCandidateInput:
 def install_authority(storage: Storage, exact_policy: StrategyRiskPolicy) -> None:
     import json
 
+    ProfitabilityValidationStore(storage).persist(validation_family())
+
     storage.execute(
         """INSERT INTO strategy_performance_snapshots(
              id,strategy_version,as_of,performance_version,policy_version,
              schema_version,quality_score,recommendation_state,trade_counts_json,
              metrics_json,components_json,raw_inputs_json,evidence_recency_days,
-             attribution_confidence,version_completeness,input_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             attribution_confidence,version_completeness,validation_family_id,
+             validation_decision_id,validation_status,validation_fingerprint,
+             input_fingerprint,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             exact_policy.performance_snapshot_id,
             exact_policy.strategy_version,
@@ -139,6 +196,10 @@ def install_authority(storage: Storage, exact_policy: StrategyRiskPolicy) -> Non
             0,
             1,
             1,
+            exact_policy.validation_family_id,
+            exact_policy.validation_decision_id,
+            exact_policy.validation_status,
+            exact_policy.validation_fingerprint,
             exact_policy.fingerprint,
             "2026-07-15T23:58:00+00:00",
         ),
@@ -149,8 +210,9 @@ def install_authority(storage: Storage, exact_policy: StrategyRiskPolicy) -> Non
              quality_score,reason,hard_gates_json,maturity_json,components_json,
              raw_inputs_json,enforcement_enabled,performance_version,policy_version,
              schema_version,input_fingerprint,evidence_version,
-             configuration_version,config_hash)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             configuration_version,config_hash,validation_family_id,
+             validation_decision_id,validation_status,validation_fingerprint)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             exact_policy.id,
             exact_policy.strategy_version,
@@ -171,6 +233,10 @@ def install_authority(storage: Storage, exact_policy: StrategyRiskPolicy) -> Non
             EVIDENCE_VERSION,
             CONFIGURATION_SCHEMA_VERSION,
             CONFIG_HASH,
+            exact_policy.validation_family_id,
+            exact_policy.validation_decision_id,
+            exact_policy.validation_status,
+            exact_policy.validation_fingerprint,
         ),
     )
 

@@ -47,7 +47,7 @@ jobs:
       - name: Verify deterministic replay
         env:
           TRADING_AGENT_TESTING: '1'
-        run: python -m pytest -q tests/test_adaptive_conviction.py tests/test_phase4_adaptive_allocator.py tests/test_phase43_multi_strategy_allocator.py tests/test_strategy_performance.py tests/test_plutus_audit_hardening.py
+        run: python -m pytest -q tests/test_adaptive_conviction.py tests/test_phase4_adaptive_allocator.py tests/test_phase43_multi_strategy_allocator.py tests/test_strategy_performance.py tests/test_profitability_validation_attribution.py tests/test_plutus_audit_hardening.py
       - name: Verify critical approval, execution, reconciliation, and recovery paths
         env:
           TRADING_AGENT_TESTING: '1'

@@ -189,7 +189,15 @@ def test_fifo_partial_complete_sells_allocate_each_lot_and_count_one_lifecycle(t
     assert sum(row["allocated_sell_fees"] for row in consumptions) == pytest.approx(0.30)
     snapshot = StrategyPerformanceEngine(db, _engine_config(), as_of="2026-01-04T00:00:00+00:00").refresh_strategy("rule_based_v2")
     assert snapshot.metrics["trade_counts"] == {"shadow_oos": 0, "actual_paper": 1, "total": 1}
-    assert db.fetch_all("SELECT COUNT(*) n FROM strategy_trade_records WHERE evidence_class='actual_paper' AND attribution_status='complete'")[0]["n"] == 1
+    record = db.fetch_all(
+        """SELECT attribution_status,attribution_confidence,profit_attribution_id,
+                  position_lifecycle_id
+             FROM strategy_trade_records WHERE evidence_class='actual_paper'"""
+    )[0]
+    assert record["attribution_status"] == "partial"
+    assert record["attribution_confidence"] == "verified_actual_only"
+    assert record["profit_attribution_id"]
+    assert record["position_lifecycle_id"] == "lc"
 
 
 def test_partial_fills_allocate_but_never_exceed_intent_initial_risk(tmp_path):

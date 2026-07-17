@@ -4,6 +4,7 @@ import json
 
 import pandas as pd
 
+from app.formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
 from app.phase3_risk import Phase3Controller
 from app.phase4_allocator import AdaptiveAllocator, STRATEGIES
 from app.service import TradingService
@@ -24,6 +25,24 @@ def _db(tmp_path):
 
 def _policy(db, state: str):
     cfg = load_config()
+    for index in range(100):
+        entry = pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(days=index)
+        exit_at = entry + pd.Timedelta(days=20)
+        db.execute(
+            """INSERT INTO strategy_trade_records(
+                 id,source_key,strategy_version,symbol,evidence_class,source_id,
+                 entry_session,exit_session,r_multiple,attribution_status,
+                 attribution_confidence,evidence_version,formula_version,
+                 details_json,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                f"validation-{index}", f"validation:{index}", "rule_based_v2",
+                "SPY", "shadow_oos", f"source-{index}", entry.isoformat(),
+                exit_at.isoformat(), 0.5, "complete", "shadow_deterministic",
+                EVIDENCE_VERSION, ACCOUNTING_VERSION, "{}",
+                exit_at.isoformat(), exit_at.isoformat(),
+            ),
+        )
     engine = StrategyPerformanceEngine(db, cfg, as_of="2026-07-12T00:00:00+00:00")
     engine.refresh_strategy("rule_based_v2")
     snapshot = db.fetch_all("SELECT * FROM strategy_performance_snapshots WHERE strategy_version='rule_based_v2'")[0]

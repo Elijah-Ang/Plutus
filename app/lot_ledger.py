@@ -194,6 +194,7 @@ class LotLedger:
                         lot["position_lifecycle_id"] or value(intent, "position_lifecycle_id"), lot["id"],
                         lot["strategy_version"], consumed, allocated_proceeds, allocated_cost_basis,
                         allocated_buy_fees, allocated_sell_fees,
+                        allocated_adjustments,
                         allocated_proceeds - allocated_cost_basis - allocated_buy_fees - allocated_sell_fees + allocated_adjustments
                         if consumption_confidence in KNOWN_CONFIDENCE else None,
                         occurred_at, consumption_confidence, ACCOUNTING_VERSION,
@@ -232,8 +233,8 @@ class LotLedger:
                 """INSERT OR IGNORE INTO lot_consumptions(
                      id,broker_event_key,sell_intent_id,position_lifecycle_id,lot_id,strategy_version,
                      quantity,allocated_proceeds,allocated_cost_basis,allocated_buy_fees,allocated_sell_fees,
-                     realized_pnl,occurred_at,confidence,accounting_version)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     allocated_adjustments,realized_pnl,occurred_at,confidence,accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 consumption_rows,
             )
         else:

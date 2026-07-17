@@ -8,7 +8,9 @@
 > Historical snapshot: this report describes the 2026-06-22 audit state and is
 > not the current configuration or runtime authority. For current behavior see
 > [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) and
-> [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md).
+> [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md). Current profitability evidence and
+> realized attribution semantics are documented in
+> [PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md](PROFITABILITY_VALIDATION_AND_ATTRIBUTION.md).
 
 ## 1. Executive Summary
 

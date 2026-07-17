@@ -21,12 +21,20 @@ from typing import Any, Mapping
 from .formula_versions import (
     CONFIGURATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
+    PROFITABILITY_VALIDATION_FORMULA_VERSION,
+    PROFIT_ATTRIBUTION_FORMULA_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
     STRATEGY_PERFORMANCE_VERSION,
     STRATEGY_POLICY_VERSION,
     TRADE_ECONOMICS_FORMULA_VERSION,
     TRADE_ECONOMICS_SCHEMA_VERSION,
 )
+from .profitability_validation import (
+    ProfitabilityValidationError,
+    ProfitabilityValidationStore,
+)
+from .shadow_strategies import STRATEGY_VERSIONS
+from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now
 
 
@@ -49,6 +57,8 @@ _REQUIRED_FORMULA_IDENTITIES = {
     "strategy_performance": STRATEGY_PERFORMANCE_VERSION,
     "strategy_policy": STRATEGY_POLICY_VERSION,
     "trade_economics": TRADE_ECONOMICS_FORMULA_VERSION,
+    "profitability_validation": PROFITABILITY_VALIDATION_FORMULA_VERSION,
+    "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
 }
 
 
@@ -863,12 +873,13 @@ class TradeEconomicsStore:
     def __init__(self, storage: Any) -> None:
         self.storage = storage
 
-    @staticmethod
     def _verify_authority(
+        self,
         conn: sqlite3.Connection,
         record: TradeEconomicsRecord,
         *,
         link_proposal: bool,
+        require_current_validation_family: bool,
     ) -> None:
         candidate = record.candidate
         snapshot = conn.execute(
@@ -921,6 +932,94 @@ class TradeEconomicsStore:
             )
         ):
             raise TradeEconomicsError("strategy policy authority is inconsistent")
+
+        family_id = str(policy.get("validation_family_id") or "")
+        decision_id = str(policy.get("validation_decision_id") or "")
+        validation_status = str(policy.get("validation_status") or "")
+        validation_fingerprint = str(
+            policy.get("validation_fingerprint") or ""
+        )
+        if (
+            not family_id
+            or not decision_id
+            or not validation_fingerprint
+            or validation_status
+            not in {"validated", "failed", "insufficient"}
+            or snapshot.get("validation_family_id") != family_id
+            or snapshot.get("validation_decision_id") != decision_id
+            or snapshot.get("validation_status") != validation_status
+            or snapshot.get("validation_fingerprint")
+            != validation_fingerprint
+        ):
+            raise TradeEconomicsError(
+                "profitability validation authority is inconsistent"
+            )
+        try:
+            family = ProfitabilityValidationStore(self.storage).load_verified(
+                family_id, conn=conn
+            )
+        except (ProfitabilityValidationError, sqlite3.Error) as exc:
+            raise TradeEconomicsError(
+                "profitability validation authority is inconsistent"
+            ) from exc
+        decisions = {decision.id: decision for decision in family.decisions}
+        decision = decisions.get(decision_id)
+        family_versions = {
+            str(hypothesis.get("strategy_version") or "")
+            for hypothesis in family.hypotheses
+        }
+        known_versions: set[str] = set()
+        if require_current_validation_family:
+            known_versions = {
+                str(version) for version in STRATEGY_VERSIONS.values()
+            }
+            known_versions.add(STRATEGY_VERSION)
+            for table in (
+                "research_opportunities",
+                "position_lots",
+                "order_intents",
+                "trade_proposals",
+            ):
+                known_versions.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        f"""SELECT DISTINCT strategy_version FROM {table}
+                            WHERE strategy_version IS NOT NULL"""
+                    ).fetchall()
+                    if row[0]
+                )
+        state = str(policy.get("state") or "").upper()
+        state_is_compatible = (
+            validation_status == "validated"
+            or (
+                validation_status == "insufficient"
+                and state in {"RESEARCH_ONLY", "PROBE"}
+            )
+            or (validation_status == "failed" and state == "SUSPENDED")
+        )
+        if (
+            decision is None
+            or family.family_key != "operational_strategy_versions"
+            or (
+                require_current_validation_family
+                and family_versions != known_versions
+            )
+            or family.configuration_version
+            != candidate["configuration_version"]
+            or family.config_hash != candidate["config_hash"]
+            or family.evidence_version != candidate["evidence_version"]
+            or any(
+                family.formula_versions.get(name) != value
+                for name, value in candidate["formula_versions"].items()
+            )
+            or decision.strategy_version != candidate["strategy_version"]
+            or decision.status != validation_status
+            or decision.decision_fingerprint != validation_fingerprint
+            or not state_is_compatible
+        ):
+            raise TradeEconomicsError(
+                "profitability validation authority is inconsistent"
+            )
         try:
             estimated_at = datetime.fromisoformat(candidate["estimated_at"])
             snapshot_as_of = datetime.fromisoformat(
@@ -929,9 +1028,16 @@ class TradeEconomicsStore:
             policy_decided_at = datetime.fromisoformat(
                 _utc_timestamp(policy.get("decided_at"), "strategy policy decided_at")
             )
+            family_as_of = datetime.fromisoformat(
+                _utc_timestamp(family.as_of, "profitability validation as_of")
+            )
         except TradeEconomicsError:
             raise
-        if snapshot_as_of > estimated_at or policy_decided_at > estimated_at:
+        if (
+            family_as_of > snapshot_as_of
+            or snapshot_as_of > estimated_at
+            or policy_decided_at > estimated_at
+        ):
             raise TradeEconomicsError(
                 "strategy evidence authority contains future information"
             )
@@ -984,12 +1090,13 @@ class TradeEconomicsStore:
             if updated.rowcount != 1:
                 raise TradeEconomicsError("proposal trade economics binding failed")
 
-    @staticmethod
     def _verified_record_from_row(
+        self,
         conn: sqlite3.Connection,
         row: Mapping[str, Any],
         *,
         verify_authority: bool,
+        require_current_validation_family: bool,
     ) -> TradeEconomicsRecord:
         try:
             candidate_payload = json.loads(row["input_json"])
@@ -1011,8 +1118,13 @@ class TradeEconomicsStore:
                     f"persisted trade economics column is inconsistent: {name}"
                 )
         if verify_authority:
-            TradeEconomicsStore._verify_authority(
-                conn, recomputed, link_proposal=False
+            self._verify_authority(
+                conn,
+                recomputed,
+                link_proposal=False,
+                require_current_validation_family=(
+                    require_current_validation_family
+                ),
             )
         return recomputed
 
@@ -1023,7 +1135,12 @@ class TradeEconomicsStore:
     ) -> str:
         values = _record_columns(record)
         values["created_at"] = iso_now()
-        self._verify_authority(conn, record, link_proposal=False)
+        self._verify_authority(
+            conn,
+            record,
+            link_proposal=False,
+            require_current_validation_family=True,
+        )
         columns = tuple(values)
         placeholders = ",".join("?" for _ in columns)
         conn.execute(
@@ -1037,9 +1154,17 @@ class TradeEconomicsStore:
         if row is None:
             raise TradeEconomicsError("trade economics persistence failed")
         self._verified_record_from_row(
-            conn, dict(row), verify_authority=True
+            conn,
+            dict(row),
+            verify_authority=True,
+            require_current_validation_family=True,
         )
-        self._verify_authority(conn, record, link_proposal=True)
+        self._verify_authority(
+            conn,
+            record,
+            link_proposal=True,
+            require_current_validation_family=True,
+        )
         return record.id
 
     def persist(
@@ -1059,7 +1184,11 @@ class TradeEconomicsStore:
             return self._persist_in_connection(conn, record)
 
     def load_verified(
-        self, record_id: str, *, verify_authority: bool = True
+        self,
+        record_id: str,
+        *,
+        verify_authority: bool = True,
+        require_current_validation_family: bool = True,
     ) -> TradeEconomicsRecord:
         with self.storage.connect() as conn:
             row = conn.execute(
@@ -1069,5 +1198,10 @@ class TradeEconomicsStore:
             if row is None:
                 raise TradeEconomicsError("trade economics record is missing")
             return self._verified_record_from_row(
-                conn, dict(row), verify_authority=verify_authority
+                conn,
+                dict(row),
+                verify_authority=verify_authority,
+                require_current_validation_family=(
+                    require_current_validation_family
+                ),
             )
