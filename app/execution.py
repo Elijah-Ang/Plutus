@@ -1361,9 +1361,54 @@ class DurableExecutionStore:
                    OR s.decision_fingerprint<>d.sizing_fingerprint
                    OR s.risk_snapshot_id<>d.snapshot_id
                    OR d.config_hash<>r.config_hash OR d.config_hash<>s.config_hash""",
+            "orphaned_crypto_strategy_decisions": """SELECT COUNT(*) n
+                FROM crypto_strategy_decisions d
+                LEFT JOIN crypto_market_data_evidence m ON m.id=d.market_evidence_id
+                LEFT JOIN crypto_research_runs rr ON rr.id=d.research_run_id
+                WHERE m.id IS NULL OR rr.id IS NULL
+                   OR m.evidence_fingerprint<>d.market_evidence_fingerprint
+                   OR m.research_run_id<>d.research_run_id
+                   OR m.symbol<>d.symbol OR m.config_hash<>d.config_hash
+                   OR rr.run_id<>d.run_id""",
+            "invalid_crypto_strategy_authority": """SELECT COUNT(*) n
+                FROM crypto_strategy_decisions d
+                WHERE d.proposal_authorized<>0 OR d.execution_authorized<>0
+                   OR d.lifecycle<>'RESEARCH_ONLY'
+                   OR json_valid(d.blockers_json)<>1
+                   OR json_valid(d.decision_json)<>1
+                   OR (d.signal_eligible=1 AND (
+                     d.selected_strategy IS NULL OR d.action<>'entry'
+                     OR d.stop_price IS NULL OR d.target_price IS NULL
+                     OR json_array_length(d.blockers_json)<>0))""",
+            "orphaned_crypto_proposal_previews": """SELECT COUNT(*) n
+                FROM crypto_proposal_previews p
+                LEFT JOIN crypto_strategy_decisions d ON d.id=p.strategy_decision_id
+                LEFT JOIN crypto_risk_decisions r ON r.id=p.risk_decision_id
+                LEFT JOIN crypto_risk_snapshots s ON s.id=p.risk_snapshot_id
+                LEFT JOIN crypto_sizing_decisions z ON z.id=p.sizing_decision_id
+                LEFT JOIN crypto_capability_snapshots c ON c.id=p.capability_snapshot_id
+                LEFT JOIN crypto_market_data_evidence m ON m.id=p.market_evidence_id
+                WHERE d.id IS NULL OR r.id IS NULL OR s.id IS NULL OR z.id IS NULL
+                   OR c.id IS NULL OR m.id IS NULL
+                   OR d.decision_fingerprint<>p.strategy_decision_fingerprint
+                   OR r.decision_fingerprint<>p.risk_decision_fingerprint
+                   OR s.snapshot_fingerprint<>p.risk_snapshot_fingerprint
+                   OR z.decision_fingerprint<>p.sizing_decision_fingerprint
+                   OR c.snapshot_fingerprint<>p.capability_snapshot_fingerprint
+                   OR m.evidence_fingerprint<>p.market_evidence_fingerprint
+                   OR p.config_hash<>d.config_hash OR p.config_hash<>r.config_hash
+                   OR p.config_hash<>s.config_hash OR p.config_hash<>z.config_hash""",
+            "invalid_crypto_proposal_preview_authority": """SELECT COUNT(*) n
+                FROM crypto_proposal_previews p
+                WHERE p.status<>'research_only_preview'
+                   OR p.manual_approval_eligible<>0 OR p.execution_authorized<>0
+                   OR json_valid(p.display_json)<>1 OR json_valid(p.proposal_json)<>1
+                   OR json_extract(p.display_json,'$.approval_command_enabled')<>0""",
             "crypto_execution_authority_escape": """SELECT
                   (SELECT COUNT(*) FROM crypto_sizing_decisions WHERE execution_authorized<>0)
-                  + (SELECT COUNT(*) FROM crypto_risk_decisions WHERE execution_authorized<>0) n""",
+                  + (SELECT COUNT(*) FROM crypto_risk_decisions WHERE execution_authorized<>0)
+                  + (SELECT COUNT(*) FROM crypto_strategy_decisions WHERE proposal_authorized<>0 OR execution_authorized<>0)
+                  + (SELECT COUNT(*) FROM crypto_proposal_previews WHERE manual_approval_eligible<>0 OR execution_authorized<>0) n""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

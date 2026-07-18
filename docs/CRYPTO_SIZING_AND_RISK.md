@@ -115,6 +115,11 @@ The older float-valued crypto research candidate fields remain explicitly
 non-authoritative measurement metadata. No future proposal may use those fields
 for quantity, notional, fee, stop-risk, or portfolio authority.
 
+The next research boundary is documented in
+`docs/CRYPTO_STRATEGIES_AND_PROPOSALS.md`. It binds point-in-time strategy
+decisions to this sizing/risk evidence and renders immutable, non-approvable
+proposal previews. It does not change the execution boundary described here.
+
 ## Current safety boundary
 
 - paper endpoint only;
