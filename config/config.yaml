@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v13_crypto_data_capability_paper
+configuration_schema_version: plutus_effective_config_v14_crypto_decimal_sizing_risk_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v13_crypto_data_capability_paper
+  required_configuration_version: plutus_effective_config_v14_crypto_decimal_sizing_risk_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -375,6 +375,8 @@ formula_versions:
   profit_attribution: profit_attribution_v1
   crypto_capability: alpaca_spot_crypto_capability_v1
   crypto_market_data: alpaca_crypto_market_evidence_v1
+  crypto_sizing: alpaca_crypto_decimal_stop_risk_sizing_v1
+  crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 
@@ -409,19 +411,58 @@ crypto:
     stablecoin_policy: reject_stablecoin_base_and_non_usd_quote
   allow_margin: false
   allow_shorting: false
-  max_notional_per_trade: 5.00
-  max_crypto_exposure_pct: 1.0
   require_fresh_price: true
   max_price_age_seconds: 300
   min_score_for_paper_watch: 70
   min_score_for_proposal: 80
   min_risk_reward_ratio: 1.5
-  min_stop_distance_pct: 0.01
-  max_stop_distance_pct: 0.08
   max_spread_bps: 50
   minimum_top_of_book_notional_usd: 1000.00
-  max_realized_volatility: 1.5
-  max_account_risk_per_trade: 0.05
+  sizing_policy:
+    mode: research_only
+    formula_version: alpaca_crypto_decimal_stop_risk_sizing_v1
+    schema_version: alpaca_crypto_decimal_sizing_decisions_v1
+    minimum_buy_notional_usd: 1.00
+    maximum_order_notional_usd: 5.00
+    maximum_quantity_decimal_places: 9
+    maximum_notional_decimal_places: 2
+    conservative_taker_fee_bps_per_side: 25.0
+    stop_execution_slippage_bps: 50.0
+    minimum_stop_distance_pct: 1.0
+    maximum_stop_distance_pct: 8.0
+    require_quantity_basis_for_sells: true
+    allow_full_position_dust_exit: true
+  risk_policy:
+    mode: research_only
+    formula_version: alpaca_crypto_portfolio_risk_authority_v1
+    schema_version: alpaca_crypto_portfolio_risk_snapshots_v1
+    snapshot_ttl_seconds: 60
+    maximum_positions: 2
+    maximum_total_portfolio_gross_exposure_pct_equity: 50.0
+    maximum_gross_exposure_pct_equity: 1.0
+    maximum_symbol_exposure_pct_equity: 0.60
+    maximum_cluster_exposure_pct_equity: 1.0
+    maximum_stop_risk_per_trade_pct_equity: 0.01
+    maximum_stop_heat_pct_equity: 0.05
+    minimum_cash_reserve_pct_equity: 20.0
+    daily_account_loss_halt_pct_equity: 1.0
+    weekly_account_loss_halt_pct_equity: 2.5
+    daily_crypto_loss_halt_pct_equity: 0.10
+    weekly_crypto_loss_halt_pct_equity: 0.25
+    drawdown_throttle_start_pct_equity: 2.0
+    drawdown_halt_pct_equity: 6.0
+    drawdown_throttle_multiplier: 0.50
+    volatility_minimum_hourly_observations: 24
+    volatility_throttle_annualized: 0.80
+    volatility_halt_annualized: 1.50
+    volatility_throttle_multiplier: 0.50
+    volatility_latest_bar_max_age_seconds: 7200
+    require_cash_funded: true
+    require_verified_loss_evidence: true
+    block_on_any_open_crypto_order: true
+    loss_session_timezone: UTC
+    correlation_clusters:
+      crypto_major: [BTC/USD, ETH/USD]
   proposal_expiry_minutes: 3
   approval_max_price_age_seconds: 30
   approval_max_price_move_bps_base: 50

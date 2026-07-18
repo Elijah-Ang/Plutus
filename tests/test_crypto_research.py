@@ -16,7 +16,14 @@ from app.reports import SHEETS
 from app.risk_engine import RiskEngine
 from app.service import TradingService
 from app.storage import Storage
-from app.formula_versions import CRYPTO_CAPABILITY_FORMULA_VERSION, CRYPTO_MARKET_DATA_FORMULA_VERSION
+from app.formula_versions import (
+    CRYPTO_CAPABILITY_FORMULA_VERSION,
+    CRYPTO_MARKET_DATA_FORMULA_VERSION,
+    CRYPTO_RISK_FORMULA_VERSION,
+    CRYPTO_RISK_SCHEMA_VERSION,
+    CRYPTO_SIZING_FORMULA_VERSION,
+    CRYPTO_SIZING_SCHEMA_VERSION,
+)
 
 
 class CryptoBroker:
@@ -140,6 +147,8 @@ def _config(**overrides):
         "formula_versions": {
             "crypto_capability": CRYPTO_CAPABILITY_FORMULA_VERSION,
             "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
+            "crypto_sizing": CRYPTO_SIZING_FORMULA_VERSION,
+            "crypto_risk": CRYPTO_RISK_FORMULA_VERSION,
         },
         "watchlist": ["SPY", "QQQ", "DIA", "IWM"],
         "risk_budget": {"max_total_portfolio_exposure_pct": 6.0},
@@ -170,19 +179,35 @@ def _config(**overrides):
             },
             "allow_margin": False,
             "allow_shorting": False,
-            "max_notional_per_trade": 5.0,
-            "max_crypto_exposure_pct": 1.0,
             "require_fresh_price": True,
             "max_price_age_seconds": 300,
             "min_score_for_paper_watch": 70,
             "min_score_for_proposal": 80,
             "min_risk_reward_ratio": 1.5,
-            "min_stop_distance_pct": 0.01,
-            "max_stop_distance_pct": 0.08,
             "max_spread_bps": 50,
             "minimum_top_of_book_notional_usd": 1000.0,
-            "max_realized_volatility": 1.5,
-            "max_account_risk_per_trade": 0.05,
+            "sizing_policy": {
+                "mode": "research_only",
+                "formula_version": CRYPTO_SIZING_FORMULA_VERSION,
+                "schema_version": CRYPTO_SIZING_SCHEMA_VERSION,
+                "minimum_buy_notional_usd": 1.0,
+                "maximum_order_notional_usd": 5.0,
+                "maximum_quantity_decimal_places": 9,
+                "maximum_notional_decimal_places": 2,
+                "conservative_taker_fee_bps_per_side": 25.0,
+                "stop_execution_slippage_bps": 50.0,
+                "minimum_stop_distance_pct": 1.0,
+                "maximum_stop_distance_pct": 8.0,
+                "require_quantity_basis_for_sells": True,
+                "allow_full_position_dust_exit": True,
+            },
+            "risk_policy": {
+                "mode": "research_only",
+                "formula_version": CRYPTO_RISK_FORMULA_VERSION,
+                "schema_version": CRYPTO_RISK_SCHEMA_VERSION,
+                "maximum_gross_exposure_pct_equity": 1.0,
+                "volatility_halt_annualized": 1.5,
+            },
             "proposal_expiry_minutes": 3,
             "approval_max_price_age_seconds": 30,
             "approval_max_price_move_bps_base": 50,
@@ -295,7 +320,7 @@ def test_crypto_uses_separate_risk_limits_and_does_not_affect_equity_watchlist(t
 
     assert config["crypto"]["allow_margin"] is False
     assert config["crypto"]["allow_shorting"] is False
-    assert config["crypto"]["max_crypto_exposure_pct"] == 1.0
+    assert config["crypto"]["risk_policy"]["maximum_gross_exposure_pct_equity"] == 1.0
     assert "BTC/USD" not in config["watchlist"]
     assert "ETH/USD" not in config["watchlist"]
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []

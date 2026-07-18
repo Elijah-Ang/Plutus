@@ -638,7 +638,8 @@ class CryptoResearchEngine:
             blockers.append(("crypto_orderbook_missing", "Alpaca crypto quote/spread unavailable"))
         elif float(spread_bps) > max_spread_bps:
             blockers.append(("crypto_spread_too_wide", f"spread_bps={float(spread_bps):.2f} max={max_spread_bps:.2f}"))
-        max_vol = float(cfg.get("max_realized_volatility", 1.5) or 1.5)
+        risk_policy = cfg.get("risk_policy") or {}
+        max_vol = float(risk_policy.get("volatility_halt_annualized") or 0.0)
         if result.realized_volatility is not None and result.realized_volatility > max_vol:
             blockers.append(("crypto_volatility_extreme", f"realized_volatility={result.realized_volatility:.4f}"))
         if not result.volume or result.volume <= 0:
@@ -734,18 +735,24 @@ def _crypto_mode_from_results(results: list[CryptoResearchResult]) -> str:
 
 def _build_candidate_metadata(result: CryptoResearchResult, config: dict[str, Any], now: datetime) -> dict[str, Any]:
     cfg = config.get("crypto") or {}
+    sizing_policy = cfg.get("sizing_policy") or {}
     entry_price = float(result.price) if result.price and result.price > 0 else None
     atr_stop_pct = float(result.atr_like_volatility or 0.0) * 2.0
-    stop_distance_pct = max(float(cfg.get("min_stop_distance_pct", 0.01) or 0.01), atr_stop_pct)
-    stop_distance_pct = min(stop_distance_pct, float(cfg.get("max_stop_distance_pct", 0.08) or 0.08))
+    minimum_stop_fraction = float(sizing_policy.get("minimum_stop_distance_pct") or 0.0) / 100.0
+    maximum_stop_fraction = float(sizing_policy.get("maximum_stop_distance_pct") or 0.0) / 100.0
+    stop_distance_pct = max(minimum_stop_fraction, atr_stop_pct)
+    stop_distance_pct = min(stop_distance_pct, maximum_stop_fraction)
     stop_price = entry_price * (1.0 - stop_distance_pct) if entry_price else None
     min_rr = float(cfg.get("min_risk_reward_ratio", 1.5) or 1.5)
     take_profit_target = entry_price * (1.0 + stop_distance_pct * min_rr) if entry_price else None
     risk_reward_ratio = None
     if entry_price and stop_price and take_profit_target and entry_price > stop_price:
         risk_reward_ratio = (take_profit_target - entry_price) / (entry_price - stop_price)
-    max_notional = float(cfg.get("max_notional_per_trade", 5.0) or 5.0)
-    account_risk_notional = float(cfg.get("max_account_risk_per_trade", max_notional * stop_distance_pct) or (max_notional * stop_distance_pct))
+    max_notional = float(sizing_policy.get("maximum_order_notional_usd") or 0.0)
+    # This legacy research record remains descriptive only.  The separately
+    # persisted Decimal crypto sizing/risk authority is the sole future source
+    # for executable quantity, notional, fees, stop risk and portfolio caps.
+    account_risk_notional = max_notional * stop_distance_pct
     risk_based_notional = account_risk_notional / stop_distance_pct if stop_distance_pct > 0 else 0.0
     position_size = max(0.0, min(max_notional, risk_based_notional))
     max_loss_estimate = position_size * stop_distance_pct if stop_distance_pct > 0 else None
@@ -774,6 +781,9 @@ def _build_candidate_metadata(result: CryptoResearchResult, config: dict[str, An
         "volatility_regime": _volatility_regime(result.realized_volatility),
         "position_size": position_size,
         "max_loss_estimate": max_loss_estimate,
+        "sizing_authority": "non_authoritative_float_research_metadata_only",
+        "authoritative_sizing_required": "crypto_sizing_decisions",
+        "authoritative_portfolio_risk_required": "crypto_risk_decisions",
         "provider_coverage": provider_coverage,
         "capability_snapshot_id": result.capability_snapshot_id,
         "capability_snapshot_fingerprint": result.capability_snapshot_fingerprint,

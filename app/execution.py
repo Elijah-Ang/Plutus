@@ -1299,6 +1299,71 @@ class DurableExecutionStore:
                          OR m.symbol<>r.symbol
                          OR m.research_run_id<>r.research_run_id
                          OR m.capability_snapshot_id<>r.capability_snapshot_id))""",
+            "orphaned_crypto_risk_snapshots": """SELECT COUNT(*) n
+                FROM crypto_risk_snapshots r
+                LEFT JOIN crypto_capability_snapshots c ON c.id=r.capability_snapshot_id
+                LEFT JOIN crypto_market_data_evidence m ON m.id=r.market_evidence_id
+                WHERE c.id IS NULL OR m.id IS NULL
+                   OR c.snapshot_fingerprint<>r.capability_snapshot_fingerprint
+                   OR m.evidence_fingerprint<>r.market_evidence_fingerprint
+                   OR m.capability_snapshot_id<>r.capability_snapshot_id
+                   OR c.config_hash<>r.config_hash OR m.config_hash<>r.config_hash""",
+            "incomplete_authoritative_crypto_risk_snapshots": """SELECT COUNT(*) n
+                FROM crypto_risk_snapshots r
+                WHERE r.authoritative=1 AND (
+                  COALESCE(r.paper_account_id_hash,'')=''
+                  OR COALESCE(r.config_hash,'')=''
+                  OR json_valid(r.account_json)<>1
+                  OR json_valid(r.positions_json)<>1
+                  OR json_valid(r.open_orders_json)<>1
+                  OR json_valid(r.durable_state_json)<>1
+                  OR json_valid(r.loss_evidence_json)<>1
+                  OR json_valid(r.volatility_evidence_json)<>1
+                  OR json_valid(r.aggregate_json)<>1
+                  OR json_valid(r.derived_authority_json)<>1
+                  OR json_valid(r.failure_reasons_json)<>1
+                  OR json_valid(r.snapshot_json)<>1
+                  OR CASE WHEN json_valid(r.failure_reasons_json)=1
+                    THEN json_array_length(r.failure_reasons_json)<>0 ELSE 1 END
+                  OR COALESCE(json_extract(r.derived_authority_json,'$.hard_notional_ceiling'),'')=''
+                  OR COALESCE(json_extract(r.derived_authority_json,'$.hard_stop_risk_ceiling'),'')=''
+                )""",
+            "orphaned_crypto_sizing_decisions": """SELECT COUNT(*) n
+                FROM crypto_sizing_decisions s
+                LEFT JOIN crypto_risk_snapshots r ON r.id=s.risk_snapshot_id
+                LEFT JOIN crypto_capability_snapshots c ON c.id=s.capability_snapshot_id
+                LEFT JOIN crypto_market_data_evidence m ON m.id=s.market_evidence_id
+                WHERE r.id IS NULL OR c.id IS NULL OR m.id IS NULL
+                   OR r.snapshot_fingerprint<>s.risk_snapshot_fingerprint
+                   OR c.snapshot_fingerprint<>s.capability_snapshot_fingerprint
+                   OR m.evidence_fingerprint<>s.market_evidence_fingerprint
+                   OR r.capability_snapshot_id<>s.capability_snapshot_id
+                   OR r.market_evidence_id<>s.market_evidence_id
+                   OR r.config_hash<>s.config_hash""",
+            "invalid_crypto_sizing_authority": """SELECT COUNT(*) n
+                FROM crypto_sizing_decisions s
+                WHERE s.execution_authorized<>0
+                   OR (s.authoritative=1 AND (
+                     s.eligible<>1
+                     OR COALESCE(s.canonical_quantity,'')=''
+                     OR COALESCE(s.canonical_notional,'')=''
+                     OR COALESCE(s.canonical_stop_risk,'')=''
+                     OR json_valid(s.blockers_json)<>1
+                     OR json_array_length(s.blockers_json)<>0
+                     OR json_valid(s.binding_caps_json)<>1
+                     OR json_valid(s.decision_json)<>1))""",
+            "orphaned_crypto_risk_decisions": """SELECT COUNT(*) n
+                FROM crypto_risk_decisions d
+                LEFT JOIN crypto_risk_snapshots r ON r.id=d.snapshot_id
+                LEFT JOIN crypto_sizing_decisions s ON s.id=d.sizing_decision_id
+                WHERE r.id IS NULL OR s.id IS NULL
+                   OR r.snapshot_fingerprint<>d.snapshot_fingerprint
+                   OR s.decision_fingerprint<>d.sizing_fingerprint
+                   OR s.risk_snapshot_id<>d.snapshot_id
+                   OR d.config_hash<>r.config_hash OR d.config_hash<>s.config_hash""",
+            "crypto_execution_authority_escape": """SELECT
+                  (SELECT COUNT(*) FROM crypto_sizing_decisions WHERE execution_authorized<>0)
+                  + (SELECT COUNT(*) FROM crypto_risk_decisions WHERE execution_authorized<>0) n""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

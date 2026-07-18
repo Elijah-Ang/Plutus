@@ -107,8 +107,10 @@ paper-constructor, asset-precision, order-state, feed, cancellation and lookup
 interfaces bound by this contract. Artifact verification requires this gate to
 be present and successful before `tests_verified=true` can be trusted.
 
-Later reviewed stages must still implement and prove Decimal sizing/rounding,
-crypto risk and loss controls, proposal/display authority, manual Telegram
-approval, crypto-specific intent construction, final broker revalidation,
-fills/fees/accounting, and continuous-market outcomes before this lane may be
-enabled.
+The next reviewed stage now implements research-only Decimal sizing/rounding
+and crypto portfolio-risk/loss evidence; see
+[CRYPTO_SIZING_AND_RISK.md](CRYPTO_SIZING_AND_RISK.md). Proposal/display
+authority, manual Telegram approval, crypto-specific intent construction,
+final broker revalidation, fills/fees/accounting, and continuous-market
+outcomes remain disabled and require later reviewed stages before this lane may
+be enabled.

@@ -30,6 +30,7 @@ TARGETED_SUITES = (
     "tests/test_profitability_validation_attribution.py",
     "tests/test_crypto_capabilities.py",
     "tests/test_crypto_market_data.py",
+    "tests/test_crypto_sizing_risk.py",
     "tests/test_crypto_research.py",
 )
 
