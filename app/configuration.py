@@ -18,8 +18,12 @@ from .formula_versions import (
     CRYPTO_MARKET_DATA_FORMULA_VERSION,
     CRYPTO_RISK_FORMULA_VERSION,
     CRYPTO_RISK_SCHEMA_VERSION,
+    CRYPTO_PROPOSAL_FORMULA_VERSION,
+    CRYPTO_PROPOSAL_SCHEMA_VERSION,
     CRYPTO_SIZING_FORMULA_VERSION,
     CRYPTO_SIZING_SCHEMA_VERSION,
+    CRYPTO_STRATEGY_FORMULA_VERSION,
+    CRYPTO_STRATEGY_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
@@ -95,7 +99,8 @@ STRICT_SECTION_KEYS = {
         "approval_max_price_move_bps_base", "approval_max_price_move_bps_hard_cap",
         "default_order_type", "limit_price_source", "fallback_market_orders",
         "allow_new_entries", "allow_add_to_winner", "allow_exits", "eodhd_research_enabled",
-        "data_source", "sizing_policy", "risk_policy", "stage_transition_governance", "runtime_evidence_gate", "schedule",
+        "data_source", "sizing_policy", "risk_policy", "strategy_policy", "proposal_policy",
+        "stage_transition_governance", "runtime_evidence_gate", "schedule",
     },
     "risk": {
         "max_trade_notional_paper", "max_trade_notional_live", "max_trades_per_day", "max_open_positions",
@@ -158,7 +163,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -209,6 +214,23 @@ STRICT_NESTED_KEYS = {
         "volatility_throttle_multiplier", "volatility_latest_bar_max_age_seconds",
         "require_cash_funded", "require_verified_loss_evidence",
         "block_on_any_open_crypto_order", "loss_session_timezone", "correlation_clusters",
+    },
+    "crypto.strategy_policy": {
+        "mode", "lifecycle", "formula_version", "schema_version", "strategies",
+        "bar_interval_seconds", "maximum_latest_bar_age_seconds",
+        "minimum_history_hours", "trend_fast_hours", "trend_slow_hours",
+        "breakout_lookback_hours", "volatility_lookback_hours",
+        "trend_minimum_24h_return", "breakout_buffer_pct",
+        "breakout_minimum_4h_return", "pullback_minimum_pct",
+        "pullback_maximum_pct", "momentum_minimum_vol_adjusted_score",
+        "maximum_annualized_volatility", "stop_atr_multiple",
+        "minimum_stop_distance_pct", "maximum_stop_distance_pct",
+        "target_reward_r_multiple",
+    },
+    "crypto.proposal_policy": {
+        "mode", "formula_version", "schema_version", "preview_expiry_minutes",
+        "create_trade_proposals", "send_telegram", "manual_approval_enabled",
+        "execution_enabled",
     },
     "profitability_engine.candidate_model": {
         "cost_model_version", "estimation_model_version",
@@ -309,6 +331,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
         "crypto_sizing": CRYPTO_SIZING_FORMULA_VERSION,
         "crypto_risk": CRYPTO_RISK_FORMULA_VERSION,
+        "crypto_strategy": CRYPTO_STRATEGY_FORMULA_VERSION,
+        "crypto_proposal": CRYPTO_PROPOSAL_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -886,6 +910,100 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         and sorted(clusters.get("crypto_major") or []) == ["BTC/USD", "ETH/USD"],
         "the initial crypto-major cluster must contain BTC/USD and ETH/USD",
     )
+
+    crypto_strategy = crypto.get("strategy_policy") or {}
+    require(crypto_strategy.get("mode") == "research_only",
+            "crypto strategy policy must remain research_only in this stage")
+    require(crypto_strategy.get("lifecycle") == "RESEARCH_ONLY",
+            "crypto strategy lifecycle must remain RESEARCH_ONLY in this stage")
+    require(crypto_strategy.get("formula_version") == CRYPTO_STRATEGY_FORMULA_VERSION,
+            f"crypto strategy formula must be {CRYPTO_STRATEGY_FORMULA_VERSION}")
+    require(crypto_strategy.get("schema_version") == CRYPTO_STRATEGY_SCHEMA_VERSION,
+            f"crypto strategy schema must be {CRYPTO_STRATEGY_SCHEMA_VERSION}")
+    require(
+        crypto_strategy.get("strategies") == [
+            "time_series_trend", "breakout_continuation", "pullback_in_trend",
+            "volatility_adjusted_momentum",
+        ],
+        "crypto strategies must use the reviewed ordered four-strategy set",
+    )
+    require(
+        crypto_strategy.get("bar_interval_seconds") == 3600,
+        "crypto strategy bars must use an exact one-hour interval",
+    )
+    _bounded(
+        crypto_strategy.get("maximum_latest_bar_age_seconds"),
+        "crypto.strategy_policy.maximum_latest_bar_age_seconds", errors, 3600, 7200,
+    )
+    strategy_history = _bounded(
+        crypto_strategy.get("minimum_history_hours"),
+        "crypto.strategy_policy.minimum_history_hours", errors, 96, 1000,
+    )
+    strategy_fast = _bounded(
+        crypto_strategy.get("trend_fast_hours"),
+        "crypto.strategy_policy.trend_fast_hours", errors, 2, 168,
+    )
+    strategy_slow = _bounded(
+        crypto_strategy.get("trend_slow_hours"),
+        "crypto.strategy_policy.trend_slow_hours", errors, 3, 500,
+    )
+    breakout_window = _bounded(
+        crypto_strategy.get("breakout_lookback_hours"),
+        "crypto.strategy_policy.breakout_lookback_hours", errors, 12, 500,
+    )
+    volatility_window = _bounded(
+        crypto_strategy.get("volatility_lookback_hours"),
+        "crypto.strategy_policy.volatility_lookback_hours", errors, 24, 500,
+    )
+    require(
+        None not in {strategy_history, strategy_fast, strategy_slow, breakout_window, volatility_window}
+        and strategy_fast < strategy_slow <= strategy_history
+        and breakout_window < strategy_history and volatility_window < strategy_history,
+        "crypto strategy windows must fit inside point-in-time history",
+    )
+    for key, minimum, maximum in (
+        ("trend_minimum_24h_return", 0.000001, 0.25),
+        ("breakout_buffer_pct", 0.000001, 0.10),
+        ("breakout_minimum_4h_return", 0.000001, 0.25),
+        ("pullback_minimum_pct", 0.000001, 0.25),
+        ("pullback_maximum_pct", 0.000001, 0.25),
+        ("momentum_minimum_vol_adjusted_score", 0.000001, 10),
+        ("maximum_annualized_volatility", 0.01, 10),
+        ("stop_atr_multiple", 0.1, 10),
+        ("minimum_stop_distance_pct", 0.000001, 0.25),
+        ("maximum_stop_distance_pct", 0.000001, 0.25),
+        ("target_reward_r_multiple", 1.5, 10),
+    ):
+        _bounded(crypto_strategy.get(key), f"crypto.strategy_policy.{key}", errors, minimum, maximum)
+    require(
+        isinstance(crypto_strategy.get("pullback_minimum_pct"), (int, float))
+        and isinstance(crypto_strategy.get("pullback_maximum_pct"), (int, float))
+        and crypto_strategy["pullback_minimum_pct"] < crypto_strategy["pullback_maximum_pct"],
+        "crypto pullback minimum must be below its maximum",
+    )
+    require(
+        isinstance(crypto_strategy.get("minimum_stop_distance_pct"), (int, float))
+        and isinstance(crypto_strategy.get("maximum_stop_distance_pct"), (int, float))
+        and crypto_strategy["minimum_stop_distance_pct"] <= crypto_strategy["maximum_stop_distance_pct"],
+        "crypto strategy stop-distance minimum must not exceed its maximum",
+    )
+
+    crypto_proposal = crypto.get("proposal_policy") or {}
+    require(crypto_proposal.get("mode") == "research_only_preview",
+            "crypto proposal policy must remain research_only_preview in this stage")
+    require(crypto_proposal.get("formula_version") == CRYPTO_PROPOSAL_FORMULA_VERSION,
+            f"crypto proposal formula must be {CRYPTO_PROPOSAL_FORMULA_VERSION}")
+    require(crypto_proposal.get("schema_version") == CRYPTO_PROPOSAL_SCHEMA_VERSION,
+            f"crypto proposal schema must be {CRYPTO_PROPOSAL_SCHEMA_VERSION}")
+    _bounded(
+        crypto_proposal.get("preview_expiry_minutes"),
+        "crypto.proposal_policy.preview_expiry_minutes", errors, 1, 5,
+    )
+    for key in (
+        "create_trade_proposals", "send_telegram", "manual_approval_enabled", "execution_enabled",
+    ):
+        require(crypto_proposal.get(key) is False,
+                f"crypto.proposal_policy.{key} must remain false in this stage")
 
     expiry_default = _number(config, "proposal_expiry_default_minutes", errors, minimum=1, maximum=1440)
     expiry_min = _number(config, "proposal_expiry_min_minutes", errors, minimum=1, maximum=1440)

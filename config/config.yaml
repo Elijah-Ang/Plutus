@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v15_equity_quote_feed_hardening_paper
+configuration_schema_version: plutus_effective_config_v17_crypto_hourly_net_target_research_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v15_equity_quote_feed_hardening_paper
+  required_configuration_version: plutus_effective_config_v17_crypto_hourly_net_target_research_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -377,6 +377,8 @@ formula_versions:
   crypto_market_data: alpaca_crypto_market_evidence_v1
   crypto_sizing: alpaca_crypto_decimal_stop_risk_sizing_v1
   crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
+  crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
+  crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 
@@ -463,6 +465,39 @@ crypto:
     loss_session_timezone: UTC
     correlation_clusters:
       crypto_major: [BTC/USD, ETH/USD]
+  strategy_policy:
+    mode: research_only
+    lifecycle: RESEARCH_ONLY
+    formula_version: crypto_multi_strategy_point_in_time_v2_hourly_cadence
+    schema_version: crypto_strategy_decisions_v1
+    strategies: [time_series_trend, breakout_continuation, pullback_in_trend, volatility_adjusted_momentum]
+    bar_interval_seconds: 3600
+    maximum_latest_bar_age_seconds: 7200
+    minimum_history_hours: 168
+    trend_fast_hours: 24
+    trend_slow_hours: 72
+    breakout_lookback_hours: 48
+    volatility_lookback_hours: 72
+    trend_minimum_24h_return: 0.005
+    breakout_buffer_pct: 0.001
+    breakout_minimum_4h_return: 0.001
+    pullback_minimum_pct: 0.01
+    pullback_maximum_pct: 0.04
+    momentum_minimum_vol_adjusted_score: 0.01
+    maximum_annualized_volatility: 1.50
+    stop_atr_multiple: 2.0
+    minimum_stop_distance_pct: 0.01
+    maximum_stop_distance_pct: 0.08
+    target_reward_r_multiple: 1.75
+  proposal_policy:
+    mode: research_only_preview
+    formula_version: crypto_research_proposal_authority_v2_net_cost_target
+    schema_version: crypto_research_proposal_previews_v1
+    preview_expiry_minutes: 3
+    create_trade_proposals: false
+    send_telegram: false
+    manual_approval_enabled: false
+    execution_enabled: false
   proposal_expiry_minutes: 3
   approval_max_price_age_seconds: 30
   approval_max_price_move_bps_base: 50

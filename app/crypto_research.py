@@ -8,6 +8,7 @@ from typing import Any
 
 from .crypto_capabilities import CryptoCapabilitySnapshot, CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
+from .crypto_strategies import CryptoStrategyError, CryptoStrategyStore
 from .storage import Storage
 from .utils import json_dumps
 
@@ -77,6 +78,12 @@ class CryptoResearchResult:
     market_evidence_authoritative: bool = False
     market_execution_eligible: bool = False
     market_evidence_failure_reasons: tuple[str, ...] = ()
+    strategy_decision_id: str | None = None
+    strategy_decision_fingerprint: str | None = None
+    selected_strategy: str | None = None
+    strategy_lifecycle: str = "RESEARCH_ONLY"
+    strategy_signal_eligible: bool = False
+    strategy_blockers: tuple[str, ...] = ()
 
 
 def normalize_crypto_symbol(symbol: str) -> str | None:
@@ -299,6 +306,32 @@ class CryptoResearchEngine:
             reason=reason,
         )
         self._with_market_evidence(result, market_evidence)
+        if market_evidence.authoritative:
+            try:
+                decision = CryptoStrategyStore(self.storage).evaluate(
+                    self.config, self.run_id, research_run_id,
+                    market_evidence.id, bars, now=now,
+                )
+                result.strategy_decision_id = decision.id
+                result.strategy_decision_fingerprint = decision.decision_fingerprint
+                result.selected_strategy = decision.selected_strategy
+                result.strategy_lifecycle = decision.lifecycle
+                result.strategy_signal_eligible = decision.signal_eligible
+                result.strategy_blockers = decision.blockers
+                result.risk_metrics.update({
+                    "strategy_decision_id": decision.id,
+                    "strategy_decision_fingerprint": decision.decision_fingerprint,
+                    "selected_strategy": decision.selected_strategy,
+                    "strategy_lifecycle": decision.lifecycle,
+                    "strategy_signal_eligible": decision.signal_eligible,
+                    "strategy_blockers": list(decision.blockers),
+                    "strategy_stop_price": decision.stop_price,
+                    "strategy_target_price": decision.target_price,
+                    "strategy_expected_reward_r": decision.expected_reward_r,
+                })
+            except CryptoStrategyError as exc:
+                result.strategy_blockers = ("crypto_strategy_evaluation_failed",)
+                result.risk_metrics["crypto_strategy_error"] = str(exc)
         return self._with_capability(result, capability)
 
     def _with_capability(
@@ -382,6 +415,12 @@ class CryptoResearchEngine:
                     "market_evidence_authoritative": result.market_evidence_authoritative,
                     "market_execution_eligible": result.market_execution_eligible,
                     "market_evidence_failure_reasons": result.market_evidence_failure_reasons,
+                    "strategy_decision_id": result.strategy_decision_id,
+                    "strategy_decision_fingerprint": result.strategy_decision_fingerprint,
+                    "selected_strategy": result.selected_strategy,
+                    "strategy_lifecycle": result.strategy_lifecycle,
+                    "strategy_signal_eligible": result.strategy_signal_eligible,
+                    "strategy_blockers": result.strategy_blockers,
                 }),
             ),
         )
@@ -400,7 +439,14 @@ class CryptoResearchEngine:
             (
                 result.symbol, result.lane, result.score, result.status, result.price, result.price_timestamp,
                 result.data_freshness, now.isoformat(), observation_since, now.isoformat(),
-                json_dumps({"risk_metrics": result.risk_metrics, "reason": result.reason}),
+                json_dumps({
+                    "risk_metrics": result.risk_metrics,
+                    "reason": result.reason,
+                    "strategy_decision_id": result.strategy_decision_id,
+                    "selected_strategy": result.selected_strategy,
+                    "strategy_lifecycle": result.strategy_lifecycle,
+                    "strategy_signal_eligible": result.strategy_signal_eligible,
+                }),
             ),
         )
         self.storage.execute(
@@ -437,9 +483,17 @@ class CryptoResearchEngine:
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                setup_id, now.isoformat(), self.run_id, result.symbol, "crypto", result.lane, "hold_watch",
+                setup_id, now.isoformat(), self.run_id, result.symbol, "crypto", result.lane,
+                result.selected_strategy or "hold_watch",
                 action_decision, proposed, result.reason, result.score, json_dumps(result.score_components),
-                json_dumps({"action": "RESEARCH", "side": "none", "reason": result.reason, "mode": mode}), 0, 0, 0,
+                json_dumps({
+                    "action": "ENTRY_RESEARCH" if result.strategy_signal_eligible else "RESEARCH",
+                    "side": "buy" if result.strategy_signal_eligible else "none",
+                    "reason": result.reason, "mode": mode,
+                    "strategy_decision_id": result.strategy_decision_id,
+                    "strategy": result.selected_strategy,
+                    "strategy_lifecycle": result.strategy_lifecycle,
+                }), int(result.strategy_signal_eligible), 0, 0,
                 result.price, result.price_timestamp, result.data_freshness, json_dumps(result.trend_metrics),
                 json_dumps({"realized_volatility": result.realized_volatility, "atr_like_volatility": result.atr_like_volatility}),
                 json_dumps({"volume": result.volume, "spread": result.spread}),
@@ -543,6 +597,11 @@ class CryptoResearchEngine:
                 now.isoformat(), now.isoformat(),
             ),
         )
+        if result.strategy_decision_id:
+            self.storage.execute(
+                "UPDATE crypto_paper_watch_candidates SET strategy_decision_id=? WHERE id=?",
+                (result.strategy_decision_id, row_id),
+            )
         return row_id
 
     def _runtime_evidence_gate_passed(self, now: datetime) -> tuple[bool, list[str]]:
