@@ -68,8 +68,10 @@ from .formula_versions import (
     STOP_POLICY_VERSION,
 )
 from .quotes import (
+    QuoteValidationError,
     bounded_marketable_limit,
     implementation_shortfall_bps,
+    quote_failure_reason,
     validate_quote_payload,
     validated_quote,
 )
@@ -4834,16 +4836,69 @@ class TradingService:
                 proposal["quote_timestamp"] = quote_data["timestamp"]
                 proposal["quote_spread_bps"] = float(quote_data["spread_bps"])
                 proposal["quote_source"] = quote_data["source"]
+                proposal["quote_feed"] = quote_data["feed"]
                 refreshed_price_at = _dt(quote_data["timestamp"])
                 if refreshed_price_at:
                     price_refreshed_at = refreshed_price_at.isoformat()
                     refreshed_price_age_seconds = (now_dt - refreshed_price_at).total_seconds()
+            except QuoteValidationError as e:
+                logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
+                evidence = dict(e.evidence)
+                proposal["quote_validation_code"] = e.code
+                proposal["quote_validation_evidence"] = evidence
+                proposal["quote_source"] = evidence.get("source") or "alpaca_quote"
+                proposal["quote_feed"] = evidence.get("feed")
+                proposal["quote_bid"] = evidence.get("bid")
+                proposal["quote_ask"] = evidence.get("ask")
+                proposal["quote_timestamp"] = evidence.get("timestamp")
+                proposal["quote_spread_bps"] = evidence.get("spread_bps")
+                if evidence.get("bid") is not None and evidence.get("ask") is not None:
+                    try:
+                        bid_value = float(evidence["bid"])
+                        ask_value = float(evidence["ask"])
+                        proposal["quote_midpoint"] = (bid_value + ask_value) / 2.0
+                        refreshed_price_val = ask_value if prop_side == "buy" else bid_value
+                    except (TypeError, ValueError):
+                        refreshed_price_val = None
+                refreshed_price_at = _dt(evidence.get("timestamp"))
+                if refreshed_price_at is not None:
+                    price_refreshed_at = refreshed_price_at.isoformat()
+                if evidence.get("age_seconds") is not None:
+                    refreshed_price_age_seconds = float(evidence["age_seconds"])
+                block_reason = quote_failure_reason(
+                    prop_symbol, e, self.config, stage="approval"
+                )
+                self.storage.audit(
+                    self.run_id,
+                    "final_quote_validation_blocked",
+                    {
+                        "proposal_id": proposal.get("id") or row.get("id"),
+                        "approval_id": approval_id,
+                        "symbol": prop_symbol,
+                        "side": prop_side,
+                        "code": e.code,
+                        "reason": block_reason,
+                        "evidence": evidence,
+                        "broker_invocation_occurred": 0,
+                    },
+                )
             except Exception as e:
                 logger.warning("Failed to refresh price for symbol %s: %s", prop_symbol, e)
-                block_reason = (
-                    "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
-                    if "stale" in str(e).lower() or "future" in str(e).lower()
-                    else "Price refresh failed or price is unavailable"
+                block_reason = quote_failure_reason(
+                    prop_symbol, e, self.config, stage="approval"
+                )
+                self.storage.audit(
+                    self.run_id,
+                    "final_quote_validation_blocked",
+                    {
+                        "proposal_id": proposal.get("id") or row.get("id"),
+                        "approval_id": approval_id,
+                        "symbol": prop_symbol,
+                        "side": prop_side,
+                        "code": "authoritative_quote_unavailable",
+                        "reason": block_reason,
+                        "broker_invocation_occurred": 0,
+                    },
                 )
 
         # Check market open status
@@ -4855,7 +4910,12 @@ class TradingService:
                 market_open = False
 
         # Get the proposal price
-        proposal_price = proposal.get("latest_price") or row.get("current_price") or row.get("price")
+        proposal_price = (
+            proposal.get("proposal_price")
+            or proposal.get("latest_price")
+            or row.get("current_price")
+            or row.get("price")
+        )
         if proposal_price is not None:
             proposal_price = float(proposal_price)
 
@@ -4948,6 +5008,7 @@ class TradingService:
                 proposal["quote_timestamp"] = quote_data["timestamp"]
                 proposal["quote_spread_bps"] = float(quote_data["spread_bps"])
                 proposal["quote_source"] = quote_data["source"]
+                proposal["quote_feed"] = quote_data["feed"]
                 if row.get("emergency_exit_triggered") == 1:
                     proposal["final_limit_price"] = None
                     proposal["protective_exit_mechanism"] = "protective_paper_exit"
@@ -7320,6 +7381,7 @@ class TradingService:
                 proposal_id = None
                 decision = None
                 proposal = None
+                proposal_quote = None
                 exact_profitability_decision = None
                 review = None
                 dedupe_status = res.get("dedupe_status", "skipped")
@@ -7382,6 +7444,55 @@ class TradingService:
                         "price_at": str(price_at),
                         "price_age_seconds": price_age_seconds
                     })
+
+                # A manual approval surface must be executable in principle at
+                # display time. Last-trade freshness alone is insufficient: the
+                # exact real-time feed must provide a fresh, non-crossed,
+                # spread-valid two-sided quote before any proposal is inserted
+                # or sent to Telegram.
+                if proposal_allowed:
+                    try:
+                        proposal_quote_now = datetime.now(UTC)
+                        proposal_quote = validated_quote(
+                            self.broker, symbol, self.config, now=proposal_quote_now
+                        )
+                    except QuoteValidationError as exc:
+                        proposal_allowed = False
+                        candidate_suppression_reason = "blocked_by_quote_policy"
+                        no_action_reason = quote_failure_reason(
+                            symbol, exc, self.config, stage="proposal"
+                        )
+                        self.storage.audit(
+                            self.run_id,
+                            "proposal_quote_validation_blocked",
+                            {
+                                "symbol": symbol,
+                                "side": signal.side,
+                                "code": exc.code,
+                                "reason": no_action_reason,
+                                "evidence": exc.evidence,
+                                "proposal_inserted": 0,
+                                "telegram_proposal_sent": 0,
+                            },
+                        )
+                    except Exception as exc:
+                        proposal_allowed = False
+                        candidate_suppression_reason = "blocked_by_quote_policy"
+                        no_action_reason = quote_failure_reason(
+                            symbol, exc, self.config, stage="proposal"
+                        )
+                        self.storage.audit(
+                            self.run_id,
+                            "proposal_quote_validation_blocked",
+                            {
+                                "symbol": symbol,
+                                "side": signal.side,
+                                "code": "authoritative_quote_unavailable",
+                                "reason": no_action_reason,
+                                "proposal_inserted": 0,
+                                "telegram_proposal_sent": 0,
+                            },
+                        )
 
                 if not proposal_allowed:
                     if no_action_reason:
@@ -7458,14 +7569,29 @@ class TradingService:
                                     selection_reason = "Selected because it was the strongest eligible candidate."
 
                             # Size adjustment calculation from res
+                            proposal_price_value = float(
+                                proposal_quote["ask"] if signal.side == "buy" else proposal_quote["bid"]
+                            )
+                            proposal_price_timestamp = str(proposal_quote["timestamp"])
+                            proposal_price_age = float(proposal_quote["age_seconds"])
                             notional = res.get("final_notional", 0.0)
                             qty_val = res.get("suggested_shares", 0.0) if (signal.action == "ENTRY" and signal.side == "buy") else (res.get("position_management_sell_qty") or qty_held)
                             if pm_decision_type in {"TAKE_PROFIT_PARTIAL", "PROFIT_PROTECT_EXIT", "TRAILING_STOP_EXIT", "TIME_STOP_EXIT"}:
-                                notional = float(qty_val or 0.0) * price
+                                notional = float(qty_val or 0.0) * proposal_price_value
 
                             stop_price = res.get("stop_price")
                             stop_distance_pct = res.get("stop_distance_pct")
                             stop_distance_dollars = res.get("stop_distance_dollars")
+                            if (
+                                signal.side == "buy"
+                                and stop_price is not None
+                                and float(stop_price) > 0
+                                and float(stop_price) < proposal_price_value
+                            ):
+                                stop_distance_dollars = proposal_price_value - float(stop_price)
+                                stop_distance_pct = (
+                                    stop_distance_dollars / proposal_price_value * 100.0
+                                )
                             stop_model_used = res.get("stop_model_used")
                             risk_budget = res.get("risk_budget")
                             score_multiplier = res.get("score_multiplier")
@@ -7513,12 +7639,19 @@ class TradingService:
                                 "notional": notional,
                                 "qty": qty_val,
                                 "notional_adjustment_note": notional_adjustment_note,
-                                "latest_price": price,
-                                "price_at": str(price_at),
-                                "proposal_price": price,
-                                "proposal_price_timestamp": price_at.isoformat() if hasattr(price_at, "isoformat") else str(price_at),
-                                "proposal_price_source": "alpaca",
-                                "proposal_price_age_seconds_at_send": price_age_seconds,
+                                "latest_price": proposal_price_value,
+                                "price_at": proposal_price_timestamp,
+                                "proposal_price": proposal_price_value,
+                                "proposal_price_timestamp": proposal_price_timestamp,
+                                "proposal_price_source": "alpaca_quote",
+                                "proposal_price_age_seconds_at_send": proposal_price_age,
+                                "quote_source": proposal_quote["source"],
+                                "quote_feed": proposal_quote["feed"],
+                                "quote_bid": float(proposal_quote["bid"]),
+                                "quote_ask": float(proposal_quote["ask"]),
+                                "quote_midpoint": float(proposal_quote["midpoint"]),
+                                "quote_timestamp": proposal_price_timestamp,
+                                "quote_spread_bps": float(proposal_quote["spread_bps"]),
                                 "historical_bars": len(bars),
                                 "volume": volume,
                                 "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100) if not bars.empty and float(bars.iloc[-1]["close"]) > 0 else 0.0,
@@ -7526,7 +7659,14 @@ class TradingService:
                                 "expires_at": expiry.isoformat(),
                                 "strategy_version": signal.strategy_version,
                                 "reason": signal.reason,
-                                "order_type": "market",
+                                "order_type": "market" if emergency_exit_triggered == 1 else "limit",
+                                "limit_price": (
+                                    None
+                                    if emergency_exit_triggered == 1
+                                    else bounded_marketable_limit(
+                                        proposal_quote, signal.side, self.config
+                                    )
+                                ),
                                 "asset_class": "equity",
                                 "indicators": signal.indicators,
                                 "score": score,
@@ -7585,13 +7725,13 @@ class TradingService:
                                 "stop_validation_status": res.get("stop_validation_status"),
                                 "stop_policy_version": res.get("stop_policy_version", STOP_POLICY_VERSION),
                                 "technical_stop_price": res.get("technical_stop_price"),
-                                "initial_stop_price": stop_price if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
-                                "initial_risk_per_share": (float(price) - float(stop_price)) if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
-                                "initial_risk_pct": stop_distance_pct if stop_price is not None and price is not None and float(stop_price) < float(price) else None,
-                                "initial_risk_dollars": ((float(price) - float(stop_price)) * float(qty_val)) if stop_price is not None and price is not None and qty_val is not None and float(stop_price) < float(price) else None,
+                                "initial_stop_price": stop_price if stop_price is not None and float(stop_price) < proposal_price_value else None,
+                                "initial_risk_per_share": (proposal_price_value - float(stop_price)) if stop_price is not None and float(stop_price) < proposal_price_value else None,
+                                "initial_risk_pct": stop_distance_pct if stop_price is not None and float(stop_price) < proposal_price_value else None,
+                                "initial_risk_dollars": ((proposal_price_value - float(stop_price)) * float(qty_val)) if stop_price is not None and qty_val is not None and float(stop_price) < proposal_price_value else None,
                                 "stop_model": stop_model_used,
                                 "stop_source": stop_model_used,
-                                "entry_price_for_r": price,
+                                "entry_price_for_r": proposal_price_value,
                                 "risk_model_version": SIZING_POLICY_VERSION,
                                 "sizing_policy_version": res.get("sizing_policy_version", SIZING_POLICY_VERSION),
                                 "sizing_caps": res.get("sizing_caps", {}),
@@ -7606,7 +7746,11 @@ class TradingService:
                                 ),
                                 "risk_budget": risk_budget,
                                 "risk_budget_dollars": res.get("risk_budget_dollars", risk_budget),
-                                "stop_risk_dollars": res.get("stop_risk_dollars", ((float(notional) / float(price) * float(stop_distance_dollars)) if notional > 0 and price > 0 and stop_distance_dollars else 0.0)),
+                                "stop_risk_dollars": (
+                                    float(qty_val or 0.0) * float(stop_distance_dollars)
+                                    if signal.side == "buy" and stop_distance_dollars
+                                    else res.get("stop_risk_dollars", 0.0)
+                                ),
                                 "score_multiplier": score_multiplier,
                                 "volatility_multiplier": volatility_multiplier,
                                 "proposed_total_exposure_pct": port_context.get("proposed_total_exposure_pct"),
@@ -7640,6 +7784,29 @@ class TradingService:
                                 self._apply_profitability_summary_to_proposal(
                                     proposal, res
                                 )
+
+                            if is_buy and proposal_allowed:
+                                # The executable ask can differ from the latest
+                                # trade used during signal sizing. Reduce to one
+                                # exact quantity/notional/stop-risk identity
+                                # before any proposal risk decision or display.
+                                try:
+                                    self._canonicalize_profitability_display_terms(
+                                        proposal
+                                    )
+                                except ValueError as exc:
+                                    proposal_allowed = False
+                                    no_action_reason = (
+                                        "blocked by candidate sizing: "
+                                        f"{redact_exception(exc)[:1000]}"
+                                    )
+                                else:
+                                    notional = float(proposal["notional"])
+                                    qty_val = float(proposal["qty"])
+                                    risk_budget = float(
+                                        proposal.get("stop_risk_dollars") or 0.0
+                                    )
+                                    port_context = self._portfolio_context(proposal)
 
                             if self._operational_adaptive_enabled() and is_buy and proposal_action in {"entry", "add"}:
                                 self._should_auto_execute(proposal)
@@ -10878,11 +11045,15 @@ class TradingService:
         ):
             return
         try:
-            entry = Decimal(
-                str(
-                    proposal.get("proposal_price")
-                    or proposal.get("latest_price")
-                )
+            prices = [
+                proposal.get("proposal_price"),
+                proposal.get("latest_price"),
+                proposal.get("limit_price"),
+            ]
+            entry = max(
+                Decimal(str(value))
+                for value in prices
+                if value not in (None, "")
             )
             quantity = Decimal(str(proposal.get("qty")))
             notional_ceiling = Decimal(str(proposal.get("notional")))
@@ -10924,7 +11095,19 @@ class TradingService:
                 float(proposal["displayed_adaptive_ceiling"]),
                 float(exact_notional),
             )
+        proposal["execution_reference_price"] = float(entry)
+        proposal["latest_price"] = float(entry)
+        proposal["entry_price_for_r"] = float(entry)
+        stop_price = proposal.get("stop_price")
         stop_distance = proposal.get("stop_distance_dollars")
+        if stop_price not in (None, ""):
+            stop_value = Decimal(str(stop_price))
+            if not stop_value.is_finite() or stop_value <= 0 or stop_value >= entry:
+                raise ValueError("BUY stop price must be below the execution reference")
+            stop_distance = entry - stop_value
+            proposal["stop_distance_dollars"] = float(stop_distance)
+            proposal["stop_distance_pct"] = float(stop_distance / entry * Decimal("100"))
+            proposal["initial_risk_per_share"] = float(stop_distance)
         if stop_distance not in (None, ""):
             distance = Decimal(str(stop_distance))
             if not distance.is_finite() or distance <= 0:
@@ -10934,6 +11117,9 @@ class TradingService:
             exact_stop_risk = quantity * distance
             proposal["stop_risk_dollars"] = float(exact_stop_risk)
             proposal["initial_risk_dollars"] = float(exact_stop_risk)
+            proposal["initial_risk_pct"] = float(
+                exact_stop_risk / entry / quantity * Decimal("100")
+            )
             proposal["risk_budget"] = float(exact_stop_risk)
             proposal["risk_budget_dollars"] = float(exact_stop_risk)
             if proposal.get("approved_stop_risk_ceiling") not in (None, ""):

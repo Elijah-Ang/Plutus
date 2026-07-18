@@ -36,7 +36,12 @@ class MockBroker:
         return type("T", (), {"price": self.price, "timestamp": datetime.now(UTC)})()
 
     def get_latest_quote(self, symbol):
-        return {"bid_price": self.price - 0.01, "ask_price": self.price + 0.01, "timestamp": datetime.now(UTC)}
+        return {
+            "bid_price": self.price - 0.01,
+            "ask_price": self.price + 0.01,
+            "timestamp": datetime.now(UTC),
+            "feed": "iex",
+        }
 
     def get_historical_bars(self, symbol, timeframe, limit):
         # Create a mock DataFrame with enough bars

@@ -266,6 +266,18 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
         )
 
     side_lower = side.lower()
+    quote_section = ""
+    if (
+        proposal.get("quote_bid") is not None
+        and proposal.get("quote_ask") is not None
+        and proposal.get("quote_spread_bps") is not None
+    ):
+        quote_section = (
+            "Execution quote at display:\n"
+            f"Alpaca {str(proposal.get('quote_feed') or 'unspecified').upper()} | "
+            f"bid ${float(proposal['quote_bid']):.2f} | ask ${float(proposal['quote_ask']):.2f} | "
+            f"spread {float(proposal['quote_spread_bps']):.1f} bps\n\n"
+        )
 
     if side_lower == "buy":
         is_add = proposal.get("action") == "add" or bool(proposal.get("is_add", False))
@@ -577,6 +589,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"{header}"
             f"{action_line}"
             f"{amount_line}"
+            f"{quote_section}"
             f"{scores_section}"
             f"{why_section}"
             f"{movement_section}"
@@ -614,6 +627,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
                 f"Suggested action: Sell {sell_pct:.0f}%" if sell_pct else "Suggested action: Sell partial position",
                 f"Estimated shares: {float(proposal.get('qty') or 0.0):.6f}",
                 f"Estimated notional: ${float(proposal.get('notional') or 0.0):.2f}",
+                quote_section.rstrip() if quote_section else None,
                 f"Why:\n{proposal.get('reason') or pm.get('reason') or 'Position management rule triggered.'}",
                 "Reply:\nyes = approve\nno = reject\n\nNo reply = expires and no order is placed.\nyes means permission to attempt after final safety check.",
             ]
@@ -679,6 +693,7 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             f"{header}"
             f"{action_line}"
             f"{details_section}"
+            f"{quote_section}"
             f"{ai_explanation_section}"
             f"{decision_time_str}"
             f"{expires_str}"

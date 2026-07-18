@@ -4,7 +4,7 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v14_crypto_decimal_sizing_risk_paper"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v15_equity_quote_feed_hardening_paper"
 STOP_POLICY_VERSION = "monotonic_trend_protective_stop_v3"
 SIZING_POLICY_VERSION = "adaptive_strategy_sleeve_winner_v5_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_position_risk_rotation_sleeve_v5"

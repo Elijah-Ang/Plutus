@@ -35,6 +35,7 @@ def _broker(timeout: float = 0.05) -> AlpacaBroker:
             "mode": "paper",
             "live_enabled": False,
             "alpaca": {
+                "equity_realtime_data_feed": "iex",
                 "timeouts": {
                     "read_seconds": timeout,
                     "market_data_seconds": timeout,
@@ -114,7 +115,7 @@ def test_listener_approval_validation_stall_is_bounded_and_blocks_without_order(
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
     broker = _broker()
-    broker.data.get_stock_latest_trade = _sleeping_call
+    broker.data.get_stock_latest_quote = _sleeping_call
     broker.trading.get_clock = lambda: SimpleNamespace(is_open=True)
     service = TradingService(
         {
@@ -136,7 +137,10 @@ def test_listener_approval_validation_stall_is_bounded_and_blocks_without_order(
     assert time.monotonic() - started < 1.0
     assert result.submitted is False
     assert result.status == "blocked"
-    assert result.reason == "Price refresh failed or price is unavailable"
+    assert result.reason == (
+        "authoritative Alpaca IEX quote was unavailable or invalid. Wait for fresh, "
+        "spread-valid data; a new proposal and new manual approval are required."
+    )
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 

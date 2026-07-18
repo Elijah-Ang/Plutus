@@ -58,6 +58,44 @@ Accordingly, the current safety state is: fresh exit decision awaiting a new pro
 from fresh valid data. The terminal approved attempt must not be reused, and a buy
 must remain blocked while the freshly reproduced exit decision has priority.
 
+## Follow-up quote-feed diagnosis
+
+Read-only follow-up inspection found the same final-validation failure on three
+separate approved proposals. All three approvals are terminal and none created an
+intent, reservation, broker request, order, or fill:
+
+| Approval-time quote | Alpaca default/IEX quote | Spread | Consolidated SIP comparison |
+|---|---:|---:|---:|
+| 2026-07-14 15:17:23Z | `233.70 / 259.88` | `1060.821 bps` | `244.14 / 244.36` (`9.007 bps`) |
+| 2026-07-16 15:12:37Z | `237.23 / 252.07` | `606.581 bps` | `251.80 / 252.06` (`10.320 bps`) |
+| 2026-07-17 about 15:00:08Z | `242.72 / 261.02` | `726.565 bps` | `258.34 / 258.54` (`7.739 bps`) |
+
+The deployed request omitted an explicit equity feed. On this Basic-data account,
+the default response matched explicit IEX data; a current explicit SIP request was
+rejected because the account lacks the required recent-SIP entitlement. IEX reflects
+one exchange rather than the consolidated market, so its ABBV bid and ask were not a
+usable executable market for this safety policy. Alpaca documents that latest stock
+quotes default to SIP when entitled and otherwise IEX, and that IEX is only one
+exchange: [latest quote API](https://docs.alpaca.markets/us/v1.4.2/reference/stocklatestquotesingle-1),
+[market-data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq), and
+[historical stock data feeds](https://docs.alpaca.markets/us/v1.1/docs/historical-stock-data-1).
+
+The configured `50 bps` spread guard was therefore correct to reject all three
+quotes. The defect was operational ambiguity around the implicit feed and generic
+Telegram explanation—not a reason to weaken the spread limit. Later current
+position-management evidence evolved from `TIME_STOP_EXIT` to a valid
+`PROFIT_PROTECT_EXIT`; exit-first BUY suppression remains intentional while that
+genuine blocker is active.
+
+The hardening change makes the configured equity feed explicit (`iex` or `sip`),
+passes it on every latest-trade and latest-quote request, binds it and the exact
+two-sided quote into the immutable Telegram display, and rejects stale, crossed,
+wrong-feed, or over-limit quotes before a proposal can be inserted or displayed.
+Final approval-time validation records structured bid, ask, feed, timestamp, age,
+spread, threshold, and failure code. Its operator message now states the exact IEX
+spread and safe next action: wait for fresh spread-valid data, then create a new
+proposal and obtain a new manual approval.
+
 ## Audit findings and implementation
 
 ### A. Approval authority was created at reply time

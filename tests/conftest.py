@@ -58,8 +58,10 @@ if "alpaca" not in sys.modules:
     class _FakeStockHistoricalDataClient:
         def __init__(self, key, secret): pass
         def get_stock_bars(self, *args, **kwargs): return []
-        def get_stock_latest_trade(self, *args, **kwargs): return SimpleNamespace(price=100.0, timestamp=datetime.now(UTC))
-        def get_stock_latest_quote(self, *args, **kwargs): return SimpleNamespace(bid_price=99.99, ask_price=100.01, timestamp=datetime.now(UTC))
+        def get_stock_latest_trade(self, request, *args, **kwargs):
+            return {request.symbol_or_symbols: SimpleNamespace(price=100.0, timestamp=datetime.now(UTC))}
+        def get_stock_latest_quote(self, request, *args, **kwargs):
+            return {request.symbol_or_symbols: SimpleNamespace(bid_price=99.99, ask_price=100.01, timestamp=datetime.now(UTC))}
 
     class _FakeCryptoHistoricalDataClient:
         def __init__(self, key=None, secret=None): pass
@@ -85,6 +87,10 @@ if "alpaca" not in sys.modules:
     class _CryptoFeed:
         US = _EnumValue("us")
 
+    class _DataFeed:
+        IEX = _EnumValue("iex")
+        SIP = _EnumValue("sip")
+
     class _TimeFrame:
         Day = _EnumValue("1Day")
         Hour = _EnumValue("1Hour")
@@ -96,6 +102,9 @@ if "alpaca" not in sys.modules:
     alpaca_data_historical.StockHistoricalDataClient = _FakeStockHistoricalDataClient
     alpaca_data_historical.CryptoHistoricalDataClient = _FakeCryptoHistoricalDataClient
     alpaca_data_enums.CryptoFeed = _CryptoFeed
+    alpaca_data_enums.DataFeed = _DataFeed
+    alpaca_data_requests.StockLatestQuoteRequest = _Request
+    alpaca_data_requests.StockLatestTradeRequest = _Request
     alpaca_data_requests.CryptoBarsRequest = _Request
     alpaca_data_requests.CryptoLatestQuoteRequest = _Request
     alpaca_data_requests.CryptoLatestTradeRequest = _Request

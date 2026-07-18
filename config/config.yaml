@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v14_crypto_decimal_sizing_risk_paper
+configuration_schema_version: plutus_effective_config_v15_equity_quote_feed_hardening_paper
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -106,7 +106,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v14_crypto_decimal_sizing_risk_paper
+  required_configuration_version: plutus_effective_config_v15_equity_quote_feed_hardening_paper
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -561,6 +561,10 @@ data_providers:
   dynamic_universe_provider: eodhd
 
 alpaca:
+  # This account currently has the Basic real-time feed. IEX is one exchange,
+  # not consolidated NBBO, so wide quotes fail closed. Change to sip only after
+  # Alpaca confirms current real-time SIP entitlement.
+  equity_realtime_data_feed: iex
   timeouts:
     read_seconds: 10
     market_data_seconds: 10

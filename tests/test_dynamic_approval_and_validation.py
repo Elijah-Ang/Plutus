@@ -57,7 +57,12 @@ class MockBroker:
         return type("T", (), {"price": self.price, "timestamp": self.price_time})()
 
     def get_latest_quote(self, symbol):
-        return {"bid_price": self.price - 0.01, "ask_price": self.price + 0.01, "timestamp": self.price_time}
+        return {
+            "bid_price": self.price - 0.01,
+            "ask_price": self.price + 0.01,
+            "timestamp": self.price_time,
+            "feed": "iex",
+        }
 
     def get_historical_bars(self, symbol, timeframe, limit=250):
         return pd.DataFrame({

@@ -18,7 +18,7 @@ def test_default_config_is_paper():
 
 def test_alpaca_defaults_to_paper():
     # If mode is not specified, it should default to paper
-    broker = AlpacaBroker({"live_enabled": False}, "dummy_key", "dummy_secret")
+    broker = AlpacaBroker({"live_enabled": False, "alpaca": {"equity_realtime_data_feed": "iex"}}, "dummy_key", "dummy_secret")
     assert broker.mode == "paper"
 
 
@@ -29,7 +29,7 @@ def test_live_trading_rejected_when_live_enabled_false():
 
 def test_live_order_submission_cannot_occur_by_accident():
     # Even if broker initialization is mocked or bypassed, submit_order guards must reject it
-    broker = AlpacaBroker({"mode": "paper", "live_enabled": False}, "dummy_key", "dummy_secret")
+    broker = AlpacaBroker({"mode": "paper", "live_enabled": False, "alpaca": {"equity_realtime_data_feed": "iex"}}, "dummy_key", "dummy_secret")
     # Change mode to live manually to simulate accidental modification
     broker.mode = "live"
     with pytest.raises(PermissionError):
@@ -40,12 +40,12 @@ def test_missing_alpaca_credentials_fail_safely(monkeypatch):
     import app.broker_alpaca
     monkeypatch.setattr(app.broker_alpaca, "get_secret", lambda name: None)
     with pytest.raises(RuntimeError) as exc_info:
-        AlpacaBroker({"mode": "paper"}, api_key=None, secret_key=None)
+        AlpacaBroker({"mode": "paper", "alpaca": {"equity_realtime_data_feed": "iex"}}, api_key=None, secret_key=None)
     assert "Alpaca credentials are not configured" in str(exc_info.value)
 
 
 def test_invalid_alpaca_credentials_fail_safely():
-    broker = AlpacaBroker({"mode": "paper"}, "invalid_key", "invalid_secret")
+    broker = AlpacaBroker({"mode": "paper", "alpaca": {"equity_realtime_data_feed": "iex"}}, "invalid_key", "invalid_secret")
     class FakeAuthFailure:
         def get_account(self):
             error = RuntimeError("unauthorized")
@@ -60,7 +60,7 @@ def test_invalid_alpaca_credentials_fail_safely():
 def test_no_broker_secrets_are_logged():
     key = "super_secret_alpaca_key_12345"
     secret = "super_secret_alpaca_secret_67890"
-    broker = AlpacaBroker({"mode": "paper"}, key, secret)
+    broker = AlpacaBroker({"mode": "paper", "alpaca": {"equity_realtime_data_feed": "iex"}}, key, secret)
     class FakeAuthFailure:
         def get_account(self):
             error = RuntimeError("unauthorized")
