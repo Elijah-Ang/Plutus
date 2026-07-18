@@ -43,6 +43,7 @@ from .internet import internet_available
 from .lot_ledger import LotLedger
 from .loss_controls import LOSS_METRICS_VERSION, build_loss_metrics
 from .market_data import normalize_bars
+from .performance_lab import PERFORMANCE_EVIDENCE_CTE_SQL, classify_performance_outcome
 from .power import get_power_status
 from .position_management import PositionManagementDecision, PositionManagementEngine
 from .position_risk import PositionRiskInput
@@ -12540,7 +12541,6 @@ class TradingService:
     def _run_performance_lab(self, profile_results: list[dict[str, Any]], active_watchlist: list[str], positions: list[Any], now: datetime, snapshot: dict[str, Any]) -> None:
         qualified_setups_cnt = 0
         shadow_trades_cnt = 0
-        actual_trades_cnt = 0
         active_set = {s.upper() for s in active_watchlist}
         held = {str(_value(p, "symbol", "")).upper() for p in positions}
 
@@ -12641,10 +12641,10 @@ class TradingService:
                     (str(uuid.uuid4()), setup_id, self.run_id, symbol, blocker, blocker_reason, "blocking", now.isoformat()),
                 )
 
-            actual_or_shadow = "actual" if proposed else "shadow"
-            if proposed:
-                actual_trades_cnt += 1
-            else:
+            # A proposal is evidence of an opportunity, not an actual trade.
+            # Only durable fill evidence may promote this classification.
+            actual_or_shadow = "proposal_unfilled" if proposed else "shadow"
+            if not proposed:
                 shadow_trades_cnt += 1
                 if signal.action == "ENTRY" and signal.side == "buy" and score >= float(self.config.get("ai", {}).get("ai_review_min_score", 65)):
                     shadow_id = str(uuid.uuid4())
@@ -12730,11 +12730,11 @@ class TradingService:
                     ),
                 )
 
-        self._sync_performance_lab_order_links()
         self.storage.execute(
             "INSERT INTO performance_lab_summaries(id, run_id, timestamp, total_qualified_setups, total_shadow_trades, total_actual_trades) VALUES(?,?,?,?,?,?)",
-            (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, actual_trades_cnt),
+            (str(uuid.uuid4()), self.run_id, now.isoformat(), qualified_setups_cnt, shadow_trades_cnt, 0),
         )
+        self._sync_performance_lab_order_links()
 
     def _run_crypto_research_due(self) -> list[Any]:
         crypto_cfg = self.config.get("crypto") or {}
@@ -12793,19 +12793,37 @@ class TradingService:
 
     def _sync_performance_lab_order_links(self) -> None:
         rows = self.storage.fetch_all(
-            """
-            SELECT ps.id AS setup_id, ps.proposal_id, o.id AS order_id, o.broker_order_id, o.status AS order_status,
-                   o.notional AS submitted_notional, f.id AS fill_id, f.price AS fill_price, f.qty AS fill_qty,
+            PERFORMANCE_EVIDENCE_CTE_SQL
+            + """ SELECT ps.id AS setup_id, ps.run_id, ps.proposal_id, p.status AS proposal_status,
+                   EXISTS(
+                     SELECT 1 FROM approvals a
+                     WHERE a.proposal_id=ps.proposal_id AND a.authorized=1
+                   ) AS approval_exists,
+                   e.order_id, e.broker_order_id, e.order_status,
+                   e.submitted_notional, e.fill_id,
+                   e.fill_qty, e.fill_price, e.filled_notional,
                    c.batch_id
             FROM performance_setups ps
-            LEFT JOIN orders o ON o.proposal_id=ps.proposal_id
-            LEFT JOIN fills f ON f.order_id=o.id
+            JOIN trade_proposals p ON p.id=ps.proposal_id
+            LEFT JOIN ranked_performance_execution e
+              ON e.proposal_id=ps.proposal_id AND e.evidence_rank=1
             LEFT JOIN proposal_batch_candidates c ON c.proposal_id=ps.proposal_id
-            WHERE ps.proposal_id IS NOT NULL
-            """
+            WHERE ps.proposed=1
+            ORDER BY ps.id"""
         )
         now_iso = iso_now()
+        affected_run_ids: set[str] = set()
         for row in rows:
+            affected_run_ids.add(str(row.get("run_id") or ""))
+            evidence_class = classify_performance_outcome(
+                proposal_status=row.get("proposal_status"),
+                authorized_approval=bool(row.get("approval_exists")),
+                order_status=row.get("order_status"),
+                fill_id=row.get("fill_id"),
+                fill_price=row.get("fill_price"),
+                fill_qty=row.get("fill_qty"),
+            )
+            valid_fill = evidence_class == "actual_fill"
             self.storage.execute(
                 """
                 UPDATE performance_setups
@@ -12827,14 +12845,27 @@ class TradingService:
                 SET batch_id=COALESCE(?, batch_id), order_id=COALESCE(?, order_id),
                     broker_order_id=COALESCE(?, broker_order_id), fill_id=COALESCE(?, fill_id),
                     entry_price=COALESCE(?, entry_price), entry_qty=COALESCE(?, entry_qty),
-                    entry_notional=COALESCE(?, entry_notional), updated_at=?
+                    entry_notional=COALESCE(?, entry_notional), actual_or_shadow=?, updated_at=?
                 WHERE setup_id=?
                 """,
                 (
                     row.get("batch_id"), row.get("order_id"), row.get("broker_order_id"),
-                    str(row.get("fill_id")) if row.get("fill_id") is not None else None,
-                    row.get("fill_price"), row.get("fill_qty"), row.get("submitted_notional"), now_iso, row.get("setup_id"),
+                    str(row.get("fill_id")) if valid_fill else None,
+                    row.get("fill_price") if valid_fill else None,
+                    row.get("fill_qty") if valid_fill else None,
+                    row.get("filled_notional") if valid_fill else row.get("submitted_notional"),
+                    evidence_class, now_iso, row.get("setup_id"),
                 ),
+            )
+        for affected_run_id in sorted(affected_run_ids - {""}):
+            self.storage.execute(
+                """UPDATE performance_lab_summaries
+                   SET total_actual_trades=(
+                         SELECT COUNT(*) FROM performance_outcomes po
+                         WHERE po.run_id=? AND po.actual_or_shadow='actual_fill'
+                       )
+                   WHERE run_id=?""",
+                (affected_run_id, affected_run_id),
             )
 
     def _update_forward_outcomes(self) -> None:

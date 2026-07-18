@@ -240,6 +240,15 @@ remains pending complete crypto profitability evidence and a later exact
 authority/display/approval integration. See
 [CROSS_ASSET_ALLOCATION.md](CROSS_ASSET_ALLOCATION.md).
 
+### Accounting and Performance Lab checkpoint (2026-07-18)
+
+Performance Lab proposal populations are now fill-bound: proposals, approvals,
+blocks, expiry, rejection, supersession, submission without fill, cancellation,
+and ambiguous submission remain separate nonactual evidence. Only a durable
+fill becomes `actual_fill`, and actual-trade summaries and integrity checks
+reconcile to that evidence. Reports group lifecycle populations by asset class.
+See [PERFORMANCE_LAB_CLASSIFICATION.md](PERFORMANCE_LAB_CLASSIFICATION.md).
+
 ## Phase 5 — live-readiness validation (does not enable live)
 
 Common metadata: rationale = prove operational readiness without authorizing capital; dependencies = Phases 0–4 gates; acceptance = signed evidence pack with no unresolved critical/high issue; status pending; commit/evidence none; rollout requires separate explicit human authorization and tiny-capital plan; rollback `L-B`; unresolved question = legal/account rules at future review date.

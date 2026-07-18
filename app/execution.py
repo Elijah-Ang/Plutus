@@ -1429,6 +1429,49 @@ class DurableExecutionStore:
             "cross_asset_execution_authority_escape": """SELECT COUNT(*) n
                 FROM cross_asset_allocation_plans
                 WHERE execution_authorized<>0""",
+            "performance_lab_actual_without_fill": """SELECT COUNT(*) n
+                FROM performance_outcomes po
+                LEFT JOIN performance_setups ps ON ps.id=po.setup_id
+                LEFT JOIN fills f ON CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
+                LEFT JOIN orders o ON o.id=f.order_id
+                WHERE po.actual_or_shadow='actual'
+                   OR (po.actual_or_shadow='actual_fill' AND (
+                         po.fill_id IS NULL OR f.id IS NULL
+                         OR COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0
+                         OR COALESCE(po.entry_qty,0)<=0 OR COALESCE(po.entry_price,0)<=0
+                         OR COALESCE(po.entry_notional,0)<=0
+                         OR COALESCE(po.order_id,'')<>COALESCE(f.order_id,'')
+                         OR COALESCE(o.proposal_id,'')<>COALESCE(ps.proposal_id,'')
+                         OR ABS(po.entry_qty-f.qty)>0.000000001
+                         OR ABS(po.entry_price-f.price)>0.000000001
+                         OR ABS(po.entry_notional-(f.qty*f.price))>0.000000001
+                       ))""",
+            "performance_lab_fill_not_actual": """SELECT COUNT(*) n
+                FROM performance_outcomes po
+                JOIN performance_setups ps ON ps.id=po.setup_id
+                WHERE EXISTS(
+                        SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
+                        WHERE o.proposal_id=ps.proposal_id AND f.qty>0 AND f.price>0
+                      )
+                  AND (COALESCE(po.actual_or_shadow,'')<>'actual_fill'
+                       OR NOT EXISTS(
+                         SELECT 1 FROM fills f JOIN orders o ON o.id=f.order_id
+                         WHERE CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
+                           AND o.proposal_id=ps.proposal_id
+                           AND f.qty>0 AND f.price>0
+                       ))""",
+            "performance_lab_invalid_fill_evidence": """SELECT COUNT(*) n
+                FROM performance_outcomes po
+                JOIN performance_setups ps ON ps.id=po.setup_id
+                WHERE EXISTS(
+                  SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
+                  WHERE o.proposal_id=ps.proposal_id
+                    AND (COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0)
+                )""",
+            "performance_lab_orphaned_proposal_link": """SELECT COUNT(*) n
+                FROM performance_setups ps
+                LEFT JOIN trade_proposals p ON p.id=ps.proposal_id
+                WHERE ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

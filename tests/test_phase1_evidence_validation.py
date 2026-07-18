@@ -175,7 +175,23 @@ def test_legacy_import_keeps_actual_blocked_observation_and_shadow_distinct(tmp_
         """INSERT INTO performance_setups(id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,proposed,proposal_id,score,current_price,created_at,updated_at)
            VALUES('actual',?,?,?,?,?,?,?,?,?,?,?,?,?)""", base,
     )
-    storage.execute("UPDATE performance_setups SET fill_id='fill-1',fill_price=101 WHERE id='actual'")
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("p1", "run", "QQQ", "buy", 5.05, "filled", now, now, "rule_based_v1"),
+    )
+    storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-1", "run", "p1", "paper-1", "client-1", "QQQ", "buy", 5.05, 0.05, "filled", now, now),
+    )
+    storage.execute(
+        "INSERT INTO fills(run_id,order_id,qty,price,filled_at) VALUES(?,?,?,?,?)",
+        ("run", "order-1", 0.05, 101.0, now),
+    )
+    fill_id = storage.fetch_all("SELECT id FROM fills WHERE order_id='order-1'")[0]["id"]
+    storage.execute(
+        "UPDATE performance_setups SET fill_id=?,fill_price=101,fill_qty=0.05 WHERE id='actual'",
+        (str(fill_id),),
+    )
     for setup_id, tier, reason in (("blocked", "paper_tradable", "risk"), ("observe", "observation", None), ("shadow", "paper_tradable", None)):
         storage.execute(
             """INSERT INTO performance_setups(id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,proposed,score,current_price,not_proposed_reason,created_at,updated_at)
@@ -190,6 +206,28 @@ def test_legacy_import_keeps_actual_blocked_observation_and_shadow_distinct(tmp_
     imported = import_legacy_opportunities(storage, repository)
     kinds = {o.source_id: o.execution_type for o in imported if o.source_table == "performance_setups"}
     assert kinds == {"actual": "actual_fill", "blocked": "blocked_hypothetical", "observe": "observation_only", "shadow": "shadow_hypothetical"}
+
+
+def test_legacy_import_rejects_forged_performance_fill_link(tmp_path):
+    storage = Storage(tmp_path / "clone.db")
+    storage.initialize()
+    now = datetime(2026, 1, 2, tzinfo=UTC).isoformat()
+    storage.execute(
+        """INSERT INTO performance_setups(
+             id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,
+             proposed,proposal_id,score,current_price,fill_id,fill_price,fill_qty,
+             created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "forged", now, "run", "QQQ", "equity", "paper_tradable", "entry",
+            "proposed", 1, "missing-proposal", 90.0, 100.0, "999", 101.0, 0.05,
+            now, now,
+        ),
+    )
+
+    imported = import_legacy_opportunities(storage, ResearchRepository(storage.path))
+
+    assert [o.execution_type for o in imported] == ["proposal_unfilled"]
 
 
 def test_score_calibration_and_report_always_show_sample_sizes():
