@@ -224,6 +224,22 @@ Common metadata: rationale = separate alpha, risk, execution, uncertainty, and c
 | P4-ADAPT-001..006 | Conservative vol target; bounded fractional Kelly; Bayesian sleeve expectancy; change points; auto throttling; contextual bandit among validated sleeves |
 | P4-SAFE-001..003 | Adaptive shadow-first; hard deterministic limits cannot be overridden; no unconstrained deep-RL agent |
 
+### Cross-asset allocation checkpoint (2026-07-18)
+
+The first cross-asset allocation boundary is implemented as immutable
+`research_advisory` evidence. It normalizes net value by stop risk, capital,
+holding time, uncertainty, costs, and marginal portfolio contribution, then
+applies total, asset, crypto, symbol, cluster, strategy, heat, buying-power,
+cash-reserve, position-count, loss, drawdown, and operational-health limits.
+Every portfolio total must reconcile before ranking.
+
+This checkpoint creates no proposal, approval, intent, reservation, or broker
+authority. Crypto remains research-only and keeps its 1% gross, 0.05% heat,
+and 0.01% per-candidate stop-risk ceilings. Operational cross-asset execution
+remains pending complete crypto profitability evidence and a later exact
+authority/display/approval integration. See
+[CROSS_ASSET_ALLOCATION.md](CROSS_ASSET_ALLOCATION.md).
+
 ## Phase 5 — live-readiness validation (does not enable live)
 
 Common metadata: rationale = prove operational readiness without authorizing capital; dependencies = Phases 0–4 gates; acceptance = signed evidence pack with no unresolved critical/high issue; status pending; commit/evidence none; rollout requires separate explicit human authorization and tiny-capital plan; rollback `L-B`; unresolved question = legal/account rules at future review date.

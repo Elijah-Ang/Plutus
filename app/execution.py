@@ -1409,6 +1409,26 @@ class DurableExecutionStore:
                   + (SELECT COUNT(*) FROM crypto_risk_decisions WHERE execution_authorized<>0)
                   + (SELECT COUNT(*) FROM crypto_strategy_decisions WHERE proposal_authorized<>0 OR execution_authorized<>0)
                   + (SELECT COUNT(*) FROM crypto_proposal_previews WHERE manual_approval_eligible<>0 OR execution_authorized<>0) n""",
+            "invalid_cross_asset_allocation_plan": """SELECT COUNT(*) n
+                FROM cross_asset_allocation_plans p
+                WHERE p.execution_authorized<>0
+                   OR COALESCE(p.portfolio_snapshot_id,'')=''
+                   OR COALESCE(p.portfolio_snapshot_fingerprint,'')=''
+                   OR COALESCE(p.candidate_set_fingerprint,'')=''
+                   OR COALESCE(p.policy_fingerprint,'')=''
+                   OR COALESCE(p.plan_fingerprint,'')=''
+                   OR COALESCE(p.config_hash,'')=''
+                   OR json_valid(p.candidate_set_json)<>1
+                   OR json_valid(p.policy_json)<>1
+                   OR json_valid(p.plan_json)<>1
+                   OR CASE
+                        WHEN json_valid(p.plan_json)=1
+                        THEN COALESCE(json_type(p.plan_json,'$.execution_authorized'),'')<>'false'
+                        ELSE 1
+                      END""",
+            "cross_asset_execution_authority_escape": """SELECT COUNT(*) n
+                FROM cross_asset_allocation_plans
+                WHERE execution_authorized<>0""",
         }
         return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
 

@@ -24,6 +24,8 @@ from .formula_versions import (
     CRYPTO_SIZING_SCHEMA_VERSION,
     CRYPTO_STRATEGY_FORMULA_VERSION,
     CRYPTO_STRATEGY_SCHEMA_VERSION,
+    CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
+    CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
@@ -69,7 +71,7 @@ _WARNED_DEPRECATIONS: set[str] = set()
 
 STRICT_TOP_LEVEL_KEYS = {
     "configuration_schema_version", "strict_unknown_keys", "effective_config_hash", "mode", "live_enabled", "explicit_live_confirmation",
-    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "profitability_validation", "execution_capabilities", "broker",
+    "phase2_shadow_strategies", "phase3", "phase4", "adaptive_conviction", "adaptive_sizing", "profitability_engine", "profitability_validation", "cross_asset_allocation", "execution_capabilities", "broker",
     "strategy_execution_registry", "winner_expansion", "trend_management", "rotation",
     "require_power", "require_market_open", "preflight", "watchlist", "strategies", "formula_versions", "crypto",
     "market_profiles", "proposal_expiry_default_minutes", "proposal_expiry_min_minutes", "proposal_expiry_max_minutes",
@@ -163,7 +165,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "cross_asset_allocation", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -183,6 +185,27 @@ STRICT_SECTION_KEYS = {
         "embargo_periods", "block_length", "bootstrap_draws",
         "fdr_alpha", "minimum_positive_fold_ratio",
         "minimum_parameter_stability_ratio",
+    },
+    "cross_asset_allocation": {
+        "enabled", "mode", "produce_order_authority", "formula_version", "schema_version",
+        "candidate_ttl_seconds", "portfolio_snapshot_ttl_seconds", "plan_ttl_seconds",
+        "maximum_total_gross_exposure_pct", "maximum_stop_heat_pct",
+        "maximum_symbol_exposure_pct", "maximum_cluster_exposure_pct",
+        "maximum_equity_exposure_pct", "maximum_crypto_exposure_pct",
+        "maximum_strategy_stop_heat_pct", "maximum_exploration_stop_heat_pct",
+        "maximum_crypto_stop_heat_pct", "maximum_equity_trade_stop_risk_pct",
+        "maximum_crypto_trade_stop_risk_pct",
+        "maximum_equity_annualized_volatility",
+        "maximum_crypto_annualized_volatility", "minimum_cash_reserve_pct",
+        "minimum_executable_notional_usd", "minimum_equity_liquidity_usd",
+        "minimum_crypto_liquidity_usd", "maximum_cost_to_gross_edge_ratio",
+        "daily_loss_halt_pct", "weekly_loss_halt_pct",
+        "drawdown_throttle_start_pct", "drawdown_halt_pct",
+        "drawdown_throttle_multiplier", "maximum_marginal_drawdown_r",
+        "maximum_positions", "maximum_equity_positions", "maximum_crypto_positions",
+        "target_conservative_net_r", "target_expected_net_r",
+        "target_capital_efficiency", "target_r_per_day",
+        "target_marginal_contribution_r", "score_weights",
     },
 }
 
@@ -231,6 +254,13 @@ STRICT_NESTED_KEYS = {
         "mode", "formula_version", "schema_version", "preview_expiry_minutes",
         "create_trade_proposals", "send_telegram", "manual_approval_enabled",
         "execution_enabled",
+    },
+    "cross_asset_allocation.score_weights": {
+        "uncertainty_adjusted_net_expectancy", "expected_net_expectancy",
+        "capital_efficiency", "holding_period_efficiency",
+        "marginal_portfolio_contribution", "probability_positive_return",
+        "severe_loss_resilience", "execution_cost_resilience", "liquidity",
+        "diversification", "volatility_resilience",
     },
     "profitability_engine.candidate_model": {
         "cost_model_version", "estimation_model_version",
@@ -333,6 +363,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "crypto_risk": CRYPTO_RISK_FORMULA_VERSION,
         "crypto_strategy": CRYPTO_STRATEGY_FORMULA_VERSION,
         "crypto_proposal": CRYPTO_PROPOSAL_FORMULA_VERSION,
+        "cross_asset_allocation": CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -557,6 +588,86 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "profitability_engine.candidate_ranking_schema_version must be "
         f"{PROFITABILITY_RANKING_SCHEMA_VERSION}",
     )
+    cross_asset = config.get("cross_asset_allocation", {}) or {}
+    require(cross_asset.get("enabled") is True,
+            "cross_asset_allocation.enabled must be true")
+    require(cross_asset.get("mode") == "research_advisory",
+            "cross-asset allocation must remain research_advisory in this stage")
+    require(cross_asset.get("produce_order_authority") is False,
+            "cross-asset allocation cannot produce order authority")
+    require(cross_asset.get("formula_version") == CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
+            f"cross-asset formula must be {CROSS_ASSET_ALLOCATION_FORMULA_VERSION}")
+    require(cross_asset.get("schema_version") == CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
+            f"cross-asset schema must be {CROSS_ASSET_ALLOCATION_SCHEMA_VERSION}")
+    for key, minimum, maximum in (
+        ("candidate_ttl_seconds", 1, 600),
+        ("portfolio_snapshot_ttl_seconds", 1, 600),
+        ("plan_ttl_seconds", 1, 600),
+        ("maximum_total_gross_exposure_pct", 0.01, 50.0),
+        ("maximum_stop_heat_pct", 0.01, 1.75),
+        ("maximum_symbol_exposure_pct", 0.01, 6.0),
+        ("maximum_cluster_exposure_pct", 0.01, 15.0),
+        ("maximum_equity_exposure_pct", 0.01, 50.0),
+        ("maximum_crypto_exposure_pct", 0.01, 1.0),
+        ("maximum_strategy_stop_heat_pct", 0.01, 0.6125),
+        ("maximum_exploration_stop_heat_pct", 0.01, 0.10),
+        ("maximum_crypto_stop_heat_pct", 0.01, 0.05),
+        ("maximum_equity_trade_stop_risk_pct", 0.01, 0.35),
+        ("maximum_crypto_trade_stop_risk_pct", 0.001, 0.01),
+        ("maximum_equity_annualized_volatility", 0.01, 0.45),
+        ("maximum_crypto_annualized_volatility", 0.01, 1.50),
+        ("minimum_cash_reserve_pct", 20.0, 100.0),
+        ("minimum_executable_notional_usd", 1.0, 250.0),
+        ("minimum_equity_liquidity_usd", 10_000_000.0, 1_000_000_000_000.0),
+        ("minimum_crypto_liquidity_usd", 1_000.0, 1_000_000_000_000.0),
+        ("maximum_cost_to_gross_edge_ratio", 0.01, 0.50),
+        ("daily_loss_halt_pct", 0.01, 0.75),
+        ("weekly_loss_halt_pct", 0.01, 1.50),
+        ("drawdown_throttle_start_pct", 0.01, 6.0),
+        ("drawdown_halt_pct", 0.01, 6.0),
+        ("drawdown_throttle_multiplier", 0.01, 1.0),
+        ("maximum_marginal_drawdown_r", 0.01, 6.0),
+        ("target_conservative_net_r", 0.000001, 10.0),
+        ("target_expected_net_r", 0.000001, 10.0),
+        ("target_capital_efficiency", 0.000001, 10.0),
+        ("target_r_per_day", 0.000001, 10.0),
+        ("target_marginal_contribution_r", 0.000001, 10.0),
+    ):
+        _bounded(cross_asset.get(key), f"cross_asset_allocation.{key}", errors, minimum, maximum)
+    for key, maximum in (
+        ("maximum_positions", 5),
+        ("maximum_equity_positions", 3),
+        ("maximum_crypto_positions", 2),
+    ):
+        _bounded(cross_asset.get(key), f"cross_asset_allocation.{key}", errors, 1, maximum)
+        require(
+            isinstance(cross_asset.get(key), int)
+            and not isinstance(cross_asset.get(key), bool),
+            f"cross_asset_allocation.{key} must be an integer",
+        )
+    require(
+        isinstance(cross_asset.get("drawdown_throttle_start_pct"), (int, float))
+        and isinstance(cross_asset.get("drawdown_halt_pct"), (int, float))
+        and cross_asset["drawdown_throttle_start_pct"] < cross_asset["drawdown_halt_pct"],
+        "cross-asset drawdown throttle must start below the halt",
+    )
+    score_weights = cross_asset.get("score_weights") or {}
+    expected_score_weights = {
+        "uncertainty_adjusted_net_expectancy", "expected_net_expectancy",
+        "capital_efficiency", "holding_period_efficiency",
+        "marginal_portfolio_contribution", "probability_positive_return",
+        "severe_loss_resilience", "execution_cost_resilience", "liquidity",
+        "diversification", "volatility_resilience",
+    }
+    require(set(score_weights) == expected_score_weights,
+            "cross-asset score weights are incomplete")
+    if set(score_weights) == expected_score_weights:
+        values = [
+            _number(score_weights, key, errors, minimum=0, maximum=1)
+            for key in sorted(expected_score_weights)
+        ]
+        require(None not in values and math.isclose(sum(values), 1.0, abs_tol=1e-12),
+                "cross-asset score weights must sum to 1")
     require(profitability.get("primary_horizon_sessions") == 20, "profitability_engine.primary_horizon_sessions must be 20")
     require(
         profitability.get("maximum_cost_to_gross_edge_ratio") == 0.50,

@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v17_crypto_hourly_net_target_research_paper
+configuration_schema_version: plutus_effective_config_v18_cross_asset_research_allocation
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -80,6 +80,59 @@ phase4:
   preserve_cash_on_unreliable_evidence: true
   require_manual_approval: true
   phase3_hard_limits_authoritative: true
+cross_asset_allocation:
+  enabled: true
+  mode: research_advisory
+  produce_order_authority: false
+  formula_version: cross_asset_normalized_constrained_allocator_v1
+  schema_version: cross_asset_research_allocation_plans_v1
+  candidate_ttl_seconds: 300
+  portfolio_snapshot_ttl_seconds: 300
+  plan_ttl_seconds: 300
+  maximum_total_gross_exposure_pct: 50.0
+  maximum_stop_heat_pct: 1.75
+  maximum_symbol_exposure_pct: 6.0
+  maximum_cluster_exposure_pct: 15.0
+  maximum_equity_exposure_pct: 50.0
+  maximum_crypto_exposure_pct: 1.0
+  maximum_strategy_stop_heat_pct: 0.6125
+  maximum_exploration_stop_heat_pct: 0.10
+  maximum_crypto_stop_heat_pct: 0.05
+  maximum_equity_trade_stop_risk_pct: 0.35
+  maximum_crypto_trade_stop_risk_pct: 0.01
+  maximum_equity_annualized_volatility: 0.45
+  maximum_crypto_annualized_volatility: 1.50
+  minimum_cash_reserve_pct: 20.0
+  minimum_executable_notional_usd: 5.0
+  minimum_equity_liquidity_usd: 10000000.0
+  minimum_crypto_liquidity_usd: 1000.0
+  maximum_cost_to_gross_edge_ratio: 0.50
+  daily_loss_halt_pct: 0.75
+  weekly_loss_halt_pct: 1.50
+  drawdown_throttle_start_pct: 2.0
+  drawdown_halt_pct: 6.0
+  drawdown_throttle_multiplier: 0.50
+  maximum_marginal_drawdown_r: 1.0
+  maximum_positions: 5
+  maximum_equity_positions: 3
+  maximum_crypto_positions: 2
+  target_conservative_net_r: 0.15
+  target_expected_net_r: 0.25
+  target_capital_efficiency: 0.02
+  target_r_per_day: 0.02
+  target_marginal_contribution_r: 0.15
+  score_weights:
+    uncertainty_adjusted_net_expectancy: 0.25
+    expected_net_expectancy: 0.10
+    capital_efficiency: 0.10
+    holding_period_efficiency: 0.10
+    marginal_portfolio_contribution: 0.12
+    probability_positive_return: 0.08
+    severe_loss_resilience: 0.07
+    execution_cost_resilience: 0.05
+    liquidity: 0.04
+    diversification: 0.05
+    volatility_resilience: 0.04
 adaptive_conviction:
   enabled: true
   enforcement_enabled: true
@@ -106,7 +159,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v17_crypto_hourly_net_target_research_paper
+  required_configuration_version: plutus_effective_config_v18_cross_asset_research_allocation
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -379,6 +432,7 @@ formula_versions:
   crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
   crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
+  cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
 

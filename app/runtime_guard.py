@@ -201,6 +201,13 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
         "display_fingerprint", "proposal_json", "proposal_fingerprint",
         "config_hash", "formula_version", "schema_version",
     },
+    "cross_asset_allocation_plans": {
+        "id", "run_id", "as_of", "expires_at", "portfolio_snapshot_id",
+        "portfolio_snapshot_fingerprint", "candidate_set_json",
+        "candidate_set_fingerprint", "policy_json", "policy_fingerprint",
+        "plan_json", "plan_fingerprint", "execution_authorized",
+        "config_hash", "formula_version", "schema_version", "created_at",
+    },
     "crypto_research_runs": {
         "capability_snapshot_id", "capability_snapshot_fingerprint",
         "capability_authoritative",
