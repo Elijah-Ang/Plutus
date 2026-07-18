@@ -11,7 +11,6 @@ from typing import Any, Iterator
 from .utils import PROJECT_ROOT, iso_now, json_dumps
 from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
 from .formula_versions import (
-    ACCOUNTING_VERSION,
     EVIDENCE_VERSION,
     FINAL_HARDENING_SCHEMA_VERSION,
     REQUIRED_SCHEMA_VERSIONS,
@@ -366,6 +365,7 @@ class Storage:
             from .crypto_proposals import apply_crypto_proposal_schema
             from .cross_asset_allocation import apply_cross_asset_allocation_schema
             from .performance_lab import apply_performance_lab_classification_schema
+            from .fixed_point_accounting import apply_fixed_point_accounting_schema
             apply_p1_execution_schema(conn)
             apply_final_hardening_schema(conn)
 
@@ -397,6 +397,7 @@ class Storage:
             apply_crypto_proposal_schema(conn)
             apply_cross_asset_allocation_schema(conn)
             apply_performance_lab_classification_schema(conn)
+            apply_fixed_point_accounting_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -484,6 +485,8 @@ class Storage:
                 apply_cross_asset_allocation_schema(conn, record_migration=False)
                 from .performance_lab import apply_performance_lab_classification_schema
                 apply_performance_lab_classification_schema(conn, record_migration=False)
+                from .fixed_point_accounting import apply_fixed_point_accounting_schema
+                apply_fixed_point_accounting_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

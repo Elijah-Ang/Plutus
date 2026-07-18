@@ -1,4 +1,4 @@
-configuration_schema_version: plutus_effective_config_v18_cross_asset_research_allocation
+configuration_schema_version: plutus_effective_config_v19_fixed_point_accounting
 strict_unknown_keys: true
 mode: paper
 live_enabled: false
@@ -159,7 +159,7 @@ strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
   formula_version: strategy_execution_registry_formula_v1
   mode: paper_only
-  required_configuration_version: plutus_effective_config_v18_cross_asset_research_allocation
+  required_configuration_version: plutus_effective_config_v19_fixed_point_accounting
   required_evidence_version: phase1_outcome_v2_exit_session
   required_performance_version: strategy_performance_v2_4_validation_attribution
   required_policy_version: strategy_policy_v2_4_validation_attribution
@@ -418,7 +418,7 @@ formula_versions:
   stop_policy: monotonic_trend_protective_stop_v3
   sizing_policy: adaptive_strategy_sleeve_winner_v5_operational_paper
   risk_decision: risk_engine_position_risk_rotation_sleeve_v5
-  accounting: fifo_equity_unrealized_cashflow_v1
+  accounting: fifo_equity_unrealized_cashflow_v2_decimal
   evidence: phase1_outcome_v2_exit_session
   strategy_performance: strategy_performance_v2_4_validation_attribution
   strategy_policy: strategy_policy_v2_4_validation_attribution

@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
@@ -30,6 +30,13 @@ from .utils import iso_now
 
 ZERO = Decimal("0")
 ATTRIBUTION_STATUSES = frozenset({"complete", "partial", "unavailable"})
+
+
+def _canonical_row_value(
+    row: Mapping[str, Any], canonical: str, legacy: str
+) -> Any:
+    value = row.get(canonical)
+    return value if value not in (None, "") else row.get(legacy)
 
 
 class ProfitAttributionError(ValueError):
@@ -916,11 +923,23 @@ class ProfitAttributionStore:
                 "durable attribution strategy authority is inconsistent"
             )
         complete_risk = bool(lots) and all(
-            row.get("initial_risk_dollars") is not None for row in lots
+            _canonical_row_value(
+                row, "initial_risk_dollars_decimal", "initial_risk_dollars"
+            ) is not None
+            for row in lots
         )
         durable_risk = (
             sum(
-                Decimal(str(row["initial_risk_dollars"])) for row in lots
+                Decimal(
+                    str(
+                        _canonical_row_value(
+                            row,
+                            "initial_risk_dollars_decimal",
+                            "initial_risk_dollars",
+                        )
+                    )
+                )
+                for row in lots
             )
             if complete_risk
             else None
@@ -986,19 +1005,31 @@ class ProfitAttributionStore:
                     "durable attribution consumption authority is inconsistent"
                 )
             quantity = _decimal(
-                consumption.get("quantity"),
+                _canonical_row_value(
+                    consumption, "quantity_decimal", "quantity"
+                ),
                 "consumption.quantity",
                 minimum=Decimal("0.00000001"),
             )
             proceeds = _decimal(
-                consumption.get("allocated_proceeds"),
+                _canonical_row_value(
+                    consumption,
+                    "allocated_proceeds_decimal",
+                    "allocated_proceeds",
+                ),
                 "consumption.allocated_proceeds",
             )
             cost_basis = _decimal(
-                consumption.get("allocated_cost_basis"),
+                _canonical_row_value(
+                    consumption,
+                    "allocated_cost_basis_decimal",
+                    "allocated_cost_basis",
+                ),
                 "consumption.allocated_cost_basis",
             )
-            if consumption.get("realized_pnl") is None:
+            if _canonical_row_value(
+                consumption, "realized_pnl_decimal", "realized_pnl"
+            ) is None:
                 raise ProfitAttributionError(
                     "durable attribution realized P&L is unavailable"
                 )
@@ -1007,17 +1038,29 @@ class ProfitAttributionStore:
                 "actual_entry_price": _decimal_text(cost_basis / quantity),
                 "actual_exit_price": _decimal_text(proceeds / quantity),
                 "allocated_buy_fees": self._canonical_decimal(
-                    consumption.get("allocated_buy_fees") or 0,
+                    _canonical_row_value(
+                        consumption,
+                        "allocated_buy_fees_decimal",
+                        "allocated_buy_fees",
+                    ) or 0,
                     "consumption.allocated_buy_fees",
                     minimum=ZERO,
                 ),
                 "allocated_sell_fees": self._canonical_decimal(
-                    consumption.get("allocated_sell_fees") or 0,
+                    _canonical_row_value(
+                        consumption,
+                        "allocated_sell_fees_decimal",
+                        "allocated_sell_fees",
+                    ) or 0,
                     "consumption.allocated_sell_fees",
                     minimum=ZERO,
                 ),
                 "allocated_adjustments": self._canonical_decimal(
-                    consumption.get("allocated_adjustments") or 0,
+                    _canonical_row_value(
+                        consumption,
+                        "allocated_adjustments_decimal",
+                        "allocated_adjustments",
+                    ) or 0,
                     "consumption.allocated_adjustments",
                 ),
                 "entry_proposal_id": self._optional_id(
@@ -1314,12 +1357,25 @@ class ProfitAttributionEngine:
             else None
         )
         risk = sum(
-            Decimal(str(row["initial_risk_dollars"]))
+            Decimal(
+                str(
+                    _canonical_row_value(
+                        row,
+                        "initial_risk_dollars_decimal",
+                        "initial_risk_dollars",
+                    )
+                )
+            )
             for row in lots
-            if row.get("initial_risk_dollars") is not None
+            if _canonical_row_value(
+                row, "initial_risk_dollars_decimal", "initial_risk_dollars"
+            ) is not None
         )
         complete_risk = bool(lots) and all(
-            row.get("initial_risk_dollars") is not None for row in lots
+            _canonical_row_value(
+                row, "initial_risk_dollars_decimal", "initial_risk_dollars"
+            ) is not None
+            for row in lots
         )
         reason: str | None = None
         legs: list[AttributionLeg] = []
@@ -1329,7 +1385,14 @@ class ProfitAttributionEngine:
         elif not consumptions:
             reason = "no attributed lot consumptions"
         elif any(
-            Decimal(str(row.get("remaining_quantity") or "0")) > ZERO
+            Decimal(
+                str(
+                    _canonical_row_value(
+                        row, "remaining_quantity_decimal", "remaining_quantity"
+                    )
+                    or "0"
+                )
+            ) > ZERO
             for row in lots
         ):
             reason = "closed lifecycle retains unconsumed attributed quantity"
@@ -1341,14 +1404,31 @@ class ProfitAttributionEngine:
                 if lot is None:
                     reason = "consumption references an unavailable lot"
                     continue
-                quantity = Decimal(str(consumption.get("quantity") or "0"))
-                proceeds = consumption.get("allocated_proceeds")
-                cost_basis = consumption.get("allocated_cost_basis")
+                quantity = Decimal(
+                    str(
+                        _canonical_row_value(
+                            consumption, "quantity_decimal", "quantity"
+                        )
+                        or "0"
+                    )
+                )
+                proceeds = _canonical_row_value(
+                    consumption,
+                    "allocated_proceeds_decimal",
+                    "allocated_proceeds",
+                )
+                cost_basis = _canonical_row_value(
+                    consumption,
+                    "allocated_cost_basis_decimal",
+                    "allocated_cost_basis",
+                )
                 if (
                     quantity <= ZERO
                     or proceeds is None
                     or cost_basis is None
-                    or consumption.get("realized_pnl") is None
+                    or _canonical_row_value(
+                        consumption, "realized_pnl_decimal", "realized_pnl"
+                    ) is None
                 ):
                     reason = "incomplete FIFO lifecycle accounting"
                     continue
@@ -1424,18 +1504,21 @@ class ProfitAttributionEngine:
                         quantity=quantity,
                         actual_entry_price=actual_entry,
                         actual_exit_price=actual_exit,
-                        allocated_buy_fees=consumption.get(
-                            "allocated_buy_fees"
-                        )
-                        or 0,
-                        allocated_sell_fees=consumption.get(
-                            "allocated_sell_fees"
-                        )
-                        or 0,
-                        allocated_adjustments=consumption.get(
-                            "allocated_adjustments"
-                        )
-                        or 0,
+                        allocated_buy_fees=_canonical_row_value(
+                            consumption,
+                            "allocated_buy_fees_decimal",
+                            "allocated_buy_fees",
+                        ) or 0,
+                        allocated_sell_fees=_canonical_row_value(
+                            consumption,
+                            "allocated_sell_fees_decimal",
+                            "allocated_sell_fees",
+                        ) or 0,
+                        allocated_adjustments=_canonical_row_value(
+                            consumption,
+                            "allocated_adjustments_decimal",
+                            "allocated_adjustments",
+                        ) or 0,
                         entry_final_ask=self._order_quote(
                             str(entry_intent_id) if entry_intent_id else None,
                             "quote_ask",

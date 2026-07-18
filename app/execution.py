@@ -10,7 +10,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping
 
 from .order_state import (
-    ACTIVE_RESERVATION_STATES,
     BROKER_RELEVANT_STATES,
     TERMINAL_STATES,
     InvalidOrderTransition,
@@ -23,6 +22,14 @@ from .risk_engine import RiskEngine
 from .capabilities import require_autonomous_entry_support, require_autonomous_exit_support, require_protective_paper_exit_support
 from .utils import iso_now, json_dumps
 from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    ZERO,
+    decimal_text,
+    decimal_value,
+    legacy_float,
+)
+from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .quotes import implementation_shortfall_bps, validate_quote_payload
 from .canonical_sizing import canonical_sizing, enforce_ceilings
 from .approval_authority import authority_fingerprint
@@ -711,7 +718,9 @@ class DurableExecutionStore:
             )
             conn.execute(
                 """UPDATE order_intents SET displayed_fingerprint=?,execution_path=?,risk_snapshot_id=?,
-                       canonical_quantity=?,canonical_notional=?,canonical_stop_risk=? WHERE id=?""",
+                       canonical_quantity=?,canonical_notional=?,canonical_stop_risk=?,
+                       filled_quantity_decimal='0',decimal_provenance=?,decimal_accounting_version=?
+                       WHERE id=?""",
                 (
                     proposal.get("displayed_fingerprint") or proposal.get("approval_authority_fingerprint"),
                     proposal.get("execution_path"),
@@ -719,6 +728,8 @@ class DurableExecutionStore:
                     sizing.quantity,
                     sizing.notional,
                     sizing.stop_risk,
+                    EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                     intent_id,
                 ),
             )
@@ -909,20 +920,32 @@ class DurableExecutionStore:
         self,
         intent_id: str,
         *,
-        cumulative_quantity: float,
-        fill_price: float,
+        cumulative_quantity: Any,
+        fill_price: Any,
         broker_event_key: str,
         broker_order_id: str | None = None,
         occurred_at: str | None = None,
-        fees: float = 0.0,
-        adjustments: float = 0.0,
+        fees: Any = 0,
+        adjustments: Any = 0,
         source: str = "broker_fill",
         price_is_cumulative_average: bool = False,
     ) -> dict[str, Any]:
-        cumulative_quantity = float(cumulative_quantity)
-        fill_price = float(fill_price)
-        if cumulative_quantity < 0 or fill_price < 0:
-            raise ValueError("fill quantity and price cannot be negative")
+        cumulative_decimal = decimal_value(
+            cumulative_quantity, "cumulative_quantity", minimum=ZERO
+        )
+        price_decimal = decimal_value(fill_price, "fill_price", minimum=ZERO)
+        fees_decimal = decimal_value(fees, "fees", minimum=ZERO)
+        adjustments_decimal = decimal_value(adjustments, "adjustments")
+        assert (
+            cumulative_decimal is not None
+            and price_decimal is not None
+            and fees_decimal is not None
+            and adjustments_decimal is not None
+        )
+        if cumulative_decimal > ZERO and price_decimal == ZERO:
+            raise ValueError("fill_price must be positive for a positive fill")
+        quantity_tolerance = decimal_value("0.000000001", "quantity_tolerance")
+        assert quantity_tolerance is not None
         now = iso_now()
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -932,15 +955,49 @@ class DurableExecutionStore:
             prior = conn.execute("SELECT 1 FROM broker_fill_events WHERE broker_event_key=?", (broker_event_key,)).fetchone()
             if prior:
                 return dict(intent)
-            requested = float(intent["requested_quantity"])
-            previous = float(intent["filled_quantity"] or 0)
-            if cumulative_quantity + 1e-9 < previous:
+            requested = decimal_value(intent["requested_quantity"], "requested_quantity", minimum=ZERO)
+            previous = decimal_value(
+                intent["filled_quantity_decimal"]
+                if "filled_quantity_decimal" in intent.keys()
+                and intent["filled_quantity_decimal"] not in (None, "")
+                else (intent["filled_quantity"] or 0),
+                "previous_filled_quantity",
+                minimum=ZERO,
+            )
+            assert requested is not None and previous is not None
+            if requested == ZERO:
+                raise ValueError("requested_quantity must be positive")
+            if cumulative_decimal + quantity_tolerance < previous:
                 # Retain/dedupe the stale broker event but never reduce quantity.
                 counter = int(intent["transition_counter"] or 0) + 1
                 conn.execute(
                     """INSERT INTO broker_fill_events(id,intent_id,broker_event_key,broker_order_id,cumulative_filled_quantity,
                            delta_quantity,fill_price,occurred_at,received_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id, cumulative_quantity, 0.0, fill_price, occurred_at or now, now, json_dumps({"out_of_order": True, "retained_cumulative": previous})),
+                    (
+                        str(uuid.uuid4()), intent_id, broker_event_key, broker_order_id,
+                        legacy_float(cumulative_decimal), 0.0, legacy_float(price_decimal),
+                        occurred_at or now, now,
+                        json_dumps(
+                            {
+                                "out_of_order": True,
+                                "retained_cumulative": decimal_text(previous),
+                                "canonical_decimal_evidence": True,
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """UPDATE broker_fill_events SET
+                       cumulative_filled_quantity_decimal=?,delta_quantity_decimal='0',
+                       fill_price_decimal=?,fees_decimal=?,adjustments_decimal=?,
+                       decimal_provenance=?,decimal_accounting_version=?
+                       WHERE broker_event_key=?""",
+                    (
+                        decimal_text(cumulative_decimal), decimal_text(price_decimal),
+                        decimal_text(fees_decimal), decimal_text(adjustments_decimal),
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                        broker_event_key,
+                    ),
                 )
                 conn.execute(
                     """UPDATE pnl_ledger_status SET confidence='partially_reconstructed',
@@ -950,28 +1007,49 @@ class DurableExecutionStore:
                 )
                 conn.execute(
                     "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), intent_id, f"{intent_id}:out_of_order_fill:{broker_event_key}", intent["state"], intent["state"], "out_of_order_fill_ignored", json_dumps({"reported": cumulative_quantity, "retained": previous}), now, counter),
+                    (str(uuid.uuid4()), intent_id, f"{intent_id}:out_of_order_fill:{broker_event_key}", intent["state"], intent["state"], "out_of_order_fill_ignored", json_dumps({"reported": decimal_text(cumulative_decimal), "retained": decimal_text(previous)}), now, counter),
                 )
                 conn.execute("UPDATE order_intents SET transition_counter=?,updated_at=? WHERE id=?", (counter, now, intent_id))
                 return dict(intent)
-            cumulative = min(cumulative_quantity, requested)
-            delta = max(0.0, cumulative - previous)
-            prior_avg = float(intent["average_fill_price"] or 0)
-            delta_fill_price = fill_price
-            if price_is_cumulative_average and delta > 0:
-                delta_fill_price = max(0.0, ((cumulative * fill_price) - (previous * prior_avg)) / delta)
-                average = fill_price
+            cumulative = min(cumulative_decimal, requested)
+            delta = max(ZERO, cumulative - previous)
+            prior_avg = decimal_value(
+                intent["average_fill_price_decimal"]
+                if "average_fill_price_decimal" in intent.keys()
+                and intent["average_fill_price_decimal"] not in (None, "")
+                else (intent["average_fill_price"] or 0),
+                "previous_average_fill_price",
+                minimum=ZERO,
+            )
+            assert prior_avg is not None
+            delta_fill_price = price_decimal
+            if price_is_cumulative_average and delta > ZERO:
+                delta_fill_price = max(
+                    ZERO,
+                    ((cumulative * price_decimal) - (previous * prior_avg)) / delta,
+                )
+                average = price_decimal
             else:
-                average = ((previous * prior_avg) + (delta * fill_price)) / cumulative if cumulative > 0 else None
+                average = (
+                    ((previous * prior_avg) + (delta * price_decimal)) / cumulative
+                    if cumulative > ZERO
+                    else None
+                )
             quote = {
                 "bid": intent["quote_bid"], "ask": intent["quote_ask"],
                 "midpoint": ((float(intent["quote_bid"]) + float(intent["quote_ask"])) / 2.0)
                 if intent["quote_bid"] is not None and intent["quote_ask"] is not None else None,
             }
-            shortfall = implementation_shortfall_bps(quote, intent["side"], float(average or fill_price))
+            shortfall = implementation_shortfall_bps(
+                quote, intent["side"], float(average or price_decimal)
+            )
             current = OrderState(intent["state"])
             late_after_cancel = current == OrderState.CANCELLED and cumulative > previous
-            target = current if late_after_cancel else (OrderState.FILLED if cumulative >= requested - 1e-9 else OrderState.PARTIALLY_FILLED)
+            target = current if late_after_cancel else (
+                OrderState.FILLED
+                if cumulative >= requested - quantity_tolerance
+                else OrderState.PARTIALLY_FILLED
+            )
             if current != target:
                 validate_transition(current, target)
             counter = int(intent["transition_counter"] or 0) + 1
@@ -979,7 +1057,34 @@ class DurableExecutionStore:
             conn.execute(
                 """INSERT INTO broker_fill_events(id,intent_id,broker_event_key,broker_order_id,cumulative_filled_quantity,
                        delta_quantity,fill_price,occurred_at,received_at,payload) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (fill_event_id, intent_id, broker_event_key, broker_order_id, cumulative, delta, delta_fill_price, occurred_at or now, now, json_dumps({"aggregate": True, "reported_price": fill_price, "price_semantics": "cumulative_average" if price_is_cumulative_average else "delta_execution"})),
+                (
+                    fill_event_id, intent_id, broker_event_key, broker_order_id,
+                    legacy_float(cumulative), legacy_float(delta), legacy_float(delta_fill_price),
+                    occurred_at or now, now,
+                    json_dumps(
+                        {
+                            "aggregate": True,
+                            "reported_price": decimal_text(price_decimal),
+                            "price_semantics": "cumulative_average"
+                            if price_is_cumulative_average
+                            else "delta_execution",
+                            "canonical_decimal_evidence": True,
+                        }
+                    ),
+                ),
+            )
+            conn.execute(
+                """UPDATE broker_fill_events SET
+                   cumulative_filled_quantity_decimal=?,delta_quantity_decimal=?,
+                   fill_price_decimal=?,fees_decimal=?,adjustments_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=?
+                   WHERE broker_event_key=?""",
+                (
+                    decimal_text(cumulative), decimal_text(delta),
+                    decimal_text(delta_fill_price), decimal_text(fees_decimal),
+                    decimal_text(adjustments_decimal), EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION, broker_event_key,
+                ),
             )
             # Lot/P&L accounting shares the fill transaction: a crash cannot
             # commit quantity while omitting its prospective accounting event.
@@ -992,8 +1097,8 @@ class DurableExecutionStore:
                 delta_quantity=delta,
                 fill_price=delta_fill_price,
                 occurred_at=occurred_at or now,
-                fees=fees,
-                adjustments=adjustments,
+                fees=fees_decimal,
+                adjustments=adjustments_decimal,
                 source=source,
             )
             from .profit_milestones import apply_take_profit_fill_in_transaction
@@ -1003,19 +1108,26 @@ class DurableExecutionStore:
                 intent=dict(intent),
                 fill_event_id=fill_event_id,
                 broker_event_key=broker_event_key,
-                cumulative_quantity=cumulative,
-                delta_quantity=delta,
-                fill_price=delta_fill_price,
+                cumulative_quantity=legacy_float(cumulative),
+                delta_quantity=legacy_float(delta),
+                fill_price=legacy_float(delta_fill_price),
                 occurred_at=occurred_at or now,
                 now=now,
             )
             conn.execute(
                 """UPDATE order_intents SET filled_quantity=?,average_fill_price=?,state=?,broker_order_id=COALESCE(?,broker_order_id),
-                       implementation_shortfall_bps=?,
+                       implementation_shortfall_bps=?,filled_quantity_decimal=?,average_fill_price_decimal=?,
+                       decimal_provenance=?,decimal_accounting_version=?,
                        updated_at=?,terminal_at=?,transition_counter=? WHERE id=?""",
-                (cumulative, average, target.value, broker_order_id, shortfall, now, now if target == OrderState.FILLED else None, counter, intent_id),
+                (
+                    legacy_float(cumulative), legacy_float(average), target.value, broker_order_id,
+                    shortfall, decimal_text(cumulative),
+                    decimal_text(average) if average is not None else None,
+                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                    now, now if target == OrderState.FILLED else None, counter, intent_id,
+                ),
             )
-            remaining_ratio = max(0.0, requested - cumulative) / requested
+            remaining_ratio = float(max(ZERO, requested - cumulative) / requested)
             reservation_state = "released" if target == OrderState.FILLED or late_after_cancel else "active"
             if late_after_cancel:
                 remaining_ratio = 0.0
@@ -1028,7 +1140,7 @@ class DurableExecutionStore:
             )
             conn.execute(
                 "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,broker_event_id,filled_quantity,fill_price,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "late_fill_after_cancelled" if late_after_cancel else ("final_fill" if target == OrderState.FILLED else "partial_fill"), broker_event_key, cumulative, delta_fill_price, json_dumps({"delta_quantity": delta}), now, counter),
+                (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "late_fill_after_cancelled" if late_after_cancel else ("final_fill" if target == OrderState.FILLED else "partial_fill"), broker_event_key, legacy_float(cumulative), legacy_float(delta_fill_price), json_dumps({"delta_quantity": decimal_text(delta)}), now, counter),
             )
             conn.execute(
                 "UPDATE orders SET broker_order_id=COALESCE(?,broker_order_id),status=?,implementation_shortfall_bps=?,updated_at=? WHERE id=?",
@@ -1042,12 +1154,31 @@ class DurableExecutionStore:
                        fill_notification_status=CASE WHEN ?='filled' THEN 'pending' ELSE fill_notification_status END,
                        fill_notification_error=CASE WHEN ?='filled' THEN NULL ELSE fill_notification_error END
                        WHERE order_id=?""",
-                    (cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), shortfall, target.value, target.value, target.value, intent_id),
+                    (legacy_float(cumulative), legacy_float(average), occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id, "canonical_decimal_evidence": True}), shortfall, target.value, target.value, target.value, intent_id),
+                )
+                conn.execute(
+                    """UPDATE fills SET qty_decimal=?,price_decimal=?,decimal_provenance=?,
+                       decimal_accounting_version=? WHERE order_id=?""",
+                    (
+                        decimal_text(cumulative),
+                        decimal_text(average) if average is not None else None,
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, intent_id,
+                    ),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,implementation_shortfall_bps,fill_notification_status) VALUES(?,?,?,?,?,?,?,?)",
-                    (intent["run_id"], intent_id, cumulative, average, occurred_at or now, json_dumps({"aggregate": True, "intent_id": intent_id}), shortfall, "pending"),
+                    """INSERT INTO fills(
+                       run_id,order_id,qty,price,filled_at,payload,implementation_shortfall_bps,
+                       fill_notification_status,qty_decimal,price_decimal,decimal_provenance,
+                       decimal_accounting_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent["run_id"], intent_id, legacy_float(cumulative), legacy_float(average),
+                        occurred_at or now,
+                        json_dumps({"aggregate": True, "intent_id": intent_id, "canonical_decimal_evidence": True}),
+                        shortfall, "pending", decimal_text(cumulative),
+                        decimal_text(average) if average is not None else None,
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                    ),
                 )
         return self.get_intent(intent_id)
 
@@ -1473,7 +1604,14 @@ class DurableExecutionStore:
                 LEFT JOIN trade_proposals p ON p.id=ps.proposal_id
                 WHERE ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
         }
-        return {name: int(self.storage.fetch_all(sql)[0]["n"]) for name, sql in checks.items()}
+        report = {
+            name: int(self.storage.fetch_all(sql)[0]["n"])
+            for name, sql in checks.items()
+        }
+        from .fixed_point_accounting import fixed_point_integrity_report
+
+        report.update(fixed_point_integrity_report(self.storage))
+        return report
 
 
 class Executor:
@@ -1517,7 +1655,7 @@ class Executor:
         only approval-less path is recovery of an already-linked intent; it
         cannot create a new intent or a new authority chain.
         """
-        from .approval_authority import authority_envelope, authority_fingerprint
+        from .approval_authority import authority_envelope
         from .approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 
         if self.storage is None:
@@ -1863,7 +2001,7 @@ class Executor:
             # Persist the final local validation decision before intent creation.
             # create_or_get_intent then links this workflow in the same SQLite
             # transaction as the intent and reservation.
-            from .approval_workflow import ApprovalWorkflowConflict, ApprovalWorkflowState, ApprovalWorkflowStore
+            from .approval_workflow import ApprovalWorkflowConflict, ApprovalWorkflowState
 
             workflow = workflow_store.get_by_approval(str(effective_approval_id)) if effective_approval_id else None
             if workflow is None:

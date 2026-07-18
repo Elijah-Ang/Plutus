@@ -7,6 +7,15 @@ from typing import Any
 
 from .execution import DurableExecutionStore
 from .accounting import separate_accounting_components
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    ZERO,
+    decimal_text,
+    decimal_value,
+    legacy_float,
+    row_decimal,
+)
+from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .lot_ledger import LotLedger
 from .order_state import BROKER_RELEVANT_STATES, OrderState, broker_status_to_state
 from .position_lifecycle import PositionLifecycleManager
@@ -319,31 +328,77 @@ class BrokerReconciler:
             return
         PositionLifecycleManager(self.storage).reconcile(positions)
         unrealized_values = [_value(position, "unrealized_pl") for position in positions]
-        unrealized = sum(float(value) for value in unrealized_values if value is not None) if all(value is not None for value in unrealized_values) else None
-        current_equity = _float_or_none(_value(account, "equity"))
+        try:
+            unrealized = (
+                sum(
+                    (
+                        decimal_value(value, "position.unrealized_pl")
+                        for value in unrealized_values
+                    ),
+                    ZERO,
+                )
+                if all(value is not None for value in unrealized_values)
+                else None
+            )
+        except ValueError:
+            unrealized = None
+        current_equity = _decimal_or_none(_value(account, "equity"))
+        current_cash = _decimal_or_none(_value(account, "cash"))
+        current_settled_cash = _decimal_or_none(
+            _value(account, "settled_cash", _value(account, "cash"))
+        )
         current_realized, realized_confidence = LotLedger(self.storage).cumulative_realized_pl(as_of=iso_now())
         prior_rows = self.storage.fetch_all(
-            "SELECT equity,realized_fifo_pnl,unrealized_pl FROM cash_snapshots ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM cash_snapshots ORDER BY id DESC LIMIT 1"
         )
         prior = prior_rows[0] if prior_rows else {}
         components = separate_accounting_components(
             current_equity=current_equity,
-            previous_equity=prior.get("equity"),
+            previous_equity=row_decimal(
+                prior, "equity_decimal", "equity", allow_none=True
+            ) if prior else None,
             current_realized_fifo_pnl=current_realized,
-            previous_realized_fifo_pnl=prior.get("realized_fifo_pnl"),
+            previous_realized_fifo_pnl=row_decimal(
+                prior,
+                "realized_fifo_pnl_decimal",
+                "realized_fifo_pnl",
+                allow_none=True,
+            ) if prior else None,
             current_unrealized_pl=unrealized,
-            previous_unrealized_pl=prior.get("unrealized_pl"),
+            previous_unrealized_pl=row_decimal(
+                prior, "unrealized_pl_decimal", "unrealized_pl", allow_none=True
+            ) if prior else None,
         )
         self.storage.execute(
             """INSERT INTO cash_snapshots(
                run_id,equity,cash,settled_cash,realized_pl,unrealized_pl,realized_fifo_pnl,
-               account_equity_change,unrealized_change,external_cash_flow,accounting_version,accounting_confidence,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (self.run_id, current_equity, _float_or_none(_value(account, "cash")),
-             _float_or_none(_value(account, "settled_cash", _value(account, "cash"))), current_realized, unrealized,
-             current_realized, components.account_equity_change, components.unrealized_change,
-             components.external_cash_flow, components.accounting_version,
-             components.confidence if realized_confidence in {"verified", "reconstructed"} else "unavailable", iso_now()),
+               account_equity_change,unrealized_change,external_cash_flow,accounting_version,
+               accounting_confidence,created_at,equity_decimal,cash_decimal,settled_cash_decimal,
+               realized_fifo_pnl_decimal,unrealized_pl_decimal,account_equity_change_decimal,
+               unrealized_change_decimal,external_cash_flow_decimal,decimal_provenance,
+               decimal_accounting_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                self.run_id, legacy_float(current_equity), legacy_float(current_cash),
+                legacy_float(current_settled_cash), legacy_float(current_realized),
+                legacy_float(unrealized), legacy_float(current_realized),
+                legacy_float(components.account_equity_change),
+                legacy_float(components.unrealized_change),
+                legacy_float(components.external_cash_flow), components.accounting_version,
+                components.confidence if realized_confidence in {"verified", "reconstructed"} else "unavailable",
+                iso_now(), decimal_text(current_equity) if current_equity is not None else None,
+                decimal_text(current_cash) if current_cash is not None else None,
+                decimal_text(current_settled_cash) if current_settled_cash is not None else None,
+                decimal_text(current_realized) if current_realized is not None else None,
+                decimal_text(unrealized) if unrealized is not None else None,
+                decimal_text(components.account_equity_change)
+                if components.account_equity_change is not None else None,
+                decimal_text(components.unrealized_change)
+                if components.unrealized_change is not None else None,
+                decimal_text(components.external_cash_flow)
+                if components.external_cash_flow is not None else None,
+                EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+            ),
         )
         for position in positions:
             self.storage.execute(
@@ -366,4 +421,11 @@ def _float_or_none(value: Any) -> float | None:
     try:
         return None if value is None else float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _decimal_or_none(value: Any):
+    try:
+        return decimal_value(value, "broker account value", allow_none=True)
+    except ValueError:
         return None

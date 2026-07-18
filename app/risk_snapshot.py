@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Any
 
 from .execution import DurableExecutionStore
@@ -105,8 +105,18 @@ class RiskSnapshotBuilder:
             unavailable.append("held_open_stop_risk")
 
         realized = LotLedger(self.storage).summary()
-        daily_pl = realized.daily_realized_pl
-        weekly_pl = realized.weekly_realized_pl
+        # The FIFO ledger is authoritative Decimal evidence.  Risk snapshots
+        # retain REAL compatibility projections for existing percentage gates.
+        daily_pl = (
+            float(realized.daily_realized_pl)
+            if realized.daily_realized_pl is not None
+            else None
+        )
+        weekly_pl = (
+            float(realized.weekly_realized_pl)
+            if realized.weekly_realized_pl is not None
+            else None
+        )
         daily_loss_pct = (max(0.0, -daily_pl) / equity * 100) if daily_pl is not None and equity else None
         weekly_loss_pct = (max(0.0, -weekly_pl) / equity * 100) if weekly_pl is not None and equity else None
         if daily_pl is None:
