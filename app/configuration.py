@@ -217,6 +217,7 @@ STRICT_NESTED_KEYS = {
     },
     "crypto.strategy_policy": {
         "mode", "lifecycle", "formula_version", "schema_version", "strategies",
+        "bar_interval_seconds", "maximum_latest_bar_age_seconds",
         "minimum_history_hours", "trend_fast_hours", "trend_slow_hours",
         "breakout_lookback_hours", "volatility_lookback_hours",
         "trend_minimum_24h_return", "breakout_buffer_pct",
@@ -925,6 +926,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "volatility_adjusted_momentum",
         ],
         "crypto strategies must use the reviewed ordered four-strategy set",
+    )
+    require(
+        crypto_strategy.get("bar_interval_seconds") == 3600,
+        "crypto strategy bars must use an exact one-hour interval",
+    )
+    _bounded(
+        crypto_strategy.get("maximum_latest_bar_age_seconds"),
+        "crypto.strategy_policy.maximum_latest_bar_age_seconds", errors, 3600, 7200,
     )
     strategy_history = _bounded(
         crypto_strategy.get("minimum_history_hours"),

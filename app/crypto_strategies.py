@@ -89,7 +89,7 @@ def _utc(value: Any, label: str) -> datetime:
     except (TypeError, ValueError) as exc:
         raise CryptoStrategyError(f"{label} timestamp is invalid") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        raise CryptoStrategyError(f"{label} timestamp must include a timezone")
     return parsed.astimezone(UTC)
 
 
@@ -122,6 +122,33 @@ def _bar_rows(raw: Any, symbol: str) -> list[dict[str, Any]]:
     if len({item["timestamp"] for item in rows}) != len(rows):
         raise CryptoStrategyError("crypto strategy bars contain duplicate timestamps")
     return rows
+
+
+def _validate_hourly_bars(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    as_of: datetime,
+    interval_seconds: int,
+    maximum_latest_age_seconds: int,
+) -> Decimal:
+    if interval_seconds != 3600:
+        raise CryptoStrategyError("crypto strategy bar interval must be exactly one hour")
+    if not rows:
+        raise CryptoStrategyError("crypto strategy history is insufficient")
+    for index, row in enumerate(rows):
+        timestamp = row["timestamp"]
+        if timestamp.minute or timestamp.second or timestamp.microsecond:
+            raise CryptoStrategyError(f"crypto strategy bar {index} is not aligned to an hourly boundary")
+        if index:
+            elapsed = Decimal(str((timestamp - rows[index - 1]["timestamp"]).total_seconds()))
+            if elapsed != Decimal(interval_seconds):
+                raise CryptoStrategyError("crypto strategy bars are not a contiguous hourly series")
+    latest_age = Decimal(str((as_of - rows[-1]["timestamp"]).total_seconds()))
+    if latest_age < ZERO:
+        raise CryptoStrategyError("crypto strategy bars contain future information")
+    if latest_age > Decimal(maximum_latest_age_seconds):
+        raise CryptoStrategyError("crypto strategy latest hourly bar is stale")
+    return latest_age
 
 
 def _ema(values: Sequence[Decimal], periods: int) -> Decimal:
@@ -183,14 +210,20 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     if strategies != SUPPORTED_STRATEGIES:
         failures.append("strategy_set_or_order_mismatch")
     try:
+        interval = int(policy.get("bar_interval_seconds"))
+        maximum_latest_age = int(policy.get("maximum_latest_bar_age_seconds"))
         minimum_history = int(policy.get("minimum_history_hours"))
         fast = int(policy.get("trend_fast_hours"))
         slow = int(policy.get("trend_slow_hours"))
         breakout = int(policy.get("breakout_lookback_hours"))
         volatility = int(policy.get("volatility_lookback_hours"))
     except (TypeError, ValueError):
-        minimum_history = fast = slow = breakout = volatility = 0
+        interval = maximum_latest_age = minimum_history = fast = slow = breakout = volatility = 0
         failures.append("strategy_integer_policy_invalid")
+    if interval != 3600:
+        failures.append("strategy_bar_interval_not_one_hour")
+    if not 3600 <= maximum_latest_age <= 7200:
+        failures.append("strategy_latest_bar_age_policy_invalid")
     if not (minimum_history >= 96 and 2 <= fast < slow <= minimum_history and 12 <= breakout < minimum_history and 24 <= volatility < minimum_history):
         failures.append("strategy_history_windows_invalid")
     decimal_names = (
@@ -212,7 +245,7 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
             decimals[name] = _trusted_decimal(policy.get(name), f"crypto.strategy_policy.{name}")
         except CryptoStrategyError:
             failures.append(f"invalid_{name}")
-    if decimals:
+    if len(decimals) == len(decimal_names):
         if not (ZERO < decimals["pullback_minimum_pct"] < decimals["pullback_maximum_pct"] < Decimal("0.25")):
             failures.append("pullback_policy_invalid")
         if not (ZERO < decimals["minimum_stop_distance_pct"] <= decimals["maximum_stop_distance_pct"] <= Decimal("0.25")):
@@ -224,6 +257,8 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         **policy,
         **decimals,
+        "bar_interval_seconds": interval,
+        "maximum_latest_bar_age_seconds": maximum_latest_age,
         "minimum_history_hours": minimum_history,
         "trend_fast_hours": fast,
         "trend_slow_hours": slow,
@@ -304,11 +339,12 @@ def evaluate_crypto_strategies(
     created_at: datetime,
 ) -> CryptoStrategyDecision:
     policy = _policy(config)
+    created = _utc(created_at, "crypto strategy creation")
     config_hash = str(config.get("effective_config_hash") or "").strip().lower()
     if not _valid_hash(config_hash) or market.config_hash != config_hash:
         raise CryptoStrategyError("crypto strategy configuration identity is missing or changed")
-    if not market.authoritative or not market.execution_eligible:
-        raise CryptoStrategyError("crypto strategy requires authoritative execution-eligible market evidence")
+    if not market.authoritative:
+        raise CryptoStrategyError("crypto strategy requires authoritative market evidence")
     if market.research_run_id != str(research_run_id):
         raise CryptoStrategyError("crypto strategy research-run binding mismatch")
     as_of = _utc(market.quote_timestamp, "market quote")
@@ -316,7 +352,7 @@ def evaluate_crypto_strategies(
         (config.get("crypto") or {}).get("max_price_age_seconds"),
         "crypto maximum price age",
     )
-    evidence_age = Decimal(str((created_at.astimezone(UTC) - as_of).total_seconds()))
+    evidence_age = Decimal(str((created - as_of).total_seconds()))
     if evidence_age < Decimal("-1") or evidence_age > maximum_age:
         raise CryptoStrategyError("crypto strategy market evidence is no longer fresh")
     rows = _bar_rows(bars, market.symbol)
@@ -326,6 +362,12 @@ def evaluate_crypto_strategies(
     if len(rows) < policy["minimum_history_hours"]:
         raise CryptoStrategyError("crypto strategy history is insufficient")
     rows = rows[-policy["minimum_history_hours"]:]
+    latest_bar_age = _validate_hourly_bars(
+        rows,
+        as_of=as_of,
+        interval_seconds=policy["bar_interval_seconds"],
+        maximum_latest_age_seconds=policy["maximum_latest_bar_age_seconds"],
+    )
     closes = [row["close"] for row in rows]
     metrics: dict[str, Decimal] = {
         "close": closes[-1],
@@ -343,6 +385,9 @@ def evaluate_crypto_strategies(
     metrics["volatility_adjusted_momentum"] = metrics["return_24h"] / max(metrics["annualized_volatility"], Decimal("0.000000001"))
     evaluations = _evaluations(metrics, policy)
     blockers: list[str] = []
+    if not market.execution_eligible:
+        reasons = tuple(market.failure_reasons) or ("market_execution_not_eligible",)
+        blockers.extend(f"market_execution_ineligible:{reason}" for reason in reasons)
     if metrics["annualized_volatility"] >= policy["maximum_annualized_volatility"]:
         blockers.append("crypto_strategy_volatility_above_policy")
     passed = [item for item in evaluations if item["passed"] is True]
@@ -368,6 +413,9 @@ def evaluate_crypto_strategies(
         "market_evidence_id": market.id,
         "market_evidence_fingerprint": market.evidence_fingerprint,
         "bar_count": len(rows),
+        "bar_timeframe": "1Hour",
+        "bar_interval_seconds": policy["bar_interval_seconds"],
+        "latest_bar_age_seconds": _text(latest_bar_age),
         "bar_start": rows[0]["timestamp"].isoformat(),
         "bar_end": rows[-1]["timestamp"].isoformat(),
         "bar_fingerprint": _hash(canonical_bars),
@@ -399,7 +447,7 @@ def evaluate_crypto_strategies(
         "formula_version": CRYPTO_STRATEGY_FORMULA_VERSION,
         "schema_version": CRYPTO_STRATEGY_SCHEMA_VERSION,
         "as_of": as_of.isoformat(),
-        "created_at": created_at.astimezone(UTC).isoformat(),
+        "created_at": created.isoformat(),
     }
     fingerprint = _hash(payload)
     return CryptoStrategyDecision(

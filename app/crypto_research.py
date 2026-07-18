@@ -306,7 +306,7 @@ class CryptoResearchEngine:
             reason=reason,
         )
         self._with_market_evidence(result, market_evidence)
-        if market_evidence.authoritative and market_evidence.execution_eligible:
+        if market_evidence.authoritative:
             try:
                 decision = CryptoStrategyStore(self.storage).evaluate(
                     self.config, self.run_id, research_run_id,

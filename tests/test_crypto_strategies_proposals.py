@@ -204,6 +204,8 @@ def test_default_config_keeps_strategy_and_proposal_stage_dormant():
     ("section", "key", "value"),
     [
         ("strategy_policy", "lifecycle", "PROBE"),
+        ("strategy_policy", "bar_interval_seconds", 60),
+        ("strategy_policy", "maximum_latest_bar_age_seconds", 7201),
         ("proposal_policy", "create_trade_proposals", True),
         ("proposal_policy", "send_telegram", True),
         ("proposal_policy", "manual_approval_enabled", True),
@@ -254,6 +256,33 @@ def test_hourly_crypto_research_persists_strategy_decision_without_proposal(tmp_
     assert broker.submit_calls == 0
 
 
+def test_hourly_research_preserves_wide_market_strategy_as_blocked_evidence(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+
+    class WideResearchBroker(Broker):
+        def __init__(self):
+            super().__init__(wide=True)
+
+        def get_crypto_historical_bars(self, symbol, timeframe="1Hour", limit=500):
+            rows = _bars(count=max(168, limit))
+            for row in rows:
+                row["symbol"] = symbol
+                row["volume"] = "1000"
+            return rows
+
+    broker = WideResearchBroker()
+    result = CryptoResearchEngine(config, storage, broker=broker, run_id="run").run_research(
+        symbols=["BTC/USD"], now=NOW
+    )[0]
+    assert result.strategy_decision_id
+    assert result.strategy_signal_eligible is False
+    assert "market_execution_ineligible:spread_exceeds_configured_limit" in result.strategy_blockers
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_strategy_decisions")[0]["n"] == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
+    assert broker.submit_calls == 0
+
+
 def test_future_bar_fails_closed_without_strategy_row(tmp_path):
     storage = _storage(tmp_path)
     config = _config()
@@ -269,6 +298,35 @@ def test_insufficient_strategy_history_fails_closed(tmp_path):
     _, market = _market(storage, config, Broker())
     with pytest.raises(CryptoStrategyError, match="history is insufficient"):
         CryptoStrategyStore(storage).evaluate(config, "run", "research", market.id, _bars(count=100), now=NOW)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("gap", "contiguous hourly"),
+        ("misaligned", "hourly boundary"),
+        ("stale", "latest hourly bar is stale"),
+    ],
+)
+def test_non_hourly_or_stale_bar_series_cannot_create_strategy_authority(tmp_path, mutation, message):
+    storage = _storage(tmp_path)
+    config = _config()
+    _, market = _market(storage, config, Broker())
+    bars = _bars()
+    if mutation == "gap":
+        for row in bars[:-1]:
+            row["timestamp"] -= timedelta(hours=1)
+    elif mutation == "misaligned":
+        for row in bars:
+            row["timestamp"] -= timedelta(minutes=5)
+    else:
+        for row in bars:
+            row["timestamp"] -= timedelta(hours=3)
+    with pytest.raises(CryptoStrategyError, match=message):
+        CryptoStrategyStore(storage).evaluate(
+            config, "run", "research", market.id, bars, now=NOW
+        )
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_strategy_decisions")[0]["n"] == 0
 
 
 def test_previously_fresh_market_evidence_cannot_be_reused_after_it_stales(tmp_path):
@@ -325,11 +383,26 @@ def test_preview_binds_strategy_risk_sizing_and_complete_display(tmp_path):
     }
     assert required <= preview.display.keys()
     assert preview.display["approval_command_enabled"] is False
-    gross_reward = D(preview.display["expected_reward_usd"])
+    quantity = D(preview.display["quantity"])
+    limit_price = D(preview.display["limit_price"])
+    target_price = D(preview.display["target_price"])
+    fee_rate = D("25") / D("10000")
+    gross_reward = quantity * (target_price - limit_price)
+    entry_fee = quantity * limit_price * fee_rate
+    target_exit_fee = quantity * target_price * fee_rate
+    expected_cost = entry_fee + target_exit_fee
+    net_reward = gross_reward - expected_cost
     maximum_loss = D(preview.display["maximum_loss_usd"])
-    assert gross_reward / maximum_loss == D(preview.display["expected_reward_r"])
+    assert D(preview.display["expected_gross_reward_usd"]) == gross_reward
+    assert D(preview.display["expected_entry_fee_usd"]) == entry_fee
+    assert D(preview.display["expected_target_exit_fee_usd"]) == target_exit_fee
+    assert D(preview.display["expected_execution_cost_usd"]) == expected_cost
+    assert D(preview.display["expected_reward_usd"]) == net_reward
+    assert D(preview.display["expected_net_reward_after_estimated_cost_usd"]) == net_reward
+    assert net_reward / maximum_loss == D(preview.display["expected_reward_r"])
+    assert gross_reward / maximum_loss == D(preview.display["gross_reward_r"])
     assert D(preview.display["expected_reward_r"]) >= D("1.75")
-    assert D(preview.display["expected_net_reward_after_estimated_cost_usd"]) > 0
+    assert net_reward > 0
     assert broker.submit_calls == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM approvals")[0]["n"] == 0
@@ -392,14 +465,33 @@ def test_mismatched_strategy_and_risk_run_cannot_create_preview(tmp_path):
         CryptoProposalStore(storage).create_preview(config, strategy.id, risk.decision_id, now=NOW)
 
 
-@pytest.mark.parametrize("broker", [Broker(stale=True), Broker(wide=True)])
-def test_stale_or_wide_market_cannot_reach_strategy_or_preview(tmp_path, broker):
+def test_stale_market_cannot_reach_strategy_or_preview(tmp_path):
     storage = _storage(tmp_path)
     config = _config()
+    broker = Broker(stale=True)
     _, market = _market(storage, config, broker)
+    assert market.authoritative is False
     assert market.execution_eligible is False
-    with pytest.raises(CryptoStrategyError, match="execution-eligible"):
+    with pytest.raises(CryptoStrategyError, match="authoritative market evidence"):
         CryptoStrategyStore(storage).evaluate(config, "run", "research", market.id, _bars(), now=NOW)
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
+    assert broker.submit_calls == 0
+
+
+def test_authoritative_wide_market_records_blocked_strategy_evidence_without_preview(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    broker = Broker(wide=True)
+    _, market = _market(storage, config, broker)
+    assert market.authoritative is True
+    assert market.execution_eligible is False
+    decision = CryptoStrategyStore(storage).evaluate(
+        config, "run", "research", market.id, _bars(), now=NOW
+    )
+    assert decision.selected_strategy in SUPPORTED_STRATEGIES
+    assert decision.signal_eligible is False
+    assert "market_execution_ineligible:spread_exceeds_configured_limit" in decision.blockers
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_strategy_decisions")[0]["n"] == 1
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
     assert broker.submit_calls == 0
 

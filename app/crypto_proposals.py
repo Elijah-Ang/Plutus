@@ -20,9 +20,9 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from typing import Any, Mapping
 
 from .approval_authority import canonical_json
-from .crypto_risk import CryptoRiskError, CryptoRiskStore
+from .crypto_risk import CryptoRiskStore
 from .crypto_sizing import load_verified_crypto_sizing
-from .crypto_strategies import CryptoStrategyError, CryptoStrategyStore
+from .crypto_strategies import CryptoStrategyStore
 from .formula_versions import (
     CRYPTO_PROPOSAL_FORMULA_VERSION,
     CRYPTO_PROPOSAL_SCHEMA_VERSION,
@@ -31,6 +31,8 @@ from .utils import iso_now, json_dumps
 
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
+BPS = Decimal("10000")
 
 
 class CryptoProposalError(ValueError):
@@ -58,6 +60,18 @@ def _decimal(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
     return number
 
 
+def _trusted_decimal(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise CryptoProposalError(f"{label} is missing or invalid")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CryptoProposalError(f"{label} is missing or invalid") from exc
+    if not number.is_finite() or number < minimum:
+        raise CryptoProposalError(f"{label} must be finite and nonnegative")
+    return number
+
+
 def _text(value: Decimal | None) -> str | None:
     if value is None:
         return None
@@ -72,7 +86,7 @@ def _utc(value: Any, label: str) -> datetime:
     except (TypeError, ValueError) as exc:
         raise CryptoProposalError(f"{label} timestamp is invalid") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        raise CryptoProposalError(f"{label} timestamp must include a timezone")
     return parsed.astimezone(UTC)
 
 
@@ -219,13 +233,37 @@ def _build_payload(
     maximum_loss = _decimal(sizing.canonical_stop_risk, "canonical maximum loss")
     estimated_fees = _decimal(sizing.estimated_fees, "estimated fees")
     estimated_slippage = _decimal(sizing.estimated_stop_slippage, "estimated stop slippage")
+    stop_execution_price = _decimal(sizing.stop_execution_price, "conservative stop execution price")
     if not (stop_price < limit_price) or quantity <= ZERO or notional <= ZERO or maximum_loss <= ZERO:
         raise CryptoProposalError("crypto proposal economics are not a valid bounded long entry")
     price_increment = _decimal(sizing.price_increment, "current price increment", minimum=Decimal("0.000000001"))
-    raw_target = limit_price + maximum_loss / quantity * target_reward_r
+    fee_bps = _trusted_decimal(
+        ((config.get("crypto") or {}).get("sizing_policy") or {}).get("conservative_taker_fee_bps_per_side"),
+        "conservative crypto fee bps per side",
+    )
+    fee_rate = fee_bps / BPS
+    if fee_rate >= ONE:
+        raise CryptoProposalError("conservative crypto fee rate is outside its finite policy range")
+    independently_recomputed_stop_fees = quantity * (limit_price + stop_execution_price) * fee_rate
+    if independently_recomputed_stop_fees != estimated_fees:
+        raise CryptoProposalError("crypto sizing fee evidence does not independently reconcile")
+    # Solve for a target whose proceeds after both entry and target-exit fees
+    # retain at least the configured R multiple of the cost-inclusive maximum
+    # stop loss.  A gross-price target would otherwise overstate net reward.
+    cost_adjusted_target = (
+        limit_price * (ONE + fee_rate) + maximum_loss / quantity * target_reward_r
+    ) / (ONE - fee_rate)
+    raw_target = max(strategy_target_price, cost_adjusted_target)
     target_price = (raw_target / price_increment).to_integral_value(rounding=ROUND_CEILING) * price_increment
-    if target_price < strategy_target_price:
-        raise CryptoProposalError("canonical cost-inclusive target is below the strategy target")
+    entry_fee = quantity * limit_price * fee_rate
+    target_exit_fee = quantity * target_price * fee_rate
+    expected_execution_cost = entry_fee + target_exit_fee
+    gross_reward = quantity * (target_price - limit_price)
+    net_reward = gross_reward - expected_execution_cost
+    net_reward_r = net_reward / maximum_loss
+    gross_reward_r = gross_reward / maximum_loss
+    if target_price < strategy_target_price or net_reward <= ZERO or net_reward_r < target_reward_r:
+        raise CryptoProposalError("canonical target does not preserve the minimum net reward authority")
     # Risk snapshots bind the market by ID/fingerprint; quote values live in
     # the separately verified market-evidence row and are added by the caller.
     aggregate = risk_snapshot.get("aggregate") or {}
@@ -257,12 +295,17 @@ def _build_payload(
         "stop_price": _text(stop_price),
         "strategy_signal_target_price": _text(strategy_target_price),
         "target_price": _text(target_price),
-        "expected_reward_usd": _text(quantity * (target_price - limit_price)),
-        "expected_net_reward_after_estimated_cost_usd": _text(max(ZERO, quantity * (target_price - limit_price) - estimated_fees)),
-        "expected_reward_r": _text(quantity * (target_price - limit_price) / maximum_loss),
+        "expected_gross_reward_usd": _text(gross_reward),
+        "expected_reward_usd": _text(net_reward),
+        "expected_net_reward_after_estimated_cost_usd": _text(net_reward),
+        "gross_reward_r": _text(gross_reward_r),
+        "expected_reward_r": _text(net_reward_r),
         "minimum_target_reward_r": _text(target_reward_r),
         "maximum_loss_usd": _text(maximum_loss),
-        "expected_execution_cost_usd": _text(estimated_fees),
+        "expected_entry_fee_usd": _text(entry_fee),
+        "expected_target_exit_fee_usd": _text(target_exit_fee),
+        "expected_execution_cost_usd": _text(expected_execution_cost),
+        "maximum_loss_fee_component_usd": _text(estimated_fees),
         "adverse_stop_slippage_usd": _text(estimated_slippage),
         "current_crypto_exposure_usd": _text(current_crypto),
         "projected_crypto_exposure_usd": _text(current_crypto + notional),
@@ -317,8 +360,8 @@ def format_crypto_proposal_preview(preview: CryptoProposalPreview) -> str:
         f"Alpaca US bid ${display['current_bid']} | ask ${display['current_ask']} | spread {display['spread_bps']} bps\n"
         f"Annualized volatility: {display['annualized_volatility']}\n"
         f"Limit ${display['limit_price']} | stop ${display['stop_price']} | target ${display['target_price']}\n"
-        f"Expected reward ${display['expected_reward_usd']} ({display['expected_reward_r']}R; net after estimated cost ${display['expected_net_reward_after_estimated_cost_usd']})\n"
-        f"Maximum loss ${display['maximum_loss_usd']} | expected execution cost ${display['expected_execution_cost_usd']} | adverse-stop slippage ${display['adverse_stop_slippage_usd']}\n"
+        f"Expected net reward ${display['expected_reward_usd']} ({display['expected_reward_r']}R; gross ${display['expected_gross_reward_usd']} / {display['gross_reward_r']}R)\n"
+        f"Maximum loss ${display['maximum_loss_usd']} | expected execution cost ${display['expected_execution_cost_usd']} (target round trip) | adverse-stop slippage ${display['adverse_stop_slippage_usd']}\n"
         f"Crypto exposure ${display['current_crypto_exposure_usd']} → ${display['projected_crypto_exposure_usd']}\n"
         f"Total exposure ${display['current_total_portfolio_exposure_usd']} → ${display['projected_total_portfolio_exposure_usd']}\n"
         f"Expires: {display['expires_at']}\n"
@@ -340,36 +383,35 @@ class CryptoProposalStore:
         now: datetime | None = None,
     ) -> CryptoProposalPreview:
         current = (now or datetime.now(UTC)).astimezone(UTC)
-        strategy = CryptoStrategyStore(self.storage).load_verified(strategy_decision_id, config)
-        risk_store = CryptoRiskStore(self.storage)
-        risk_decision = risk_store.load_verified_decision(risk_decision_id, config, now=current)
-        risk_snapshot = risk_store.load_verified(risk_decision["snapshot_id"], config, now=current)
-        sizing = load_verified_crypto_sizing(self.storage, risk_decision["sizing_decision_id"], config)
-        payload = _build_payload(
-            preview_id=str(uuid.uuid4()), strategy=strategy, risk_decision=risk_decision,
-            risk_snapshot=risk_snapshot, sizing=sizing, config=config, created_at=current,
-        )
-        market_rows = self.storage.fetch_all(
-            "SELECT bid_price,ask_price,spread_bps,evidence_fingerprint FROM crypto_market_data_evidence WHERE id=?",
-            (sizing.market_evidence_id,),
-        )
-        if len(market_rows) != 1 or market_rows[0]["evidence_fingerprint"] != sizing.market_evidence_fingerprint:
-            raise CryptoProposalError("crypto proposal market evidence is missing or changed")
-        display = dict(payload["display"])
-        display["current_bid"] = market_rows[0]["bid_price"]
-        display["current_ask"] = market_rows[0]["ask_price"]
-        display["spread_bps"] = market_rows[0]["spread_bps"]
-        payload["display"] = display
-        payload["display_fingerprint"] = _hash(display)
-        proposal_fingerprint = _hash(payload)
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             apply_crypto_proposal_schema(conn, record_migration=False)
-            strategy_row = conn.execute("SELECT decision_fingerprint FROM crypto_strategy_decisions WHERE id=?", (strategy.id,)).fetchone()
-            risk_row = conn.execute("SELECT decision_fingerprint FROM crypto_risk_decisions WHERE id=?", (risk_decision["id"],)).fetchone()
-            sizing_row = conn.execute("SELECT decision_fingerprint FROM crypto_sizing_decisions WHERE id=?", (sizing.id,)).fetchone()
-            if strategy_row is None or risk_row is None or sizing_row is None or strategy_row["decision_fingerprint"] != strategy.decision_fingerprint or risk_row["decision_fingerprint"] != payload["risk_decision_fingerprint"] or sizing_row["decision_fingerprint"] != sizing.decision_fingerprint:
-                raise CryptoProposalError("crypto proposal authority changed before persistence")
+            # Acquire the SQLite writer reservation before loading authority so
+            # every independently verified relationship belongs to one coherent
+            # durable state.  Other writers cannot replace evidence between
+            # verification, display construction, and insertion.
+            strategy = CryptoStrategyStore(self.storage).load_verified(strategy_decision_id, config)
+            risk_store = CryptoRiskStore(self.storage)
+            risk_decision = risk_store.load_verified_decision(risk_decision_id, config, now=current)
+            risk_snapshot = risk_store.load_verified(risk_decision["snapshot_id"], config, now=current)
+            sizing = load_verified_crypto_sizing(self.storage, risk_decision["sizing_decision_id"], config)
+            payload = _build_payload(
+                preview_id=str(uuid.uuid4()), strategy=strategy, risk_decision=risk_decision,
+                risk_snapshot=risk_snapshot, sizing=sizing, config=config, created_at=current,
+            )
+            market_row = conn.execute(
+                "SELECT bid_price,ask_price,spread_bps,evidence_fingerprint FROM crypto_market_data_evidence WHERE id=?",
+                (sizing.market_evidence_id,),
+            ).fetchone()
+            if market_row is None or market_row["evidence_fingerprint"] != sizing.market_evidence_fingerprint:
+                raise CryptoProposalError("crypto proposal market evidence is missing or changed")
+            display = dict(payload["display"])
+            display["current_bid"] = market_row["bid_price"]
+            display["current_ask"] = market_row["ask_price"]
+            display["spread_bps"] = market_row["spread_bps"]
+            payload["display"] = display
+            payload["display_fingerprint"] = _hash(display)
+            proposal_fingerprint = _hash(payload)
             conn.execute(
                 """INSERT INTO crypto_proposal_previews(
                   id,run_id,strategy_decision_id,strategy_decision_fingerprint,

@@ -31,11 +31,15 @@ These protocol facts are evidence only. They do not grant order authority.
 3. pullback in trend;
 4. volatility-adjusted momentum.
 
-The evaluator uses exact Decimal OHLC values from hourly bars at or before the
-bound Alpaca quote timestamp. Future timestamps, duplicate timestamps,
-malformed OHLC relationships, insufficient history, an unverified market
-snapshot, or an identity mismatch fail closed before persistence. Equity
-market clocks, gap rules, thresholds, and session labels are never used.
+The evaluator uses exact Decimal OHLC values from a contiguous series of
+UTC-hour-aligned, one-hour bars at or before the bound Alpaca quote timestamp.
+The newest bar must be no more than two hours behind that quote. Future,
+duplicate, misaligned, gapped, or stale timestamps; malformed OHLC
+relationships; insufficient history; an unverified market snapshot; or an
+identity mismatch fail closed before persistence. The persisted input binds
+the `1Hour` timeframe, 3,600-second cadence, newest-bar age, exact bars, and
+their fingerprint. Equity market clocks, gap rules, thresholds, and session
+labels are never used.
 
 The reviewed configuration fixes all lookbacks and thresholds. EMA, return,
 ATR-like distance, breakout range, pullback, and annualized volatility metrics
@@ -54,8 +58,12 @@ execution_authorized = false
 ```
 
 The hourly crypto research loop records these decisions automatically when its
-Alpaca quote/order-book evidence is execution-eligible. A failed strategy
-evaluation remains research evidence and never creates a proposal.
+Alpaca quote/order-book evidence is authoritative. Fresh but temporarily wide
+or shallow evidence still records the selected research setup with an explicit
+market-execution blocker, preserving suppressed opportunity evidence without
+granting proposal authority. Stale, malformed, or otherwise unauthoritative
+market evidence cannot create a strategy row. A failed strategy evaluation
+remains research evidence and never creates a proposal.
 
 ## Immutable proposal previews
 
@@ -77,7 +85,8 @@ approval surface:
 - symbol, strategy, lifecycle, and action;
 - quantity/notional basis;
 - bid, ask, spread, and annualized volatility;
-- limit, stop, target, expected reward, maximum loss, and expected costs;
+- limit, stop, target, gross reward, cost-adjusted net reward, maximum loss,
+  and expected costs;
 - existing/projected crypto exposure and total portfolio exposure;
 - expiry and the would-be exact approval command;
 - an explicit paper-only, non-approvable warning.
@@ -97,6 +106,14 @@ Preview creation never writes `trade_proposals`, `approvals`, `order_intents`,
 or `risk_reservations`; it never calls Telegram or Alpaca. Integrity checks
 detect orphaned relationships or any attempt to turn strategy, sizing, risk,
 or preview evidence into execution authority.
+
+The target is solved from the canonical limit price so that proceeds after the
+configured entry and target-exit fees retain at least the displayed net R
+multiple of the cost-inclusive maximum stop loss. The preview separately shows
+gross reward, net reward, gross R, net R, target round-trip fees, the stop-loss
+fee component, and adverse stop slippage. Authority is loaded after a SQLite
+`BEGIN IMMEDIATE`, so verified strategy, risk, sizing, capability, and market
+evidence cannot change between display construction and preview persistence.
 
 ## Enabling a later paper proposal stage
 
