@@ -26,7 +26,7 @@ decisions and evidence:
 - `phase3_adaptive_modes_v4_operational_paper` and
   `phase4_multi_strategy_allocation_v7_stop_risk_dollars`: operational mode and
   evidence-aware allocation boundaries.
-- `fifo_equity_unrealized_cashflow_v1`: realized FIFO P&L, account-equity
+- `fifo_equity_unrealized_cashflow_v2_decimal`: canonical Decimal FIFO P&L, account-equity
   change, unrealized change, and external cash-flow separation.
 - `phase1_outcome_v2_exit_session`: corrected early-exit attribution.
 - `profitability_validation_v1`: immutable purged walk-forward folds, circular

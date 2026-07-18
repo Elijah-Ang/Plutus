@@ -2,30 +2,30 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
+from .fixed_point_accounting import decimal_value
 from .formula_versions import ACCOUNTING_VERSION
 
 
 @dataclass(frozen=True)
 class AccountingComponents:
-    account_equity_change: float | None
-    realized_fifo_pnl: float | None
-    unrealized_change: float | None
-    external_cash_flow: float | None
+    account_equity_change: Decimal | None
+    realized_fifo_pnl: Decimal | None
+    unrealized_change: Decimal | None
+    external_cash_flow: Decimal | None
     confidence: str
     accounting_version: str = ACCOUNTING_VERSION
 
 
-def _finite(value: Any) -> float | None:
+def _finite(value: Any) -> Decimal | None:
     try:
-        if value is None or isinstance(value, bool):
+        if value is None:
             return None
-        result = float(value)
-        return result if math.isfinite(result) else None
-    except (TypeError, ValueError):
+        return decimal_value(value, "accounting component")
+    except ValueError:
         return None
 
 

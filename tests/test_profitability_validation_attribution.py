@@ -623,12 +623,18 @@ def test_profit_attribution_store_recomputes_and_detects_tampering(tmp_path):
     storage.execute(
         "UPDATE lot_consumptions SET allocated_proceeds=999"
     )
+    # REAL is a compatibility projection; canonical Decimal text is authority.
+    assert store.load_verified(record.id).record_fingerprint == record.record_fingerprint
+    storage.execute(
+        "UPDATE lot_consumptions SET allocated_proceeds_decimal='999'"
+    )
     with pytest.raises(
         ProfitAttributionError, match="leg values are inconsistent"
     ):
         store.load_verified(record.id)
     storage.execute(
-        "UPDATE lot_consumptions SET allocated_proceeds=1120"
+        """UPDATE lot_consumptions
+           SET allocated_proceeds=1120,allocated_proceeds_decimal='1120'"""
     )
     storage.execute(
         """UPDATE profit_attribution_records

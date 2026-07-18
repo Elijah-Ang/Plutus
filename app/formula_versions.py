@@ -4,7 +4,7 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v18_cross_asset_research_allocation"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v19_fixed_point_accounting"
 STOP_POLICY_VERSION = "monotonic_trend_protective_stop_v3"
 SIZING_POLICY_VERSION = "adaptive_strategy_sleeve_winner_v5_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_position_risk_rotation_sleeve_v5"
@@ -12,7 +12,9 @@ PHASE3_DECISION_VERSION = "phase3_registry_sleeves_v5_operational_paper"
 PHASE4_ALLOCATION_VERSION = "phase4_multi_strategy_allocation_v7_stop_risk_dollars"
 PHASE4_ALLOCATOR_VERSION = "multi_strategy_paper_allocator_v6_explicit_units"
 PHASE4_SCHEMA_VERSION = "phase4_multi_strategy_operational_paper_v5_units"
-ACCOUNTING_VERSION = "fifo_equity_unrealized_cashflow_v1"
+ACCOUNTING_VERSION = "fifo_equity_unrealized_cashflow_v2_decimal"
+FIXED_POINT_ACCOUNTING_VERSION = "fixed_point_fifo_accounting_v1"
+FIXED_POINT_ACCOUNTING_SCHEMA_VERSION = "fixed_point_fifo_accounting_schema_v1"
 EVIDENCE_VERSION = "phase1_outcome_v2_exit_session"
 STRATEGY_PERFORMANCE_VERSION = "strategy_performance_v2_4_validation_attribution"
 STRATEGY_POLICY_VERSION = "strategy_policy_v2_4_validation_attribution"
@@ -82,6 +84,7 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         CRYPTO_PROPOSAL_SCHEMA_VERSION,
         CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
         PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION,
+        FIXED_POINT_ACCOUNTING_SCHEMA_VERSION,
         STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
         STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
         ADAPTIVE_CONVICTION_SCHEMA_VERSION,

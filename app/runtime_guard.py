@@ -4,9 +4,6 @@ import json
 import os
 from pathlib import Path
 
-from .formula_versions import REQUIRED_SCHEMA_VERSIONS
-
-
 STATE_ROOT = Path.home() / "Library" / "Application Support" / "TradingAgent"
 RELEASE_ROOT = Path.home() / "TradingAgentReleases"
 RUNTIME_LINK = Path.home() / "TradingAgentRuntime"
@@ -21,8 +18,9 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "config_snapshots": {"run_id", "config_json", "effective_config_json", "effective_config_hash"},
     "risk_checks": {"run_id", "proposal_id", "name", "passed", "formula_version", "evidence_version", "config_hash"},
     "orders": {"id", "client_order_id", "status", "quote_bid", "quote_ask", "limit_price"},
-    "fills": {"order_id", "qty", "price", "implementation_shortfall_bps"},
-    "order_intents": {"id", "logical_action_key", "client_order_id", "reserved_notional", "reserved_stop_risk", "state", "trading_mode", "strategy_registry_snapshot_id", "strategy_sleeve", "sleeve_allocation_id", "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling", "incremental_risk", "rotation_step_id", "approval_authority_fingerprint", "displayed_fingerprint", "execution_path", "risk_snapshot_id", "canonical_quantity", "canonical_notional", "canonical_stop_risk", "broker_invocation_occurred"},
+    "fills": {"order_id", "qty", "price", "implementation_shortfall_bps", "qty_decimal", "price_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "order_intents": {"id", "logical_action_key", "client_order_id", "reserved_notional", "reserved_stop_risk", "state", "trading_mode", "strategy_registry_snapshot_id", "strategy_sleeve", "sleeve_allocation_id", "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling", "incremental_risk", "rotation_step_id", "approval_authority_fingerprint", "displayed_fingerprint", "execution_path", "risk_snapshot_id", "canonical_quantity", "canonical_notional", "canonical_stop_risk", "broker_invocation_occurred", "filled_quantity_decimal", "average_fill_price_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "broker_fill_events": {"intent_id", "broker_event_key", "cumulative_filled_quantity_decimal", "delta_quantity_decimal", "fill_price_decimal", "fees_decimal", "adjustments_decimal", "decimal_provenance", "decimal_accounting_version"},
     "risk_reservations": {"intent_id", "active_notional", "active_stop_risk", "state", "strategy_version", "strategy_sleeve", "sleeve_allocation_id", "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling", "incremental_risk", "risk_value", "risk_unit", "conversion_equity", "conversion_equity_as_of", "risk_formula_version"},
     "approvals": {"proposal_id", "proposal_reference_price", "refreshed_bid", "refreshed_ask", "directional_price_move_bps", "movement_classification", "final_limit_price", "directional_validation_reason", "authority_envelope_json", "authority_fingerprint", "display_envelope_id", "displayed_fingerprint", "approval_source_type", "execution_path"},
     "proposal_display_envelopes": {"proposal_id", "proposal_version", "telegram_message_id", "displayed_envelope_json", "displayed_fingerprint"},
@@ -49,9 +47,10 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "phase4_allocation_decisions": {"run_id", "strategy_weights_json", "allocation_class", "operational_kelly_used", "binding_caps_json", "evidence_versions_json", "strategy_policy_map_json", "strategy_policy_version", "probe_allocation_json", "payload"},
     "trade_proposals": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version", "trade_economics_id", "strategy_registry_snapshot_id", "strategy_sleeve", "sleeve_allocation_id", "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling", "winner_expansion_decision_id", "pyramiding_milestone_id", "pyramiding_milestone_key", "rotation_group_id", "rotation_step_id", "relationship_type"},
     "position_sizing_decisions": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
-    "cash_snapshots": {"equity", "realized_fifo_pnl", "account_equity_change", "unrealized_change", "external_cash_flow", "accounting_version"},
-    "position_lots": {"strategy_version", "entry_proposal_id", "entry_intent_id", "entry_regime", "entry_score", "initial_risk_dollars", "config_hash", "evidence_version", "formula_version"},
-    "lot_consumptions": {"broker_event_key", "sell_intent_id", "position_lifecycle_id", "lot_id", "allocated_proceeds", "allocated_cost_basis", "allocated_buy_fees", "allocated_sell_fees", "allocated_adjustments", "realized_pnl", "accounting_version"},
+    "cash_snapshots": {"equity", "realized_fifo_pnl", "account_equity_change", "unrealized_change", "external_cash_flow", "accounting_version", "equity_decimal", "cash_decimal", "settled_cash_decimal", "realized_fifo_pnl_decimal", "unrealized_pl_decimal", "account_equity_change_decimal", "unrealized_change_decimal", "external_cash_flow_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "position_lots": {"strategy_version", "entry_proposal_id", "entry_intent_id", "entry_regime", "entry_score", "initial_risk_dollars", "config_hash", "evidence_version", "formula_version", "original_quantity_decimal", "remaining_quantity_decimal", "unit_cost_decimal", "fees_allocated_decimal", "initial_risk_dollars_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "realized_pnl_events": {"quantity_decimal", "gross_proceeds_decimal", "cost_basis_decimal", "fees_decimal", "adjustments_decimal", "realized_pl_decimal", "remaining_position_quantity_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "lot_consumptions": {"broker_event_key", "sell_intent_id", "position_lifecycle_id", "lot_id", "allocated_proceeds", "allocated_cost_basis", "allocated_buy_fees", "allocated_sell_fees", "allocated_adjustments", "realized_pnl", "accounting_version", "quantity_decimal", "allocated_proceeds_decimal", "allocated_cost_basis_decimal", "allocated_buy_fees_decimal", "allocated_sell_fees_decimal", "allocated_adjustments_decimal", "realized_pnl_decimal", "decimal_provenance", "decimal_accounting_version"},
     "strategy_trade_records": {"source_key", "strategy_version", "evidence_class", "attribution_status", "r_multiple", "evidence_version", "formula_version", "profit_attribution_id"},
     "strategy_performance_snapshots": {"strategy_version", "performance_version", "policy_version", "quality_score", "metrics_json", "input_fingerprint", "validation_family_id", "validation_decision_id", "validation_status", "validation_fingerprint"},
     "strategy_policy_decisions": {"strategy_version", "state", "performance_snapshot_id", "enforcement_enabled", "policy_version", "schema_version", "input_fingerprint", "evidence_version", "configuration_version", "config_hash", "validation_family_id", "validation_decision_id", "validation_status", "validation_fingerprint"},
