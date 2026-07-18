@@ -18,6 +18,7 @@ from app.formula_versions import (
 )
 from app.lot_ledger import LotLedger
 from app.order_state import OrderState
+from app.reconciliation import BrokerReconciler
 from app.storage import Storage
 
 
@@ -340,3 +341,43 @@ def test_zero_delta_event_cannot_smuggle_fees_or_adjustments(tmp_path):
     assert storage.fetch_all("SELECT fees_allocated_decimal FROM position_lots") == [
         {"fees_allocated_decimal": "0"}
     ]
+
+
+def test_account_reconciliation_persists_exact_decimal_components(tmp_path):
+    storage = _database(tmp_path)
+
+    class Broker:
+        account = {
+            "equity": "100.1",
+            "cash": "90.05",
+            "settled_cash": "89.95",
+        }
+
+        def get_account(self):
+            return self.account
+
+        @staticmethod
+        def get_positions():
+            return []
+
+    broker = Broker()
+    BrokerReconciler(broker, storage, "first").reconcile()
+    broker.account = {
+        "equity": "100.3",
+        "cash": "90.25",
+        "settled_cash": "90.15",
+    }
+    BrokerReconciler(broker, storage, "second").reconcile()
+    row = storage.fetch_all(
+        "SELECT * FROM cash_snapshots ORDER BY id DESC LIMIT 1"
+    )[0]
+    assert row["equity_decimal"] == "100.3"
+    assert row["cash_decimal"] == "90.25"
+    assert row["settled_cash_decimal"] == "90.15"
+    assert row["realized_fifo_pnl_decimal"] == "0"
+    assert row["unrealized_pl_decimal"] == "0"
+    assert row["account_equity_change_decimal"] == "0.2"
+    assert row["unrealized_change_decimal"] == "0"
+    assert row["external_cash_flow_decimal"] == "0.2"
+    assert row["decimal_provenance"] == EXACT_DECIMAL_PROVENANCE
+    assert not any(fixed_point_integrity_report(storage).values())
