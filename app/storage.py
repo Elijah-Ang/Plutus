@@ -364,6 +364,7 @@ class Storage:
             from .crypto_risk import apply_crypto_risk_schema
             from .crypto_strategies import apply_crypto_strategy_schema
             from .crypto_proposals import apply_crypto_proposal_schema
+            from .cross_asset_allocation import apply_cross_asset_allocation_schema
             apply_p1_execution_schema(conn)
             apply_final_hardening_schema(conn)
 
@@ -393,6 +394,7 @@ class Storage:
             apply_crypto_risk_schema(conn)
             apply_crypto_strategy_schema(conn)
             apply_crypto_proposal_schema(conn)
+            apply_cross_asset_allocation_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -476,6 +478,8 @@ class Storage:
                 apply_crypto_strategy_schema(conn, record_migration=False)
                 from .crypto_proposals import apply_crypto_proposal_schema
                 apply_crypto_proposal_schema(conn, record_migration=False)
+                from .cross_asset_allocation import apply_cross_asset_allocation_schema
+                apply_cross_asset_allocation_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

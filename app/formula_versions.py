@@ -4,7 +4,7 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v17_crypto_hourly_net_target_research_paper"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v18_cross_asset_research_allocation"
 STOP_POLICY_VERSION = "monotonic_trend_protective_stop_v3"
 SIZING_POLICY_VERSION = "adaptive_strategy_sleeve_winner_v5_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_position_risk_rotation_sleeve_v5"
@@ -37,6 +37,8 @@ CRYPTO_STRATEGY_FORMULA_VERSION = "crypto_multi_strategy_point_in_time_v2_hourly
 CRYPTO_STRATEGY_SCHEMA_VERSION = "crypto_strategy_decisions_v1"
 CRYPTO_PROPOSAL_FORMULA_VERSION = "crypto_research_proposal_authority_v2_net_cost_target"
 CRYPTO_PROPOSAL_SCHEMA_VERSION = "crypto_research_proposal_previews_v1"
+CROSS_ASSET_ALLOCATION_FORMULA_VERSION = "cross_asset_normalized_constrained_allocator_v1"
+CROSS_ASSET_ALLOCATION_SCHEMA_VERSION = "cross_asset_research_allocation_plans_v1"
 STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION = "strategy_policy_enforcement_v1"
 STRATEGY_PROBE_POLICY_SCHEMA_VERSION = "strategy_probe_policy_v1"
 ADAPTIVE_CONVICTION_FORMULA_VERSION = "adaptive_conviction_formula_v2_operational_paper"
@@ -76,6 +78,7 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         CRYPTO_RISK_SCHEMA_VERSION,
         CRYPTO_STRATEGY_SCHEMA_VERSION,
         CRYPTO_PROPOSAL_SCHEMA_VERSION,
+        CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
         STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
         STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
         ADAPTIVE_CONVICTION_SCHEMA_VERSION,
