@@ -413,6 +413,11 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
                         "allocated_adjustments_decimal",
                     },
                     "order_intents": {"filled_quantity_decimal"},
+                    "cash_snapshots": {
+                        "equity_decimal",
+                        "cash_decimal",
+                        "settled_cash_decimal",
+                    },
                 }.get(table, set())
                 if table == "order_intents":
                     filled = parsed.get("filled_quantity_decimal", ZERO)

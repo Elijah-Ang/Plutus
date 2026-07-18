@@ -307,3 +307,36 @@ def test_broker_fill_and_aggregate_rows_store_canonical_decimal_evidence(tmp_pat
     assert fill["qty_decimal"] == "0.3"
     assert fill["price_decimal"] == "0.2333333333333333333333333333"
     assert not any(fixed_point_integrity_report(storage).values())
+
+
+def test_zero_cumulative_fill_event_is_rejected_without_evidence_rows(tmp_path):
+    storage = _database(tmp_path)
+    store, buy = _intent(storage, "zero-fill", "buy", "1", "10")
+    with pytest.raises(ValueError, match="cumulative_quantity must be positive"):
+        store.record_fill(
+            buy["id"], cumulative_quantity="0", fill_price="10",
+            broker_event_key="zero-fill-event",
+        )
+    assert storage.fetch_all("SELECT * FROM broker_fill_events") == []
+    assert storage.fetch_all("SELECT * FROM fills") == []
+    assert storage.fetch_all("SELECT * FROM position_lots") == []
+
+
+def test_zero_delta_event_cannot_smuggle_fees_or_adjustments(tmp_path):
+    storage = _database(tmp_path)
+    store, buy = _intent(storage, "zero-delta", "buy", "2", "10")
+    store.record_fill(
+        buy["id"], cumulative_quantity="1", fill_price="10",
+        broker_event_key="zero-delta-first",
+    )
+    with pytest.raises(ValueError, match="zero-delta fill events"):
+        store.record_fill(
+            buy["id"], cumulative_quantity="1", fill_price="10",
+            broker_event_key="zero-delta-second", fees="1",
+        )
+    assert storage.fetch_all(
+        "SELECT broker_event_key FROM broker_fill_events"
+    ) == [{"broker_event_key": "zero-delta-first"}]
+    assert storage.fetch_all("SELECT fees_allocated_decimal FROM position_lots") == [
+        {"fees_allocated_decimal": "0"}
+    ]

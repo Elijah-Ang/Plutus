@@ -215,7 +215,8 @@ class LotLedger:
             allocated_sell_fees_total = ZERO
             allocated_adjustments_total = ZERO
             lots = conn.execute(
-                """SELECT * FROM position_lots WHERE symbol=? AND remaining_quantity>0
+                """SELECT * FROM position_lots WHERE symbol=?
+                   AND (COALESCE(remaining_quantity_decimal,'0')<>'0' OR remaining_quantity>0)
                    ORDER BY opened_at,id""",
                 (symbol,),
             ).fetchall()

@@ -942,8 +942,10 @@ class DurableExecutionStore:
             and fees_decimal is not None
             and adjustments_decimal is not None
         )
-        if cumulative_decimal > ZERO and price_decimal == ZERO:
-            raise ValueError("fill_price must be positive for a positive fill")
+        if cumulative_decimal == ZERO:
+            raise ValueError("cumulative_quantity must be positive for a fill event")
+        if price_decimal == ZERO:
+            raise ValueError("fill_price must be positive for a fill event")
         quantity_tolerance = decimal_value("0.000000001", "quantity_tolerance")
         assert quantity_tolerance is not None
         now = iso_now()
@@ -1013,6 +1015,12 @@ class DurableExecutionStore:
                 return dict(intent)
             cumulative = min(cumulative_decimal, requested)
             delta = max(ZERO, cumulative - previous)
+            if delta == ZERO and (
+                fees_decimal != ZERO or adjustments_decimal != ZERO
+            ):
+                raise ValueError(
+                    "zero-delta fill events cannot introduce fees or adjustments"
+                )
             prior_avg = decimal_value(
                 intent["average_fill_price_decimal"]
                 if "average_fill_price_decimal" in intent.keys()
