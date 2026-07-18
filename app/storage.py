@@ -360,6 +360,8 @@ class Storage:
             from .profit_milestones import apply_profit_milestone_schema
             from .crypto_capabilities import apply_crypto_capability_schema
             from .crypto_market_data import apply_crypto_market_data_schema
+            from .crypto_sizing import apply_crypto_sizing_schema
+            from .crypto_risk import apply_crypto_risk_schema
             apply_p1_execution_schema(conn)
             apply_final_hardening_schema(conn)
 
@@ -385,6 +387,8 @@ class Storage:
             apply_profit_attribution_schema(conn)
             apply_crypto_capability_schema(conn)
             apply_crypto_market_data_schema(conn)
+            apply_crypto_sizing_schema(conn)
+            apply_crypto_risk_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -460,6 +464,10 @@ class Storage:
                 apply_crypto_capability_schema(conn, record_migration=False)
                 from .crypto_market_data import apply_crypto_market_data_schema
                 apply_crypto_market_data_schema(conn, record_migration=False)
+                from .crypto_sizing import apply_crypto_sizing_schema
+                apply_crypto_sizing_schema(conn, record_migration=False)
+                from .crypto_risk import apply_crypto_risk_schema
+                apply_crypto_risk_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

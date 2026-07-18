@@ -4,7 +4,7 @@ These values are persisted with decisions and evidence so a later formula
 change cannot silently mix old and new risk or outcome calculations.
 """
 
-CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v13_crypto_data_capability_paper"
+CONFIGURATION_SCHEMA_VERSION = "plutus_effective_config_v14_crypto_decimal_sizing_risk_paper"
 STOP_POLICY_VERSION = "monotonic_trend_protective_stop_v3"
 SIZING_POLICY_VERSION = "adaptive_strategy_sleeve_winner_v5_operational_paper"
 RISK_DECISION_VERSION = "risk_engine_position_risk_rotation_sleeve_v5"
@@ -29,6 +29,10 @@ CRYPTO_CAPABILITY_FORMULA_VERSION = "alpaca_spot_crypto_capability_v1"
 CRYPTO_CAPABILITY_SCHEMA_VERSION = "alpaca_spot_crypto_capability_snapshot_v1"
 CRYPTO_MARKET_DATA_FORMULA_VERSION = "alpaca_crypto_market_evidence_v1"
 CRYPTO_MARKET_DATA_SCHEMA_VERSION = "alpaca_crypto_market_evidence_schema_v1"
+CRYPTO_SIZING_FORMULA_VERSION = "alpaca_crypto_decimal_stop_risk_sizing_v1"
+CRYPTO_SIZING_SCHEMA_VERSION = "alpaca_crypto_decimal_sizing_decisions_v1"
+CRYPTO_RISK_FORMULA_VERSION = "alpaca_crypto_portfolio_risk_authority_v1"
+CRYPTO_RISK_SCHEMA_VERSION = "alpaca_crypto_portfolio_risk_snapshots_v1"
 STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION = "strategy_policy_enforcement_v1"
 STRATEGY_PROBE_POLICY_SCHEMA_VERSION = "strategy_probe_policy_v1"
 ADAPTIVE_CONVICTION_FORMULA_VERSION = "adaptive_conviction_formula_v2_operational_paper"
@@ -64,6 +68,8 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         PROFIT_ATTRIBUTION_SCHEMA_VERSION,
         CRYPTO_CAPABILITY_SCHEMA_VERSION,
         CRYPTO_MARKET_DATA_SCHEMA_VERSION,
+        CRYPTO_SIZING_SCHEMA_VERSION,
+        CRYPTO_RISK_SCHEMA_VERSION,
         STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
         STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
         ADAPTIVE_CONVICTION_SCHEMA_VERSION,

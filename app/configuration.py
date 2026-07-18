@@ -16,6 +16,10 @@ from .formula_versions import (
     CONFIGURATION_SCHEMA_VERSION,
     CRYPTO_CAPABILITY_FORMULA_VERSION,
     CRYPTO_MARKET_DATA_FORMULA_VERSION,
+    CRYPTO_RISK_FORMULA_VERSION,
+    CRYPTO_RISK_SCHEMA_VERSION,
+    CRYPTO_SIZING_FORMULA_VERSION,
+    CRYPTO_SIZING_SCHEMA_VERSION,
     EVIDENCE_VERSION,
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
@@ -80,15 +84,14 @@ STRICT_SECTION_KEYS = {
         "enabled", "mode", "paper_trading_enabled", "proposals_enabled", "live_enabled",
         "symbols", "optional_symbols", "max_symbols", "broker", "market_profile", "data_feed",
         "quote_currency", "capability_contract", "allow_margin", "allow_shorting",
-        "max_notional_per_trade", "max_crypto_exposure_pct", "require_fresh_price",
+        "require_fresh_price",
         "max_price_age_seconds", "min_score_for_paper_watch", "min_score_for_proposal",
-        "min_risk_reward_ratio", "min_stop_distance_pct", "max_stop_distance_pct",
-        "max_spread_bps", "minimum_top_of_book_notional_usd", "max_realized_volatility", "max_account_risk_per_trade",
+        "min_risk_reward_ratio", "max_spread_bps", "minimum_top_of_book_notional_usd",
         "proposal_expiry_minutes", "approval_max_price_age_seconds",
         "approval_max_price_move_bps_base", "approval_max_price_move_bps_hard_cap",
         "default_order_type", "limit_price_source", "fallback_market_orders",
         "allow_new_entries", "allow_add_to_winner", "allow_exits", "eodhd_research_enabled",
-        "data_source", "stage_transition_governance", "runtime_evidence_gate", "schedule",
+        "data_source", "sizing_policy", "risk_policy", "stage_transition_governance", "runtime_evidence_gate", "schedule",
     },
     "risk": {
         "max_trade_notional_paper", "max_trade_notional_live", "max_trades_per_day", "max_open_positions",
@@ -151,7 +154,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "adaptive_conviction", "adaptive_sizing"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -179,6 +182,29 @@ STRICT_NESTED_KEYS = {
         "order_types", "time_in_force", "request_bases", "default_time_in_force",
         "require_asset_api_verification", "require_paper_account_identity",
         "snapshot_ttl_minutes", "maintenance_policy", "weekend_policy", "stablecoin_policy",
+    },
+    "crypto.sizing_policy": {
+        "mode", "formula_version", "schema_version", "minimum_buy_notional_usd",
+        "maximum_order_notional_usd", "maximum_quantity_decimal_places",
+        "maximum_notional_decimal_places", "conservative_taker_fee_bps_per_side",
+        "stop_execution_slippage_bps", "minimum_stop_distance_pct",
+        "maximum_stop_distance_pct", "require_quantity_basis_for_sells",
+        "allow_full_position_dust_exit",
+    },
+    "crypto.risk_policy": {
+        "mode", "formula_version", "schema_version", "snapshot_ttl_seconds",
+        "maximum_positions", "maximum_total_portfolio_gross_exposure_pct_equity",
+        "maximum_gross_exposure_pct_equity", "maximum_symbol_exposure_pct_equity",
+        "maximum_cluster_exposure_pct_equity", "maximum_stop_risk_per_trade_pct_equity",
+        "maximum_stop_heat_pct_equity", "minimum_cash_reserve_pct_equity",
+        "daily_account_loss_halt_pct_equity", "weekly_account_loss_halt_pct_equity",
+        "daily_crypto_loss_halt_pct_equity", "weekly_crypto_loss_halt_pct_equity",
+        "drawdown_throttle_start_pct_equity", "drawdown_halt_pct_equity",
+        "drawdown_throttle_multiplier", "volatility_minimum_hourly_observations",
+        "volatility_throttle_annualized", "volatility_halt_annualized",
+        "volatility_throttle_multiplier", "volatility_latest_bar_max_age_seconds",
+        "require_cash_funded", "require_verified_loss_evidence",
+        "block_on_any_open_crypto_order", "loss_session_timezone", "correlation_clusters",
     },
     "profitability_engine.candidate_model": {
         "cost_model_version", "estimation_model_version",
@@ -277,6 +303,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "profit_attribution": PROFIT_ATTRIBUTION_FORMULA_VERSION,
         "crypto_capability": CRYPTO_CAPABILITY_FORMULA_VERSION,
         "crypto_market_data": CRYPTO_MARKET_DATA_FORMULA_VERSION,
+        "crypto_sizing": CRYPTO_SIZING_FORMULA_VERSION,
+        "crypto_risk": CRYPTO_RISK_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
     }
@@ -698,6 +726,157 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     ttl = _bounded(contract.get("snapshot_ttl_minutes"), "crypto capability snapshot TTL", errors, 1, 1440)
     require(ttl is not None, "crypto capability snapshot TTL is required")
     _bounded(crypto.get("minimum_top_of_book_notional_usd"), "crypto minimum top-of-book notional", errors, 0.01, 100000000)
+
+    crypto_sizing = crypto.get("sizing_policy") or {}
+    require(crypto_sizing.get("mode") == "research_only",
+            "crypto sizing policy must remain research_only in this stage")
+    require(crypto_sizing.get("formula_version") == CRYPTO_SIZING_FORMULA_VERSION,
+            f"crypto sizing formula must be {CRYPTO_SIZING_FORMULA_VERSION}")
+    require(crypto_sizing.get("schema_version") == CRYPTO_SIZING_SCHEMA_VERSION,
+            f"crypto sizing schema must be {CRYPTO_SIZING_SCHEMA_VERSION}")
+    minimum_crypto_notional = _bounded(
+        crypto_sizing.get("minimum_buy_notional_usd"),
+        "crypto.sizing_policy.minimum_buy_notional_usd", errors, 1, 1,
+    )
+    maximum_crypto_notional = _bounded(
+        crypto_sizing.get("maximum_order_notional_usd"),
+        "crypto.sizing_policy.maximum_order_notional_usd", errors, 1, 5,
+    )
+    require(
+        minimum_crypto_notional is not None and maximum_crypto_notional is not None
+        and minimum_crypto_notional <= maximum_crypto_notional,
+        "crypto notional bounds must satisfy one-dollar minimum <= five-dollar maximum",
+    )
+    require(crypto_sizing.get("maximum_quantity_decimal_places") == 9,
+            "crypto quantity precision must remain at most nine decimal places")
+    require(crypto_sizing.get("maximum_notional_decimal_places") == 2,
+            "crypto notional precision must remain at most two decimal places")
+    taker_fee = _bounded(
+        crypto_sizing.get("conservative_taker_fee_bps_per_side"),
+        "crypto.sizing_policy.conservative_taker_fee_bps_per_side", errors, 25, 25,
+    )
+    _bounded(
+        crypto_sizing.get("stop_execution_slippage_bps"),
+        "crypto.sizing_policy.stop_execution_slippage_bps", errors, 0, 500,
+    )
+    minimum_stop = _bounded(
+        crypto_sizing.get("minimum_stop_distance_pct"),
+        "crypto.sizing_policy.minimum_stop_distance_pct", errors, 0.01, 100,
+    )
+    maximum_stop = _bounded(
+        crypto_sizing.get("maximum_stop_distance_pct"),
+        "crypto.sizing_policy.maximum_stop_distance_pct", errors, 0.01, 100,
+    )
+    require(
+        taker_fee == 25 and minimum_stop is not None and maximum_stop is not None
+        and minimum_stop <= maximum_stop,
+        "crypto fee and stop-distance policy is invalid",
+    )
+    require(crypto_sizing.get("require_quantity_basis_for_sells") is True,
+            "crypto SELLs must use an exact quantity basis")
+    require(crypto_sizing.get("allow_full_position_dust_exit") is True,
+            "crypto must permit an exact full-position dust exit")
+
+    crypto_risk = crypto.get("risk_policy") or {}
+    require(crypto_risk.get("mode") == "research_only",
+            "crypto risk policy must remain research_only in this stage")
+    require(crypto_risk.get("formula_version") == CRYPTO_RISK_FORMULA_VERSION,
+            f"crypto risk formula must be {CRYPTO_RISK_FORMULA_VERSION}")
+    require(crypto_risk.get("schema_version") == CRYPTO_RISK_SCHEMA_VERSION,
+            f"crypto risk schema must be {CRYPTO_RISK_SCHEMA_VERSION}")
+    require(crypto_risk.get("maximum_positions") == 2,
+            "initial crypto lane must allow at most two positions")
+    _bounded(crypto_risk.get("snapshot_ttl_seconds"), "crypto.risk_policy.snapshot_ttl_seconds", errors, 1, 300)
+    total_crypto_portfolio = _bounded(
+        crypto_risk.get("maximum_total_portfolio_gross_exposure_pct_equity"),
+        "crypto.risk_policy.maximum_total_portfolio_gross_exposure_pct_equity", errors, 0, 50,
+    )
+    crypto_gross = _bounded(
+        crypto_risk.get("maximum_gross_exposure_pct_equity"),
+        "crypto.risk_policy.maximum_gross_exposure_pct_equity", errors, 0, 1,
+    )
+    crypto_symbol = _bounded(
+        crypto_risk.get("maximum_symbol_exposure_pct_equity"),
+        "crypto.risk_policy.maximum_symbol_exposure_pct_equity", errors, 0, 1,
+    )
+    crypto_cluster = _bounded(
+        crypto_risk.get("maximum_cluster_exposure_pct_equity"),
+        "crypto.risk_policy.maximum_cluster_exposure_pct_equity", errors, 0, 1,
+    )
+    require(
+        None not in {total_crypto_portfolio, crypto_gross, crypto_symbol, crypto_cluster}
+        and 0 < crypto_symbol <= crypto_cluster <= crypto_gross <= total_crypto_portfolio,
+        "crypto exposure limits must satisfy symbol <= cluster <= sleeve <= total portfolio",
+    )
+    crypto_trade_risk = _bounded(
+        crypto_risk.get("maximum_stop_risk_per_trade_pct_equity"),
+        "crypto.risk_policy.maximum_stop_risk_per_trade_pct_equity", errors, 0, 0.01,
+    )
+    crypto_heat = _bounded(
+        crypto_risk.get("maximum_stop_heat_pct_equity"),
+        "crypto.risk_policy.maximum_stop_heat_pct_equity", errors, 0, 0.05,
+    )
+    require(
+        crypto_trade_risk is not None and crypto_heat is not None
+        and 0 < crypto_trade_risk <= crypto_heat,
+        "crypto stop-risk limits must satisfy per-trade <= sleeve heat",
+    )
+    _bounded(
+        crypto_risk.get("minimum_cash_reserve_pct_equity"),
+        "crypto.risk_policy.minimum_cash_reserve_pct_equity", errors, 0, 100,
+    )
+    for key, maximum in (
+        ("daily_account_loss_halt_pct_equity", 100),
+        ("weekly_account_loss_halt_pct_equity", 100),
+        ("daily_crypto_loss_halt_pct_equity", 1),
+        ("weekly_crypto_loss_halt_pct_equity", 1),
+    ):
+        value = _bounded(crypto_risk.get(key), f"crypto.risk_policy.{key}", errors, 0, maximum)
+        require(value is not None and value > 0, f"crypto.risk_policy.{key} must be positive")
+    drawdown_throttle = _bounded(
+        crypto_risk.get("drawdown_throttle_start_pct_equity"),
+        "crypto.risk_policy.drawdown_throttle_start_pct_equity", errors, 0, 100,
+    )
+    drawdown_halt = _bounded(
+        crypto_risk.get("drawdown_halt_pct_equity"),
+        "crypto.risk_policy.drawdown_halt_pct_equity", errors, 0, 100,
+    )
+    require(
+        drawdown_throttle is not None and drawdown_halt is not None
+        and drawdown_throttle < drawdown_halt,
+        "crypto drawdown throttle must precede the halt",
+    )
+    _bounded(crypto_risk.get("drawdown_throttle_multiplier"), "crypto.risk_policy.drawdown_throttle_multiplier", errors, 0.01, 1)
+    volatility_throttle = _bounded(
+        crypto_risk.get("volatility_throttle_annualized"),
+        "crypto.risk_policy.volatility_throttle_annualized", errors, 0, 10,
+    )
+    volatility_halt = _bounded(
+        crypto_risk.get("volatility_halt_annualized"),
+        "crypto.risk_policy.volatility_halt_annualized", errors, 0, 10,
+    )
+    require(
+        volatility_throttle is not None and volatility_halt is not None
+        and 0 < volatility_throttle < volatility_halt,
+        "crypto volatility throttle must precede the halt",
+    )
+    _bounded(crypto_risk.get("volatility_throttle_multiplier"), "crypto.risk_policy.volatility_throttle_multiplier", errors, 0.01, 1)
+    _bounded(crypto_risk.get("volatility_minimum_hourly_observations"), "crypto.risk_policy.volatility_minimum_hourly_observations", errors, 24, 168)
+    _bounded(crypto_risk.get("volatility_latest_bar_max_age_seconds"), "crypto.risk_policy.volatility_latest_bar_max_age_seconds", errors, 60, 86400)
+    require(crypto_risk.get("require_cash_funded") is True,
+            "crypto must remain cash-funded without margin")
+    require(crypto_risk.get("require_verified_loss_evidence") is True,
+            "crypto requires verified daily and weekly loss evidence")
+    require(crypto_risk.get("block_on_any_open_crypto_order") is True,
+            "new crypto BUYs must block on any open crypto order")
+    require(crypto_risk.get("loss_session_timezone") == "UTC",
+            "continuous crypto loss sessions must use UTC")
+    clusters = crypto_risk.get("correlation_clusters") or {}
+    require(
+        isinstance(clusters, dict)
+        and sorted(clusters.get("crypto_major") or []) == ["BTC/USD", "ETH/USD"],
+        "the initial crypto-major cluster must contain BTC/USD and ETH/USD",
+    )
 
     expiry_default = _number(config, "proposal_expiry_default_minutes", errors, minimum=1, maximum=1440)
     expiry_min = _number(config, "proposal_expiry_min_minutes", errors, minimum=1, maximum=1440)
