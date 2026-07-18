@@ -37,6 +37,7 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Suppressed Sleep BUY Candidates", "SELECT symbol, price, signal, score, no_action_reason, candidate_suppression_reason, created_at FROM market_memory WHERE candidate_suppression_reason = 'suppressed_by_sleep_mode'"),
     ("Wake Summary Events", "SELECT * FROM audit_events WHERE event_type = 'wake_summary_sent'"),
     ("Performance Lab Summary", "performance_lab_summaries"),
+    ("Performance Lifecycle", "SELECT COALESCE(ps.asset_class,'unknown') asset_class,COALESCE(po.actual_or_shadow,'unclassified') evidence_class,COUNT(*) opportunity_count FROM performance_outcomes po JOIN performance_setups ps ON ps.id=po.setup_id GROUP BY COALESCE(ps.asset_class,'unknown'),COALESCE(po.actual_or_shadow,'unclassified') ORDER BY asset_class,evidence_class"),
     ("Crypto Research Summary", "SELECT symbol,lane,score,data_freshness,price,price_timestamp,return_1h,return_4h,return_1d,return_7d,return_20d,provider,created_at,'research-only; proposals/orders disabled by default' AS safety_status FROM crypto_research_snapshots ORDER BY created_at DESC, symbol"),
     ("Crypto Candidate Briefs", "SELECT symbol,lane,score,price,data_freshness,trend_metrics,score_components,risk_metrics,'research_only' AS action_mode,'no proposals/orders unless explicitly enabled later' AS blocked_actions,created_at FROM crypto_research_snapshots ORDER BY created_at DESC, score DESC"),
     ("Crypto Observation State", "crypto_observation_state"),

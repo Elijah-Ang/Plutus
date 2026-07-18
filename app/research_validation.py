@@ -728,10 +728,16 @@ def import_legacy_opportunities(
     linked_execution_keys: set[tuple[str, str]] = set()
     setups = storage.fetch_all(
         """SELECT ps.*, po.actual_or_shadow, po.entry_time, po.entry_price,
+                  df.id AS durable_fill_id,df.price AS durable_fill_price,
+                  df.qty AS durable_fill_qty,eo.id AS durable_order_id,
                   GROUP_CONCAT(pb.blocker, '|') AS blockers
            FROM performance_setups ps
            LEFT JOIN performance_outcomes po ON po.setup_id=ps.id
            LEFT JOIN performance_blockers pb ON pb.setup_id=ps.id
+           LEFT JOIN fills df
+             ON CAST(df.id AS TEXT)=CAST(COALESCE(po.fill_id,ps.fill_id) AS TEXT)
+           LEFT JOIN orders eo
+             ON eo.id=df.order_id AND eo.proposal_id=ps.proposal_id
            WHERE (? IS NULL OR ps.run_id=?)
            GROUP BY ps.id"""
         , (run_id, run_id)
@@ -741,7 +747,12 @@ def import_legacy_opportunities(
         if not observed_at:
             continue
         tier = str(row.get("tier") or "unknown")
-        if row.get("fill_id") or row.get("fill_price") is not None:
+        if (
+            row.get("durable_fill_id") is not None
+            and row.get("durable_order_id") is not None
+            and float(row.get("durable_fill_price") or 0) > 0
+            and float(row.get("durable_fill_qty") or 0) > 0
+        ):
             execution_type = "actual_fill"
         elif int(row.get("proposed") or 0):
             execution_type = "proposal_unfilled"
@@ -755,7 +766,7 @@ def import_legacy_opportunities(
             execution_type = "hypothetical"
         signal = _safe_json(row.get("signal_state"))
         score_components = _safe_json(row.get("score_components"))
-        entry_price = row.get("fill_price") if execution_type == "actual_fill" else row.get("entry_price") or row.get("current_price")
+        entry_price = row.get("durable_fill_price") if execution_type == "actual_fill" else row.get("entry_price") or row.get("current_price")
         source_id = str(row["id"])
         opportunity = Opportunity(
             id=hashlib.sha256(f"performance_setups|{source_id}".encode()).hexdigest()[:32],
@@ -785,17 +796,32 @@ def import_legacy_opportunities(
             },
             universe_snapshot={"tier": tier, "asset_class": row.get("asset_class")},
             regime=_safe_json(row.get("volatility_metrics")).get("regime") or "unknown",
-            provenance={"run_id": row.get("run_id"), "proposal_id": row.get("proposal_id"), "fill_id": row.get("fill_id")},
+            provenance={"run_id": row.get("run_id"), "proposal_id": row.get("proposal_id"), "fill_id": row.get("durable_fill_id")},
         )
         opportunities.append(opportunity)
         for key in ("fill_id", "order_id", "proposal_id"):
-            if row.get(key):
-                linked_execution_keys.add((key, str(row[key])))
+            evidence_value = (
+                row.get("durable_fill_id")
+                if key == "fill_id"
+                else row.get("durable_order_id")
+                if key == "order_id"
+                else row.get(key)
+            )
+            if evidence_value:
+                linked_execution_keys.add((key, str(evidence_value)))
 
     # Full clone backfills normalize the legacy trade-outcome ledger. Runtime
     # cycles import only their newly captured Performance Lab rows; actual fill
     # linkage is synchronized there without rescanning all historical trades.
     trades = storage.fetch_all("SELECT * FROM trade_outcomes") if run_id is None else []
+    durable_fills = {
+        str(row["id"]): row
+        for row in storage.fetch_all(
+            """SELECT f.id,f.order_id,f.qty,f.price,o.proposal_id
+               FROM fills f JOIN orders o ON o.id=f.order_id
+               WHERE f.qty>0 AND f.price>0"""
+        )
+    }
     existing_sources = {(o.source_table, o.source_id) for o in opportunities}
     for row in trades:
         source_id = str(row["id"])
@@ -804,7 +830,20 @@ def import_legacy_opportunities(
         if any(row.get(key) and (key, str(row[key])) in linked_execution_keys for key in ("fill_id", "order_id", "proposal_id")):
             continue
         actual = str(row.get("actual_or_shadow") or "unknown")
-        execution_type = "actual_fill" if actual == "actual" else "shadow_hypothetical" if actual == "shadow" else "hypothetical"
+        durable_fill = durable_fills.get(str(row.get("fill_id")))
+        durable_fill_matches = durable_fill is not None and (
+            not row.get("order_id") or row.get("order_id") == durable_fill["order_id"]
+        ) and (
+            not row.get("proposal_id")
+            or row.get("proposal_id") == durable_fill["proposal_id"]
+        )
+        execution_type = (
+            "actual_fill"
+            if actual in {"actual", "actual_fill"} and durable_fill_matches
+            else "shadow_hypothetical"
+            if actual == "shadow"
+            else "hypothetical"
+        )
         opportunity = Opportunity(
             id=hashlib.sha256(f"trade_outcomes|{source_id}".encode()).hexdigest()[:32],
             source_table="trade_outcomes",

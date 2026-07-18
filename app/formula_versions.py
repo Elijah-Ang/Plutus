@@ -39,6 +39,8 @@ CRYPTO_PROPOSAL_FORMULA_VERSION = "crypto_research_proposal_authority_v2_net_cos
 CRYPTO_PROPOSAL_SCHEMA_VERSION = "crypto_research_proposal_previews_v1"
 CROSS_ASSET_ALLOCATION_FORMULA_VERSION = "cross_asset_normalized_constrained_allocator_v1"
 CROSS_ASSET_ALLOCATION_SCHEMA_VERSION = "cross_asset_research_allocation_plans_v1"
+PERFORMANCE_LAB_CLASSIFICATION_FORMULA_VERSION = "performance_lab_fill_bound_classification_v1"
+PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION = "performance_lab_fill_bound_classification_v1"
 STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION = "strategy_policy_enforcement_v1"
 STRATEGY_PROBE_POLICY_SCHEMA_VERSION = "strategy_probe_policy_v1"
 ADAPTIVE_CONVICTION_FORMULA_VERSION = "adaptive_conviction_formula_v2_operational_paper"
@@ -79,6 +81,7 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         CRYPTO_STRATEGY_SCHEMA_VERSION,
         CRYPTO_PROPOSAL_SCHEMA_VERSION,
         CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
+        PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION,
         STRATEGY_POLICY_ENFORCEMENT_SCHEMA_VERSION,
         STRATEGY_PROBE_POLICY_SCHEMA_VERSION,
         ADAPTIVE_CONVICTION_SCHEMA_VERSION,
