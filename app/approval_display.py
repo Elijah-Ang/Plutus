@@ -15,7 +15,7 @@ from .execution_risk_snapshot import REQUIRED_FORMULA_VERSIONS
 from .utils import iso_now
 
 
-DISPLAY_SCHEMA_VERSION = "telegram_approval_display_v1"
+DISPLAY_SCHEMA_VERSION = "telegram_approval_display_v2_equity_quote_feed"
 
 
 def display_envelope(
@@ -109,6 +109,19 @@ def display_envelope(
         "approval_source_type": source_type,
         "execution_path": execution_path,
         "request_basis": request_basis,
+        "display_quote": {
+            "source": proposal.get("quote_source") or payload.get("quote_source"),
+            "feed": proposal.get("quote_feed") or payload.get("quote_feed"),
+            "bid": proposal.get("quote_bid") if proposal.get("quote_bid") is not None else payload.get("quote_bid"),
+            "ask": proposal.get("quote_ask") if proposal.get("quote_ask") is not None else payload.get("quote_ask"),
+            "timestamp": proposal.get("quote_timestamp") or payload.get("quote_timestamp"),
+            "spread_bps": (
+                proposal.get("quote_spread_bps")
+                if proposal.get("quote_spread_bps") is not None
+                else payload.get("quote_spread_bps")
+            ),
+            "limit_price": proposal.get("limit_price") if proposal.get("limit_price") is not None else payload.get("limit_price"),
+        },
         "rotation_group_id": proposal.get("rotation_group_id") or payload.get("rotation_group_id"),
         "rotation_step_id": proposal.get("rotation_step_id") or payload.get("rotation_step_id"),
         "emergency_triggered": emergency_triggered,

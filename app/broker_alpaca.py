@@ -37,6 +37,11 @@ class AlpacaBroker(BrokerInterface):
             # This build has no live capability. Fail before reading any key so
             # live credentials cannot be selected through configuration alone.
             require_live_trading_support()
+        self.equity_realtime_data_feed = str(
+            (config.get("alpaca", {}) or {}).get("equity_realtime_data_feed") or ""
+        ).strip().lower()
+        if self.equity_realtime_data_feed not in {"iex", "sip"}:
+            raise RuntimeError("Alpaca real-time equity data feed must be explicitly iex or sip")
         key = api_key or get_secret("ALPACA_API_KEY")
         secret = secret_key or get_secret("ALPACA_SECRET_KEY")
         if not key or not secret:
@@ -142,12 +147,40 @@ class AlpacaBroker(BrokerInterface):
         return list(self._call("get_open_orders", "read", lambda: self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))))
 
     def get_latest_price(self, symbol: str) -> Any:
+        from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockLatestTradeRequest
-        return self._call("get_latest_price", "market_data", lambda: self.data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol])
+        feed = {"iex": DataFeed.IEX, "sip": DataFeed.SIP}[self.equity_realtime_data_feed]
+        return self._call(
+            "get_latest_price",
+            "market_data",
+            lambda: self.data.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol, feed=feed)
+            )[symbol],
+        )
 
     def get_latest_quote(self, symbol: str) -> Any:
+        from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockLatestQuoteRequest
-        return self._call("get_latest_quote", "market_data", lambda: self.data.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))[symbol])
+        feed = {"iex": DataFeed.IEX, "sip": DataFeed.SIP}[self.equity_realtime_data_feed]
+        quote = self._call(
+            "get_latest_quote",
+            "market_data",
+            lambda: self.data.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=feed)
+            )[symbol],
+        )
+        # Preserve the exact requested feed as trusted evidence. Alpaca's Quote
+        # model contains exchange codes but does not retain the request feed.
+        return {
+            "bid_price": getattr(quote, "bid_price", None),
+            "ask_price": getattr(quote, "ask_price", None),
+            "bid_size": getattr(quote, "bid_size", None),
+            "ask_size": getattr(quote, "ask_size", None),
+            "bid_exchange": getattr(quote, "bid_exchange", None),
+            "ask_exchange": getattr(quote, "ask_exchange", None),
+            "timestamp": getattr(quote, "timestamp", None),
+            "feed": self.equity_realtime_data_feed,
+        }
 
     def get_historical_bars(self, symbol: str, timeframe: str = "1Day", limit: int = 250) -> Any:
         from alpaca.data.requests import StockBarsRequest

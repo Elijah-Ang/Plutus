@@ -79,6 +79,10 @@ STRICT_TOP_LEVEL_KEYS = {
 
 STRICT_SECTION_KEYS = {
     "execution_capabilities": {"live_execution_enabled", "autonomous_entries_enabled", "autonomous_exits_enabled", "protective_paper_exit_enabled"},
+    "alpaca": {
+        "paper_trading_endpoint", "live_trading_endpoint",
+        "equity_realtime_data_feed", "timeouts",
+    },
     "quotes": {"max_age_seconds", "max_spread_bps", "max_limit_slippage_bps", "price_increment_usd"},
     "crypto": {
         "enabled", "mode", "paper_trading_enabled", "proposals_enabled", "live_enabled",
@@ -606,6 +610,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(config.get("live_enabled") is False, "live_enabled must be false in this build")
     require(config.get("auto_execution_enabled", False) is False, "auto_execution_enabled must remain false")
     require(config.get("auto_execution_mode", "manual_only") == "manual_only", "auto_execution_mode must be manual_only")
+    alpaca = config.get("alpaca", {}) or {}
+    require(
+        alpaca.get("equity_realtime_data_feed") in {"iex", "sip"},
+        "alpaca.equity_realtime_data_feed must explicitly select iex or sip",
+    )
     capabilities = config.get("execution_capabilities", {}) or {}
     require(capabilities.get("live_execution_enabled", False) is False, "live execution capability must remain disabled")
     require(capabilities.get("autonomous_entries_enabled", False) is False, "autonomous ordinary entries must remain disabled")

@@ -95,6 +95,15 @@ To facilitate testing on small accounts:
 *   Every normal order uses a fresh quote and a bounded limit price.
 *   All ordinary entries/adds require manual Telegram approval and final revalidation.
 
+The configured Alpaca equity quote feed is explicit and is part of proposal
+authority. A proposal is never displayed unless that feed returns a fresh,
+non-crossed, two-sided quote within the configured spread bound. If Telegram reports
+an IEX spread failure, do not retry the old approval, clear an exit blocker, or relax
+the threshold. IEX is a single-exchange feed; wait for a new spread-valid quote and a
+new proposal, or provision SIP entitlement and roll out a separately reviewed feed
+configuration. The audit trail records feed, bid, ask, timestamp, age, spread, limit,
+and the zero-invocation outcome.
+
 See [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) for the formula and schema version contract.
 
 ## Approval, exit, and recovery workflow

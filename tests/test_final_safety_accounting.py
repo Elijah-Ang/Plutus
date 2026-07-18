@@ -162,7 +162,7 @@ def test_fake_test_proposal_formatter_is_test_only(monkeypatch):
 
 
 def test_paper_identity_uses_public_account_and_endpoint_evidence():
-    broker = AlpacaBroker({"mode": "paper", "alpaca": {"paper_trading_endpoint": "https://paper-api.alpaca.markets"}}, "key", "secret")
+    broker = AlpacaBroker({"mode": "paper", "alpaca": {"paper_trading_endpoint": "https://paper-api.alpaca.markets", "equity_realtime_data_feed": "iex"}}, "key", "secret")
     broker.trading._base_url = ""
     broker.trading._sandbox = None
     identity = broker.paper_account_identity()

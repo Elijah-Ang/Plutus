@@ -166,8 +166,9 @@ def test_proposal_created_if_fresh_price_at_scan(temp_storage, base_config):
             props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
             assert len(props) == 1
             payload = json.loads(props[0]["payload"])
-            assert payload["proposal_price"] == 100.0
-            assert payload["proposal_price_source"] == "alpaca"
+            assert payload["proposal_price"] == 100.01
+            assert payload["proposal_price_source"] == "alpaca_quote"
+            assert payload["quote_feed"] == "iex"
             assert payload["proposal_price_age_seconds_at_send"] is not None
 
 def test_volatility_aware_price_movement_limits(temp_storage, base_config):
@@ -300,7 +301,8 @@ def test_missing_fresh_price_at_approval_blocks_order(temp_storage, base_config)
     
     assert success is False
     assert decision == "blocked"
-    assert "Final validation could not get a fresh Alpaca price" in reason
+    assert "quote was not fresh" in reason
+    assert "new proposal and new manual approval are required" in reason
     
     assert len(service.telegram.messages) > 0
-    assert "Final validation could not get a fresh Alpaca price" in service.telegram.messages[0]
+    assert "quote was not fresh" in service.telegram.messages[0]
