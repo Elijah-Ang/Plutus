@@ -136,13 +136,20 @@ class DurableExecutionStore:
 
             proposal_identity = str(proposal.get("proposal_id") or proposal.get("id") or "")
             synthetic_approval_id = approval_id or f"test-unapproved:{proposal_identity}"
+            synthetic_config: dict[str, Any] = {}
+            if proposal.get("config_hash"):
+                synthetic_config["effective_config_hash"] = proposal["config_hash"]
+            if isinstance(proposal.get("formula_versions"), Mapping):
+                synthetic_config["formula_versions"] = dict(
+                    proposal["formula_versions"]
+                )
             synthetic_snapshot = capture_execution_risk_snapshot(
                 self.storage, None,
                 proposal_id=proposal_identity,
                 approval_id=synthetic_approval_id,
                 run_id=run_id or "isolated-test-run",
                 context={},
-                config={},
+                config=synthetic_config,
                 candidate=proposal,
             )
             proposal["risk_snapshot_id"] = synthetic_snapshot["id"]
@@ -511,6 +518,15 @@ class DurableExecutionStore:
                 )
             )
             if side == "buy" and (sleeve_fields_present or limits.get("require_strategy_sleeve") is True):
+                from .allocation_authority import (
+                    AllocationAuthorityError,
+                    Phase4AllocationStore,
+                )
+                from .strategy_execution_registry import (
+                    StrategyRegistryIntegrityError,
+                    StrategyRegistryStore,
+                )
+
                 required = {
                     "strategy_registry_snapshot_id": proposal.get("strategy_registry_snapshot_id"),
                     "strategy_sleeve": proposal.get("strategy_sleeve"),
@@ -522,26 +538,46 @@ class DurableExecutionStore:
                 missing = [name for name, value in required.items() if value in (None, "")]
                 if missing:
                     raise RuntimeError("atomic strategy sleeve reservation missing " + ", ".join(sorted(missing)))
-                registry_authority = conn.execute(
-                    """SELECT 1 FROM strategy_registry_decisions
-                       WHERE snapshot_id=? AND strategy_version=? AND authorized=1 AND run_id=? LIMIT 1""",
-                    (proposal["strategy_registry_snapshot_id"], proposal["strategy_version"], run_id),
-                ).fetchone()
-                if registry_authority is None:
-                    raise RuntimeError("atomic strategy sleeve reservation lacks registry authority")
-                allocation = conn.execute(
-                    """SELECT run_id,decided_at,payload FROM phase4_allocation_decisions
-                       WHERE id=? AND run_id=? LIMIT 1""",
-                    (proposal["sleeve_allocation_id"], run_id),
-                ).fetchone()
-                if allocation is None:
-                    raise RuntimeError("atomic strategy sleeve reservation references an unknown current-run allocation")
                 try:
-                    allocation_payload = json.loads(allocation["payload"] or "{}")
-                    canonical_sleeves = allocation_payload["strategy_sleeves"]
+                    verified_registry = StrategyRegistryStore(self.storage).load_verified(
+                        str(proposal["strategy_registry_snapshot_id"]),
+                        conn=conn,
+                        expected_run_id=str(run_id),
+                    )
+                    registry_decisions = {
+                        decision.strategy_version: decision
+                        for decision in (
+                            *verified_registry.evaluation.authorized,
+                            *verified_registry.evaluation.rejected,
+                        )
+                    }
+                    registry_decision = registry_decisions.get(
+                        str(proposal["strategy_version"])
+                    )
+                    if registry_decision is None or not registry_decision.authorized:
+                        raise RuntimeError(
+                            "atomic strategy sleeve reservation lacks registry authority"
+                        )
+                    verified_allocation = Phase4AllocationStore(
+                        self.storage
+                    ).load_verified(
+                        str(proposal["sleeve_allocation_id"]),
+                        conn=conn,
+                        expected_run_id=str(run_id),
+                        expected_registry_snapshot_id=str(
+                            proposal["strategy_registry_snapshot_id"]
+                        ),
+                        expected_strategy_version=str(proposal["strategy_version"]),
+                        expected_config_hash=expected_config_hash,
+                        require_executable=True,
+                    )
+                    allocation_payload = dict(verified_allocation.payload)
+                    canonical_sleeves = verified_allocation.strategy_sleeves
                     canonical_sleeve = canonical_sleeves[proposal["strategy_version"]]
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise RuntimeError("atomic strategy sleeve allocation payload is invalid") from exc
+                except (AllocationAuthorityError, StrategyRegistryIntegrityError) as exc:
+                    raise RuntimeError(
+                        "atomic strategy sleeve persisted authority is invalid"
+                    ) from exc
                 if proposal["strategy_sleeve"] != proposal["strategy_version"]:
                     raise RuntimeError("atomic strategy sleeve identity does not match the strategy")
                 if canonical_sleeve.get("strategy_version") != proposal["strategy_version"]:
@@ -1617,8 +1653,12 @@ class DurableExecutionStore:
             for name, sql in checks.items()
         }
         from .fixed_point_accounting import fixed_point_integrity_report
+        from .allocation_authority import allocation_authority_integrity_report
+        from .strategy_execution_registry import strategy_registry_integrity_report
 
         report.update(fixed_point_integrity_report(self.storage))
+        report.update(strategy_registry_integrity_report(self.storage))
+        report.update(allocation_authority_integrity_report(self.storage))
         return report
 
 

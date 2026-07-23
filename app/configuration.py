@@ -27,6 +27,7 @@ from .formula_versions import (
     CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
     CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
     EVIDENCE_VERSION,
+    PHASE4_ALLOCATION_VERSION,
     PHASE4_ALLOCATOR_VERSION,
     PROFITABILITY_RANKING_FORMULA_VERSION,
     PROFITABILITY_RANKING_SCHEMA_VERSION,
@@ -165,7 +166,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "cross_asset_allocation", "adaptive_conviction", "adaptive_sizing"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "cross_asset_allocation", "adaptive_conviction", "adaptive_sizing", "phase4_allocation", "strategy_registry"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -366,6 +367,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "cross_asset_allocation": CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
+        "phase4_allocation": PHASE4_ALLOCATION_VERSION,
+        "strategy_registry": STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     }
     for key, expected in expected_formulas.items():
         require(formula_versions.get(key) == expected, f"formula_versions.{key} must be {expected}")

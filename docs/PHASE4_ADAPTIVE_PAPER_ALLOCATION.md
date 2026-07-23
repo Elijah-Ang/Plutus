@@ -41,6 +41,35 @@ Schema: `phase4_multi_strategy_operational_paper_v5_units`. Allocator:
 `multi_strategy_paper_allocator_v6_explicit_units`. Formula:
 `phase4_multi_strategy_allocation_v7_stop_risk_dollars`.
 
+## Persisted execution authority
+
+An executable allocation is not authorized merely because a row says
+`ALLOCATE` or contains a positive sleeve. The allocator first reloads and
+deterministically verifies the exact persisted strategy-registry snapshot for
+the same run. Its payload then carries
+`phase4_allocation_authority_v1_exact_registry`, the exact replayed registry
+evaluation under `strategy_execution_registry_formula_v2_full_policy`, the
+registry snapshot ID, complete policy-decision and performance-snapshot
+identities, quality/maturity/metrics evidence, ordered strategy family,
+authorized strategy order, evidence-version inventory, sleeve limits,
+configuration hash, and formula identities.
+
+At intent creation and rotation approval, the system reloads both persisted
+records and recomputes every registry fingerprint, decision identity,
+allocation replay fingerprint, and allocation ID inside the authoritative
+transaction. The allocation must reference the same run, registry snapshot,
+strategy, configuration, and exact registry evaluation. Regenerating a local
+evidence fingerprint is insufficient: a separate authority fingerprint binds
+the complete allocation payload and is itself part of the allocation ID.
+Altered policy, registry, sleeve, or payload evidence therefore cannot retain
+the displayed allocation identity. Missing, stale, malformed, or cross-run
+authority fails before an intent or reservation is inserted.
+
+Historical allocation rows created before the explicit exact-registry authority
+version remain available as audit evidence. They are never executable. This
+compatibility does not grant authority: every execution consumer requires the
+current authority version and an exact verified registry binding.
+
 Candidate, sleeve, global-budget, allocation, reservation, and reconciliation
 risk values carry `risk_value` and `risk_unit`. Supported source units are
 `stop_risk_dollars` and `pct_equity`; every operational calculation normalizes

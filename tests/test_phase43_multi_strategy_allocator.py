@@ -6,6 +6,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
+from app.allocation_authority import Phase4AllocationStore
 from app.formula_versions import (
     EVIDENCE_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
@@ -14,7 +15,12 @@ from app.formula_versions import (
 )
 from app.phase4_allocator import AdaptiveAllocator, allocate_candidates_to_sleeves
 from app.storage import Storage
-from app.strategy_execution_registry import REGISTRY_FORMULA_VERSION, REGISTRY_SCHEMA_VERSION
+from app.strategy_execution_registry import (
+    REGISTRY_FORMULA_VERSION,
+    REGISTRY_SCHEMA_VERSION,
+    StrategyExecutionRegistry,
+    persist,
+)
 from app.utils import load_config
 
 
@@ -42,9 +48,15 @@ def _entry(strategy: str) -> dict:
 
 def _policy(config: dict, strategy: str, state: str = "ACTIVE", quality: float = 85.0) -> dict:
     return {
+        "id": f"policy:{strategy}:{state}",
         "strategy_version": strategy,
         "state": state,
         "quality_score": quality,
+        "reason": f"test {state}",
+        "performance_snapshot_id": f"performance:{strategy}:{state}",
+        "decided_at": AS_OF,
+        "maturity": {"test": True},
+        "metrics": {"quality_score": quality},
         "enforcement_enabled": True,
         "evidence_current": True,
         "evidence_version_complete": True,
@@ -56,7 +68,6 @@ def _policy(config: dict, strategy: str, state: str = "ACTIVE", quality: float =
         "config_hash": config["effective_config_hash"],
         "suspended": False,
         "fingerprint": f"policy:{strategy}:{state}",
-        "reason": f"test {state}",
     }
 
 
@@ -138,9 +149,80 @@ def test_one_authorized_strategy_uses_valid_degenerate_covariance_and_exact_slee
     assert covariance["aligned_pairwise_inputs"] == {}
     sleeve = result["strategy_sleeves"]["alpha_v1"]
     assert sleeve["allocated_risk"] > 0
-    assert sleeve["remaining_risk"] == pytest.approx(sleeve["allocated_risk"] - 0.01)
-    assert sum(item["allocated_risk"] for item in result["strategy_sleeves"].values()) + result["unallocated_available_risk"] == pytest.approx(1.0)
+    assert sleeve["remaining_risk"] == pytest.approx(
+        sleeve["allocated_risk"] - 0.01
+    )
+    assert (
+        sum(
+            item["allocated_risk"]
+            for item in result["strategy_sleeves"].values()
+        )
+        + result["unallocated_available_risk"]
+        == pytest.approx(1.0)
+    )
     assert result["risk_reconciliation_residual"] == 0.0
+
+
+def test_executable_allocation_binds_exact_persisted_registry_evaluation(
+    tmp_path,
+) -> None:
+    strategies = ("alpha_v1",)
+    config = _config(*strategies)
+    storage, allocator = _allocator(tmp_path, config, strategies, "exact-registry")
+    policy = _policy(config, "alpha_v1")
+    registry_as_of = "2026-07-14T07:59:00+00:00"
+    evaluation = StrategyExecutionRegistry(
+        config,
+        available_implementations={
+            "implementation:alpha_v1": "implementation_v1"
+        },
+    ).evaluate({"alpha_v1": policy}, as_of=registry_as_of)
+    snapshot_id = str(
+        persist(storage, "exact-registry", evaluation)["snapshot_id"]
+    )
+    forged_caller_policy = {
+        **policy,
+        "id": "forged-policy-decision",
+        "state": "SUSPENDED",
+        "quality_score": 0.0,
+        "reason": "forged caller hint",
+    }
+
+    result = allocator.run(
+        regime="normal",
+        drawdown_pct=0.0,
+        strategy_policy_map={"alpha_v1": forged_caller_policy},
+        portfolio_snapshot={
+            "phase3_available_risk_pct": 1.0,
+            "portfolio_equity": 100.0,
+            "as_of": AS_OF,
+            "equity_as_of": AS_OF,
+            "strategy_registry_snapshot_id": snapshot_id,
+        },
+        as_of=AS_OF,
+    )
+
+    assert result["registry_evaluation"] == evaluation.as_dict()
+    assert result["registry_evaluation"]["as_of"] == registry_as_of
+    assert result["authorized_strategies"] == ["alpha_v1"]
+    assert (
+        result["strategy_policies"]["alpha_v1"]["policy_decision_id"]
+        == policy["id"]
+    )
+    assert (
+        result["strategy_policies"]["alpha_v1"]["quality_score"]
+        == policy["quality_score"]
+    )
+    verified = Phase4AllocationStore(storage).load_verified(
+        result["allocation_id"],
+        expected_run_id="exact-registry",
+        expected_registry_snapshot_id=snapshot_id,
+        expected_strategy_version="alpha_v1",
+        expected_config_hash=config["effective_config_hash"],
+        require_executable=True,
+    )
+    assert verified.registry_binding_exact is True
+    assert verified.executable is True
 
 
 def test_multiple_authorized_strategies_have_deterministic_psd_order_and_replay_payload(tmp_path) -> None:

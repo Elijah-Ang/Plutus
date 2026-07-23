@@ -6,6 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
+from app.allocation_authority import (
+    ALLOCATION_AUTHORITY_VERSION,
+    allocation_authority_fingerprint,
+    allocation_identity,
+)
 from app.rotation_coordinator import (
     RotationCoordinator,
     RotationState,
@@ -16,14 +21,23 @@ from app.execution import DurableExecutionStore, ExecutionResult
 from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.formula_versions import (
     CONFIGURATION_SCHEMA_VERSION,
+    EVIDENCE_VERSION,
     PHASE4_ALLOCATION_VERSION,
+    PHASE4_ALLOCATOR_VERSION,
     PHASE4_SCHEMA_VERSION,
+    STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+    STRATEGY_PERFORMANCE_VERSION,
+    STRATEGY_POLICY_VERSION,
     STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
 )
 from app.order_state import OrderState
 from app.service import TradingService
 from app.storage import Storage
+from app.strategy_execution_registry import StrategyExecutionRegistry, persist
+
+
+CONFIG_HASH = "a" * 64
 
 
 @pytest.fixture()
@@ -32,57 +46,149 @@ def coordinator(tmp_path):
     storage.initialize()
     with storage.connect() as conn:
         apply_rotation_schema(conn)
-    now = datetime.now(UTC).isoformat()
-    for snapshot_id, allocation_id in (("registry-before", "allocation-before"), ("registry-after", "allocation-after")):
-        storage.execute(
-            """INSERT INTO strategy_registry_snapshots(
-                 id,run_id,evaluated_at,registry_schema_version,registry_formula_version,
-                 configuration_version,config_hash,authorized_strategies_json,rejected_strategies_json,
-                 global_reasons_json,raw_inputs_json,evaluation_fingerprint,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (snapshot_id, "run-1", now, STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
-             STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION, CONFIGURATION_SCHEMA_VERSION, "config-hash",
-             '["rule_based_v2"]', "[]", "[]", "{}", f"fingerprint-{snapshot_id}", now),
-        )
-        storage.execute(
-            """INSERT INTO strategy_registry_decisions(
-                 id,snapshot_id,run_id,strategy_name,strategy_version,authorized,policy_state,
-                 reasons_json,reason,decision_json,raw_inputs_json,evidence_version,performance_version,
-                 policy_version,policy_schema_version,configuration_version,config_hash,decision_fingerprint,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"decision-{snapshot_id}", snapshot_id, "run-1", "Rule", "rule_based_v2", 1, "ACTIVE",
-             "[]", "authorized", "{}", "{}", "evidence", "performance", "policy", "policy-schema",
-             CONFIGURATION_SCHEMA_VERSION, "config-hash", f"decision-fingerprint-{snapshot_id}", now),
-        )
-        payload = json.dumps({
+    now_dt = datetime.now(UTC)
+    now = now_dt.isoformat()
+    config = {
+        "configuration_schema_version": CONFIGURATION_SCHEMA_VERSION,
+        "effective_config_hash": CONFIG_HASH,
+        "mode": "paper",
+        "live_enabled": False,
+        "auto_execution_enabled": False,
+        "execution_capabilities": {"live_execution_enabled": False},
+        "strategy_execution_registry": {
+            "schema_version": STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+            "formula_version": STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+            "mode": "paper_only",
+            "required_configuration_version": CONFIGURATION_SCHEMA_VERSION,
+            "required_evidence_version": EVIDENCE_VERSION,
+            "required_performance_version": STRATEGY_PERFORMANCE_VERSION,
+            "required_policy_version": STRATEGY_POLICY_VERSION,
+            "required_policy_schema_version": STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+            "entries": {"rule_based_v2": {
+                "strategy_name": "Rule",
+                "strategy_version": "rule_based_v2",
+                "implementation_id": "implementation:rule_based_v2",
+                "implementation_version": "implementation_v1",
+                "implementation_available": True,
+                "execution_eligible": True,
+                "paper_eligible": True,
+                "live_eligible": False,
+                "human_authorized": True,
+                "config_authorized": True,
+                "authorization_id": "rotation-test-paper-authority",
+                "effective_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": "2027-01-01T00:00:00+00:00",
+                "suspended": False,
+            }},
+        },
+    }
+    policy = {
+        "id": "rotation-test-policy-decision",
+        "strategy_version": "rule_based_v2",
+        "state": "ACTIVE",
+        "quality_score": 85.0,
+        "reason": "test ACTIVE policy",
+        "performance_snapshot_id": "rotation-test-performance-snapshot",
+        "decided_at": now,
+        "maturity": {"test": True},
+        "metrics": {"quality_score": 85.0},
+        "enforcement_enabled": True,
+        "evidence_current": True,
+        "evidence_version_complete": True,
+        "evidence_version": EVIDENCE_VERSION,
+        "performance_version": STRATEGY_PERFORMANCE_VERSION,
+        "policy_version": STRATEGY_POLICY_VERSION,
+        "schema_version": STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+        "configuration_version": CONFIGURATION_SCHEMA_VERSION,
+        "config_hash": CONFIG_HASH,
+        "suspended": False,
+        "fingerprint": "rotation-test-policy",
+    }
+    authorities: dict[str, str] = {}
+    for index, label in enumerate(("before", "after")):
+        evaluated_at = (now_dt + timedelta(microseconds=index)).isoformat()
+        evaluation = StrategyExecutionRegistry(
+            config,
+            available_implementations={
+                "implementation:rule_based_v2": "implementation_v1"
+            },
+        ).evaluate({"rule_based_v2": policy}, as_of=evaluated_at)
+        snapshot_id = str(persist(storage, "run-1", evaluation)["snapshot_id"])
+        payload = {
             "schema_version": PHASE4_SCHEMA_VERSION,
+            "allocation_authority_version": ALLOCATION_AUTHORITY_VERSION,
             "formula_version": PHASE4_ALLOCATION_VERSION,
-            "config_hash": "config-hash",
+            "config_hash": CONFIG_HASH,
             "registry_snapshot_id": snapshot_id,
             "authorized_strategies": ["rule_based_v2"],
-        })
+            "registry_evaluation": evaluation.as_dict(),
+            "strategy_order": ["rule_based_v2"],
+            "evidence_versions": {"rule_based_v2": EVIDENCE_VERSION},
+            "strategy_sleeves": {"rule_based_v2": {
+                "strategy_version": "rule_based_v2",
+                "risk_unit": "stop_risk_dollars",
+                "remaining_risk": 25.0,
+                "remaining_notional": 500.0,
+            }},
+            "raw_replay_inputs": {
+                "as_of": evaluated_at,
+                "regime": "normal",
+                "drawdown_pct": 0.0,
+                "portfolio_snapshot": {
+                    "strategy_registry_snapshot_id": snapshot_id,
+                },
+                "registry": evaluation.as_dict(),
+                "strategy_order": ["rule_based_v2"],
+                "authorized_strategy_order": ["rule_based_v2"],
+                "evidence_fingerprints": {},
+                "covariance_inputs": {},
+                "available_risk_inputs": {},
+                "configuration_hash": CONFIG_HASH,
+                "formula_version": PHASE4_ALLOCATION_VERSION,
+            },
+        }
+        payload["allocation_authority_fingerprint"] = (
+            allocation_authority_fingerprint(payload)
+        )
+        weights = {"rule_based_v2": 1.0}
+        evidence_fingerprint, allocation_id = allocation_identity(
+            "run-1", payload["raw_replay_inputs"], weights,
+            payload["strategy_sleeves"], authority_payload=payload,
+        )
         storage.execute(
             """INSERT INTO phase4_allocation_decisions(
                  id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
                  fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-                 uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,formula_version,config_hash,payload)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (allocation_id, "run-1", now, "ACTIVE_ADAPTIVE_PAPER", "test", "{\"rule_based_v2\":1}", 0.0,
-             0.25, "{}", "{}", "normal", 0.0, 0.0, 1.0, "ALLOCATE", "test",
-             f"allocation-fingerprint-{allocation_id}", PHASE4_ALLOCATION_VERSION, "config-hash", payload),
+                 uncertainty_penalty,data_quality,decision,reason,evidence_versions_json,
+                 evidence_fingerprint,formula_version,config_hash,payload)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (allocation_id, "run-1", evaluated_at, "ACTIVE_ADAPTIVE_PAPER",
+             PHASE4_ALLOCATOR_VERSION, json.dumps(weights), 0.0, 0.25, "{}", "{}",
+             "normal", 0.0, 0.0, 1.0, "ALLOCATE_ADAPTIVELY", "test",
+             json.dumps(payload["evidence_versions"]), evidence_fingerprint,
+             PHASE4_ALLOCATION_VERSION, CONFIG_HASH, json.dumps(payload)),
         )
+        authorities[f"registry-{label}"] = snapshot_id
+        authorities[f"allocation-{label}"] = allocation_id
     storage.execute(
         """INSERT INTO position_lifecycles(
              id,symbol,side,state,opened_at,opening_quantity,current_quantity,average_entry_price,
              source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         ("lifecycle-old", "OLD", "long", "active", now, 10.0, 10.0, 100.0, "test", now, now),
     )
-    return storage, RotationCoordinator(storage, config_hash="config-hash")
+    manager = RotationCoordinator(storage, config_hash=CONFIG_HASH)
+    manager._test_authority_ids = authorities
+    return storage, manager
 
 
 def _create(coordinator, *, entries=None, exits=None, minutes=30,
             registry_snapshot_id="registry-before", allocation_id="allocation-before"):
     _storage, manager = coordinator
+    authority_ids = getattr(manager, "_test_authority_ids", {})
+    registry_snapshot_id = authority_ids.get(
+        registry_snapshot_id, registry_snapshot_id
+    )
+    allocation_id = authority_ids.get(allocation_id, allocation_id)
     evaluated_at = datetime.now(UTC)
     exit_rows = exits or [{
         "proposal_id": "exit-proposal",
@@ -157,7 +263,8 @@ def test_group_display_binds_complete_workflow_before_any_exit_intent(coordinato
         storage.execute("UPDATE rotation_steps SET sequence=99 WHERE group_id=? AND sequence=0", (group["id"],))
     elif mutation == "lifecycle":
         row = storage.fetch_all("SELECT id,payload FROM rotation_steps WHERE group_id=? ORDER BY sequence LIMIT 1", (group["id"],))[0]
-        payload = json.loads(row["payload"]); payload["position_lifecycle_id"] = "other-lifecycle"
+        payload = json.loads(row["payload"])
+        payload["position_lifecycle_id"] = "other-lifecycle"
         storage.execute("UPDATE rotation_steps SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
     elif mutation == "contingent_entry":
         storage.execute("UPDATE rotation_contingent_entries SET candidate_key='other-entry' WHERE group_id=?", (group["id"],))
@@ -183,19 +290,37 @@ def test_rotation_creation_requires_both_authority_ids(coordinator):
         _create(coordinator, registry_snapshot_id="")
 
 
-@pytest.mark.parametrize("mutation", [
-    lambda storage: storage.execute(
-        "UPDATE strategy_registry_snapshots SET evaluated_at=? WHERE id='registry-before'",
-        ((datetime.now(UTC) - timedelta(minutes=6)).isoformat(),),
-    ),
-    lambda storage: storage.execute(
-        "UPDATE strategy_registry_snapshots SET config_hash='wrong-hash' WHERE id='registry-before'"
-    ),
-])
+@pytest.mark.parametrize("mutation", ["stale", "config_hash", "decision", "allocation"])
 def test_rotation_approval_fails_closed_for_stale_or_mismatched_authority(coordinator, mutation):
     storage, manager = coordinator
     group = _create(coordinator)
-    mutation(storage)
+    snapshot_id = manager._test_authority_ids["registry-before"]
+    if mutation == "stale":
+        storage.execute(
+            "UPDATE strategy_registry_snapshots SET evaluated_at=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(minutes=6)).isoformat(), snapshot_id),
+        )
+    elif mutation == "config_hash":
+        storage.execute(
+            "UPDATE strategy_registry_snapshots SET config_hash='wrong-hash' WHERE id=?",
+            (snapshot_id,),
+        )
+    elif mutation == "decision":
+        storage.execute(
+            "UPDATE strategy_registry_decisions SET authorized=0 WHERE snapshot_id=?",
+            (snapshot_id,),
+        )
+    else:
+        allocation_id = manager._test_authority_ids["allocation-before"]
+        payload = json.loads(storage.fetch_all(
+            "SELECT payload FROM phase4_allocation_decisions WHERE id=?",
+            (allocation_id,),
+        )[0]["payload"])
+        payload["strategy_sleeves"]["rule_based_v2"]["remaining_notional"] = 999999
+        storage.execute(
+            "UPDATE phase4_allocation_decisions SET payload=? WHERE id=?",
+            (json.dumps(payload), allocation_id),
+        )
     with pytest.raises(RuntimeError, match="rotation approval blocked"):
         manager.approve(group["id"], approval_id="authority-test", sender_id="owner", command="APPROVE ROTATION")
     assert manager.get_group(group["id"])["state"] == RotationState.CANCELLED.value
@@ -246,7 +371,8 @@ def test_full_fill_rotation_uses_only_reconciled_capacity_and_never_enlarges(coo
         group["id"], entry["id"], candidate_key=entry["candidate_key"], price=100,
         requested_quantity=8, stop_risk_per_share=5, allocation_notional_cap=700,
         allocation_risk_cap=20, other_available_cash=600, minimum_notional=5,
-        registry_snapshot_id="registry-after", allocation_id="allocation-after",
+        registry_snapshot_id=manager._test_authority_ids["registry-after"],
+        allocation_id=manager._test_authority_ids["allocation-after"],
     )
     assert result.allowed
     assert result.final_quantity == 4
@@ -278,7 +404,8 @@ def test_partial_fill_caps_entry_at_actual_release_not_estimate(coordinator):
         group["id"], entry["id"], candidate_key=entry["candidate_key"], price=50,
         requested_quantity=10, stop_risk_per_share=1, allocation_notional_cap=500,
         allocation_risk_cap=25, other_available_cash=1000, minimum_notional=5,
-        registry_snapshot_id="registry-after", allocation_id="allocation-after",
+        registry_snapshot_id=manager._test_authority_ids["registry-after"],
+        allocation_id=manager._test_authority_ids["allocation-after"],
     )
     assert result.allowed
     assert result.final_notional == 175
@@ -302,7 +429,8 @@ def test_later_exit_fill_is_accounted_without_enlarging_or_reviving_dependency(c
         group["id"], entry["id"], candidate_key=entry["candidate_key"], price=50,
         requested_quantity=1, stop_risk_per_share=1, allocation_notional_cap=500,
         allocation_risk_cap=25, other_available_cash=1000, minimum_notional=5,
-        registry_snapshot_id="registry-after", allocation_id="allocation-after",
+        registry_snapshot_id=manager._test_authority_ids["registry-after"],
+        allocation_id=manager._test_authority_ids["allocation-after"],
     )
     before = manager.get_group(group["id"])
     assert before["state"] == RotationState.ENTRY_REVALIDATING.value
@@ -372,7 +500,8 @@ def test_material_candidate_change_requires_new_approval(coordinator):
         group["id"], entry["id"], candidate_key="different-logical-action", price=100,
         requested_quantity=1, stop_risk_per_share=5, allocation_notional_cap=100,
         allocation_risk_cap=5, other_available_cash=100, minimum_notional=5,
-        registry_snapshot_id="registry-after", allocation_id="allocation-after",
+        registry_snapshot_id=manager._test_authority_ids["registry-after"],
+        allocation_id=manager._test_authority_ids["allocation-after"],
     )
     assert not result.allowed
     assert manager.get_group(group["id"])["state"] == RotationState.ENTRY_BLOCKED.value
@@ -401,7 +530,7 @@ def test_restart_recovery_never_submits_and_resumes_reconciliation(coordinator):
     _approve_and_submit_exit(coordinator, group)
     manager.record_exit_fill(group["id"], intent_id="exit-intent", cumulative_quantity=2,
                              cumulative_notional=200, released_risk=4, exit_complete=False)
-    restarted = RotationCoordinator(storage, config_hash="config-hash")
+    restarted = RotationCoordinator(storage, config_hash=CONFIG_HASH)
     action = next(row for row in restarted.recovery_actions() if row["group_id"] == group["id"])
     assert action["action"] == "reconcile_exit_only"
     assert action["broker_submission_allowed"] is False
@@ -479,7 +608,7 @@ def test_recovered_exit_submission_lifecycle_event_is_notified(coordinator):
 
     service = TradingService.__new__(TradingService)
     service.storage = storage
-    service.config = {"effective_config_hash": "config-hash"}
+    service.config = {"effective_config_hash": CONFIG_HASH}
     service.telegram = Telegram()
     service._send_rotation_lifecycle_events()
 
@@ -530,7 +659,7 @@ def test_service_recovery_blocks_expired_rotation_before_intent_and_releases_res
     )
     service = TradingService.__new__(TradingService)
     service.storage = storage
-    service.config = {"effective_config_hash": "config-hash"}
+    service.config = {"effective_config_hash": CONFIG_HASH}
     service.broker = None
     service.run_id = "recovery"
     service._recover_local_workflows()
@@ -588,7 +717,7 @@ def test_final_execution_boundary_rechecks_rotation_expiry(coordinator):
     service.broker = Broker()
     service.run_id = "final-boundary"
     service.config = {
-        "mode": "paper", "live_enabled": False, "effective_config_hash": "config-hash",
+        "mode": "paper", "live_enabled": False, "effective_config_hash": CONFIG_HASH,
         "telegram": {
             "approval_price_refresh_required": True,
             "approval_max_price_age_seconds": 120,
@@ -672,7 +801,7 @@ def test_service_rotation_recovery_defers_when_broker_unavailable_then_resumes(c
     workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
     service = TradingService.__new__(TradingService)
     service.storage = storage
-    service.config = {"effective_config_hash": "config-hash"}
+    service.config = {"effective_config_hash": CONFIG_HASH}
     service.broker = None
     service.run_id = "recovery"
 

@@ -37,6 +37,10 @@ decisions and evidence:
 - `candidate_trade_economics_v1` and `candidate_profitability_ranking_v1`:
   immutable candidate economics and conservative ranking inputs bound to exact
   strategy policy and validation authority.
+- `strategy_execution_registry_formula_v2_full_policy`: current execution
+  eligibility is bound to the complete persisted policy decision, including
+  decision and performance-snapshot IDs, quality, maturity, metrics, evidence,
+  configuration, validation provenance, and policy fingerprint.
 
 ## Effective paper sizing
 
