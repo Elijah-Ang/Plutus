@@ -6,17 +6,28 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.allocation_authority import (
+    ALLOCATION_AUTHORITY_VERSION,
+    allocation_authority_fingerprint,
+    allocation_identity,
+)
 from app.execution import DurableExecutionStore, _winner_add_reservation_risk
 from app.formula_versions import (
     CONFIGURATION_SCHEMA_VERSION,
+    EVIDENCE_VERSION,
     PHASE4_ALLOCATION_VERSION,
+    PHASE4_ALLOCATOR_VERSION,
     PHASE4_SCHEMA_VERSION,
+    STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+    STRATEGY_PERFORMANCE_VERSION,
+    STRATEGY_POLICY_VERSION,
     STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
 )
-from app.rotation_coordinator import RotationCoordinator, RotationState
+from app.rotation_coordinator import RotationCoordinator
 from app.service import TradingService, _hydrate_proposal_row, _validated_authoritative_stop
 from app.storage import Storage
+from app.strategy_execution_registry import StrategyExecutionRegistry, persist
 from app.trend_management import TrendManagementEngine, TrendManagementInput
 from app.winner_expansion import WinnerExpansionStore
 
@@ -198,30 +209,101 @@ def test_stale_stop_writer_cannot_regress_exit_mode_and_same_stop_refreshes_age(
     assert state["protective_stop_source"] == "same-stop-revalidation"
 
 
-def _persist_registry_and_allocation(storage: Storage) -> None:
+_AUTHORITY_CONFIG_HASH = "a" * 64
+
+
+def _persist_registry_and_allocation(
+    storage: Storage, *, run_id: str = "run-1"
+) -> tuple[str, str]:
     now = datetime.now(UTC).isoformat()
-    storage.execute(
-        """INSERT INTO strategy_registry_snapshots(
-             id,run_id,evaluated_at,registry_schema_version,registry_formula_version,
-             configuration_version,config_hash,authorized_strategies_json,rejected_strategies_json,
-             global_reasons_json,raw_inputs_json,evaluation_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("registry-1", "run-1", now, "schema", "formula", "config", "hash", "[]", "[]", "[]", "{}", "fp", now),
-    )
-    storage.execute(
-        """INSERT INTO strategy_registry_decisions(
-             id,snapshot_id,run_id,strategy_name,strategy_version,authorized,policy_state,
-             reasons_json,reason,decision_json,raw_inputs_json,evidence_version,performance_version,
-             policy_version,policy_schema_version,configuration_version,config_hash,decision_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("registry-decision", "registry-1", "run-1", "Rule", "rule_based_v2", 1, "ACTIVE",
-         "[]", "authorized", "{}", "{}", "e", "p", "policy", "schema", "config", "hash", "decision-fp", now),
-    )
+    implementation_id = "implementation:rule_based_v2"
+    implementation_version = "implementation_v1"
+    config = {
+        "configuration_schema_version": CONFIGURATION_SCHEMA_VERSION,
+        "effective_config_hash": _AUTHORITY_CONFIG_HASH,
+        "mode": "paper",
+        "live_enabled": False,
+        "auto_execution_enabled": False,
+        "execution_capabilities": {"live_execution_enabled": False},
+        "strategy_execution_registry": {
+            "schema_version": STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
+            "formula_version": STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
+            "mode": "paper_only",
+            "required_configuration_version": CONFIGURATION_SCHEMA_VERSION,
+            "required_evidence_version": EVIDENCE_VERSION,
+            "required_performance_version": STRATEGY_PERFORMANCE_VERSION,
+            "required_policy_version": STRATEGY_POLICY_VERSION,
+            "required_policy_schema_version": STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+            "entries": {"rule_based_v2": {
+                "strategy_name": "Rule",
+                "strategy_version": "rule_based_v2",
+                "implementation_id": implementation_id,
+                "implementation_version": implementation_version,
+                "implementation_available": True,
+                "execution_eligible": True,
+                "paper_eligible": True,
+                "live_eligible": False,
+                "human_authorized": True,
+                "config_authorized": True,
+                "authorization_id": "test-paper-authorization",
+                "effective_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": "2027-01-01T00:00:00+00:00",
+                "suspended": False,
+            }},
+        },
+    }
+    policy = {
+        "id": "test-policy-decision",
+        "strategy_version": "rule_based_v2",
+        "state": "ACTIVE",
+        "quality_score": 85.0,
+        "reason": "test ACTIVE policy",
+        "performance_snapshot_id": "test-performance-snapshot",
+        "decided_at": now,
+        "maturity": {"test": True},
+        "metrics": {"quality_score": 85.0},
+        "enforcement_enabled": True,
+        "evidence_current": True,
+        "evidence_version_complete": True,
+        "evidence_version": EVIDENCE_VERSION,
+        "performance_version": STRATEGY_PERFORMANCE_VERSION,
+        "policy_version": STRATEGY_POLICY_VERSION,
+        "schema_version": STRATEGY_PERFORMANCE_SCHEMA_VERSION,
+        "configuration_version": CONFIGURATION_SCHEMA_VERSION,
+        "config_hash": _AUTHORITY_CONFIG_HASH,
+        "suspended": False,
+        "fingerprint": "test-policy-fingerprint",
+    }
+    evaluation = StrategyExecutionRegistry(
+        config,
+        available_implementations={implementation_id: implementation_version},
+    ).evaluate({"rule_based_v2": policy}, as_of=now)
+    registry_id = str(persist(storage, run_id, evaluation)["snapshot_id"])
     payload = {
+        "schema_version": PHASE4_SCHEMA_VERSION,
+        "allocation_authority_version": ALLOCATION_AUTHORITY_VERSION,
+        "formula_version": PHASE4_ALLOCATION_VERSION,
+        "config_hash": _AUTHORITY_CONFIG_HASH,
         "authorized_strategies": ["rule_based_v2"],
-        "registry_snapshot_id": "registry-1",
-        "raw_replay_inputs": {"portfolio_snapshot": {
+        "registry_snapshot_id": registry_id,
+        "registry_evaluation": evaluation.as_dict(),
+        "strategy_order": ["rule_based_v2"],
+        "evidence_versions": {"rule_based_v2": EVIDENCE_VERSION},
+        "raw_replay_inputs": {
+            "as_of": now,
+            "regime": "normal",
+            "drawdown_pct": 0.0,
+            "registry": evaluation.as_dict(),
+            "strategy_order": ["rule_based_v2"],
+            "authorized_strategy_order": ["rule_based_v2"],
+            "evidence_fingerprints": {},
+            "covariance_inputs": {},
+            "available_risk_inputs": {},
+            "configuration_hash": _AUTHORITY_CONFIG_HASH,
+            "formula_version": PHASE4_ALLOCATION_VERSION,
+            "portfolio_snapshot": {
             "portfolio_equity": 10_000.0,
+            "strategy_registry_snapshot_id": registry_id,
             "active_reservation_ids_by_strategy": {},
             "pending_proposal_claims_by_strategy": {},
         }},
@@ -234,33 +316,91 @@ def _persist_registry_and_allocation(storage: Storage) -> None:
             }
         },
     }
+    payload["allocation_authority_fingerprint"] = (
+        allocation_authority_fingerprint(payload)
+    )
+    weights = {"rule_based_v2": 1.0}
+    evidence_fingerprint, allocation_id = allocation_identity(
+        run_id,
+        payload["raw_replay_inputs"],
+        weights,
+        payload["strategy_sleeves"],
+        authority_payload=payload,
+    )
     storage.execute(
         """INSERT INTO phase4_allocation_decisions(
              id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
              fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("allocation-1", "run-1", now, "ACTIVE_ADAPTIVE_PAPER", "allocator", "{}", 1.0,
-         0.25, "{}", "{}", "normal", 0.0, 1.0, 1.0, "ALLOCATE", "test", "allocation-fp", json.dumps(payload)),
+             uncertainty_penalty,data_quality,decision,reason,evidence_versions_json,
+             evidence_fingerprint,formula_version,config_hash,payload)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (allocation_id, run_id, now, "ACTIVE_ADAPTIVE_PAPER", PHASE4_ALLOCATOR_VERSION,
+         json.dumps(weights), 1.0, 0.25, "{}", "{}", "normal", 0.0, 1.0, 1.0,
+         "ALLOCATE_ADAPTIVELY", "test", json.dumps(payload["evidence_versions"]),
+         evidence_fingerprint, PHASE4_ALLOCATION_VERSION, _AUTHORITY_CONFIG_HASH,
+         json.dumps(payload)),
     )
+    return registry_id, allocation_id
 
 
 def _sleeved_proposal(
-    identifier: str, *, notional: float, notional_ceiling: float, risk_ceiling: float
+    identifier: str, *, notional: float, notional_ceiling: float, risk_ceiling: float,
+    registry_id: str, allocation_id: str,
 ) -> dict:
     return {
         "id": identifier, "proposal_id": identifier, "symbol": "SPY", "side": "buy",
         "action": "entry", "notional": notional, "latest_price": 100.0, "stop_price": 99.0,
         "trading_mode": "paper", "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-        "strategy_version": "rule_based_v2", "strategy_registry_snapshot_id": "registry-1",
-        "strategy_sleeve": "rule_based_v2", "sleeve_allocation_id": "allocation-1",
+        "strategy_version": "rule_based_v2", "strategy_registry_snapshot_id": registry_id,
+        "strategy_sleeve": "rule_based_v2", "sleeve_allocation_id": allocation_id,
         "sleeve_notional_ceiling": notional_ceiling, "sleeve_stop_risk_ceiling": risk_ceiling,
+        "config_hash": _AUTHORITY_CONFIG_HASH,
     }
+
+
+def _persist_allocation_variant(
+    storage: Storage,
+    source_id: str,
+    payload: dict,
+    *,
+    replace_source: bool = False,
+) -> str:
+    row = dict(storage.fetch_all(
+        "SELECT * FROM phase4_allocation_decisions WHERE id=?", (source_id,)
+    )[0])
+    weights = json.loads(row["strategy_weights_json"])
+    payload["allocation_authority_fingerprint"] = (
+        allocation_authority_fingerprint(payload)
+    )
+    evidence_fingerprint, allocation_id = allocation_identity(
+        row["run_id"], payload["raw_replay_inputs"], weights,
+        payload["strategy_sleeves"], authority_payload=payload,
+    )
+    row.update({
+        "id": allocation_id,
+        "decided_at": payload["raw_replay_inputs"]["as_of"],
+        "evidence_versions_json": json.dumps(payload["evidence_versions"]),
+        "evidence_fingerprint": evidence_fingerprint,
+        "formula_version": PHASE4_ALLOCATION_VERSION,
+        "config_hash": _AUTHORITY_CONFIG_HASH,
+        "payload": json.dumps(payload),
+    })
+    if replace_source:
+        storage.execute(
+            "DELETE FROM phase4_allocation_decisions WHERE id=?", (source_id,)
+        )
+    columns = tuple(row)
+    storage.execute(
+        f"INSERT INTO phase4_allocation_decisions({','.join(columns)}) "
+        f"VALUES({','.join('?' for _ in columns)})",
+        tuple(row[name] for name in columns),
+    )
+    return allocation_id
 
 
 def test_atomic_sleeve_uses_persisted_authority_and_rejects_proposal_enlargement(tmp_path) -> None:
     storage = _storage(tmp_path)
-    _persist_registry_and_allocation(storage)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
     store = DurableExecutionStore(storage)
 
     with pytest.raises(RuntimeError, match="exceeds canonical persisted allocation"):
@@ -268,93 +408,208 @@ def test_atomic_sleeve_uses_persisted_authority_and_rejects_proposal_enlargement
             _sleeved_proposal(
                 "inflated", notional=100.0,
                 notional_ceiling=1_000_000.0, risk_ceiling=1_000_000.0,
+                registry_id=registry_id, allocation_id=allocation_id,
             ),
             run_id="run-1", source_type="proposal",
         )
 
     intent = store.create_or_get_intent(
-        _sleeved_proposal("bounded", notional=5.0, notional_ceiling=10.0, risk_ceiling=1.0),
+        _sleeved_proposal(
+            "bounded", notional=5.0, notional_ceiling=10.0, risk_ceiling=1.0,
+            registry_id=registry_id, allocation_id=allocation_id,
+        ),
         run_id="run-1", source_type="proposal",
     )
     assert intent["reserved_notional"] == pytest.approx(5.0)
     assert intent["reserved_stop_risk"] == pytest.approx(0.05)
 
 
+def test_atomic_sleeve_rejects_tampered_registry_before_inserting_authority(
+    tmp_path,
+) -> None:
+    storage = _storage(tmp_path)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
+    storage.execute(
+        "UPDATE strategy_registry_decisions SET authorized=0 WHERE snapshot_id=?",
+        (registry_id,),
+    )
+
+    with pytest.raises(RuntimeError, match="persisted authority is invalid"):
+        DurableExecutionStore(storage).create_or_get_intent(
+            _sleeved_proposal(
+                "tampered-registry",
+                notional=5.0,
+                notional_ceiling=10.0,
+                risk_ceiling=1.0,
+                registry_id=registry_id,
+                allocation_id=allocation_id,
+            ),
+            run_id="run-1",
+            source_type="proposal",
+        )
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+    assert DurableExecutionStore(storage).integrity_report()[
+        "invalid_strategy_registry_authority"
+    ] == 1
+
+
+def test_atomic_sleeve_rejects_tampering_with_regenerated_local_fingerprints(
+    tmp_path,
+) -> None:
+    storage = _storage(tmp_path)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
+    row = storage.fetch_all(
+        "SELECT payload FROM phase4_allocation_decisions WHERE id=?",
+        (allocation_id,),
+    )[0]
+    payload = json.loads(row["payload"])
+    payload["strategy_sleeves"]["rule_based_v2"]["remaining_notional"] = 1_000_000.0
+    payload["allocation_authority_fingerprint"] = (
+        allocation_authority_fingerprint(payload)
+    )
+    evidence_fingerprint, regenerated_id = allocation_identity(
+        "run-1",
+        payload["raw_replay_inputs"],
+        {"rule_based_v2": 1.0},
+        payload["strategy_sleeves"],
+        authority_payload=payload,
+    )
+    assert regenerated_id != allocation_id
+    storage.execute(
+        "UPDATE phase4_allocation_decisions SET payload=?,evidence_fingerprint=? WHERE id=?",
+        (json.dumps(payload), evidence_fingerprint, allocation_id),
+    )
+
+    with pytest.raises(RuntimeError, match="persisted authority is invalid"):
+        DurableExecutionStore(storage).create_or_get_intent(
+            _sleeved_proposal(
+                "tampered-allocation",
+                notional=5.0,
+                notional_ceiling=10.0,
+                risk_ceiling=1.0,
+                registry_id=registry_id,
+                allocation_id=allocation_id,
+            ),
+            run_id="run-1",
+            source_type="proposal",
+        )
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+    assert DurableExecutionStore(storage).integrity_report()[
+        "invalid_phase4_allocation_authority"
+    ] == 1
+
+
+def test_atomic_sleeve_rejects_allocation_bound_to_different_registry_replay(
+    tmp_path,
+) -> None:
+    storage = _storage(tmp_path)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
+    payload = json.loads(
+        storage.fetch_all(
+            "SELECT payload FROM phase4_allocation_decisions WHERE id=?",
+            (allocation_id,),
+        )[0]["payload"]
+    )
+    mismatched_registry = json.loads(
+        json.dumps(payload["registry_evaluation"])
+    )
+    mismatched_registry["as_of"] = (
+        datetime.now(UTC) + timedelta(seconds=1)
+    ).isoformat()
+    payload["registry_evaluation"] = mismatched_registry
+    payload["raw_replay_inputs"]["registry"] = mismatched_registry
+    mismatched_allocation_id = _persist_allocation_variant(
+        storage, allocation_id, payload
+    )
+
+    with pytest.raises(RuntimeError, match="persisted authority is invalid"):
+        DurableExecutionStore(storage).create_or_get_intent(
+            _sleeved_proposal(
+                "mismatched-registry-replay",
+                notional=5.0,
+                notional_ceiling=10.0,
+                risk_ceiling=1.0,
+                registry_id=registry_id,
+                allocation_id=mismatched_allocation_id,
+            ),
+            run_id="run-1",
+            source_type="proposal",
+        )
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+    assert DurableExecutionStore(storage).integrity_report()[
+        "invalid_phase4_allocation_authority"
+    ] == 1
+
+
 def test_atomic_sleeve_coordinates_overlapping_allocation_ids(tmp_path) -> None:
     storage = _storage(tmp_path)
-    _persist_registry_and_allocation(storage)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
     payload = json.loads(storage.fetch_all(
-        "SELECT payload FROM phase4_allocation_decisions WHERE id='allocation-1'"
+        "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
     payload["strategy_sleeves"]["rule_based_v2"]["remaining_notional"] = 200.0
-    storage.execute(
-        "UPDATE phase4_allocation_decisions SET payload=? WHERE id='allocation-1'",
-        (json.dumps(payload),),
-    )
-    base = storage.fetch_all(
-        "SELECT * FROM phase4_allocation_decisions WHERE id='allocation-1'"
-    )[0]
-    storage.execute(
-        """INSERT INTO phase4_allocation_decisions(
-             id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
-             fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("allocation-2", base["run_id"], base["decided_at"], base["mode"], base["allocator_version"],
-         base["strategy_weights_json"], base["cash_weight"], base["fractional_kelly_ceiling"],
-         base["marginal_risk_json"], base["component_risk_json"], base["regime"], base["drawdown_pct"],
-         base["uncertainty_penalty"], base["data_quality"], base["decision"], base["reason"],
-         "allocation-fp-2", json.dumps(payload)),
+    allocation_id = _persist_allocation_variant(
+        storage, allocation_id, payload, replace_source=True
     )
     store = DurableExecutionStore(storage)
-    first = _sleeved_proposal("first", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0)
+    first = _sleeved_proposal(
+        "first", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0,
+        registry_id=registry_id, allocation_id=allocation_id,
+    )
     store.create_or_get_intent(first, run_id="run-1", source_type="proposal")
-    second = _sleeved_proposal("second", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0)
+    second_payload = json.loads(json.dumps(payload))
+    second_payload["raw_replay_inputs"]["as_of"] = (
+        datetime.now(UTC) + timedelta(seconds=1)
+    ).isoformat()
+    second_allocation_id = _persist_allocation_variant(
+        storage, allocation_id, second_payload
+    )
+    second = _sleeved_proposal(
+        "second", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0,
+        registry_id=registry_id, allocation_id=second_allocation_id,
+    )
     second["symbol"] = "QQQ"
-    second["sleeve_allocation_id"] = "allocation-2"
     with pytest.raises(RuntimeError, match="strategy sleeve stop-risk ceiling"):
         store.create_or_get_intent(second, run_id="run-1", source_type="proposal")
 
 
 def test_atomic_sleeve_snapshot_ids_close_read_to_persist_race_without_double_count(tmp_path) -> None:
     storage = _storage(tmp_path)
-    _persist_registry_and_allocation(storage)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
     payload = json.loads(storage.fetch_all(
-        "SELECT payload FROM phase4_allocation_decisions WHERE id='allocation-1'"
+        "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
     payload["strategy_sleeves"]["rule_based_v2"].update({
         "remaining_notional": 200.0, "remaining_risk": 1.0,
     })
-    storage.execute(
-        "UPDATE phase4_allocation_decisions SET payload=? WHERE id='allocation-1'",
-        (json.dumps(payload),),
+    allocation_id = _persist_allocation_variant(
+        storage, allocation_id, payload, replace_source=True
     )
     store = DurableExecutionStore(storage)
     first = store.create_or_get_intent(
-        _sleeved_proposal("gap-first", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0),
+        _sleeved_proposal(
+            "gap-first", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0,
+            registry_id=registry_id, allocation_id=allocation_id,
+        ),
         run_id="run-1", source_type="proposal",
     )
 
     stale_payload = json.loads(json.dumps(payload))
     stale_payload["raw_replay_inputs"]["portfolio_snapshot"]["active_reservation_ids_by_strategy"] = {}
-    now = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
-    base = storage.fetch_all(
-        "SELECT * FROM phase4_allocation_decisions WHERE id='allocation-1'"
-    )[0]
-    storage.execute(
-        """INSERT INTO phase4_allocation_decisions(
-             id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
-             fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("allocation-gap", base["run_id"], now, base["mode"], base["allocator_version"],
-         base["strategy_weights_json"], base["cash_weight"], base["fractional_kelly_ceiling"],
-         base["marginal_risk_json"], base["component_risk_json"], base["regime"], base["drawdown_pct"],
-         base["uncertainty_penalty"], base["data_quality"], base["decision"], base["reason"],
-         "allocation-gap-fp", json.dumps(stale_payload)),
+    stale_payload["raw_replay_inputs"]["as_of"] = (
+        datetime.now(UTC) + timedelta(seconds=1)
+    ).isoformat()
+    stale_allocation_id = _persist_allocation_variant(
+        storage, allocation_id, stale_payload
     )
-    second = _sleeved_proposal("gap-second", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0)
-    second.update({"symbol": "QQQ", "sleeve_allocation_id": "allocation-gap"})
+    second = _sleeved_proposal(
+        "gap-second", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0,
+        registry_id=registry_id, allocation_id=stale_allocation_id,
+    )
+    second["symbol"] = "QQQ"
     with pytest.raises(RuntimeError, match="strategy sleeve stop-risk ceiling"):
         store.create_or_get_intent(second, run_id="run-1", source_type="proposal")
 
@@ -368,35 +623,38 @@ def test_atomic_sleeve_snapshot_ids_close_read_to_persist_race_without_double_co
     accounted_payload["raw_replay_inputs"]["portfolio_snapshot"]["active_reservation_ids_by_strategy"] = {
         "rule_based_v2": [first_reservation_id]
     }
-    storage.execute(
-        "UPDATE phase4_allocation_decisions SET id=?,evidence_fingerprint=?,payload=? WHERE id='allocation-gap'",
-        ("allocation-accounted", "allocation-accounted-fp", json.dumps(accounted_payload)),
+    accounted_payload["raw_replay_inputs"]["as_of"] = (
+        datetime.now(UTC) + timedelta(seconds=2)
+    ).isoformat()
+    accounted_allocation_id = _persist_allocation_variant(
+        storage, stale_allocation_id, accounted_payload, replace_source=True
     )
     accounted = _sleeved_proposal(
-        "accounted-second", notional=40.0, notional_ceiling=140.0, risk_ceiling=0.4
+        "accounted-second", notional=40.0, notional_ceiling=140.0, risk_ceiling=0.4,
+        registry_id=registry_id, allocation_id=accounted_allocation_id,
     )
-    accounted.update({"symbol": "IWM", "sleeve_allocation_id": "allocation-accounted"})
+    accounted["symbol"] = "IWM"
     intent = store.create_or_get_intent(accounted, run_id="run-1", source_type="proposal")
     assert intent["reserved_stop_risk"] == pytest.approx(0.4)
 
 
 def test_pending_claim_identity_survives_conversion_to_reservation(tmp_path) -> None:
     storage = _storage(tmp_path)
-    _persist_registry_and_allocation(storage)
+    registry_id, allocation_id = _persist_registry_and_allocation(storage)
     payload = json.loads(storage.fetch_all(
-        "SELECT payload FROM phase4_allocation_decisions WHERE id='allocation-1'"
+        "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
     payload["strategy_sleeves"]["rule_based_v2"].update({
         "remaining_notional": 200.0, "remaining_risk": 0.01,
     })
-    storage.execute(
-        "UPDATE phase4_allocation_decisions SET payload=? WHERE id='allocation-1'",
-        (json.dumps(payload),),
+    allocation_id = _persist_allocation_variant(
+        storage, allocation_id, payload, replace_source=True
     )
     store = DurableExecutionStore(storage)
     converted = store.create_or_get_intent(
         _sleeved_proposal(
             "pending-a", notional=60.0, notional_ceiling=200.0, risk_ceiling=1.0
+            , registry_id=registry_id, allocation_id=allocation_id
         ),
         run_id="run-1", source_type="proposal",
     )
@@ -414,25 +672,17 @@ def test_pending_claim_identity_survives_conversion_to_reservation(tmp_path) -> 
             }],
         },
     })
-    base = storage.fetch_all(
-        "SELECT * FROM phase4_allocation_decisions WHERE id='allocation-1'"
-    )[0]
-    storage.execute(
-        """INSERT INTO phase4_allocation_decisions(
-             id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
-             fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("allocation-after-pending", base["run_id"], datetime.now(UTC).isoformat(), base["mode"],
-         base["allocator_version"], base["strategy_weights_json"], base["cash_weight"],
-         base["fractional_kelly_ceiling"], base["marginal_risk_json"], base["component_risk_json"],
-         base["regime"], base["drawdown_pct"], base["uncertainty_penalty"], base["data_quality"],
-         base["decision"], base["reason"], "after-pending-fp", json.dumps(next_payload)),
+    next_payload["raw_replay_inputs"]["as_of"] = (
+        datetime.now(UTC) + timedelta(seconds=1)
+    ).isoformat()
+    next_allocation_id = _persist_allocation_variant(
+        storage, allocation_id, next_payload
     )
     candidate = _sleeved_proposal(
-        "candidate-b", notional=40.0, notional_ceiling=40.0, risk_ceiling=0.4
+        "candidate-b", notional=40.0, notional_ceiling=40.0, risk_ceiling=0.4,
+        registry_id=registry_id, allocation_id=next_allocation_id,
     )
-    candidate.update({"symbol": "QQQ", "sleeve_allocation_id": "allocation-after-pending"})
+    candidate["symbol"] = "QQQ"
     intent = store.create_or_get_intent(candidate, run_id="run-1", source_type="proposal")
     assert intent["reserved_notional"] == pytest.approx(40.0)
     assert intent["reserved_stop_risk"] == pytest.approx(0.4)
@@ -493,48 +743,16 @@ def test_phase4_strategy_consumption_includes_pending_nonrotation_claims(tmp_pat
 
 
 def _rotation(storage: Storage) -> tuple[RotationCoordinator, dict]:
-    now = datetime.now(UTC).isoformat()
-    storage.execute(
-        """INSERT INTO strategy_registry_snapshots(
-             id,run_id,evaluated_at,registry_schema_version,registry_formula_version,
-             configuration_version,config_hash,authorized_strategies_json,rejected_strategies_json,
-             global_reasons_json,raw_inputs_json,evaluation_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("rotation-registry", "run", now, STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
-         STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION, CONFIGURATION_SCHEMA_VERSION, "hash",
-         '["rule_based_v2"]', "[]", "[]", "{}", "rotation-registry-fingerprint", now),
+    registry_id, allocation_id = _persist_registry_and_allocation(
+        storage, run_id="run"
     )
-    storage.execute(
-        """INSERT INTO strategy_registry_decisions(
-             id,snapshot_id,run_id,strategy_name,strategy_version,authorized,policy_state,
-             reasons_json,reason,decision_json,raw_inputs_json,evidence_version,performance_version,
-             policy_version,policy_schema_version,configuration_version,config_hash,decision_fingerprint,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("rotation-decision", "rotation-registry", "run", "Rule", "rule_based_v2", 1, "ACTIVE",
-         "[]", "authorized", "{}", "{}", "evidence", "performance", "policy", "policy-schema",
-         CONFIGURATION_SCHEMA_VERSION, "hash", "rotation-decision-fingerprint", now),
-    )
-    storage.execute(
-        """INSERT INTO phase4_allocation_decisions(
-             id,run_id,decided_at,mode,allocator_version,strategy_weights_json,cash_weight,
-             fractional_kelly_ceiling,marginal_risk_json,component_risk_json,regime,drawdown_pct,
-             uncertainty_penalty,data_quality,decision,reason,evidence_fingerprint,formula_version,config_hash,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("rotation-allocation", "run", now, "ACTIVE_ADAPTIVE_PAPER", "test", "{\"rule_based_v2\":1}", 0.0,
-         0.25, "{}", "{}", "normal", 0.0, 0.0, 1.0, "ALLOCATE", "test",
-         "rotation-allocation-fingerprint", PHASE4_ALLOCATION_VERSION, "hash", json.dumps({
-             "schema_version": PHASE4_SCHEMA_VERSION,
-             "formula_version": PHASE4_ALLOCATION_VERSION,
-             "config_hash": "hash",
-             "registry_snapshot_id": "rotation-registry",
-             "authorized_strategies": ["rule_based_v2"],
-         })),
-    )
-    manager = RotationCoordinator(storage, config_hash="hash")
+    manager = RotationCoordinator(storage, config_hash=_AUTHORITY_CONFIG_HASH)
+    manager._test_registry_id = registry_id
+    manager._test_allocation_id = allocation_id
     evaluated_at = datetime.now(UTC)
     group = manager.create_group(
         run_id="run", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
-        registry_snapshot_id="rotation-registry", allocation_id="rotation-allocation",
+        registry_snapshot_id=registry_id, allocation_id=allocation_id,
         exit_legs=[{"proposal_id": "exit-1", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
         contingent_entries=[{"proposal_id": "buy-1", "candidate_key": "setup", "strategy_version": "rule_based_v2",
                              "symbol": "NEW", "side": "buy", "max_quantity": 1, "max_notional": 100,
@@ -550,7 +768,8 @@ def test_rotation_dedupes_logical_exit_and_enforces_group_ceiling_fingerprint(tm
         evaluated_at = datetime.now(UTC)
         manager.create_group(
             run_id="run-2", expires_at=evaluated_at + timedelta(minutes=10), evaluation_time=evaluated_at,
-            registry_snapshot_id="rotation-registry", allocation_id="rotation-allocation",
+            registry_snapshot_id=manager._test_registry_id,
+            allocation_id=manager._test_allocation_id,
             exit_legs=[{"proposal_id": "exit-2", "position_lifecycle_id": "lifecycle-old", "symbol": "OLD", "side": "sell", "quantity": 1, "estimated_notional": 100}],
             contingent_entries=[{"proposal_id": "buy-2", "candidate_key": "other", "strategy_version": "rule_based_v2",
                                  "symbol": "NEW2", "side": "buy", "max_quantity": 1, "max_notional": 100,

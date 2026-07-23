@@ -10,11 +10,20 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .allocation_authority import (
+    ALLOCATION_AUTHORITY_VERSION,
+    allocation_authority_fingerprint,
+    allocation_identity,
+)
 from .execution import DurableExecutionStore
 from .evidence import OPERATIONAL_EVIDENCE_TYPES, SHADOW_OUTCOME, classify_evidence_type
 from .formula_versions import EVIDENCE_VERSION, PHASE4_ALLOCATION_VERSION, PHASE4_ALLOCATOR_VERSION, PHASE4_SCHEMA_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
-from .strategy_execution_registry import StrategyExecutionRegistry, StrategyRegistryEvaluation
+from .strategy_execution_registry import (
+    StrategyExecutionRegistry,
+    StrategyRegistryEvaluation,
+    StrategyRegistryStore,
+)
 from .strategy_rule_based import STRATEGY_VERSION
 from .utils import iso_now, json_dumps
 
@@ -459,7 +468,8 @@ def apply_phase4_schema(conn: Any, *, record_migration: bool = True) -> None:
       account_json TEXT NOT NULL, integrity_json TEXT NOT NULL, profile_version TEXT NOT NULL);
     """
     for statement in sql.split(";"):
-        if statement.strip(): conn.execute(statement)
+        if statement.strip():
+            conn.execute(statement)
     additions = {
         "allocation_class": "TEXT DEFAULT 'unallocated'", "operational_kelly_used": "INTEGER NOT NULL DEFAULT 0",
         "kelly_diagnostic_json": "TEXT", "adaptive_allocation_json": "TEXT", "exploration_allocation_json": "TEXT",
@@ -537,6 +547,7 @@ class AdaptiveAllocator:
         policies: Mapping[str, Any] | None,
         *,
         as_of: str,
+        registry_snapshot_id: str | None,
     ) -> tuple[StrategyRegistryEvaluation | None, tuple[str, ...], dict[str, str], dict[str, Any]]:
         registry_cfg = self.config.get("strategy_execution_registry")
         if not isinstance(registry_cfg, Mapping) or policies is None:
@@ -548,6 +559,23 @@ class AdaptiveAllocator:
             }
             payload["fingerprint"] = _fingerprint(payload)
             return None, (STRATEGY_VERSION,), rejected, payload
+
+        if registry_snapshot_id:
+            verified = StrategyRegistryStore(self.storage).load_verified(
+                registry_snapshot_id,
+                expected_run_id=self.run_id,
+            )
+            evaluation = verified.evaluation
+            rejected = {
+                decision.strategy_version: decision.reason
+                for decision in evaluation.rejected
+            }
+            return (
+                evaluation,
+                evaluation.authorized_versions,
+                rejected,
+                evaluation.as_dict(),
+            )
 
         inventory = dict(self.available_implementations)
         configured_inventory = self.config.get("strategy_implementation_inventory", {})
@@ -918,8 +946,28 @@ class AdaptiveAllocator:
         snapshot["as_of"] = now
         evaluation_time = now
         registry_eval, authorized_order, registry_rejections, registry_payload = self._registry_evaluation(
-            strategy_policy_map, as_of=evaluation_time,
+            strategy_policy_map,
+            as_of=evaluation_time,
+            registry_snapshot_id=(
+                str(snapshot.get("strategy_registry_snapshot_id"))
+                if snapshot.get("strategy_registry_snapshot_id")
+                else None
+            ),
         )
+        if (
+            registry_eval is not None
+            and snapshot.get("strategy_registry_snapshot_id")
+        ):
+            persisted_policies = registry_eval.raw_inputs.get("policies")
+            if not isinstance(persisted_policies, Mapping):
+                raise ValueError(
+                    "persisted registry policy family is invalid"
+                )
+            strategy_policy_map = {
+                str(strategy): dict(policy)
+                for strategy, policy in persisted_policies.items()
+                if isinstance(policy, Mapping)
+            }
         if not healthy:
             authorized_order = ()
             registry_rejections = {**registry_rejections, "__integrity__": "durable integrity health failed"}
@@ -1223,10 +1271,9 @@ class AdaptiveAllocator:
             "available_risk_inputs": available_risk_inputs, "configuration_hash": self.config.get("effective_config_hash"),
             "formula_version": PHASE4_ALLOCATION_VERSION,
         }
-        fingerprint = _fingerprint(raw_replay_inputs)
-        allocation_id = _fingerprint([self.run_id, fingerprint, full_weights, sleeves])[:32]
         payload = {
             "schema_version": PHASE4_SCHEMA_VERSION,
+            "allocation_authority_version": ALLOCATION_AUTHORITY_VERSION,
             "covariance_id": covariance_id, "phase3_limits_authoritative": True, "full_kelly": False, "llm_decisions": False,
             "covariance_fallback": fallback, "covariance_validation": self._last_covariance_payload,
             "operational_kelly_enabled": False, "operational_allocation_mode": "bounded_evidence_aware",
@@ -1260,6 +1307,16 @@ class AdaptiveAllocator:
             "strategy_policy_version": next((policy_value(strategy, "policy_version") for strategy in strategy_order if policy_value(strategy, "policy_version")), None),
             "policy_authoritative": policy_authoritative, "raw_replay_inputs": raw_replay_inputs,
         }
+        payload["allocation_authority_fingerprint"] = (
+            allocation_authority_fingerprint(payload)
+        )
+        fingerprint, allocation_id = allocation_identity(
+            self.run_id,
+            raw_replay_inputs,
+            full_weights,
+            sleeves,
+            authority_payload=payload,
+        )
         placeholders = ",".join("?" for _ in range(42))
         marginal_map = {strategy: float(marginal[index]) for index, strategy in enumerate(authorized_order)}
         component_map = {strategy: float(component[index]) for index, strategy in enumerate(authorized_order)}

@@ -10,9 +10,12 @@ import pytest
 
 from app.strategy_execution_registry import (
     EXECUTABLE_POLICY_STATES,
+    LEGACY_REGISTRY_FORMULA_VERSION,
     REGISTRY_FORMULA_VERSION,
     REGISTRY_SCHEMA_VERSION,
     StrategyExecutionRegistry,
+    StrategyRegistryIntegrityError,
+    StrategyRegistryStore,
     apply_strategy_registry_schema,
     persist,
 )
@@ -72,8 +75,15 @@ def _config(*strategies: str) -> dict:
 
 def _policy(strategy: str = "rule_based_v2", state: str = "ACTIVE") -> dict:
     return {
+        "id": f"policy-decision:{strategy}:{state}",
         "strategy_version": strategy,
         "state": state,
+        "quality_score": 85.0,
+        "reason": f"test {state} policy",
+        "performance_snapshot_id": f"performance:{strategy}:{state}",
+        "decided_at": AS_OF.isoformat(),
+        "maturity": {"test": True},
+        "metrics": {"quality_score": 85.0},
         "enforcement_enabled": True,
         "evidence_current": True,
         "evidence_version_complete": True,
@@ -149,6 +159,54 @@ def test_research_evidence_without_current_enforced_policy_cannot_authorize() ->
     assert result.authorized == ()
     assert "profitability_policy_missing" in result.rejected[0].reasons
     assert "policy_state_invalid" in result.rejected[0].reasons
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("id", "policy_decision_identity_missing"),
+        ("performance_snapshot_id", "performance_snapshot_identity_missing"),
+        ("decided_at", "policy_decision_time_missing"),
+        ("reason", "policy_reason_missing"),
+        ("quality_score", "policy_quality_invalid"),
+    ],
+)
+def test_current_registry_requires_full_policy_authority(
+    field: str, reason: str
+) -> None:
+    policy = _policy()
+    policy[field] = None
+
+    result = _evaluate(_config(), {"rule_based_v2": policy})
+
+    assert result.authorized == ()
+    assert reason in result.rejected[0].reasons
+
+
+def test_legacy_registry_snapshot_remains_replayable_but_is_not_current() -> None:
+    config = _config()
+    config["strategy_execution_registry"]["formula_version"] = (
+        LEGACY_REGISTRY_FORMULA_VERSION
+    )
+    evaluation = StrategyExecutionRegistry(
+        config,
+        available_implementations=_implementations(),
+        expected_formula_version=LEGACY_REGISTRY_FORMULA_VERSION,
+    ).evaluate({"rule_based_v2": _policy()}, as_of=AS_OF)
+    storage = _MemoryStorage()
+    snapshot_id = str(persist(storage, "legacy-run", evaluation)["snapshot_id"])
+
+    verified = StrategyRegistryStore(storage).load_verified(
+        snapshot_id,
+        conn=storage.conn,
+        expected_run_id="legacy-run",
+    )
+
+    assert verified.evaluation.fingerprint == evaluation.fingerprint
+    assert (
+        verified.evaluation.raw_inputs["registry"]["formula_version"]
+        == LEGACY_REGISTRY_FORMULA_VERSION
+    )
 
 
 @pytest.mark.parametrize(
@@ -301,8 +359,15 @@ def test_global_version_or_hash_omission_rejects_every_entry_with_exact_reason()
 
 def test_actual_strategy_risk_policy_fields_supply_strict_evidence_metadata() -> None:
     policy = StrategyRiskPolicy(
+        id="persisted-policy-decision",
         strategy_version="rule_based_v2",
         state="ACTIVE",
+        quality_score=85.0,
+        reason="persisted policy",
+        performance_snapshot_id="persisted-performance-snapshot",
+        decided_at=AS_OF.isoformat(),
+        maturity={"test": True},
+        metrics={"quality_score": 85.0},
         enforcement_enabled=True,
         performance_version=PERFORMANCE_VERSION,
         policy_version=POLICY_VERSION,
@@ -410,3 +475,41 @@ def test_replayed_evaluation_has_byte_identical_fingerprint_and_persists_per_run
     assert {row["evaluation_fingerprint"] for row in rows} == {first.fingerprint}
     assert rows[0]["raw_inputs_json"] == rows[1]["raw_inputs_json"]
     assert storage.conn.execute("SELECT COUNT(*) FROM strategy_registry_decisions").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("strategy_registry_snapshots", "evaluation_fingerprint", "forged"),
+        ("strategy_registry_snapshots", "authorized_strategies_json", "[]"),
+        ("strategy_registry_decisions", "authorized", 0),
+        ("strategy_registry_decisions", "decision_json", "{}"),
+        ("strategy_registry_decisions", "decision_fingerprint", "forged"),
+    ],
+)
+def test_verified_registry_rejects_persisted_authority_tampering(
+    table: str, column: str, value: object
+) -> None:
+    evaluation = _evaluate(_config(), {"rule_based_v2": _policy()})
+    storage = _MemoryStorage()
+    snapshot_id = str(persist(storage, "run-1", evaluation)["snapshot_id"])
+    storage.conn.execute(f"UPDATE {table} SET {column}=?", (value,))
+
+    with pytest.raises(
+        StrategyRegistryIntegrityError, match="persisted .* inconsistent"
+    ):
+        StrategyRegistryStore(storage).load_verified(
+            snapshot_id, conn=storage.conn, expected_run_id="run-1"
+        )
+
+
+def test_idempotent_registry_persist_does_not_accept_corrupted_existing_row() -> None:
+    evaluation = _evaluate(_config(), {"rule_based_v2": _policy()})
+    storage = _MemoryStorage()
+    persist(storage, "run-1", evaluation)
+    storage.conn.execute(
+        "UPDATE strategy_registry_decisions SET authorized=0"
+    )
+
+    with pytest.raises(StrategyRegistryIntegrityError):
+        persist(storage, "run-1", evaluation)

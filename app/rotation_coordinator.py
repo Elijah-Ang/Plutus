@@ -11,33 +11,19 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
+from .allocation_authority import AllocationAuthorityError, Phase4AllocationStore
 from .formula_versions import (
     CONFIGURATION_SCHEMA_VERSION,
-    PHASE4_ALLOCATION_VERSION,
-    PHASE4_SCHEMA_VERSION,
     ROTATION_FORMULA_VERSION,
     ROTATION_SCHEMA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION,
     STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION,
 )
 from .utils import iso_now, json_dumps
-
-
-def _authorized_strategy_ids(value: Any, *, label: str) -> set[str]:
-    if not isinstance(value, list) or not value:
-        raise RuntimeError(f"{label} authorized strategy set is empty or invalid")
-    result: set[str] = set()
-    for item in value:
-        if isinstance(item, Mapping):
-            identifier = item.get("strategy_version") or item.get("id") or item.get("name")
-        else:
-            identifier = item
-        identifier = str(identifier or "").strip()
-        if not identifier or identifier in result:
-            raise RuntimeError(f"{label} authorized strategy identity is invalid or duplicated")
-        result.add(identifier)
-    return result
-
+from .strategy_execution_registry import (
+    StrategyRegistryIntegrityError,
+    StrategyRegistryStore,
+)
 
 class RotationState(StrEnum):
     PENDING_GROUP_APPROVAL = "pending_group_approval"
@@ -279,77 +265,51 @@ class RotationCoordinator:
         expected_config_hash = str(group.get("config_hash") or self.config_hash or "")
         evaluated_at = _utc(evaluation_time)
 
-        registry_rows = self.storage.fetch_all(
-            """SELECT s.*,d.strategy_version,d.authorized,d.configuration_version AS decision_configuration_version,
-                      d.config_hash AS decision_config_hash,d.run_id AS decision_run_id
-               FROM strategy_registry_snapshots s
-               JOIN strategy_registry_decisions d ON d.snapshot_id=s.id
-               WHERE s.id=? AND d.strategy_version=?""",
-            (snapshot_id, strategy_version),
-        )
-        if len(registry_rows) != 1:
-            raise RuntimeError("rotation registry snapshot or strategy decision does not exist")
-        registry = registry_rows[0]
-        authority_run_id = str(registry.get("run_id") or "")
         expected_run_id = str(group.get("origin_run_id") or group.get("run_id") or "")
-        if not authority_run_id or str(registry.get("decision_run_id") or "") != authority_run_id:
-            raise RuntimeError("rotation registry authority has inconsistent run identity")
+        try:
+            verified_registry = StrategyRegistryStore(self.storage).load_verified(
+                snapshot_id,
+                expected_run_id=None if allow_later_run else expected_run_id,
+            )
+        except StrategyRegistryIntegrityError as exc:
+            raise RuntimeError("rotation registry persisted authority is invalid") from exc
+        authority_run_id = verified_registry.run_id
         if not allow_later_run and authority_run_id != expected_run_id:
             raise RuntimeError("rotation registry authority belongs to a different run")
-        if int(registry.get("authorized") or 0) != 1:
+        authorized_decisions = {
+            decision.strategy_version: decision
+            for decision in verified_registry.evaluation.authorized
+        }
+        if strategy_version not in authorized_decisions:
             raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
-        try:
-            authorized_strategies = json.loads(registry.get("authorized_strategies_json") or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("rotation registry authorized strategy record is invalid") from exc
-        if strategy_version not in _authorized_strategy_ids(authorized_strategies, label="rotation registry"):
-            raise RuntimeError("rotation strategy is not authorized in the referenced registry snapshot")
-        if str(registry.get("config_hash") or "") != expected_config_hash or str(registry.get("decision_config_hash") or "") != expected_config_hash:
+        registry_inputs = verified_registry.evaluation.raw_inputs
+        registry_config = registry_inputs.get("registry", {})
+        if str(registry_inputs.get("configuration_hash") or "") != expected_config_hash:
             raise RuntimeError("rotation registry configuration hash does not match current configuration")
-        if str(registry.get("registry_schema_version") or "") != STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION:
+        if str(registry_config.get("schema_version") or "") != STRATEGY_EXECUTION_REGISTRY_SCHEMA_VERSION:
             raise RuntimeError("rotation registry schema version mismatch")
-        if str(registry.get("registry_formula_version") or "") != STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION:
+        if str(registry_config.get("formula_version") or "") != STRATEGY_EXECUTION_REGISTRY_FORMULA_VERSION:
             raise RuntimeError("rotation registry formula version mismatch")
-        if str(registry.get("configuration_version") or "") != CONFIGURATION_SCHEMA_VERSION:
+        if str(registry_inputs.get("configuration_version") or "") != CONFIGURATION_SCHEMA_VERSION:
             raise RuntimeError("rotation registry configuration version mismatch")
-        if str(registry.get("decision_configuration_version") or "") != CONFIGURATION_SCHEMA_VERSION:
+        if str(authorized_decisions[strategy_version].configuration_version or "") != CONFIGURATION_SCHEMA_VERSION:
             raise RuntimeError("rotation strategy decision configuration version mismatch")
 
-        allocation_rows = self.storage.fetch_all(
-            "SELECT * FROM phase4_allocation_decisions WHERE id=?",
-            (allocation_key,),
-        )
-        if len(allocation_rows) != 1:
-            raise RuntimeError("rotation allocation authority does not exist")
-        allocation = allocation_rows[0]
-        if str(allocation.get("run_id") or "") != authority_run_id:
-            raise RuntimeError("rotation allocation authority belongs to a different run")
-        if str(allocation.get("config_hash") or "") != expected_config_hash:
-            raise RuntimeError("rotation allocation configuration hash does not match current configuration")
-        if not str(allocation.get("decision") or "").startswith("ALLOCATE"):
-            raise RuntimeError("rotation allocation is not executable for the referenced strategy")
-        if str(allocation.get("formula_version") or "") != PHASE4_ALLOCATION_VERSION:
-            raise RuntimeError("rotation allocation formula version mismatch")
         try:
-            payload = json.loads(allocation.get("payload") or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("rotation allocation payload is invalid") from exc
-        if str(payload.get("schema_version") or "") != PHASE4_SCHEMA_VERSION:
-            raise RuntimeError("rotation allocation schema version mismatch")
-        if str(payload.get("formula_version") or "") != PHASE4_ALLOCATION_VERSION:
-            raise RuntimeError("rotation allocation payload formula version mismatch")
-        if str(payload.get("config_hash") or "") != expected_config_hash:
-            raise RuntimeError("rotation allocation payload configuration hash mismatch")
-        if str(payload.get("registry_snapshot_id") or "") != snapshot_id:
-            raise RuntimeError("rotation allocation is not linked to the referenced registry snapshot")
-        authorized = _authorized_strategy_ids(
-            payload.get("authorized_strategies"), label="rotation allocation"
-        )
-        if strategy_version not in authorized:
-            raise RuntimeError("rotation strategy is not authorized in the referenced allocation")
+            verified_allocation = Phase4AllocationStore(self.storage).load_verified(
+                allocation_key,
+                expected_run_id=authority_run_id,
+                expected_registry_snapshot_id=snapshot_id,
+                expected_strategy_version=strategy_version,
+                expected_config_hash=expected_config_hash,
+                require_executable=True,
+            )
+        except AllocationAuthorityError as exc:
+            raise RuntimeError("rotation allocation persisted authority is invalid") from exc
+        allocation = verified_allocation.row
 
         for label, timestamp in (
-            ("registry snapshot", registry.get("evaluated_at")),
+            ("registry snapshot", verified_registry.evaluation.as_of),
             ("allocation", allocation.get("decided_at")),
         ):
             try:

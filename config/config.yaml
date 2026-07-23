@@ -157,7 +157,7 @@ adaptive_sizing:
 
 strategy_execution_registry:
   schema_version: strategy_execution_registry_v1
-  formula_version: strategy_execution_registry_formula_v1
+  formula_version: strategy_execution_registry_formula_v2_full_policy
   mode: paper_only
   required_configuration_version: plutus_effective_config_v19_fixed_point_accounting
   required_evidence_version: phase1_outcome_v2_exit_session
@@ -435,6 +435,8 @@ formula_versions:
   cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
+  phase4_allocation: phase4_multi_strategy_allocation_v7_stop_risk_dollars
+  strategy_registry: strategy_execution_registry_formula_v2_full_policy
 
 # Crypto research lane: research-only by default. This is intentionally
 # isolated from equity proposal frequency, sizing, scanner, and execution.
