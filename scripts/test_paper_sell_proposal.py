@@ -1,14 +1,22 @@
 import json
-import uuid
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 from dotenv import load_dotenv
-from app.storage import Storage
-from app.telegram_bot import TelegramBot
-from app.broker_alpaca import AlpacaBroker
-from app.risk_engine import RiskEngine
-from app.power import get_power_status
-from app.utils import PROJECT_ROOT, load_config, format_proposal_message
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from app.broker_alpaca import AlpacaBroker  # noqa: E402
+from app.power import get_power_status  # noqa: E402
+from app.risk_engine import RiskEngine  # noqa: E402
+from app.storage import Storage  # noqa: E402
+from app.telegram_bot import TelegramBot  # noqa: E402
+from app.utils import PROJECT_ROOT, format_proposal_message, load_config  # noqa: E402
+
 
 def main():
     load_dotenv(PROJECT_ROOT / ".env")
@@ -16,25 +24,27 @@ def main():
     db_path = PROJECT_ROOT / config["storage"]["sqlite_path"]
     storage = Storage(db_path)
     storage.initialize()
-    
+
     # 1. Initialize AlpacaBroker to fetch real data
     try:
         broker = AlpacaBroker(config)
     except Exception as e:
         print(f"Error initializing AlpacaBroker: {e}", file=sys.stderr)
         sys.exit(1)
-        
+
     symbol = "SPY"
     print(f"Checking current position for {symbol}...")
     positions = broker.get_positions()
-    spy_position = next((p for p in positions if getattr(p, "symbol", "") == symbol), None)
+    spy_position = next(
+        (p for p in positions if getattr(p, "symbol", "") == symbol), None
+    )
     if not spy_position:
         print(f"Error: No active {symbol} position found to exit.", file=sys.stderr)
         sys.exit(1)
-        
+
     qty = float(spy_position.qty)
     print(f"Current {symbol} position quantity: {qty}")
-    
+
     # Check conflicting open orders
     print("Checking conflicting open orders...")
     orders = broker.get_open_orders()
@@ -42,7 +52,7 @@ def main():
     if conflict:
         print(f"Error: There is already an open order for {symbol}.", file=sys.stderr)
         sys.exit(1)
-        
+
     print(f"Fetching latest price and bars for {symbol}...")
     try:
         trade = broker.get_latest_price(symbol)
@@ -52,18 +62,18 @@ def main():
     except Exception as e:
         print(f"Failed to fetch {symbol} data: {e}", file=sys.stderr)
         sys.exit(1)
-            
+
     # 2. Build proposal and context
     run_id = storage.start_run("paper")
     proposal_id = str(uuid.uuid4())
     signal_id = str(uuid.uuid4())
-    
+
     now = datetime.now(UTC)
     expiry = now + timedelta(minutes=10)
-    
+
     # Calculate estimated notional for risk check validation
     notional = round(qty * price, 4)
-    
+
     proposal = {
         "id": proposal_id,
         "run_id": run_id,
@@ -74,7 +84,9 @@ def main():
         "qty": qty,
         "notional": notional,
         "latest_price": price,
-        "price_at": price_at.isoformat() if hasattr(price_at, "isoformat") else str(price_at),
+        "price_at": price_at.isoformat()
+        if hasattr(price_at, "isoformat")
+        else str(price_at),
         "historical_bars": len(bars),
         "volume": float(bars.iloc[-1]["volume"]),
         "price_gap_pct": float((price / float(bars.iloc[-1]["close"]) - 1) * 100),
@@ -85,12 +97,15 @@ def main():
         "order_type": "market",
         "asset_class": "equity",
     }
-    
+
     # Check if market is open
     market_open = broker.is_market_open()
     account = broker.get_account()
-    today_orders = storage.fetch_all("SELECT id FROM orders WHERE substr(created_at,1,10)=?", (now.date().isoformat(),))
-    
+    today_orders = storage.fetch_all(
+        "SELECT id FROM orders WHERE substr(created_at,1,10)=?",
+        (now.date().isoformat(),),
+    )
+
     context = {
         "power_connected": get_power_status().connected is True,
         "internet_available": True,
@@ -109,59 +124,89 @@ def main():
         "buying_power": float(getattr(account, "buying_power", 0) or 0),
         "approval_valid": False,
     }
-    
+
     # 3. Evaluate via RiskEngine
     risk_engine = RiskEngine(config)
     decision = risk_engine.evaluate(proposal, context)
     if not decision.passed:
-        print(f"Risk checks failed. Proposal blocked: {'; '.join(decision.reasons)}", file=sys.stderr)
+        print(
+            f"Risk checks failed. Proposal blocked: {'; '.join(decision.reasons)}",
+            file=sys.stderr,
+        )
         sys.exit(2)
-        
-    print(f"Risk checks passed. Saving {symbol} sell proposal {proposal_id} to database...")
-    
+
+    print(
+        f"Risk checks passed. Saving {symbol} sell proposal {proposal_id} to database..."
+    )
+
     # Expire old pending proposals to avoid parser ambiguity
-    storage.execute("UPDATE trade_proposals SET status='expired' WHERE status='pending'")
-    
+    storage.execute(
+        "UPDATE trade_proposals SET status='expired' WHERE status='pending'"
+    )
+
     # Write proposal to database
     storage.execute(
         "INSERT INTO trade_proposals(id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,strategy_version,payload) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (proposal_id, run_id, signal_id, symbol, "sell", notional, "pending", now.isoformat(), expiry.isoformat(), "rule_based_v1", json.dumps(proposal))
+        (
+            proposal_id,
+            run_id,
+            signal_id,
+            symbol,
+            "sell",
+            notional,
+            "pending",
+            now.isoformat(),
+            expiry.isoformat(),
+            "rule_based_v1",
+            json.dumps(proposal),
+        ),
     )
-    
+
     # Write mock AI review summarizing the paper test
     review = {
         "summary": f"PAPER SELL TEST — Real-symbol {symbol} paper sell proposal test.",
         "risks": [
             "This is a controlled paper sell execution test.",
-            "Mode is paper only. No real money will be used."
+            "Mode is paper only. No real money will be used.",
         ],
         "telegram_message": f"PAPER SELL TEST — Real-symbol {symbol} paper sell proposal test. FAKE MONEY ONLY.",
         "caution_level": "low",
         "should_block_for_reasoning_only": False,
-        "reasoning_notes": "Real-symbol paper sell execution test."
+        "reasoning_notes": "Real-symbol paper sell execution test.",
     }
     storage.execute(
         "INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)",
-        (run_id, proposal_id, review["summary"], json.dumps(review["risks"]), review["caution_level"], json.dumps(review), now.isoformat())
+        (
+            run_id,
+            proposal_id,
+            review["summary"],
+            json.dumps(review["risks"]),
+            review["caution_level"],
+            json.dumps(review),
+            now.isoformat(),
+        ),
     )
-    
+
     # Save config snapshot
     storage.execute(
         "INSERT INTO config_snapshots(run_id,config_json,created_at) VALUES(?,?,?)",
-        (run_id, json.dumps({"mode": "paper", "live_enabled": False}), now.isoformat())
+        (run_id, json.dumps({"mode": "paper", "live_enabled": False}), now.isoformat()),
     )
-    
+
     # 4. Send message to Telegram
     try:
         bot = TelegramBot()
-        msg_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(proposal, config)
+        msg_text = f"Proposal {proposal_id}\n\n" + format_proposal_message(
+            proposal, config
+        )
         bot.send_message(msg_text)
         print("Real-symbol paper sell proposal sent to Telegram successfully.")
         print(f"Proposal ID: {proposal_id}")
     except Exception as e:
         print(f"Error sending Telegram message: {str(e)}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
