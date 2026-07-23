@@ -6,10 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
-from app.adaptive_sizing import evidence_report, trading_state_counts
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from app.adaptive_sizing import evidence_report, trading_state_counts  # noqa: E402
 
 
 def build_report(database: str | Path) -> dict[str, Any]:
@@ -23,7 +28,9 @@ def build_report(database: str | Path) -> dict[str, Any]:
         after = trading_state_counts(conn)
     report["trading_state_counts_before"] = before
     report["trading_state_counts_after"] = after
-    report["trading_state_mutations"] = sum(abs(after[name] - before[name]) for name in before)
+    report["trading_state_mutations"] = sum(
+        abs(after[name] - before[name]) for name in before
+    )
     return report
 
 
@@ -45,14 +52,22 @@ def format_report(report: dict[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", help="SQLite database to inspect read-only")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
     args = parser.parse_args()
     try:
         report = build_report(args.database)
     except (OSError, sqlite3.Error, ValueError):
-        print("Adaptive sizing evidence report unavailable: database or required schema could not be read safely.")
+        print(
+            "Adaptive sizing evidence report unavailable: database or required schema could not be read safely."
+        )
         return 2
-    print(json.dumps(report, indent=2, sort_keys=True) if args.json else format_report(report))
+    print(
+        json.dumps(report, indent=2, sort_keys=True)
+        if args.json
+        else format_report(report)
+    )
     return 0
 
 
