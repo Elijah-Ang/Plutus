@@ -36,6 +36,13 @@ Before committing or pushing code:
 
 GitHub Actions runs for every pull request, every push to `main`, and the audit-hardening branch. It compiles `app`, `tests`, and `scripts`; validates configuration and migrations; runs no-live and paper-only capability suites; checks schema/version and deterministic replay contracts; exercises critical approval/execution/reconciliation/recovery paths; and finishes with the full pytest suite. Failed steps are release-blocking and are not allowed to continue.
 
+The workflow pins every external action to the full Git commit of a reviewed
+Node 24 release and does not persist checkout credentials. The adjacent
+semantic-version comments are maintained by the weekly `github-actions`
+Dependabot configuration, so immutable action references receive reviewed
+upgrade pull requests instead of silently following movable tags or becoming
+permanently stale.
+
 The helper scans staged blobs only. It does not certify Git history, unstaged files, or arbitrary unknown secret formats. For sensitive releases, also use a maintained scanner such as Gitleaks and review the staged diff manually.
 
 ## 3. Handling Suspected Secret Exposure
