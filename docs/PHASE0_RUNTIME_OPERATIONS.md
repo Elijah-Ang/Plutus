@@ -44,6 +44,13 @@ the jobs.
 
 Check the active release with `readlink "$HOME/TradingAgentRuntime"`; inspect schema versions with a read-only SQLite connection; inspect process paths with `launchctl print` and `ps`. Runtime logs and locks are under the Application Support state root.
 
+Operational kill-switch state is also external:
+`$HOME/Library/Application Support/TradingAgent/runtime/KILL_SWITCH`. Enable it
+with `"$HOME/TradingAgentRuntime/scripts/stop_agent.sh"` and clear it only with
+the exact paper-resume confirmation accepted by `start_agent.sh`. The active
+release tree must remain byte-for-byte unchanged. Deployment fails closed if a
+legacy release-local switch is active but has not been preserved externally.
+
 After both jobs are started, wait for one listener poll and one completed scanner
 cycle, then run the immutable-runtime evidence gate:
 

@@ -44,10 +44,32 @@ PY
 
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "scanner must be stopped"; exit 2; }
 [[ "$(launchctl print gui/$(id -u)/com.elijah.tradingagent.telegram 2>&1 || true)" == *"Could not find service"* ]] || { print -u2 -- "listener must be stopped"; exit 2; }
+"$RELEASE/.venv/bin/python" - "$STATE_ROOT/runtime" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+runtime = pathlib.Path(sys.argv[1])
+metadata = runtime.lstat()
+assert (
+    runtime.is_absolute()
+    and not runtime.is_symlink()
+    and stat.S_ISDIR(metadata.st_mode)
+    and metadata.st_uid == os.getuid()
+    and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+), "external runtime state directory must be owner-only"
+PY
+if [[ -L "$RUNTIME" && -e "${RUNTIME:A}/config/KILL_SWITCH" && ! -e "$STATE_ROOT/runtime/KILL_SWITCH" ]]; then
+  print -u2 -- "legacy active kill switch must be preserved in external runtime state before deployment"
+  exit 2
+fi
+[[ ! -L "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist" ]] || { print -u2 -- "scanner plist target is a symlink"; exit 2; }
+[[ ! -L "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist" ]] || { print -u2 -- "listener plist target is a symlink"; exit 2; }
 ln -sfn "$RELEASE" "$RUNTIME"
 [[ "$(readlink "$RUNTIME")" == "$RELEASE" ]] || { print -u2 -- "runtime pointer switch failed"; exit 2; }
-cp "$RELEASE/launchd/com.elijah.tradingagent.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
-cp "$RELEASE/launchd/com.elijah.tradingagent.telegram.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
+/usr/bin/install -m 600 "$RELEASE/launchd/com.elijah.tradingagent.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
+/usr/bin/install -m 600 "$RELEASE/launchd/com.elijah.tradingagent.telegram.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
 plutil -lint "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
 mkdir -p "$STATE_ROOT/release"

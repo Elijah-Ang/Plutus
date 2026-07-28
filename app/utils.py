@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime, timezone, timedelta
@@ -30,6 +31,83 @@ def resolve_project_root(package_file: str | Path = __file__) -> Path:
 
 
 PROJECT_ROOT = resolve_project_root()
+
+
+def kill_switch_path() -> Path:
+    """Return the durable kill-switch path for the current runtime.
+
+    Production releases are immutable, so operational state must never be
+    created beneath ``PROJECT_ROOT``. Development retains the repository-local
+    path to keep local runs isolated from production.
+    """
+    if os.getenv("TRADING_AGENT_RUNTIME") != "production-paper":
+        return PROJECT_ROOT / "config" / "KILL_SWITCH"
+
+    configured = str(os.getenv("TRADING_AGENT_STATE_ROOT") or "").strip()
+    if not configured:
+        raise RuntimeError("production kill switch requires TRADING_AGENT_STATE_ROOT")
+    state_root = Path(configured).expanduser()
+    if not state_root.is_absolute():
+        raise RuntimeError("production state root must be absolute")
+    runtime_dir = state_root / "runtime"
+    if runtime_dir.is_symlink() or not runtime_dir.is_dir():
+        raise RuntimeError("production runtime state directory is missing or unsafe")
+    metadata = runtime_dir.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise RuntimeError("production runtime state directory must be owner-only")
+    return runtime_dir / "KILL_SWITCH"
+
+
+def kill_switch_active() -> bool:
+    """Fail closed when production kill-switch authority is unavailable."""
+    try:
+        path = kill_switch_path()
+        if path.is_symlink():
+            return True
+        return path.exists()
+    except Exception:
+        if os.getenv("TRADING_AGENT_RUNTIME") == "production-paper":
+            return True
+        raise
+
+
+def set_kill_switch(active: bool) -> Path:
+    """Atomically enable or safely clear the authoritative kill switch."""
+    path = kill_switch_path()
+    parent = path.parent
+    if path.is_symlink():
+        raise RuntimeError("kill-switch path must not be a symlink")
+    if path.exists():
+        existing = path.stat()
+        if not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid():
+            raise RuntimeError("kill-switch path must be an owner-controlled regular file")
+
+    if active:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    elif path.exists():
+        metadata = path.stat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("kill-switch file is not a trusted owner-only regular file")
+        path.unlink()
+
+    directory_descriptor = os.open(parent, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    return path
 
 
 def get_git_commit() -> str:

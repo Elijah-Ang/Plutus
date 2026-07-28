@@ -2,7 +2,7 @@
 
 ## Daily
 
-Keep the Mac plugged in, confirm `config/KILL_SWITCH` is absent only when operation is intended, run once manually, and review the newest preflight/risk/audit rows. Confirm proposals in Alpaca paper mode before responding. Use `/status`, `/pending`, `/report`, `/cashout`, and `/help`; cashout only reports a suggestion.
+Keep the Mac plugged in, confirm the external runtime kill switch is inactive only when operation is intended, and review the newest preflight/risk/audit rows. Confirm proposals in Alpaca paper mode before responding. Use `/status`, `/pending`, `/report`, `/cashout`, and `/help`; cashout only reports a suggestion.
 
 ## Weekly and monthly
 
@@ -10,7 +10,18 @@ Weekly: inspect rejected/unknown orders, loss gates, data freshness, Telegram au
 
 ## Pause, resume, and incidents
 
-Pause with `scripts/stop_agent.sh`. Resume only after diagnosing the cause, reviewing audit logs, and locally deleting `config/KILL_SWITCH`; Telegram cannot resume live mode. On an unknown order status, do not rerun execution: inspect Alpaca by client order ID and reconcile manually. Rotate logs with `scripts/rotate_logs.sh`.
+Pause production through the active immutable runtime with
+`"$HOME/TradingAgentRuntime/scripts/stop_agent.sh"`. This enables the
+owner-only external switch at
+`$HOME/Library/Application Support/TradingAgent/runtime/KILL_SWITCH`; it does
+not modify the release or unload launchd. Resume only after diagnosing the
+cause and reviewing audit logs, using
+`"$HOME/TradingAgentRuntime/scripts/start_agent.sh" "CONFIRM PAPER RESUME"`.
+The resume helper revalidates paper/manual-only release authority and does not
+load or restart jobs. Telegram `/resume CONFIRM PAPER RESUME` uses the same
+external switch and cannot resume live mode. On an unknown order status, do not
+rerun execution: inspect Alpaca by client order ID and reconcile manually.
+Rotate logs with `scripts/rotate_logs.sh`.
 
 Stay in paper mode until a long, reviewed paper record exists and independent security/risk review is complete. This v1 does not provide a supported live migration procedure.
 
@@ -38,7 +49,16 @@ Missing, malformed, stale, future-dated, permissively readable, symlinked, wrong
 
 ### Restarting runtime jobs
 
-If either process is stale, stop the launchd jobs and follow the controlled immutable-release install/start procedure. Then wait for both new heartbeats and run the complete freshness gate above. Do not use a source checkout's Git HEAD as runtime authority; the active immutable release manifest and runtime pointer are authoritative. Do not remove a lock or signal a PID until its recorded process-start identity has been checked, because PID reuse can otherwise target an unrelated process.
+If either process is stale, stop the launchd jobs and follow the controlled
+immutable-release install/start procedure. A listener-only restart may use
+`"$HOME/TradingAgentRuntime/scripts/restart_telegram_listener.sh"` only when the
+same exact listener is already launchd-owned. That helper verifies the active
+release, installed plist and remote forward/rollback authority, uses only
+`launchctl bootout/bootstrap`, refuses PID signalling or lock deletion, and
+finishes with the complete freshness gate. Then wait for both new heartbeats
+and retain the complete freshness report. Do not use a source checkout's Git
+HEAD as runtime authority; the active immutable release manifest and runtime
+pointer are authoritative.
 
 ### Stale listener guard
 If an approval reply (e.g. `yes AMX`) is received while the listener is running stale code:

@@ -104,7 +104,7 @@ The `scripts/` directory contains operational shell and Python scripts used for 
 - `uninstall_launchd.sh`: Uninstalls the launchd plist file. **[Scheduling-related]**
 - `rotate_logs.sh`: Deletes/archives logs according to retention rules. **[Local-state modifying]**
 - `backup_db.sh`: Creates and retains local SQLite/archive copies. **[Local-state modifying]**
-- `start_agent.sh` / `stop_agent.sh`: Utility scripts to load or unload the scheduled jobs. **[Scheduling-related]**
+- `start_agent.sh` / `stop_agent.sh`: Exact-confirmation helpers that clear or enable the active immutable runtime's external paper-mode kill switch; they do not load or unload launchd jobs. **[Operational-state modifying]**
 - `telegram_get_updates.py`: Small Python utility to print raw Telegram JSON updates. **[Safe/Read-only]**
 - `telegram_test.py`: Simple verification script to send a basic Telegram message. **[Safe/Read-only]**
 
@@ -463,25 +463,24 @@ The system is configured with two separate scheduled jobs:
 1. **Scanner (`com.elijah.tradingagent`)**:
    - **Schedule**: Every 10 minutes (600 seconds)
    - **Command**: `scripts/run_once.sh`
-   - **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
-   - **Stdout/Stderr Logs**: `logs/runtime/launchd.out` and `logs/errors/launchd.err`
+   - **Working Directory**: `/Users/elijahang/TradingAgentRuntime`
+   - **Stdout/Stderr Logs**: external Application Support runtime logs
    - **Behavior**: Runs the full scan loop (reconciliation + rule-based evaluation + scoring + proposal creation + optional AI review). Telegram update polling is completely disabled for the scanner (`market_scan_processes_telegram_updates: false`).
 
 2. **Telegram listener (`com.elijah.tradingagent.telegram`)**:
    - **Schedule**: Constantly kept alive in the background
    - **Command**: `scripts/run_telegram_listener.sh`
-   - **Working Directory**: `/Users/elijahang/Projects/TradingAgent`
-   - **Stdout/Stderr Logs**: `logs/runtime/listener.out` and `logs/errors/listener.err`
+   - **Working Directory**: `/Users/elijahang/TradingAgentRuntime`
+   - **Stdout/Stderr Logs**: external Application Support listener logs
    - **Behavior**: Runs the fast Telegram listener loop. Polls Telegram for replies every 30 seconds. Implements bootstrap protection to ignore updates queued before startup or older than 2 minutes. This is the sole polling owner for Telegram updates to prevent update consumption races.
 
 - **How to Check Status**: Run `launchctl list | grep tradingagent`
-- **How to Stop/Disable**: Run `./scripts/stop_agent.sh` (or `touch config/KILL_SWITCH`)
-- **How to Uninstall**: Run `./scripts/uninstall_launchd.sh`
-- **Manual Scan**: Run `./scripts/run_once.sh`
-- **Manual Listener**: Run `PYTHONPATH=. .venv/bin/python -m app.main --mode listener`
+- **How to Pause**: Run `"$HOME/TradingAgentRuntime/scripts/stop_agent.sh"` to enable the external kill switch.
+- **How to Uninstall**: Run `"$HOME/TradingAgentRuntime/scripts/uninstall_launchd.sh"`.
+- **Manual Scan/Listener**: Unsupported in production; use only the controlled immutable launchd paths.
 - **Reconciliation**: Each passing cycle reads existing Alpaca order/account/position state and reconciles SQLite before scanning. Reconciliation has no submission or retry operation.
 - **Lock Recovery**: `run_once.sh` records PID and epoch time. Active/recent locks are preserved; only a dead owner older than the grace period is atomically recovered and audited.
-- **macOS Sandbox Note**: The project has been relocated to `/Users/elijahang/Projects/TradingAgent` to completely bypass the macOS TCC/Sandbox restrictions on `~/Desktop`, ensuring launchd runs execute successfully without requiring system-wide Full Disk Access configurations.
+- **Runtime isolation**: Production launchd never executes a mutable source checkout; it uses the immutable runtime pointer and external Application Support state.
 
 ## 17. Live Trading Gates
 Live trading is disabled. If a live proposal is attempted, it is caught and blocked by the safety gate:

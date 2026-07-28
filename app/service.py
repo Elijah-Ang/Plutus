@@ -4,7 +4,6 @@ import json
 import hashlib
 import logging
 import math
-import os
 import re
 import time
 import dataclasses
@@ -12,7 +11,6 @@ import uuid
 import pandas as pd
 from datetime import UTC, datetime, time as dt_time, timedelta
 from decimal import Decimal, ROUND_DOWN
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -83,11 +81,11 @@ from .strategy_rule_based import evaluate_symbol
 from .strategy_rule_based import STRATEGY_VERSION
 from .telegram_bot import TelegramBot
 from .utils import (
-    PROJECT_ROOT,
     format_proposal_message,
     format_sgt,
     iso_now,
     json_dumps,
+    kill_switch_active,
     redact_exception,
     translate_reason,
 )
@@ -526,7 +524,7 @@ class TradingService:
             "internet": internet_available,
             "power": lambda: get_power_status().connected is True,
             "telegram": lambda: bool(telegram_health(force=True)) if callable(telegram_health) else False,
-            "kill_switch": lambda: (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
+            "kill_switch": kill_switch_active,
         }
 
     def _authoritative_runtime_state(self, force: bool = False) -> dict[str, Any]:
@@ -2588,7 +2586,7 @@ class TradingService:
             "broker_available": state["broker_available"],
             "telegram_available": state["telegram_available"],
             "market_open": state["market_open"],
-            "kill_switch": (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
+            "kill_switch": kill_switch_active(),
             "open_positions": len(positions), "trades_today": len(today_orders), "buy_trades_today": len(today_buy_orders),
             "conflicting_buy_order": conflicting_buy_order,
             "conflicting_sell_order": conflicting_sell_order,
@@ -4746,7 +4744,7 @@ class TradingService:
         # General safety pre-flights
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             block_reason = "this build supports paper mode only"
-        elif (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+        elif kill_switch_active():
             block_reason = "kill switch active"
         elif not self.storage.writable():
             block_reason = "database is not writable"
@@ -5752,7 +5750,7 @@ class TradingService:
         if not self.storage.writable():
             return False, "database is not writable"
 
-        if (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+        if kill_switch_active():
             return False, "kill switch active"
 
         symbol = proposal["symbol"]
@@ -9344,7 +9342,7 @@ class TradingService:
             self._run_dynamic_universe_due()
         if self.config.get("telegram", {}).get("market_scan_processes_telegram_updates", True):
             self.process_telegram()
-        if not (PROJECT_ROOT / "config" / "KILL_SWITCH").exists():
+        if not kill_switch_active():
             self.scan()
         self.check_and_send_digest()
         self.storage.audit(self.run_id, "scan_cycle_completed", {"run_dynamic_universe": run_dynamic_universe})

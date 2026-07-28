@@ -15,7 +15,12 @@ from app.power import get_power_status  # noqa: E402
 from app.risk_engine import RiskEngine  # noqa: E402
 from app.storage import Storage  # noqa: E402
 from app.telegram_bot import TelegramBot  # noqa: E402
-from app.utils import PROJECT_ROOT, format_proposal_message, load_config  # noqa: E402
+from app.utils import (  # noqa: E402
+    PROJECT_ROOT,
+    format_proposal_message,
+    kill_switch_active,
+    load_config,
+)
 
 
 def main():
@@ -113,7 +118,7 @@ def main():
         "broker_available": True,
         "telegram_available": True,
         "market_open": market_open,
-        "kill_switch": (PROJECT_ROOT / "config" / "KILL_SWITCH").exists(),
+        "kill_switch": kill_switch_active(),
         "open_positions": len(positions),
         "trades_today": len(today_orders),
         "duplicate_order": conflict,

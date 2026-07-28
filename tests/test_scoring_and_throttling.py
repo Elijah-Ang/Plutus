@@ -102,8 +102,10 @@ def test_launchd_definition_and_install_contract():
     assert source.is_file()
     assert installer.is_file()
     installer_text = installer.read_text()
-    assert 'launchd/com.elijah.tradingagent.plist' in installer_text
-    assert '$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist' in installer_text
+    assert '"$ROOT/launchd/$name"' in installer_text
+    assert 'TARGET_DIR="$HOME/Library/LaunchAgents"' in installer_text
+    assert "verify_release_artifact.py" in installer_text
+    assert "active immutable release" in installer_text
 
     # Installation is deployment state, not a portable unit-test precondition.
     # Operators can opt into verifying that state on a configured macOS host.

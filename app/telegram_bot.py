@@ -68,17 +68,17 @@ class TelegramBot:
         if command in {"/pause", "/resume", "/killswitch"} and not self.is_authorized(sender_id):
             return "Unauthorized command rejected and should be audited."
         if command in {"/pause", "/killswitch"}:
-            from .utils import PROJECT_ROOT
-            (PROJECT_ROOT / "config" / "KILL_SWITCH").touch(exist_ok=True)
+            from .utils import set_kill_switch
+            set_kill_switch(True)
             return "Local kill switch enabled. No new proposal or execution is allowed."
         if command == "/resume":
             if raw != "/resume CONFIRM PAPER RESUME":
                 return "Resume rejected. Exact phrase required: /resume CONFIRM PAPER RESUME"
-            from .utils import PROJECT_ROOT, load_config
+            from .utils import load_config, set_kill_switch
             config = load_config()
             if config.get("mode") != "paper" or config.get("live_enabled") is not False:
                 return "Resume blocked: local configuration is not paper-only."
-            (PROJECT_ROOT / "config" / "KILL_SWITCH").unlink(missing_ok=True)
+            set_kill_switch(False)
             return "Paper-mode kill switch cleared locally."
         messages = {
             "/status": "Status is available from the latest run and audit log.",

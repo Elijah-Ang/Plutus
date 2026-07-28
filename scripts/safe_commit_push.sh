@@ -4,18 +4,19 @@ set -euo pipefail
 
 # 1. Parse arguments and check for commit message
 COMMIT_MSG=""
-RESTART_LISTENER=false
 
 for arg in "$@"; do
     if [[ "$arg" == "--restart-listener" ]]; then
-        RESTART_LISTENER=true
+        echo "ERROR: Source-tree pushes cannot restart the immutable production listener." >&2
+        echo "Build and deploy an independently gated immutable release instead." >&2
+        exit 2
     else
         COMMIT_MSG="$arg"
     fi
 done
 
 if [[ -z "$COMMIT_MSG" ]]; then
-    echo "Usage: $0 \"Your commit message\" [--restart-listener]" >&2
+    echo "Usage: $0 \"Your commit message\"" >&2
     exit 1
 fi
 
@@ -100,28 +101,6 @@ git commit -m "$COMMIT_MSG"
 echo "=== Step 7: Pushing to GitHub ==="
 git push origin "$(git branch --show-current)"
 
-# Check if any files affecting python/config/scripts changed in this commit
-CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
-AFFECTS_RUNTIME=false
-while IFS= read -r file; do
-    if [[ "$file" == *.py || "$file" == config/*.yaml || "$file" == scripts/*.sh || "$file" == scripts/*.py ]]; then
-        AFFECTS_RUNTIME=true
-    fi
-done <<< "$CHANGED_FILES"
-
-if [[ "$AFFECTS_RUNTIME" == "true" ]]; then
-    # Check if listener is currently running
-    if launchctl print "gui/$(id -u)/com.elijah.tradingagent.telegram" >/dev/null 2>&1; then
-        if [[ "$RESTART_LISTENER" == "true" ]]; then
-            echo "=== Option --restart-listener specified; restarting Telegram listener ==="
-            "$ROOT/scripts/restart_telegram_listener.sh"
-        else
-            echo ""
-            echo "⚠️  WARNING: Telegram listener may be stale after this code change."
-            echo "Run ./scripts/restart_telegram_listener.sh before relying on approvals."
-            echo ""
-        fi
-    fi
-fi
+echo "Source was pushed only. Production remains on its independently built immutable release."
 
 echo "=== Safe commit and push completed successfully! ==="
