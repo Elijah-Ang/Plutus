@@ -1,8 +1,17 @@
 import json
 
-from app.reports import SHEETS, export_excel, redact_report_value
-from app.storage import Storage
+import pytest
 from openpyxl import load_workbook
+
+import app.reports as reports
+from app.reports import (
+    EXCEL_INVALID_SHEET_TITLE,
+    EXCEL_MAX_SHEET_TITLE_LENGTH,
+    SHEETS,
+    export_excel,
+    redact_report_value,
+)
+from app.storage import Storage
 
 
 def test_export_has_expected_sheets(tmp_path):
@@ -11,6 +20,61 @@ def test_export_has_expected_sheets(tmp_path):
     path = export_excel(storage, {"mode": "paper"}, tmp_path / "report.xlsx")
     workbook = load_workbook(path, read_only=True)
     assert workbook.sheetnames == [name for name, _ in SHEETS]
+
+
+def test_registered_report_sheet_titles_are_excel_compatible():
+    titles = [name for name, _query in SHEETS]
+
+    assert all(titles)
+    assert all(len(title) <= EXCEL_MAX_SHEET_TITLE_LENGTH for title in titles)
+    assert all(EXCEL_INVALID_SHEET_TITLE.search(title) is None for title in titles)
+    assert all(
+        not title.startswith("'") and not title.endswith("'") for title in titles
+    )
+    assert len({title.casefold() for title in titles}) == len(titles)
+
+
+@pytest.mark.parametrize(
+    "invalid_title",
+    [
+        "X" * (EXCEL_MAX_SHEET_TITLE_LENGTH + 1),
+        "Invalid/Title",
+        "'Apostrophe",
+        "apostrophe'",
+    ],
+)
+def test_export_rejects_invalid_sheet_title_before_writing(
+    tmp_path, monkeypatch, invalid_title
+):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    monkeypatch.setattr(
+        reports,
+        "SHEETS",
+        [("Summary Dashboard", None), (invalid_title, "orders")],
+    )
+
+    with pytest.raises(ValueError, match="worksheet title"):
+        export_excel(storage, {"mode": "paper"}, tmp_path / "report.xlsx")
+
+    assert not (tmp_path / "report.xlsx").exists()
+
+
+def test_export_rejects_case_insensitive_duplicate_sheet_title(
+    tmp_path, monkeypatch
+):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    monkeypatch.setattr(
+        reports,
+        "SHEETS",
+        [("Summary Dashboard", None), ("summary dashboard", "orders")],
+    )
+
+    with pytest.raises(ValueError, match="case-insensitively unique"):
+        export_excel(storage, {"mode": "paper"}, tmp_path / "report.xlsx")
+
+    assert not (tmp_path / "report.xlsx").exists()
 
 
 def test_report_redacts_telegram_text_and_sender_ids_inside_json_detail():
