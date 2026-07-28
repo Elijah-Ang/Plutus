@@ -19,13 +19,27 @@ Use `--mode forward` explicitly for ordinary exact-current-main deployment. Cont
 Apply a production migration only during deployment:
 
 ```sh
+RELEASE=/Users/elijahang/TradingAgentReleases/<release-id>
 TRADINGAGENT_ALLOW_PRODUCTION_DB_MIGRATION=YES_I_AM_DEPLOYING \
-  ./scripts/migrate_runtime_db.py \
+  "$RELEASE/.venv/bin/python" "$RELEASE/scripts/migrate_runtime_db.py" \
   --database "$HOME/Library/Application Support/TradingAgent/database/trading_agent.sqlite3" \
-  --release-manifest /Users/elijahang/TradingAgentRuntime/release-manifest.json \
+  --release-manifest "$RELEASE/release-manifest.json" \
   --allow-production-migration
 ```
 
-The command writes a verified pre-migration backup under `Application Support/TradingAgent/backups/`. If compatibility requires restoration: stop both jobs, create a new backup of the current database, restore the selected verified backup with SQLite backup tooling, run `PRAGMA integrity_check`, switch to the compatible release, and then reload the jobs.
+The command fails closed unless both launchd writers are absent and the exact
+immutable release manifest binds paper/manual-only controls, successful
+artifact tests, CI, schema versions, and source-tree authority. It checks disk
+capacity before creating a collision-resistant exclusive backup, verifies
+`quick_check`, `integrity_check`, foreign keys, schema, page counts, and every
+table row count, then applies and verifies the migration twice. The final JSON
+must report `"idempotent": true`; retain its backup path, SHA-256, and both
+migration-pass evidence objects with the deployment record.
+
+If compatibility requires restoration: stop both jobs, create a new backup of
+the current database, restore the selected verified backup with SQLite backup
+tooling, run `PRAGMA quick_check`, `PRAGMA integrity_check`, and
+`PRAGMA foreign_key_check`, switch to the compatible release, and then reload
+the jobs.
 
 Check the active release with `readlink "$HOME/TradingAgentRuntime"`; inspect schema versions with a read-only SQLite connection; inspect process paths with `launchctl print` and `ps`. Runtime logs and locks are under the Application Support state root.
