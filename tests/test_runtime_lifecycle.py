@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -20,6 +21,7 @@ from app.utils import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ZSH = shutil.which("zsh")
 
 
 def _production_state(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
@@ -299,6 +301,7 @@ def test_launchd_install_and_deploy_reject_symlink_targets() -> None:
     assert "external runtime state directory must be owner-only" in deploy
 
 
+@pytest.mark.skipif(ZSH is None, reason="macOS runtime lifecycle requires zsh")
 def test_emergency_pause_works_without_release_authority(
     tmp_path: Path,
 ) -> None:
@@ -309,7 +312,7 @@ def test_emergency_pause_works_without_release_authority(
     environment = {**os.environ, "HOME": str(home)}
 
     result = subprocess.run(
-        ["/bin/zsh", str(ROOT / "scripts" / "stop_agent.sh")],
+        [str(ZSH), str(ROOT / "scripts" / "stop_agent.sh")],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -323,6 +326,7 @@ def test_emergency_pause_works_without_release_authority(
     assert stat.S_IMODE(switch.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(ZSH is None, reason="macOS runtime lifecycle requires zsh")
 def test_resume_without_active_release_authority_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -337,7 +341,7 @@ def test_resume_without_active_release_authority_fails_closed(
 
     result = subprocess.run(
         [
-            "/bin/zsh",
+            str(ZSH),
             str(ROOT / "scripts" / "start_agent.sh"),
             "CONFIRM PAPER RESUME",
         ],
