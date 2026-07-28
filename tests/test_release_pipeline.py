@@ -251,6 +251,12 @@ def test_build_records_tests_verified_only_after_fresh_environment_tests() -> No
     assert script.index(test_call) < script.index('"tests_verified":True')
 
 
+def test_release_manifest_serializes_ci_run_id_as_positive_integer() -> None:
+    script = (Path(__file__).parents[1] / "scripts" / "build_release.sh").read_text()
+    assert '"run_id":int(os.environ["CI_RUN_ID"])' in script
+    assert '"run_id":os.environ["CI_RUN_ID"]' not in script
+
+
 def test_fresh_artifact_runner_verifies_pinned_crypto_sdk_before_pytest() -> None:
     script = (Path(__file__).parents[1] / "scripts" / "run_artifact_tests.py").read_text()
     sdk_gate = '"alpaca_crypto_sdk_contract"'

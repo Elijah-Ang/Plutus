@@ -43,3 +43,18 @@ tooling, run `PRAGMA quick_check`, `PRAGMA integrity_check`, and
 the jobs.
 
 Check the active release with `readlink "$HOME/TradingAgentRuntime"`; inspect schema versions with a read-only SQLite connection; inspect process paths with `launchctl print` and `ps`. Runtime logs and locks are under the Application Support state root.
+
+After both jobs are started, wait for one listener poll and one completed scanner
+cycle, then run the immutable-runtime evidence gate:
+
+```sh
+"$HOME/TradingAgentRuntime/scripts/check_runtime_freshness.sh" --json
+```
+
+Retain the JSON with the deployment record. A zero exit requires both process
+identities, both commit-bound database heartbeats, the listener PID/lock, the
+owner-controlled runtime symlink, the immutable release authority, and a
+read-only database quick check to agree. Source-tree authority proves tracked
+release inputs; generated-artifact inventories separately prove the built
+environment and test evidence. Neither substitutes for current runtime
+identity and heartbeat evidence.

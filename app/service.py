@@ -3780,7 +3780,7 @@ class TradingService:
                 attempted_at=iso_now(),
                 completed_at=iso_now(),
                 successful_at=iso_now(),
-                detail={"updates_processed": 0},
+                detail={"updates_processed": 0, "run_id": self.run_id},
             )
             return
 
@@ -4534,7 +4534,10 @@ class TradingService:
             attempted_at=iso_now(),
             completed_at=iso_now(),
             successful_at=iso_now(),
-            detail={"updates_processed": len(processed_update_ids)},
+            detail={
+                "updates_processed": len(processed_update_ids),
+                "run_id": self.run_id,
+            },
         )
 
     def _update_batch_status(self, batch_id: str) -> None:

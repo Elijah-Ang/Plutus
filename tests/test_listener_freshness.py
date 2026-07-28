@@ -3,8 +3,6 @@ import uuid
 import pytest
 import os
 from datetime import datetime, UTC, timedelta
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from app.storage import Storage
 from app.service import TradingService
@@ -13,7 +11,6 @@ from app.utils import (
     is_git_clean,
     record_process_identity,
     check_listener_freshness,
-    BOOT_COMMIT
 )
 
 class MockTelegramBot:
@@ -123,7 +120,6 @@ def test_git_utils():
     assert isinstance(clean, bool)
 
 def test_record_process_identity(tmp_path, monkeypatch):
-    from pathlib import Path
     monkeypatch.setattr("app.utils.PROJECT_ROOT", tmp_path)
     
     run_id = "run-test-1"
@@ -141,9 +137,48 @@ def test_record_process_identity(tmp_path, monkeypatch):
         data = json.load(f)
     assert data["role"] == role
     assert data["run_id"] == run_id
+    assert json_path.stat().st_mode & 0o777 == 0o600
+    assert json_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_record_process_identity_atomically_replaces_symlink(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("app.utils.PROJECT_ROOT", tmp_path)
+    runtime = tmp_path / "logs" / "runtime"
+    runtime.mkdir(parents=True)
+    external = tmp_path / "external.json"
+    external.write_text("do not overwrite", encoding="utf-8")
+    identity_path = runtime / "scanner_identity.json"
+    identity_path.symlink_to(external)
+
+    record_process_identity("scanner", "scanner-run")
+
+    assert external.read_text(encoding="utf-8") == "do not overwrite"
+    assert identity_path.is_file()
+    assert not identity_path.is_symlink()
+    assert json.loads(identity_path.read_text(encoding="utf-8"))["run_id"] == "scanner-run"
+
+
+def test_production_identity_write_failure_is_fatal(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("app.utils.PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("TRADING_AGENT_RUNTIME", "production-paper")
+    monkeypatch.setattr(
+        "app.utils.os.replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="authoritative process identity could not be written"
+    ):
+        record_process_identity("scanner", "scanner-run")
+
+    runtime = tmp_path / "logs" / "runtime"
+    assert not list(runtime.glob("*.tmp"))
 
 def test_check_listener_freshness(tmp_path, monkeypatch):
-    from pathlib import Path
     monkeypatch.setattr("app.utils.PROJECT_ROOT", tmp_path)
     state_root = tmp_path / "external-state"
     monkeypatch.setenv("TRADING_AGENT_STATE_ROOT", str(state_root))
@@ -195,43 +230,23 @@ def test_release_manifest_is_commit_source_without_git(tmp_path, monkeypatch):
     assert utils.is_git_clean() is True
 
 
-def test_runtime_freshness_script_reads_external_state(tmp_path, monkeypatch, capsys):
-    import importlib.util
+def test_listener_poll_heartbeat_is_bound_to_listener_run(
+    temp_storage, base_config
+):
+    run_id = temp_storage.start_run("listener")
+    service = TradingService(base_config, temp_storage, MockBroker(), run_id)
+    service.telegram = MockTelegramBot()
 
-    release = tmp_path / "release"
-    release.mkdir()
-    commit = "b" * 40
-    (release / "release-manifest.json").write_text(
-        json.dumps({"release_id": "release-2", "release_commit": commit}),
-        encoding="utf-8",
-    )
-    state_root = tmp_path / "state"
-    runtime = state_root / "runtime"
-    runtime.mkdir(parents=True)
-    identity = {
-        "pid": os.getpid(),
-        "commit": commit,
-        "start_time": datetime.now(UTC).isoformat(),
-        "project_root": str(release),
-    }
-    (runtime / "telegram_listener_identity.json").write_text(json.dumps(identity), encoding="utf-8")
-    (runtime / "scanner_identity.json").write_text(json.dumps(identity), encoding="utf-8")
+    service.process_telegram()
 
-    script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_runtime_freshness.py"
-    spec = importlib.util.spec_from_file_location("runtime_freshness_test_module", script_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "PROJECT_ROOT", release)
-    monkeypatch.setattr(module, "DEFAULT_STATE_ROOT", state_root)
-    monkeypatch.delenv("TRADING_AGENT_STATE_ROOT", raising=False)
+    heartbeat = temp_storage.fetch_all(
+        "SELECT state,detail FROM health_heartbeats WHERE component='listener_poll'"
+    )[0]
+    assert heartbeat["state"] == "healthy"
+    detail = json.loads(heartbeat["detail"])
+    assert detail["run_id"] == run_id
+    assert detail["updates_processed"] == 0
 
-    with pytest.raises(SystemExit) as exc:
-        module.main()
-    assert exc.value.code == 0
-    output = capsys.readouterr().out
-    assert f"Runtime State Root: {state_root}" in output
-    assert "Listener status: FRESH" in output
 
 def test_stale_listener_blocks_approvals(temp_storage, base_config, monkeypatch):
     monkeypatch.setattr("app.utils.BOOT_COMMIT", "boot-commit-abc")

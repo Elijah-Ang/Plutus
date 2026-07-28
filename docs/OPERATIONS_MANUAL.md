@@ -16,21 +16,29 @@ Stay in paper mode until a long, reviewed paper record exists and independent se
 
 ## Deployment and process freshness
 
-The Telegram listener runs as a daemon/long-running process, holding code in memory. To prevent running stale code after git commits/pulls (while scanner reloads code dynamically), we implement a freshness verification mechanism.
+The scanner is periodic and the Telegram listener is long-running. Deployment is not proven merely because launchd accepted both jobs: the active runtime pointer, immutable release manifest, process identities, database heartbeats, and listener lock must all identify the same release.
 
 ### Checking freshness
-Run the check script to verify if the running Telegram listener matches the git HEAD commit:
+
+After the listener has polled and one scanner cycle has completed, run:
+
 ```bash
 ./scripts/check_runtime_freshness.sh
 ```
-Or check directly via Telegram command `/status`, which reports listener fresh/stale status.
 
-### Restarting the listener
-If the listener is reported stale, restart it safely using the dedicated restart helper:
-```bash
-./scripts/restart_telegram_listener.sh
-```
-This script unloads the stale listener, removes stale lock directory markers (only when no process is running), starts the new listener daemon, and verifies its PID and startup commit hash match the repository HEAD.
+Use `./scripts/check_runtime_freshness.sh --json` for retained deployment evidence. The command uses the immutable release's Python 3.13.9 interpreter and fails closed unless:
+
+- `$HOME/TradingAgentRuntime` is an owner-controlled symlink to a release directory whose name and manifest ID agree;
+- the manifest binds paper-only, manual-only, live-disabled controls, successful artifact tests, exact CI, configuration, schema/formula, Git tree, and tracked-source authority;
+- the scanner's owner-only identity matches the release and is recent, and its database heartbeat is `healthy` or safely `blocked`, recent, and bound to the same run and commit;
+- the listener's owner-only identity matches the release and has a live PID, its `healthy` poll heartbeat is recent and bound to the same run and commit, and its active lock binds the same PID, release root, and commit;
+- the production SQLite database opens read-only and passes a bounded `PRAGMA quick_check(1)`.
+
+Missing, malformed, stale, future-dated, permissively readable, symlinked, wrong-root, wrong-commit, wrong-run, dead-process, or mismatched-lock evidence returns nonzero. A market-closed scanner cycle may report `blocked` and still count as fresh; a failed or unknown cycle does not. `/status` remains a useful application health view, but it is not a substitute for this deployment evidence gate.
+
+### Restarting runtime jobs
+
+If either process is stale, stop the launchd jobs and follow the controlled immutable-release install/start procedure. Then wait for both new heartbeats and run the complete freshness gate above. Do not use a source checkout's Git HEAD as runtime authority; the active immutable release manifest and runtime pointer are authoritative. Do not remove a lock or signal a PID until its recorded process-start identity has been checked, because PID reuse can otherwise target an unrelated process.
 
 ### Stale listener guard
 If an approval reply (e.g. `yes AMX`) is received while the listener is running stale code:
