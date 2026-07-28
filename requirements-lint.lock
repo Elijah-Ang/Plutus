@@ -1,0 +1,5 @@
+# Static-analysis toolchain for ubuntu-latest (x86_64) and macOS (arm64).
+# Install with: python -m pip install --require-hashes --requirement requirements-lint.lock
+ruff==0.12.0 \
+    --hash=sha256:68853e8517b17bba004152aebd9dd77d5213e503a5f2789395b25f26acac0da4 \
+    --hash=sha256:07a7aa9b69ac3fcfda3c507916d5d1bca10821fe3797d46bad10f2c6de1edda0

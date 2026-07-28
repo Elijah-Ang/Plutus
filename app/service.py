@@ -12065,6 +12065,7 @@ class TradingService:
         canonical = RiskSnapshotBuilder(self.storage, self._get_symbol_cluster).build(
             self._authoritative_runtime_state().get("positions", []), account, source_at=now.isoformat()
         )
+        allocation_as_of = str(canonical.source_at or "")
         buying_power_remaining = max(0.0, self._buying_power(account) - canonical.active_reserved_exposure)
         total_exposure_after = (
             canonical.projected_gross_exposure / equity * 100
