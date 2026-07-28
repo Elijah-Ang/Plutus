@@ -6,19 +6,38 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
-from app.adaptive_conviction import AdaptiveConvictionEngine
-from app.utils import load_config
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from app.adaptive_conviction import AdaptiveConvictionEngine  # noqa: E402
+from app.utils import load_config  # noqa: E402
 
 
-TRADING_TABLES = ("trade_proposals", "approvals", "risk_reservations", "order_intents", "orders", "fills")
+TRADING_TABLES = (
+    "trade_proposals",
+    "approvals",
+    "risk_reservations",
+    "order_intents",
+    "orders",
+    "fills",
+)
 
 
 def _counts(conn: sqlite3.Connection) -> dict[str, int]:
-    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    return {table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]) for table in TRADING_TABLES if table in present}
+    present = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    return {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in TRADING_TABLES
+        if table in present
+    }
 
 
 def _payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -41,41 +60,78 @@ def _proposal_records(conn: sqlite3.Connection, limit: int) -> list[dict[str, An
         action = str(payload.get("action") or "entry").lower()
         if action != "entry":
             continue
-        equity = payload.get("portfolio_equity") or (payload.get("indicators") or {}).get("portfolio_equity")
-        proposal_pct = (float(row["notional"] or 0.0) / float(equity) * 100.0) if equity else None
+        equity = payload.get("portfolio_equity") or (
+            payload.get("indicators") or {}
+        ).get("portfolio_equity")
+        proposal_pct = (
+            (float(row["notional"] or 0.0) / float(equity) * 100.0) if equity else None
+        )
         proposed_gross = payload.get("proposed_total_exposure_pct")
         proposed_symbol = payload.get("proposed_symbol_exposure_pct")
         proposed_cluster = payload.get("proposed_cluster_exposure_pct")
-        records.append({
-            "run_id": row["run_id"], "proposal_id": row["id"], "candidate_id": row["signal_id"],
-            "setup_id": payload.get("setup_key"), "strategy_version": row["strategy_version"],
-            "policy_decision_id": row["policy_decision_id"], "performance_snapshot_id": row["performance_snapshot_id"],
-            "action": "entry", "side": "buy", "strategy_authorized": row["strategy_state"] in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
-            "strategy_policy_state": row["strategy_state"],
-            "evidence_quality": (float(row["strategy_quality_score"]) / 100.0) if row["strategy_quality_score"] is not None else None,
-            "evidence_calibrated": row["strategy_state"] in {"EXPLORATION", "THROTTLED", "ACTIVE"} and row["performance_snapshot_id"] is not None,
-            "market_regime": payload.get("volatility_regime"), "account_drawdown_pct": payload.get("phase3_account_drawdown_pct"),
-            "daily_realized_loss_pct": payload.get("daily_loss_pct"), "weekly_realized_loss_pct": payload.get("weekly_loss_pct"),
-            "execution_integrity_ok": payload.get("execution_integrity_ok"), "reconciliation_ok": payload.get("reconciliation_ok"),
-            "current_portfolio_heat_pct": payload.get("current_portfolio_heat_pct"),
-            "current_gross_exposure_pct": max(0.0, float(proposed_gross) - proposal_pct) if proposed_gross is not None and proposal_pct is not None else None,
-            "symbol_exposure_pct": max(0.0, float(proposed_symbol) - proposal_pct) if proposed_symbol is not None and proposal_pct is not None else None,
-            "cluster_exposure_pct": max(0.0, float(proposed_cluster) - proposal_pct) if proposed_cluster is not None and proposal_pct is not None else None,
-            "correlation_score": payload.get("correlation_score"), "setup_score": payload.get("score"),
-            "stop_valid": payload.get("stop_validation_status") == "validated", "stop_distance_pct": payload.get("stop_distance_pct"),
-            "reward_to_risk": payload.get("reward_to_risk"), "average_dollar_volume": payload.get("average_dollar_volume"),
-            "quote_spread_bps": payload.get("quote_spread_bps"),
-            "market_data_fresh": payload.get("proposal_price_age_seconds_at_send") is not None and float(payload["proposal_price_age_seconds_at_send"]) <= 60.0,
-            "risk_checks_passed": str(row["status"] or "").lower() not in {"blocked", "rejected"},
-            "deterioration_detected": None,
-            "operational_stop_risk_pct": row["permitted_stop_risk_pct"],
-            "replay_source": "trade_proposal",
-        })
+        records.append(
+            {
+                "run_id": row["run_id"],
+                "proposal_id": row["id"],
+                "candidate_id": row["signal_id"],
+                "setup_id": payload.get("setup_key"),
+                "strategy_version": row["strategy_version"],
+                "policy_decision_id": row["policy_decision_id"],
+                "performance_snapshot_id": row["performance_snapshot_id"],
+                "action": "entry",
+                "side": "buy",
+                "strategy_authorized": row["strategy_state"]
+                in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
+                "strategy_policy_state": row["strategy_state"],
+                "evidence_quality": (float(row["strategy_quality_score"]) / 100.0)
+                if row["strategy_quality_score"] is not None
+                else None,
+                "evidence_calibrated": row["strategy_state"]
+                in {"EXPLORATION", "THROTTLED", "ACTIVE"}
+                and row["performance_snapshot_id"] is not None,
+                "market_regime": payload.get("volatility_regime"),
+                "account_drawdown_pct": payload.get("phase3_account_drawdown_pct"),
+                "daily_realized_loss_pct": payload.get("daily_loss_pct"),
+                "weekly_realized_loss_pct": payload.get("weekly_loss_pct"),
+                "execution_integrity_ok": payload.get("execution_integrity_ok"),
+                "reconciliation_ok": payload.get("reconciliation_ok"),
+                "current_portfolio_heat_pct": payload.get("current_portfolio_heat_pct"),
+                "current_gross_exposure_pct": max(
+                    0.0, float(proposed_gross) - proposal_pct
+                )
+                if proposed_gross is not None and proposal_pct is not None
+                else None,
+                "symbol_exposure_pct": max(0.0, float(proposed_symbol) - proposal_pct)
+                if proposed_symbol is not None and proposal_pct is not None
+                else None,
+                "cluster_exposure_pct": max(0.0, float(proposed_cluster) - proposal_pct)
+                if proposed_cluster is not None and proposal_pct is not None
+                else None,
+                "correlation_score": payload.get("correlation_score"),
+                "setup_score": payload.get("score"),
+                "stop_valid": payload.get("stop_validation_status") == "validated",
+                "stop_distance_pct": payload.get("stop_distance_pct"),
+                "reward_to_risk": payload.get("reward_to_risk"),
+                "average_dollar_volume": payload.get("average_dollar_volume"),
+                "quote_spread_bps": payload.get("quote_spread_bps"),
+                "market_data_fresh": payload.get("proposal_price_age_seconds_at_send")
+                is not None
+                and float(payload["proposal_price_age_seconds_at_send"]) <= 60.0,
+                "risk_checks_passed": str(row["status"] or "").lower()
+                not in {"blocked", "rejected"},
+                "deterioration_detected": None,
+                "operational_stop_risk_pct": row["permitted_stop_risk_pct"],
+                "replay_source": "trade_proposal",
+            }
+        )
     return records
 
 
 def _research_records(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
-    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    present = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
     if "research_opportunities" not in present:
         return []
     rows = conn.execute(
@@ -101,29 +157,61 @@ def _research_records(conn: sqlite3.Connection, limit: int) -> list[dict[str, An
         entry = row["entry_price"]
         stop = row["stop_price"]
         target = row["target_price"]
-        stop_valid = entry is not None and stop is not None and float(entry) > float(stop) > 0
-        stop_distance = ((float(entry) - float(stop)) / float(entry) * 100.0) if stop_valid else None
-        reward = ((float(target) - float(entry)) / (float(entry) - float(stop))) if stop_valid and target is not None else None
+        stop_valid = (
+            entry is not None and stop is not None and float(entry) > float(stop) > 0
+        )
+        stop_distance = (
+            ((float(entry) - float(stop)) / float(entry) * 100.0)
+            if stop_valid
+            else None
+        )
+        reward = (
+            ((float(target) - float(entry)) / (float(entry) - float(stop)))
+            if stop_valid and target is not None
+            else None
+        )
         state = row["replay_policy_state"]
-        records.append({
-            "run_id": None, "proposal_id": None, "candidate_id": row["id"], "setup_id": row["source_id"],
-            "strategy_version": row["strategy_version"], "policy_decision_id": row["replay_policy_id"],
-            "performance_snapshot_id": row["replay_snapshot_id"], "action": "entry", "side": "buy",
-            "strategy_authorized": state in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
-            "strategy_policy_state": state, "evidence_quality": (float(row["replay_quality_score"]) / 100.0) if row["replay_quality_score"] is not None else None,
-            "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"} and row["replay_snapshot_id"] is not None,
-            "market_regime": row["regime"], "setup_score": row["score"], "stop_valid": stop_valid,
-            "stop_distance_pct": stop_distance, "reward_to_risk": reward,
-            "average_dollar_volume": features.get("average_dollar_volume") or features.get("adv20"),
-            "quote_spread_bps": features.get("quote_spread_bps"),
-            "market_data_fresh": entry is not None, "risk_checks_passed": row["blocker"] is None and stop_valid,
-            "deterioration_detected": None, "operational_stop_risk_pct": 0.03 if state == "PROBE" else None,
-            "replay_source": "research_opportunity", "source_execution_type": row["execution_type"],
-        })
+        records.append(
+            {
+                "run_id": None,
+                "proposal_id": None,
+                "candidate_id": row["id"],
+                "setup_id": row["source_id"],
+                "strategy_version": row["strategy_version"],
+                "policy_decision_id": row["replay_policy_id"],
+                "performance_snapshot_id": row["replay_snapshot_id"],
+                "action": "entry",
+                "side": "buy",
+                "strategy_authorized": state
+                in {"PROBE", "EXPLORATION", "THROTTLED", "ACTIVE"},
+                "strategy_policy_state": state,
+                "evidence_quality": (float(row["replay_quality_score"]) / 100.0)
+                if row["replay_quality_score"] is not None
+                else None,
+                "evidence_calibrated": state in {"EXPLORATION", "THROTTLED", "ACTIVE"}
+                and row["replay_snapshot_id"] is not None,
+                "market_regime": row["regime"],
+                "setup_score": row["score"],
+                "stop_valid": stop_valid,
+                "stop_distance_pct": stop_distance,
+                "reward_to_risk": reward,
+                "average_dollar_volume": features.get("average_dollar_volume")
+                or features.get("adv20"),
+                "quote_spread_bps": features.get("quote_spread_bps"),
+                "market_data_fresh": entry is not None,
+                "risk_checks_passed": row["blocker"] is None and stop_valid,
+                "deterioration_detected": None,
+                "operational_stop_risk_pct": 0.03 if state == "PROBE" else None,
+                "replay_source": "research_opportunity",
+                "source_execution_type": row["execution_type"],
+            }
+        )
     return records
 
 
-def replay_database(database: str | Path, *, as_of: str, limit: int = 1000) -> dict[str, Any]:
+def replay_database(
+    database: str | Path, *, as_of: str, limit: int = 1000
+) -> dict[str, Any]:
     if not as_of:
         raise ValueError("replay requires explicit as_of")
     uri = f"file:{Path(database).resolve()}?mode=ro"
@@ -133,12 +221,18 @@ def replay_database(database: str | Path, *, as_of: str, limit: int = 1000) -> d
         before = _counts(conn)
         proposal_records = _proposal_records(conn, limit)
         research_records = _research_records(conn, limit)
-        records = [{**record, "evaluation_time": as_of} for record in [*proposal_records, *research_records]]
+        records = [
+            {**record, "evaluation_time": as_of}
+            for record in [*proposal_records, *research_records]
+        ]
         result = AdaptiveConvictionEngine(load_config()).replay(records)
         after = _counts(conn)
         if before != after:
             raise RuntimeError("read-only replay observed a trading-state count change")
-        result["source_records"] = {"production_paper_proposals": len(proposal_records), "research_records": len(research_records)}
+        result["source_records"] = {
+            "production_paper_proposals": len(proposal_records),
+            "research_records": len(research_records),
+        }
         result["trading_state_counts_before"] = before
         result["trading_state_counts_after"] = after
         return result
@@ -149,7 +243,9 @@ def replay_database(database: str | Path, *, as_of: str, limit: int = 1000) -> d
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
-    parser.add_argument("--as-of", required=True, help="ISO-8601 replay evaluation timestamp")
+    parser.add_argument(
+        "--as-of", required=True, help="ISO-8601 replay evaluation timestamp"
+    )
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--output")
     args = parser.parse_args()

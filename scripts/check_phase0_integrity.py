@@ -3,15 +3,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from app.execution import DurableExecutionStore
-from app.storage import Storage
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from app.execution import DurableExecutionStore  # noqa: E402
+from app.storage import Storage  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only Phase 0 integrity report")
-    parser.add_argument("--db", type=Path, required=True, help="Explicit SQLite database path; no default is provided")
+    parser.add_argument(
+        "--db",
+        type=Path,
+        required=True,
+        help="Explicit SQLite database path; no default is provided",
+    )
     args = parser.parse_args()
     if not args.db.exists():
         parser.error("database path does not exist")
