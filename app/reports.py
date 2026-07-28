@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
 import json
 import re
+from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
@@ -12,6 +12,9 @@ from openpyxl.styles import Font, PatternFill
 
 from .storage import Storage
 from .utils import PROJECT_ROOT, json_dumps, redact
+
+EXCEL_MAX_SHEET_TITLE_LENGTH = 31
+EXCEL_INVALID_SHEET_TITLE = re.compile(r"[\\*?:/\[\]]")
 
 SHEETS: list[tuple[str, str | None]] = [
     ("Summary Dashboard", None), ("Proposals", "SELECT *, CASE WHEN status='pending' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 'active_pending' WHEN status='pending' THEN 'pending_expired' WHEN status='approved' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 'approved_unsubmitted' WHEN status='approved' THEN 'approved_historical' WHEN status='submitted' THEN 'submitted_historical' WHEN status='filled' THEN 'filled_historical' WHEN status='rejected' THEN 'rejected_historical' WHEN status='superseded' THEN 'superseded_historical' WHEN status='blocked' THEN 'blocked_historical' WHEN status='expired' THEN 'expired_historical' ELSE COALESCE(status, 'unknown') END AS proposal_runtime_state, CASE WHEN status='pending' AND expires_at > strftime('%Y-%m-%dT%H:%M:%f+00:00','now') THEN 1 ELSE 0 END AS active_pending_actionable FROM trade_proposals ORDER BY created_at DESC"), ("Daily PnL", "daily_summaries"), ("Trades", "orders"),
@@ -136,7 +139,7 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Candidate Scores", "SELECT b.symbol,b.rank,b.research_score,b.data_confidence,s.liquidity_score,s.trend_score,s.intraday_momentum_score,s.relative_strength_score,s.volatility_quality_score,s.screener_mover_score,s.news_score,s.sector_theme_score,s.data_quality_score,b.created_at FROM research_candidate_briefs b LEFT JOIN symbol_research_scores s ON s.run_id=b.run_id AND s.symbol=b.symbol ORDER BY b.created_at DESC,b.rank"),
     ("Candidate Data Coverage", "SELECT symbol,data_confidence,price_freshness,liquidity_metrics,dollar_volume,trend_summary,intraday_summary,relative_strength_vs_spy,volatility_risk_summary,missing_neutral_data,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
     ("Candidate Endpoint Coverage", "SELECT symbol,endpoint_coverage,missing_neutral_data,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
-    ("Candidate Promotion Requirements", "SELECT symbol,current_stage,next_stage_requirements,before_observation_requirements,before_paper_tradable_requirements,next_expected_check,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
+    ("Candidate Promotion Criteria", "SELECT symbol,current_stage,next_stage_requirements,before_observation_requirements,before_paper_tradable_requirements,next_expected_check,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
     ("Candidate Block Reasons", "SELECT symbol,main_blockers,missing_neutral_data,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
     ("Candidate Next Steps", "SELECT symbol,current_stage,next_expected_check,allowed_actions,blocked_actions,proposal_order_confirmation,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
     ("Candidate Chart Data", "SELECT symbol,rank,research_score,data_confidence,dollar_volume,latest_price,created_at FROM research_candidate_briefs ORDER BY created_at DESC, rank"),
@@ -164,8 +167,8 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Alpaca Quote Fallback Checks", "SELECT symbol,current_tier,decision,alpaca_quote_freshness,alpaca_tradability_result,promotion_freshness_path,proposal_block_reason,created_at FROM dynamic_universe_stage_reviews WHERE alpaca_quote_freshness IS NOT NULL ORDER BY created_at DESC, symbol"),
     ("Cached Intraday Usage", "SELECT symbol,current_tier,decision,intraday_freshness,promotion_freshness_path,promotion_confidence_adjustment,created_at FROM dynamic_universe_stage_reviews WHERE promotion_freshness_path='cached_intraday' OR intraday_freshness='cached' ORDER BY created_at DESC, symbol"),
     ("EOD-Only Market-Closed Reviews", "SELECT symbol,current_tier,decision,eod_freshness,promotion_freshness_path,promotion_confidence_adjustment,proposal_block_reason,created_at FROM dynamic_universe_stage_reviews WHERE promotion_freshness_path='eod_only_market_closed' ORDER BY created_at DESC, symbol"),
-    ("Proposal Fresh Validation Blocks", "SELECT symbol,current_tier,decision,promotion_freshness_path,proposal_allowed_status,proposal_block_reason,proposal_block_reason_after_promotion,created_at FROM dynamic_universe_stage_reviews WHERE proposal_allowed_status!='allowed' ORDER BY created_at DESC, symbol"),
-    ("Observation Promotion Block Reasons", "SELECT symbol,current_tier,decision,reason,promotion_requirements_missing,next_stage_blocker,next_review_time,created_at FROM dynamic_universe_stage_reviews WHERE current_tier='observation' AND decision LIKE 'keep_observation%' ORDER BY created_at DESC, symbol"),
+    ("Proposal Validation Blocks", "SELECT symbol,current_tier,decision,promotion_freshness_path,proposal_allowed_status,proposal_block_reason,proposal_block_reason_after_promotion,created_at FROM dynamic_universe_stage_reviews WHERE proposal_allowed_status!='allowed' ORDER BY created_at DESC, symbol"),
+    ("Observation Promotion Blocks", "SELECT symbol,current_tier,decision,reason,promotion_requirements_missing,next_stage_blocker,next_review_time,created_at FROM dynamic_universe_stage_reviews WHERE current_tier='observation' AND decision LIKE 'keep_observation%' ORDER BY created_at DESC, symbol"),
     ("Global Research-Only Updates", "SELECT symbol,tier,universe_lane,alpaca_compatible,executable,observation_only,score,source,exclusion_reason,updated_at FROM universe_symbols WHERE universe_lane='global_research_only' ORDER BY updated_at DESC, symbol"),
     ("Static Reconciliation Events", "SELECT symbol,from_tier,to_tier,score,reason,created_at FROM symbol_promotion_decisions WHERE json_extract(payload,'$.existing_static')=1 ORDER BY created_at DESC"),
     ("Dynamic Promotion Events", "SELECT symbol,from_tier,to_tier,score,reason,json_extract(payload,'$.promotion_freshness_path') AS promotion_freshness_path,json_extract(payload,'$.fallback_used') AS fallback_used,json_extract(payload,'$.proposal_block_reason_after_promotion') AS proposal_block_reason,created_at FROM symbol_promotion_decisions WHERE COALESCE(json_extract(payload,'$.existing_static'),0)!=1 ORDER BY created_at DESC"),
@@ -191,7 +194,7 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Endpoint Availability", "SELECT provider,endpoint_name,available,plan_limited,last_success_at,last_failure_at,failure_count,last_status_code,last_error_category,disabled_until,used_for_scoring,updated_at FROM data_provider_capabilities ORDER BY provider, endpoint_name"),
     ("Dynamic Universe Performance", "dynamic_universe_performance"),
     ("Dynamic Universe Schedule State", "dynamic_universe_schedule_state"),
-    ("Latest Dynamic Universe Subtask Status", "SELECT schedule_name,schedule_type,last_started_at,last_completed_at,last_success_at,last_skipped_at,last_skip_reason,CASE WHEN last_skip_reason IS NOT NULL AND (last_success_at IS NULL OR datetime(last_skipped_at)>datetime(last_success_at)) THEN 'current_skip' WHEN last_success_at IS NOT NULL THEN 'latest_success' ELSE 'unknown' END AS current_status,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM dynamic_universe_schedule_state ORDER BY schedule_name"),
+    ("Latest Universe Subtask Status", "SELECT schedule_name,schedule_type,last_started_at,last_completed_at,last_success_at,last_skipped_at,last_skip_reason,CASE WHEN last_skip_reason IS NOT NULL AND (last_success_at IS NULL OR datetime(last_skipped_at)>datetime(last_success_at)) THEN 'current_skip' WHEN last_success_at IS NOT NULL THEN 'latest_success' ELSE 'unknown' END AS current_status,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM dynamic_universe_schedule_state ORDER BY schedule_name"),
     ("Research Subtask Skip Reasons", "SELECT event_type,json_extract(detail,'$.run_type') AS run_type,json_extract(detail,'$.reason') AS reason,created_at,CASE WHEN EXISTS (SELECT 1 FROM universe_research_runs r WHERE r.research_type=json_extract(dynamic_universe_audit.detail,'$.run_type') AND r.status='completed' AND datetime(r.ended_at)>datetime(dynamic_universe_audit.created_at)) THEN 'historical_superseded' ELSE 'current_or_unrecovered' END AS skip_status FROM dynamic_universe_audit WHERE event_type IN ('dynamic_universe_research_skipped','dynamic_universe_research_missed') ORDER BY created_at DESC"),
     ("Stale Research Guard Status", "SELECT event_type,detail,created_at,'Blocks BUY/ADD eligibility and unsafe paper-tradable promotion; observation-only tracking and SELL/EXIT monitoring may continue' AS guard_semantics FROM dynamic_universe_audit WHERE event_type IN ('dynamic_universe_stale_data_guard','dynamic_universe_promotions_blocked_stale_research') ORDER BY created_at DESC"),
     ("Provider State Recovery", "SELECT event_type,detail,created_at,'dynamic_universe_audit' AS source_table FROM dynamic_universe_audit WHERE event_type='provider_missing_key_state_recovered' UNION ALL SELECT event_type,detail,created_at,'audit_events' AS source_table FROM audit_events WHERE event_type='provider_missing_key_state_recovered' ORDER BY created_at DESC"),
@@ -201,12 +204,12 @@ SHEETS: list[tuple[str, str | None]] = [
     ("Missed Research Cycles", "SELECT * FROM dynamic_universe_schedule_state WHERE missed_count > 0 OR catchup_required=1 ORDER BY updated_at DESC"),
     ("Catch-Up Runs", "SELECT * FROM dynamic_universe_schedule_state WHERE catchup_attempted_at IS NOT NULL OR catchup_completed_at IS NOT NULL ORDER BY updated_at DESC"),
     ("Stale Research Guards", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_stale_data_guard' ORDER BY created_at DESC"),
-    ("Dynamic Universe Promotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_promotions_blocked_stale_research' ORDER BY created_at DESC"),
-    ("Dynamic Universe Demotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable' ORDER BY created_at DESC"),
+    ("Universe Promotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_promotions_blocked_stale_research' ORDER BY created_at DESC"),
+    ("Universe Demotion Blocks", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_demotions_blocked_provider_unavailable' ORDER BY created_at DESC"),
     ("Research Candidate Blocks", "research_candidate_block_reasons"),
     ("Data Confidence", "SELECT symbol,tier,universe_lane,score,data_confidence,data_confidence_reason,data_freshness_status,provider_health_status,promotion_allowed,demotion_allowed,updated_at FROM universe_symbols ORDER BY updated_at DESC, score DESC"),
     ("Top Near-Miss Symbols", "SELECT * FROM dynamic_universe_audit WHERE event_type='dynamic_universe_near_miss_symbols' ORDER BY created_at DESC"),
-    ("Dynamic Universe Source Coverage", "SELECT source,tier,universe_lane,data_confidence,COUNT(*) AS symbols,AVG(score) AS avg_score,MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY source,tier,universe_lane,data_confidence ORDER BY source,tier,universe_lane,data_confidence"),
+    ("Universe Source Coverage", "SELECT source,tier,universe_lane,data_confidence,COUNT(*) AS symbols,AVG(score) AS avg_score,MAX(updated_at) AS latest_update FROM universe_symbols GROUP BY source,tier,universe_lane,data_confidence ORDER BY source,tier,universe_lane,data_confidence"),
     ("Symbol Intake Classification", "SELECT symbol, provider_symbol, exchange, asset_class, region, currency, universe_lane, alpaca_compatible, exclusion_reason, tier, source, score, updated_at FROM universe_symbols ORDER BY universe_lane, score DESC, symbol"),
     ("Alpaca-Compatible Candidates", "SELECT * FROM universe_symbols WHERE universe_lane='alpaca_compatible_us' ORDER BY score DESC, symbol"),
     ("Global Research-Only Symbols", "SELECT * FROM universe_symbols WHERE universe_lane='global_research_only' ORDER BY score DESC, symbol"),
@@ -381,7 +384,34 @@ def _write_rows(sheet: Any, rows: list[dict[str, Any]], table: str, include_raw_
         sheet.column_dimensions[column[0].column_letter].width = width
 
 
+def _validate_sheet_titles(titles: Iterable[str]) -> None:
+    seen: dict[str, str] = {}
+    for title in titles:
+        if not title:
+            raise ValueError("report worksheet title must be nonempty")
+        if len(title) > EXCEL_MAX_SHEET_TITLE_LENGTH:
+            raise ValueError(
+                f"report worksheet title exceeds {EXCEL_MAX_SHEET_TITLE_LENGTH} characters: {title!r}"
+            )
+        if EXCEL_INVALID_SHEET_TITLE.search(title):
+            raise ValueError(
+                f"report worksheet title contains an invalid character: {title!r}"
+            )
+        if title.startswith("'") or title.endswith("'"):
+            raise ValueError(
+                f"report worksheet title cannot start or end with an apostrophe: {title!r}"
+            )
+        normalized = title.casefold()
+        if normalized in seen:
+            raise ValueError(
+                "report worksheet titles must be case-insensitively unique: "
+                f"{seen[normalized]!r}, {title!r}"
+            )
+        seen[normalized] = title
+
+
 def export_excel(storage: Storage, config: dict[str, Any], output_path: str | Path | None = None, include_raw_telegram: bool = False) -> Path:
+    _validate_sheet_titles(name for name, _query in SHEETS)
     output = Path(output_path or PROJECT_ROOT / "data" / "exports" / f"trading_agent_report_{date.today().isoformat()}.xlsx")
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()

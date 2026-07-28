@@ -1168,7 +1168,7 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Candidate Scores" in sheet_names
     assert "Candidate Data Coverage" in sheet_names
     assert "Candidate Endpoint Coverage" in sheet_names
-    assert "Candidate Promotion Requirements" in sheet_names
+    assert "Candidate Promotion Criteria" in sheet_names
     assert "Candidate Block Reasons" in sheet_names
     assert "Candidate Next Steps" in sheet_names
     assert "Candidate Chart Data" in sheet_names
@@ -1181,7 +1181,7 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Data Provider Health" in sheet_names
     assert "Dynamic Universe Performance" in sheet_names
     assert "Dynamic Universe Schedule State" in sheet_names
-    assert "Latest Dynamic Universe Subtask Status" in sheet_names
+    assert "Latest Universe Subtask Status" in sheet_names
     assert "Research Subtask Skip Reasons" in sheet_names
     assert "Stale Research Guard Status" in sheet_names
     assert "Provider State Recovery" in sheet_names
@@ -1216,7 +1216,7 @@ def test_dynamic_universe_report_sheets_registered():
     assert "Research Candidate Blocks" in sheet_names
     assert "Data Confidence" in sheet_names
     assert "Top Near-Miss Symbols" in sheet_names
-    assert "Dynamic Universe Source Coverage" in sheet_names
+    assert "Universe Source Coverage" in sheet_names
     assert "Symbol Intake Classification" in sheet_names
     assert "Alpaca-Compatible Candidates" in sheet_names
     assert "Global Research-Only Symbols" in sheet_names
