@@ -249,7 +249,13 @@ def run_listener(config_path: str | Path | None = None) -> int:
             except Exception as e:
                 logger.exception("Error processing Telegram updates: %s", e)
                 from .health import record_heartbeat
-                record_heartbeat(storage, "listener_poll", "failed", attempted_at=iso_now(), detail={"error_type": type(e).__name__})
+                record_heartbeat(
+                    storage,
+                    "listener_poll",
+                    "failed",
+                    attempted_at=iso_now(),
+                    detail={"error_type": type(e).__name__, "run_id": run_id},
+                )
             time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Listener stopped by user")

@@ -17,6 +17,7 @@ APP_IMPORTING_SCRIPTS = (
     "adaptive_sizing_evidence.py",
     "check_phase0_integrity.py",
     "check_release_eligibility.py",
+    "check_runtime_freshness.py",
     "migrate_runtime_db.py",
     "phase0_migration_proof.py",
     "phase1_evidence.py",
@@ -34,6 +35,7 @@ HELP_ENTRYPOINTS = (
     "activate_phase4.py",
     "adaptive_sizing_evidence.py",
     "check_phase0_integrity.py",
+    "check_runtime_freshness.py",
     "replay_adaptive_conviction.py",
     "telegram_get_updates.py",
 )

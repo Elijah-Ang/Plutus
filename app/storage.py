@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .utils import PROJECT_ROOT, iso_now, json_dumps
+from .utils import PROJECT_ROOT, get_git_commit, iso_now, json_dumps
 from .runtime_guard import REQUIRED_SCHEMA_VERSION, is_production_path
 from .formula_versions import (
     EVIDENCE_VERSION,
@@ -1126,10 +1126,13 @@ class Storage:
         if mode == "paper":
             now = iso_now()
             self.execute(
-                """INSERT INTO health_heartbeats(component,state,attempted_at,detail,updated_at)
-                   VALUES('scanner','unknown',?,?,?) ON CONFLICT(component) DO UPDATE SET
-                   state='unknown',attempted_at=excluded.attempted_at,detail=excluded.detail,updated_at=excluded.updated_at""",
-                (now, json_dumps({"run_id": run_id}), now),
+                """INSERT INTO health_heartbeats(
+                       component,state,attempted_at,detail,commit_sha,updated_at)
+                   VALUES('scanner','unknown',?,?,?,?) ON CONFLICT(component) DO UPDATE SET
+                   state='unknown',attempted_at=excluded.attempted_at,
+                   detail=excluded.detail,commit_sha=excluded.commit_sha,
+                   updated_at=excluded.updated_at""",
+                (now, json_dumps({"run_id": run_id}), get_git_commit(), now),
             )
         return run_id
 
@@ -1140,11 +1143,22 @@ class Storage:
             now = iso_now()
             state = "healthy" if status in {"completed", "research_completed_trading_blocked_market_closed"} else ("blocked" if status == "blocked" else "failed")
             self.execute(
-                """INSERT INTO health_heartbeats(component,state,completed_at,successful_at,blocked_reason,detail,updated_at)
-                   VALUES('scanner',?,?,?,?,?,?) ON CONFLICT(component) DO UPDATE SET
+                """INSERT INTO health_heartbeats(
+                       component,state,completed_at,successful_at,blocked_reason,
+                       detail,commit_sha,updated_at)
+                   VALUES('scanner',?,?,?,?,?,?,?) ON CONFLICT(component) DO UPDATE SET
                    state=excluded.state,completed_at=excluded.completed_at,successful_at=excluded.successful_at,
-                   blocked_reason=excluded.blocked_reason,detail=excluded.detail,updated_at=excluded.updated_at""",
-                (state, now, now if state == "healthy" else None, detail if state == "blocked" else None, json_dumps({"run_id": run_id, "status": status}), now),
+                   blocked_reason=excluded.blocked_reason,detail=excluded.detail,
+                   commit_sha=excluded.commit_sha,updated_at=excluded.updated_at""",
+                (
+                    state,
+                    now,
+                    now if state == "healthy" else None,
+                    detail if state == "blocked" else None,
+                    json_dumps({"run_id": run_id, "status": status}),
+                    get_git_commit(),
+                    now,
+                ),
             )
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:

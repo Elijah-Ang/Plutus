@@ -164,7 +164,7 @@ manifest={
   "mode":"paper","manual_approval_only":True,"live_capability":False,
   "authority_model":"exact_current_main_or_verified_immutable_release_rollback",
   "release_authority":json.loads(os.environ["AUTHORITY_EVIDENCE"]),
-  "ci":{"workflow_name":os.environ["CI_WORKFLOW"],"run_id":os.environ["CI_RUN_ID"],"head_sha":os.environ["COMMIT"]},
+  "ci":{"workflow_name":os.environ["CI_WORKFLOW"],"run_id":int(os.environ["CI_RUN_ID"]),"head_sha":os.environ["COMMIT"]},
   "built_at_utc":datetime.now(UTC).isoformat(),"python_version":platform.python_version(),
   "requirements_lock_sha256":os.environ["LOCK_HASH"],
   "requirements_hash_lock_sha256":os.environ["HASH_LOCK_HASH"],

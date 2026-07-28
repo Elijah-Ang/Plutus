@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import tempfile
 from datetime import UTC, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -97,13 +99,32 @@ def record_process_identity(role: str, run_id: str) -> dict[str, Any]:
     }
     runtime_dir = Path(os.environ["TRADING_AGENT_STATE_ROOT"]) / "runtime" if os.getenv("TRADING_AGENT_STATE_ROOT") else PROJECT_ROOT / "logs" / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    if runtime_dir.is_symlink() or not runtime_dir.is_dir():
+        raise RuntimeError("runtime identity directory is unsafe")
+    os.chmod(runtime_dir, 0o700)
     json_path = runtime_dir / f"{role}_identity.json"
+    temporary_path: Path | None = None
     try:
-        with json_path.open("w", encoding="utf-8") as handle:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{role}_identity.",
+            suffix=".tmp",
+            dir=runtime_dir,
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(identity, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, json_path)
+        temporary_path = None
         os.chmod(json_path, 0o600)
-    except Exception:
-        pass
+    except Exception as exc:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        if os.getenv("TRADING_AGENT_RUNTIME") == "production-paper":
+            raise RuntimeError("authoritative process identity could not be written") from exc
     return identity
 
 
@@ -568,8 +589,8 @@ def format_proposal_message(proposal: dict[str, Any], config: dict[str, Any], is
             )
         else:
             ai_review_section = (
-                f"AI review: Not available\n"
-                f"Rule-based only. AI review was not available. Treat with extra caution.\n\n"
+                "AI review: Not available\n"
+                "Rule-based only. AI review was not available. Treat with extra caution.\n\n"
             )
 
         decision_time_str = f"Decision time: {expiry_minutes} minutes\n"
@@ -939,7 +960,7 @@ def format_digest_message(digest_data: dict[str, Any], config: dict[str, Any]) -
 
     else:
         msg_parts = [
-            f"📊 30-min market digest\n",
+            "📊 30-min market digest\n",
             f"US market: {digest_data['market_open_status']}",
             f"Window: {w_start}–{w_end} SGT",
             f"Mode: {mode_str}\n",
