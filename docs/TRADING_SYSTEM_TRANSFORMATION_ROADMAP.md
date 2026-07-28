@@ -270,7 +270,7 @@ Common acceptance: reachability, tests, docs, scripts, and runtime references ve
 | ID | Item | Disposition | Rationale/dependency | Status | Commit/evidence | Rollout/rollback | Question |
 |---|---|---|---|---|---|---|---|
 | CLN-001 | `config/risk_limits.yaml` | absent; responsibilities consolidated | no active file; `config/config.yaml` is authoritative | implemented | configuration validation/docs/tests | L-R/L-B | none |
-| CLN-002 | `scripts/start_agent.sh` | retain documented legacy wrapper | launchd uses `run_once.sh` | pending | reachability audit | L-R/L-B | remove only after operator docs migrate |
+| CLN-002 | `scripts/start_agent.sh` | retained as exact-confirmation external kill-switch resume helper | launchd uses immutable `run_once.sh`; helper cannot start source code | implemented | lifecycle tests/docs | L-R/L-B | none |
 | CLN-003 | unused cash manager | archive after reachability proof | avoid dead policy confusion | pending | tests exist only | L-R/L-B | any operator import? |
 | CLN-004 | market snapshot helper | retain/integrate | storage path is active | pending | service references | L-R/L-B | canonical v2 linkage |
 | CLN-005 | disabled ML shadow | retain isolated | research evidence only | pending | tests | L-R/L-B | Phase 1 ablation use |

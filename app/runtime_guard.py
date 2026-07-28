@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import re
+import stat
 from pathlib import Path
 
 STATE_ROOT = Path.home() / "Library" / "Application Support" / "TradingAgent"
 RELEASE_ROOT = Path.home() / "TradingAgentReleases"
 RUNTIME_LINK = Path.home() / "TradingAgentRuntime"
 REQUIRED_SCHEMA_VERSION = "runtime_safety_accounting_v1"
+REQUIRED_PYTHON_VERSION = "3.13.9"
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 # Runtime starts only after the migration ledger and the concrete columns used
 # by safety gates agree. Checking only one marker row allowed a partial P1
@@ -276,6 +281,15 @@ def validate_production_runtime() -> dict:
         raise RuntimeGuardError("production runtime rejects TRADING_AGENT_TESTING=1")
     if os.getenv("TRADING_AGENT_RUNTIME") != "production-paper":
         raise RuntimeGuardError("production runtime marker is required")
+    try:
+        runtime_link_metadata = RUNTIME_LINK.lstat()
+    except OSError as exc:
+        raise RuntimeGuardError("runtime pointer is unavailable") from exc
+    if (
+        not stat.S_ISLNK(runtime_link_metadata.st_mode)
+        or runtime_link_metadata.st_uid != os.getuid()
+    ):
+        raise RuntimeGuardError("runtime pointer must be an owner-controlled symlink")
     runtime = RUNTIME_LINK.resolve()
     if not runtime.is_relative_to(RELEASE_ROOT.resolve()):
         raise RuntimeGuardError("runtime path must resolve inside TradingAgentReleases")
@@ -283,14 +297,47 @@ def validate_production_runtime() -> dict:
     if cwd != runtime:
         raise RuntimeGuardError("runtime working directory does not match selected immutable release")
     manifest_path = runtime / "release-manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeGuardError("release manifest is unavailable or unsafe")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RuntimeGuardError("release manifest is unavailable or invalid") from exc
     if manifest.get("mode") != "paper":
         raise RuntimeGuardError("release manifest is not paper-only")
+    if (
+        manifest.get("manual_approval_only") is not True
+        or manifest.get("live_capability") is not False
+    ):
+        raise RuntimeGuardError("release manifest is not manual-only and live-disabled")
+    if manifest.get("tests_verified") is not True:
+        raise RuntimeGuardError("release artifact tests are not verified")
+    if (
+        manifest.get("python_version") != REQUIRED_PYTHON_VERSION
+        or platform.python_version() != REQUIRED_PYTHON_VERSION
+    ):
+        raise RuntimeGuardError("release Python identity is invalid")
+    if not COMMIT_RE.fullmatch(str(manifest.get("release_commit") or "")):
+        raise RuntimeGuardError("release commit identity is invalid")
     if manifest.get("schema_version") != REQUIRED_SCHEMA_VERSION:
         raise RuntimeGuardError("release schema requirement is not explicit")
     if os.getenv("TRADING_AGENT_RELEASE_ID") != manifest.get("release_id"):
         raise RuntimeGuardError("runtime release ID does not match manifest")
+    configured_state_root = str(os.getenv("TRADING_AGENT_STATE_ROOT") or "").strip()
+    if not configured_state_root:
+        raise RuntimeGuardError("external runtime state root is required")
+    state_root = Path(configured_state_root).expanduser()
+    runtime_state = state_root / "runtime"
+    try:
+        runtime_state_metadata = runtime_state.lstat()
+    except OSError as exc:
+        raise RuntimeGuardError("external runtime state directory is unavailable") from exc
+    if (
+        not state_root.is_absolute()
+        or stat.S_ISLNK(runtime_state_metadata.st_mode)
+        or not stat.S_ISDIR(runtime_state_metadata.st_mode)
+        or runtime_state_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(runtime_state_metadata.st_mode) & 0o077
+    ):
+        raise RuntimeGuardError("external runtime state directory must be owner-only")
     return manifest

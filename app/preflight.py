@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .internet import internet_available
 from .power import get_power_status
-from .utils import PROJECT_ROOT, secret_present
+from .utils import kill_switch_active, secret_present
 
 
 @dataclass(frozen=True)
@@ -39,8 +39,7 @@ def _run_checks(check_builder: Callable[[Callable[[str, bool, str], None]], None
 
 def run_core_preflight(config: dict[str, Any], storage: Any, lock_held: bool = True, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
     def build(add: Callable[[str, bool, str], None]) -> None:
-        kill_switch = PROJECT_ROOT / "config" / "KILL_SWITCH"
-        add("core_kill_switch", not kill_switch.exists(), "kill switch must not exist")
+        add("core_kill_switch", not kill_switch_active(), "kill switch must not be active")
         add("core_config", config.get("mode") in {"paper", "live"}, "configuration loaded and mode valid")
         add("core_database", storage.writable(), "SQLite database must be writable")
         add("core_run_lock", lock_held, "starter must hold the run lock")

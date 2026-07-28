@@ -11,7 +11,7 @@
 - Initial R, winner expansion, and R-based management require current position-lifecycle fill provenance and never use symbol-only historical proposals.
 - Phase 4 risk values always carry `risk_value` and `risk_unit` and normalize to stop-risk dollars with fresh authoritative equity.
 - A proposal must be single, pending, unexpired, authorized, matching, unused, and finally revalidated.
-- Create `config/KILL_SWITCH` or run `scripts/stop_agent.sh` to block activity.
+- Production uses the owner-only external runtime `KILL_SWITCH`; run the active immutable release's `scripts/stop_agent.sh` to block activity without mutating release files.
 - Cash-out is a recommendation only; API withdrawals always raise.
 - Secrets stay in Keychain or `.env`, never source, Git, logs, AI prompts, or reports.
 - This software is educational infrastructure, not financial advice.
