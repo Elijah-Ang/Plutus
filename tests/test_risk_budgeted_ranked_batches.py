@@ -203,6 +203,37 @@ def test_risk_budget_allows_multiple_candidates_without_fixed_count_cap(tmp_path
     assert len(storage.fetch_all("SELECT * FROM ranked_opportunity_sets")) == 2
 
 
+def test_phase4_ranked_batch_uses_current_authoritative_equity_timestamp(tmp_path):
+    service, _ = make_service(tmp_path)
+    service.config["phase4"] = {"active": True}
+    service._phase4_allocation_cache = {
+        "strategy_sleeves": {
+            "rule_based_v1": {
+                "strategy_version": "rule_based_v1",
+                "risk_unit": "stop_risk_dollars",
+                "remaining_risk": 10.0,
+                "remaining_notional": 100.0,
+            }
+        }
+    }
+    candidate = sized_candidate("SPY", 90, 20.0)
+    candidate["strategy_version"] = "rule_based_v1"
+    now = datetime.now(UTC)
+
+    allowed, reasons = service._apply_risk_budget_to_ranked_candidates(
+        [candidate],
+        exposure_snapshot(10_000.0),
+        service.broker.get_account(),
+        now,
+    )
+
+    assert allowed == {"SPY"}
+    assert "passes ranked risk budget" in reasons["SPY"]
+    conversion = candidate["phase4_candidate_allocation"]["risk_conversion"]
+    assert conversion["conversion_equity_as_of"] == now.isoformat()
+    assert conversion["evaluation_time"] == now.isoformat()
+
+
 def test_lower_ranked_candidate_blocked_when_open_risk_budget_exhausted(tmp_path):
     service, storage = make_service(tmp_path)
     service.config["risk_budget"]["max_open_risk_pct"] = 0.08

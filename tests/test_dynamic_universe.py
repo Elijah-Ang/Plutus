@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from app.data_providers.base import ProviderResponse
 from app.data_providers.cache import ProviderCache
 from app.data_providers.eodhd import EODHDProvider
