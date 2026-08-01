@@ -42,6 +42,17 @@ def _manifest(**overrides: Any) -> dict[str, Any]:
         "required_schema_versions": ["runtime-safety-v1"],
         "formula_versions": {"risk": "risk-v1"},
         "configuration_hash": CONFIG_HASH,
+        "requirements_lock_sha256": "e" * 64,
+        "requirements_hash_lock_sha256": "f" * 64,
+        "dependency_inventory_sha256": "1" * 64,
+        "artifact_test_results_sha256": "2" * 64,
+        "tracked_source_inventory_sha256": "3" * 64,
+        "wheel_build_evidence_sha256": "4" * 64,
+        "release_wheel_sha256": "5" * 64,
+        "release_file_inventory_sha256": "6" * 64,
+        "release_wheel_filename": "trading-agent-0.1.0-py3-none-any.whl",
+        "distribution_name": "trading-agent",
+        "distribution_version": "0.1.0",
         "git_tree_sha": TREE,
         "tracked_source_inventory_digest": SOURCE_DIGEST,
         "release_authority": {
@@ -374,6 +385,16 @@ def test_runtime_pointer_release_directory_must_match_manifest_id(tmp_path) -> N
     _write_json(manifest_path, _manifest(release_id="different-release"))
     report = _evaluate(paths)
     assert "directory" in report["components"]["runtime_authority"]["error"]
+
+
+def test_runtime_pointer_rejects_release_without_generated_artifact_evidence(tmp_path) -> None:
+    paths = _fixture(tmp_path)
+    manifest_path = paths["release"] / "release-manifest.json"
+    manifest = _manifest(release_file_inventory_sha256=None)
+    _write_json(manifest_path, manifest)
+    report = _evaluate(paths)
+    assert report["ok"] is False
+    assert "artifact evidence hash" in report["components"]["runtime_authority"]["error"]
 
 
 def test_database_probe_is_read_only_and_fails_for_missing_heartbeat_table(tmp_path) -> None:

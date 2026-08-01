@@ -55,6 +55,17 @@ def _production_runtime_authority(
         "tests_verified": True,
         "python_version": "3.13.9",
         "schema_version": runtime_guard.REQUIRED_SCHEMA_VERSION,
+        "requirements_lock_sha256": "e" * 64,
+        "requirements_hash_lock_sha256": "f" * 64,
+        "dependency_inventory_sha256": "1" * 64,
+        "artifact_test_results_sha256": "2" * 64,
+        "tracked_source_inventory_sha256": "3" * 64,
+        "wheel_build_evidence_sha256": "4" * 64,
+        "release_wheel_sha256": "5" * 64,
+        "release_file_inventory_sha256": "6" * 64,
+        "release_wheel_filename": "trading-agent-0.1.0-py3-none-any.whl",
+        "distribution_name": "trading-agent",
+        "distribution_version": "0.1.0",
         **manifest_overrides,
     }
     (release / "release-manifest.json").write_text(
@@ -199,6 +210,7 @@ def test_production_startup_accepts_exact_manual_only_release_authority(
         ({"live_capability": True}, "manual-only"),
         ({"tests_verified": False}, "tests are not verified"),
         ({"python_version": "3.13.8"}, "Python identity"),
+        ({"release_file_inventory_sha256": None}, "artifact evidence hash"),
         ({"release_commit": "wrong"}, "commit identity"),
     ),
 )

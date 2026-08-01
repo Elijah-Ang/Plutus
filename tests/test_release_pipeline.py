@@ -28,6 +28,21 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_release_file_inventory(root: Path) -> str:
+    excluded = {"release-file-inventory.sha256", "release-manifest.json"}
+    paths = sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and path.name not in excluded
+    )
+    content = "".join(
+        f"{_digest(path)}  ./{path.relative_to(root).as_posix()}\n"
+        for path in paths
+    )
+    inventory = root / "release-file-inventory.sha256"
+    inventory.write_text(content, encoding="utf-8")
+    return _digest(inventory)
+
+
 def test_deployment_authority_script_runs_by_path_from_external_cwd(tmp_path: Path) -> None:
     script = Path(__file__).resolve().parents[1] / "scripts" / "verify_deployment_authority.py"
     result = subprocess.run(
@@ -147,6 +162,7 @@ def _artifact(tmp_path: Path) -> tuple[Path, dict[str, object]]:
             "tracked_source_inventory_digest": source_inventory["inventory_digest"],
         },
     }
+    manifest["release_file_inventory_sha256"] = _write_release_file_inventory(tmp_path)
     (tmp_path / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return tmp_path, manifest
 
@@ -340,7 +356,7 @@ def test_release_build_uses_external_verified_wheel_workspace_and_atomic_promoti
     assert prune in script
     assert script.index(prune) < script.index(source_verify, script.index(prune))
     assert script.rindex(source_verify) > script.index(artifact_verify)
-    assert script.rindex(source_verify) < script.index(final_inventory)
+    assert script.rindex(source_verify) > script.index(final_inventory)
     assert 'rm -rf "$STAGING/.git" "$STAGING/data" "$STAGING/logs" "$STAGING/scratch"' not in script
     assert script.index('mv "$STAGING" "$DEST"') > script.index('scripts/verify_release_artifact.py')
 
@@ -400,6 +416,24 @@ def test_ci_pins_release_pip_before_installing_dependencies() -> None:
 def test_release_artifact_verifier_accepts_exact_evidence(tmp_path) -> None:
     root, _ = _artifact(tmp_path)
     assert _verify(root)["verified"] is True
+
+
+def test_release_file_inventory_digest_is_manifest_bound(tmp_path) -> None:
+    root, _ = _artifact(tmp_path)
+    inventory = root / "release-file-inventory.sha256"
+    inventory.write_text(inventory.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="release file inventory digest"):
+        _verify(root)
+
+
+def test_regenerated_release_file_inventory_cannot_bless_changed_generated_file(tmp_path) -> None:
+    root, manifest = _artifact(tmp_path)
+    target = root / "dependency-inventory.txt"
+    target.write_text("attacker==9\n", encoding="utf-8")
+    manifest["release_file_inventory_sha256"] = _write_release_file_inventory(root)
+    (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="dependency inventory changed"):
+        _verify(root)
 
 
 def test_isolated_wheel_build_succeeds_without_contaminating_staging(tmp_path) -> None:
@@ -494,6 +528,8 @@ def test_tampered_wheel_payload_cannot_be_blessed_by_regenerated_local_evidence(
     (root / "release-file-inventory.sha256").write_text(
         f"{_digest(wheel)}  ./release-wheel/{wheel.name}\n", encoding="utf-8"
     )
+    manifest["release_file_inventory_sha256"] = _digest(root / "release-file-inventory.sha256")
+    (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="package payload changed"):
         _verify(root)

@@ -13,6 +13,22 @@ RUNTIME_LINK = Path.home() / "TradingAgentRuntime"
 REQUIRED_SCHEMA_VERSION = "runtime_safety_accounting_v1"
 REQUIRED_PYTHON_VERSION = "3.13.9"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+# These generated-evidence identities are part of the release authority.  A
+# manifest that predates the isolated-wheel and final-inventory gates must not
+# be accepted as a current production runtime merely because it says
+# ``tests_verified``.
+REQUIRED_ARTIFACT_EVIDENCE_HASHES = (
+    "requirements_lock_sha256",
+    "requirements_hash_lock_sha256",
+    "dependency_inventory_sha256",
+    "artifact_test_results_sha256",
+    "tracked_source_inventory_sha256",
+    "wheel_build_evidence_sha256",
+    "release_wheel_sha256",
+    "release_file_inventory_sha256",
+)
 
 # Runtime starts only after the migration ledger and the concrete columns used
 # by safety gates agree. Checking only one marker row allowed a partial P1
@@ -317,6 +333,13 @@ def validate_production_runtime() -> dict:
         or platform.python_version() != REQUIRED_PYTHON_VERSION
     ):
         raise RuntimeGuardError("release Python identity is invalid")
+    for field in REQUIRED_ARTIFACT_EVIDENCE_HASHES:
+        if not SHA256_RE.fullmatch(str(manifest.get(field) or "").lower()):
+            raise RuntimeGuardError(f"release artifact evidence hash is missing or invalid: {field}")
+    if not str(manifest.get("release_wheel_filename") or "").strip():
+        raise RuntimeGuardError("release wheel filename evidence is missing")
+    if not str(manifest.get("distribution_name") or "").strip() or not str(manifest.get("distribution_version") or "").strip():
+        raise RuntimeGuardError("release distribution identity evidence is missing")
     if not COMMIT_RE.fullmatch(str(manifest.get("release_commit") or "")):
         raise RuntimeGuardError("release commit identity is invalid")
     if manifest.get("schema_version") != REQUIRED_SCHEMA_VERSION:
