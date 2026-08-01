@@ -482,8 +482,12 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
             runtime_schema_reason = str(exc)
     migration_compatible = first_signature == second_signature and not missing_versions and runtime_schema_compatible
     if run_tests:
-        compile_result = _run("python", "-m", "compileall", "app", "tests", "scripts")
-        pytest_result = _run("python", "-m", "pytest", "-q")
+        # Keep the release gate bound to the interpreter that invoked this
+        # script.  A bare ``python`` can resolve to a different installation
+        # (and dependency inventory) than the explicitly selected 3.13.9
+        # release environment.
+        compile_result = _run(sys.executable, "-m", "compileall", "app", "tests", "scripts")
+        pytest_result = _run(sys.executable, "-m", "pytest", "-q")
         local_tests = {
             "status": "passed" if compile_result.returncode == 0 and pytest_result.returncode == 0 else "failed",
             "passed": compile_result.returncode == 0 and pytest_result.returncode == 0,
