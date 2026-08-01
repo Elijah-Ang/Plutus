@@ -299,6 +299,7 @@ def test_launchd_install_and_deploy_reject_symlink_targets() -> None:
     assert "listener plist target is a symlink" in deploy
     assert "legacy active kill switch must be preserved" in deploy
     assert "external runtime state directory must be owner-only" in deploy
+    assert deploy.index("/usr/bin/install -m 600") < deploy.index('ln -sfn "$RELEASE" "$RUNTIME"')
 
 
 @pytest.mark.skipif(ZSH is None, reason="macOS runtime lifecycle requires zsh")
