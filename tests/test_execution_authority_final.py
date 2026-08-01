@@ -177,3 +177,30 @@ def test_missing_config_or_formula_versions_fail_closed(tmp_path, monkeypatch):
             storage, Broker(), proposal_id="proposal", approval_id="approval", run_id="run",
             context={}, config={"effective_config_hash": "cfg"}, candidate=candidate(),
         )
+
+
+@pytest.mark.parametrize("kind", ["candidate", "configuration"])
+def test_nonfinite_risk_evidence_fails_closed(tmp_path, kind):
+    storage = Storage(tmp_path / f"nonfinite-{kind}.sqlite3")
+    storage.initialize()
+    value = candidate()
+    current_config = config()
+    if kind == "candidate":
+        value["notional"] = float("nan")
+        expected = "candidate notional"
+    else:
+        current_config["portfolio_behavior"] = {
+            "max_total_portfolio_exposure_pct": float("nan"),
+        }
+        expected = "maximum total portfolio exposure"
+    with pytest.raises(RuntimeError, match=expected):
+        capture_execution_risk_snapshot(
+            storage,
+            Broker(),
+            proposal_id="proposal",
+            approval_id="approval",
+            run_id="run",
+            context={},
+            candidate=value,
+            config=current_config,
+        )

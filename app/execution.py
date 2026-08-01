@@ -453,7 +453,21 @@ class DurableExecutionStore:
 
                 def enforce(name: str, projected: float, ceiling_key: str) -> None:
                     ceiling = limits.get(ceiling_key)
-                    if ceiling is not None and projected > float(ceiling) + 1e-9:
+                    if ceiling in (None, ""):
+                        return
+                    try:
+                        ceiling_value = float(ceiling)
+                        projected_value = float(projected)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid") from exc
+                    if (
+                        not math.isfinite(ceiling_value)
+                        or ceiling_value < 0
+                        or not math.isfinite(projected_value)
+                        or projected_value < 0
+                    ):
+                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid")
+                    if projected_value > ceiling_value + 1e-9:
                         raise RuntimeError(f"atomic reservation blocked by {name}")
 
                 enforce(
