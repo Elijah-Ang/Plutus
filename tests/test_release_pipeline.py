@@ -28,6 +28,19 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_deployment_authority_script_runs_by_path_from_external_cwd(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "verify_deployment_authority.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Verify exact-current-main" in result.stdout
+
+
 def _write_wheel(
     path: Path,
     *,

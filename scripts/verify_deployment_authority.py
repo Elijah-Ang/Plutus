@@ -5,8 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import urllib.parse
 from pathlib import Path
+
+# Deployment invokes this file by path from an immutable release directory.
+# Add that release root explicitly so sibling ``scripts`` modules resolve even
+# when Python does not include the caller's working directory on sys.path.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from scripts.check_release_eligibility import _github_json, _release_attestation_asset
 from scripts.verify_source_tree import github_tree
