@@ -223,6 +223,51 @@ def test_final_abbv_revalidation_blocks_with_evidence_and_zero_broker_calls(tmp_
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 
+def test_missing_broker_has_deterministic_pre_submission_reason(tmp_path) -> None:
+    storage = Storage(tmp_path / "quote-no-broker.db")
+    storage.initialize()
+    service = TradingService(quote_config(), storage, None, "quote-no-broker-run")
+    proposal = {
+        "id": "no-broker-proposal",
+        "symbol": "ABBV",
+        "side": "sell",
+        "action": "exit",
+        "qty": 1.0,
+        "notional": 250.0,
+        "latest_price": 250.0,
+        "price_at": datetime.now(UTC).isoformat(),
+    }
+    row = {
+        "id": "no-broker-proposal",
+        "symbol": "ABBV",
+        "side": "sell",
+        "notional": 250.0,
+        "current_price": 250.0,
+        "emergency_exit_triggered": 0,
+    }
+
+    result, *_ = service._execute_final_revalidation(
+        row, proposal, "ABBV", "sell", False, "no-broker-approval"
+    )
+
+    assert result.submitted is False
+    assert result.status == "blocked"
+    assert result.intent_id is None
+    assert "broker was unavailable before final quote validation" in result.reason
+    assert "no broker request was attempted" in result.reason
+    assert "Price refresh failed or price is unavailable" not in result.reason
+    audits = storage.fetch_all(
+        "SELECT detail FROM audit_events WHERE event_type='final_execution_preflight_blocked'"
+    )
+    assert len(audits) == 1
+    detail = json.loads(audits[0]["detail"])
+    assert detail["code"] == "broker_unavailable_pre_submission"
+    assert detail["broker_invocation_occurred"] == 0
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
 def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
     tmp_path, monkeypatch
 ) -> None:

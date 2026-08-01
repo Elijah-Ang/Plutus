@@ -4829,7 +4829,28 @@ class TradingService:
         # Normal orders require a fresh authoritative two-sided quote. The
         # protective emergency path retains its separately validated paper
         # market-exit path.
-        if block_reason is None and self.broker is not None:
+        if block_reason is None and self.broker is None:
+            block_reason = (
+                f"No order placed for {prop_symbol}. The Alpaca paper broker was "
+                "unavailable before final quote validation; no broker request was "
+                "attempted. Restore paper-broker connectivity, wait for fresh "
+                "spread-valid data, then create a new proposal and obtain a new "
+                "manual approval."
+            )
+            self.storage.audit(
+                self.run_id,
+                "final_execution_preflight_blocked",
+                {
+                    "proposal_id": proposal.get("id") or row.get("id"),
+                    "approval_id": approval_id,
+                    "symbol": prop_symbol,
+                    "side": prop_side,
+                    "code": "broker_unavailable_pre_submission",
+                    "reason": block_reason,
+                    "broker_invocation_occurred": 0,
+                },
+            )
+        elif block_reason is None:
             try:
                 quote_data = validated_quote(self.broker, prop_symbol, self.config, now=now_dt)
                 refreshed_price_val = float(quote_data["ask"] if prop_side == "buy" else quote_data["bid"])
@@ -4964,7 +4985,12 @@ class TradingService:
         if block_reason is None:
             if refresh_required:
                 if refreshed_price_val is None or refreshed_price_val <= 0:
-                    block_reason = "Price refresh failed or price is unavailable"
+                    block_reason = (
+                        f"No order placed for {prop_symbol}. Final validation did not "
+                        "produce a valid fresh Alpaca quote; no broker request was "
+                        "attempted. A new proposal and new manual approval are "
+                        "required."
+                    )
                 elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
                     block_reason = "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
                 elif not market_open:

@@ -96,6 +96,14 @@ spread, threshold, and failure code. Its operator message now states the exact I
 spread and safe next action: wait for fresh spread-valid data, then create a new
 proposal and obtain a new manual approval.
 
+The final-validation boundary also distinguishes a broker-unavailable preflight
+from a quote-quality failure. When no broker is present before validation, it
+records `broker_unavailable_pre_submission`, explicitly records zero broker
+invocation, and tells the operator to restore paper-broker connectivity before
+creating a fresh proposal. The historical generic sentence above remains a record
+of the legacy runtime's wording; it is no longer an emitted fallback in the
+audited source.
+
 ## Audit findings and implementation
 
 ### A. Approval authority was created at reply time
