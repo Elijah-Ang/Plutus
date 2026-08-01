@@ -149,15 +149,26 @@ def _remote_ci(sha: str, repository: str | None, *, skip: bool) -> dict[str, Any
             jobs_payload = json.load(response)
     except (OSError, urllib.error.URLError, ValueError) as exc:
         return {**result, "status": "unverified", "reason": f"GitHub jobs lookup failed: {type(exc).__name__}"}
-    jobs = {str(job.get("name") or ""): job for job in jobs_payload.get("jobs", [])}
-    missing = sorted(REQUIRED_CI_JOBS - jobs.keys())
+    job_rows = [job for job in jobs_payload.get("jobs", []) if isinstance(job, dict)]
+    jobs = {str(job.get("name") or ""): job for job in job_rows}
+    job_counts = {
+        name: sum(1 for job in job_rows if str(job.get("name") or "") == name)
+        for name in REQUIRED_CI_JOBS
+    }
+    missing = sorted(name for name, count in job_counts.items() if count == 0)
+    duplicated = sorted(name for name, count in job_counts.items() if count != 1 and count > 1)
     unsuccessful = sorted(
         name for name in REQUIRED_CI_JOBS
         if name in jobs and (jobs[name].get("status") != "completed" or jobs[name].get("conclusion") != "success")
     )
-    if missing or unsuccessful:
-        return {**result, "required_jobs_missing": missing, "required_jobs_unsuccessful": unsuccessful,
-                "reason": "required CI jobs are missing or unsuccessful"}
+    if missing or duplicated or unsuccessful:
+        return {
+            **result,
+            "required_jobs_missing": missing,
+            "required_jobs_duplicated": duplicated,
+            "required_jobs_unsuccessful": unsuccessful,
+            "reason": "required CI jobs must exist exactly once and complete successfully",
+        }
     return {**result, "status": "passed", "passed": True, "required_jobs": sorted(REQUIRED_CI_JOBS)}
 
 

@@ -2599,7 +2599,9 @@ class TradingService:
             ):
                 excluded_rotation_group_id = relationship_group_id
         exit_blocker = self._exit_blocker_context(
-            orders, exclude_reconciled_rotation_group_id=excluded_rotation_group_id
+            orders,
+            positions=positions,
+            exclude_reconciled_rotation_group_id=excluded_rotation_group_id,
         )
         exit_pending = bool(exit_blocker.get("active"))
 

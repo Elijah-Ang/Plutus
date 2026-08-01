@@ -59,6 +59,25 @@ def test_remote_ci_requires_named_jobs_to_pass(monkeypatch) -> None:
     assert result["required_jobs"] == ["offline-tests"]
 
 
+def test_remote_ci_rejects_duplicate_required_jobs(monkeypatch) -> None:
+    run_payload = {"workflow_runs": [
+        {"id": 8, "name": "CI", "head_sha": "abc", "created_at": "2026-07-14T08:00:00Z",
+         "status": "completed", "conclusion": "success"},
+    ]}
+    jobs_payload = {"jobs": [
+        {"name": "offline-tests", "status": "completed", "conclusion": "success"},
+        {"name": "offline-tests", "status": "completed", "conclusion": "success"},
+    ]}
+    payloads = iter((run_payload, jobs_payload))
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(json.dumps(next(payloads)).encode()),
+    )
+    result = _remote_ci("abc", "owner/repo", skip=False)
+    assert result["passed"] is False
+    assert result["required_jobs_duplicated"] == ["offline-tests"]
+
+
 def test_release_reachability_uses_exact_github_main_sha(monkeypatch) -> None:
     def fake_run(*args):
         if args[:3] == ("git", "fetch", "--prune"):

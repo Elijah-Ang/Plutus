@@ -341,6 +341,7 @@ class AlpacaBroker(BrokerInterface):
             "weekly_loss_confidence": "verified" if weekly_loss is not None else "unavailable",
             "provenance": "alpaca_account_and_portfolio_history",
             "metrics_version": "loss_controls_v2",
+            "captured_at": datetime.now(UTC).isoformat(),
         }
 
     def is_market_open(self) -> bool:

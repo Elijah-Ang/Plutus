@@ -371,7 +371,14 @@ def _loss_controls(
         }
     if not isinstance(raw, Mapping):
         raise RuntimeError("trusted loss-control provider returned invalid evidence")
-    as_of_value = raw.get("captured_at") or raw.get("as_of") or now.isoformat()
+    as_of_value = raw.get("captured_at") or raw.get("as_of")
+    if not as_of_value:
+        if os.getenv("TRADING_AGENT_TESTING") == "1":
+            # Synthetic offline fixtures are allowed to use the capture time;
+            # production providers must emit their own freshness evidence.
+            as_of_value = now.isoformat()
+        else:
+            raise RuntimeError("trusted loss-control evidence timestamp is missing")
     try:
         as_of = _utc(as_of_value)
     except (TypeError, ValueError) as exc:

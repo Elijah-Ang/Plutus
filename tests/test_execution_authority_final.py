@@ -111,6 +111,24 @@ def test_caller_holdings_kill_switch_and_loss_hints_are_not_authority(tmp_path):
         capture(storage, Broker(), trusted_providers={"loss_controls": stale})
 
 
+def test_missing_loss_timestamp_is_not_authoritative_outside_test_mode(tmp_path, monkeypatch):
+    class MissingTimestampBroker(Broker):
+        def get_loss_metrics(self):
+            return {
+                "daily_loss_dollars": 0.0,
+                "weekly_loss_dollars": 0.0,
+                "daily_loss_confidence": "verified",
+                "weekly_loss_confidence": "verified",
+                "reference_equity": 100_000.0,
+            }
+
+    monkeypatch.delenv("TRADING_AGENT_TESTING", raising=False)
+    storage = Storage(tmp_path / "missing-loss-timestamp.sqlite3")
+    storage.initialize()
+    with pytest.raises(RuntimeError, match="timestamp is missing"):
+        capture(storage, MissingTimestampBroker())
+
+
 def test_account_identity_is_stable_nonempty_and_not_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("TRADING_AGENT_TESTING", raising=False)
     storage = Storage(tmp_path / "account.sqlite3"); storage.initialize()

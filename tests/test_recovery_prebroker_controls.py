@@ -284,6 +284,19 @@ def test_invoked_intent_is_never_resubmitted(tmp_path):
     assert not result.submitted and broker.submit_calls == 0
 
 
+def test_broker_absence_does_not_relabel_ambiguous_intent_as_retryable(tmp_path):
+    storage, broker, controls, engine, proposal = _retryable(tmp_path, side="buy")
+    storage.execute(
+        "UPDATE order_intents SET state='unknown',broker_invocation_occurred=1"
+    )
+    result = Executor(None, engine, storage, "run-1").execute(
+        proposal, {}, approval_id="approval-1"
+    )
+    assert result.status == "unknown"
+    assert "reconciliation" in result.reason
+    assert broker.submit_calls == 0
+
+
 def test_repeated_restarts_never_duplicate_intent_reservation_or_broker_call(tmp_path):
     storage, broker, controls, engine, proposal = _retryable(tmp_path, side="buy")
     first = _recover(storage, broker, controls, engine, proposal)
