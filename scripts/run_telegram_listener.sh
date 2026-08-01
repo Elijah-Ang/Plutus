@@ -56,4 +56,4 @@ export TRADING_AGENT_RELEASE_ID="$RELEASE_ID"
 export TRADING_AGENT_LOCK_ROOT="$RUNTIME"
 export TRADING_AGENT_LOG_ROOT="$LOGS"
 export PYTHONDONTWRITEBYTECODE=1
-"$ROOT/.venv/bin/python" -m app.main --mode listener >> "$LOGS/listener.out" 2>> "$LOGS/listener.err"
+exec "$ROOT/.venv/bin/python" -m app.main --mode listener >> "$LOGS/listener.out" 2>> "$LOGS/listener.err"
