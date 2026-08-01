@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -63,6 +64,33 @@ def _write_lock(lock, pid: int, *, age: float = 300, command="listener-command",
     (lock / "process_start_token").write_text(start + "\n")
     (lock / "repository_path").write_text(str(repo or lock.parent) + "\n")
     (lock / "commit").write_text(commit + "\n")
+
+
+def test_process_identity_uses_wide_args_for_long_listener_script(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if "args=" in args:
+            stdout = "/bin/zsh /Users/elijahang/TradingAgentRuntime/scripts/run_telegram_listener.sh\n"
+        else:
+            stdout = "Sun Aug 2 06:24:41 2026\n"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+        )
+
+    monkeypatch.setattr(run_lock.subprocess, "run", fake_run)
+    identity = run_lock._process_identity(42)
+
+    assert identity == run_lock.ProcessIdentity(
+        "/bin/zsh /Users/elijahang/TradingAgentRuntime/scripts/run_telegram_listener.sh",
+        "Sun Aug 2 06:24:41 2026",
+    )
+    assert [call[0] for call in calls] == [
+        ["/bin/ps", "-p", "42", "-ww", "-o", "args="],
+        ["/bin/ps", "-p", "42", "-ww", "-o", "lstart="],
+    ]
 
 
 def test_dead_listener_lock_becomes_reclaimable_after_grace(tmp_path, monkeypatch):

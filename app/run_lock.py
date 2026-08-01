@@ -37,8 +37,15 @@ def _pid_exists(pid: int) -> bool:
 def _process_identity(pid: int) -> ProcessIdentity | None:
     """Return non-sensitive OS process identity used to detect PID reuse."""
     try:
-        result = subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "command=", "-o", "lstart="],
+        command_result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-ww", "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        start_result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-ww", "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=2,
@@ -46,14 +53,14 @@ def _process_identity(pid: int) -> ProcessIdentity | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if result.returncode != 0 or not result.stdout.strip():
+    if (
+        command_result.returncode != 0
+        or start_result.returncode != 0
+        or not command_result.stdout.strip()
+        or not start_result.stdout.strip()
+    ):
         return None
-    line = result.stdout.strip()
-    # lstart is the final five whitespace-separated fields on macOS/Linux ps.
-    parts = line.rsplit(maxsplit=5)
-    if len(parts) < 6:
-        return ProcessIdentity(line, "unknown")
-    return ProcessIdentity(parts[0], " ".join(parts[1:]))
+    return ProcessIdentity(command_result.stdout.strip(), start_result.stdout.strip())
 
 
 def write_owner_metadata(path: str | Path, pid: int, repository_path: str, commit: str) -> None:
