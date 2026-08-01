@@ -179,6 +179,16 @@ proposal/approval/workflow/intent/broker provenance plus required user action an
 safe automatic recovery. Digest text no longer says `No action needed` when an exit
 blocker is active.
 
+The follow-up lifecycle audit also fixed two fail-closed edges. Once all current
+broker and position evidence proves that no exit source remains, stale validation
+clears every durable blocker proven absent rather than only the first stale symbol;
+this prevents an unrelated historical row from keeping other BUYs blocked. If a
+broker order or position read is unavailable, the validator now preserves an
+existing durable blocker as explicitly unverified and records that evidence instead
+of interpreting an unavailable response as an empty order/position set. The
+operator wording identifies the unavailable broker evidence and requires
+revalidation before new orders.
+
 ### K. Rotation authorization normalization
 
 Fixed. Registry/allocation authorization accepts only non-empty, unique normalized

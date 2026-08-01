@@ -633,11 +633,24 @@ class TradingService:
         positions_known = positions is not None
         if positions is None:
             try:
-                positions = list(self.broker.get_positions()) if self.broker is not None else []
+                if self.broker is None:
+                    raise RuntimeError("broker is unavailable")
+                positions = list(self.broker.get_positions())
                 positions_known = True
             except Exception:
                 positions = []
                 positions_known = False
+
+        broker_orders_known = broker_orders is not None
+        if broker_orders is None:
+            try:
+                if self.broker is None:
+                    raise RuntimeError("broker is unavailable")
+                broker_orders = list(self.broker.get_open_orders())
+                broker_orders_known = True
+            except Exception:
+                broker_orders = []
+                broker_orders_known = False
         position_symbols = {
             str(_value(position, "symbol", "")).upper()
             for position in positions or []
@@ -674,6 +687,46 @@ class TradingService:
             }
             self.storage.audit(self.run_id, "exit_blocker_validated", self._exit_blocker_audit_detail(source, "active", source.get("validation_reason")))
             return ExitBlockerStore(self.storage, self.run_id).observe(source)
+
+        def retained_unverified(reason: str) -> dict[str, Any] | None:
+            """Retain an existing blocker when current broker evidence is unavailable."""
+            rows = self.storage.fetch_all(
+                """SELECT * FROM exit_blocker_states
+                   WHERE active=1 ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1"""
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            detail: dict[str, Any] = {}
+            try:
+                parsed = json.loads(row.get("detail_json") or "{}")
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+            symbol = str(row.get("symbol") or detail.get("symbol") or "").upper()
+            result = {
+                **detail,
+                "active": True,
+                "stale": False,
+                "unverified": True,
+                "source_type": str(row.get("source_type") or detail.get("source_type") or ""),
+                "source_id": str(row.get("source_id") or detail.get("source_id") or ""),
+                "symbol": symbol,
+                "status": "unverified",
+                "reason": f"{symbol} exit blocker retained: {reason}".strip(),
+                "validation_reason": reason,
+                "latest_validation_at": now_iso,
+                "blocker_state_id": row.get("id"),
+                "blocker_state": row.get("state"),
+                "blocker_generation": row.get("generation"),
+            }
+            self.storage.audit(
+                self.run_id,
+                "exit_blocker_unverified",
+                self._exit_blocker_audit_detail(result, "unverified", reason),
+            )
+            return result
 
         # Broker state is the strongest current source. A sell order remains
         # blocking until reconciliation proves it terminal; elapsed wall-clock
@@ -887,9 +940,23 @@ class TradingService:
                 "validation_reason": "fresh current-cycle exit signal reproduced from current position and market data",
             })
 
+        # Without a complete broker/position snapshot, an active durable
+        # blocker cannot be proven stale. Preserve it for reconciliation.
+        if not broker_orders_known:
+            retained = retained_unverified("broker open orders could not be verified")
+            if retained:
+                return retained
+        if not positions_known:
+            retained = retained_unverified("broker positions could not be verified")
+            if retained:
+                return retained
+
         if stale_sources:
+            # This function evaluated all authoritative sources above. Once
+            # broker orders and positions are known and no active source was
+            # found, clear every durable blocker that is now proven absent,
+            # not only the first stale proposal encountered.
             ExitBlockerStore(self.storage, self.run_id).clear_absent(
-                observed_symbols={str(stale_sources[0].get("symbol") or "").upper()},
                 reason=str(stale_sources[0].get("stale_reason") or "stale blocker cleared"),
             )
             return stale_sources[0]
@@ -930,6 +997,8 @@ class TradingService:
             except Exception:
                 pass
         if source_type == "broker_open_order":
+            if blocker.get("unverified"):
+                return f"{symbol} broker exit state unavailable; revalidate before new orders"
             return f"{symbol} sell order remains open"
         if source_type == "active_sell_proposal":
             if int(blocker.get("emergency_exit_triggered") or 0) == 1:
@@ -8615,7 +8684,9 @@ class TradingService:
         try:
             current_orders = list(self.broker.get_open_orders())
         except Exception:
-            current_orders = []
+            # An unavailable broker order read is not evidence that no order
+            # exists. Preserve the unknown state through blocker validation.
+            current_orders = None
         digest_exit_blocker = self._digest_exit_blocker_context(
             current_orders,
             current_positions,
