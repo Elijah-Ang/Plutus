@@ -10320,7 +10320,15 @@ class TradingService:
                 if not symbol or not math.isfinite(notional) or notional <= 0 or not math.isfinite(price) or price <= 0 or not math.isfinite(stop) or stop <= 0 or not math.isfinite(risk_dollars) or risk_dollars <= 0 or not cluster:
                     raise ValueError("pending buy exposure is incomplete")
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                unknown_rows.append({"proposal_id": row_id, "reason": str(exc) or "malformed pending buy exposure"})
+                # Keep the admission decision fail-closed, but do not expose
+                # implementation details such as ``float(None)`` in Telegram
+                # or scan summaries.  The proposal identity and exception
+                # type remain available for durable audit/debugging.
+                unknown_rows.append({
+                    "proposal_id": row_id,
+                    "reason": "pending buy exposure is incomplete or malformed",
+                    "error_type": type(exc).__name__,
+                })
                 continue
             total_notional += notional
             total_stop_risk += risk_dollars
