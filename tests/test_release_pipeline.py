@@ -344,6 +344,9 @@ def test_release_entrypoints_export_project_root_before_artifact_imports() -> No
         assert export in script
         assert script.index(export) < script.index('"$ROOT/.venv/bin/python" -m app.')
 
+    listener = (root / "scripts" / "run_telegram_listener.sh").read_text()
+    assert 'exec "$ROOT/.venv/bin/python" -m app.main --mode listener' in listener
+
 
 def test_release_build_uses_external_verified_wheel_workspace_and_atomic_promotion() -> None:
     script = (Path(__file__).parents[1] / "scripts" / "build_release.sh").read_text()
