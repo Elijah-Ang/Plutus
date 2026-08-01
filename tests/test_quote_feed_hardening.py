@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -269,8 +270,9 @@ def test_missing_broker_has_deterministic_pre_submission_reason(tmp_path) -> Non
 
 
 def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ) -> None:
+    caplog.set_level(logging.INFO, logger="trading_agent")
     config = load_config()
     config["market_profiles"] = {
         "abbv_only": {
@@ -316,6 +318,13 @@ def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
     assert len(memory) == 1
     assert memory[0]["proposal_generated"] == 0
     assert "Alpaca IEX quote spread 606.6 bps" in memory[0]["no_action_reason"]
+    summary_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "Why no proposal was generated:" in record.getMessage()
+    ]
+    assert summary_records
+    assert "ABBV: proposal not sent: Alpaca IEX quote spread 606.6 bps" in summary_records[-1]
     audits = storage.fetch_all(
         "SELECT detail FROM audit_events WHERE event_type='proposal_quote_validation_blocked'"
     )

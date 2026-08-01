@@ -8239,6 +8239,12 @@ class TradingService:
                 res["proposal_allowed"] = proposal_allowed
                 res["proposal_generated"] = proposal_generated
                 res["proposal_id"] = proposal_id
+                # Keep the in-memory scan result aligned with the durable
+                # market_memory row.  The scan summary below reads this field
+                # to explain why a candidate was not proposed; without it the
+                # persisted reason was correct but the operational log showed
+                # an unhelpful ``N/A``.
+                res["no_action_reason"] = no_action_reason
                 res["performance_action_decision"] = (
                     "proposed" if proposal_generated else
                     ("failed_final_validation" if no_action_reason and "final validation" in no_action_reason.lower() else

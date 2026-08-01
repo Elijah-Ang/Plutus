@@ -248,6 +248,11 @@ the documented rule: a genuinely fresh, position-backed exit decision may block
 new BUY proposals until it is resolved, while a terminal historical proposal or
 stale market-memory wording must never do so.
 
+The scan-summary logger now carries the same `no_action_reason` as the durable
+`market_memory` row. Operational output therefore preserves actionable details—
+such as stale-price and exit-priority suppressions—instead of rendering them as
+`N/A`; proposal and execution decisions remain unchanged and fail closed.
+
 ## Verification and rollout constraints
 
 The complete offline pytest suite and compile pass must be green on the PR head, and
