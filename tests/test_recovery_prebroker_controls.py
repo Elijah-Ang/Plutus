@@ -196,6 +196,51 @@ def _recover(storage, broker, controls, engine, proposal):
     ).execute(proposal, {}, approval_id="approval-1")
 
 
+def test_real_risk_engine_immediately_before_broker_invocation_recovery(tmp_path):
+    storage = Storage(tmp_path / "immediately-before-submit.sqlite3")
+    storage.initialize()
+    proposal = _proposal("buy", "immediately-before-submit")
+    _approved(storage, proposal)
+    broker = Broker(side="buy")
+    controls = Controls()
+    engine = RiskEngine(_config())
+
+    def crash(boundary, _detail):
+        if boundary == "immediately_before_broker_submit":
+            raise SimulatedCrash(boundary)
+
+    with pytest.raises(SimulatedCrash):
+        Executor(
+            broker,
+            engine,
+            storage,
+            "run-1",
+            fault_hook=crash,
+            trusted_evidence_providers=controls.providers(),
+        ).execute(proposal, {}, approval_id="approval-1")
+
+    intent = storage.fetch_all(
+        "SELECT state,broker_invocation_occurred FROM order_intents"
+    )[0]
+    assert intent == {"state": "submitting", "broker_invocation_occurred": 0}
+    assert broker.submit_calls == 0
+
+    recovered = Executor(
+        broker,
+        engine,
+        Storage(storage.path),
+        "run-1",
+        recovery_proven_no_submit=True,
+        trusted_evidence_providers=controls.providers(),
+    ).execute(proposal, {}, approval_id="approval-1")
+
+    assert recovered.submitted
+    assert recovered.status == "submitted"
+    assert broker.submit_calls == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM risk_reservations")[0]["n"] == 1
+
+
 def _insert_unrelated_intent(storage: Storage) -> None:
     with storage.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
