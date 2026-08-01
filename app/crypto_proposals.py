@@ -1,12 +1,11 @@
 """Immutable, non-executable proposal previews for supervised spot crypto.
 
-This is the proposal-authority half of the crypto strategy roadmap stage.  It
-binds an exact research setup to verified broker/capability/market/risk/sizing
-evidence and renders the complete future approval surface.  The current stage
-intentionally persists ``manual_approval_eligible=0`` and
-``execution_authorized=0`` and never writes ``trade_proposals`` or calls
-Telegram or Alpaca.  A later separately reviewed execution stage must replace
-that boundary; regenerating this local preview is never order authority.
+This is the non-approvable research-preview half of the crypto strategy lane.
+It binds an exact setup to verified evidence and renders a future approval
+surface.  It intentionally persists ``manual_approval_eligible=0`` and
+``execution_authorized=0`` and never writes ``trade_proposals``.  The separate
+``crypto_paper_lane`` owns the opt-in manual paper authority; regenerating this
+preview is never order authority.
 """
 
 from __future__ import annotations

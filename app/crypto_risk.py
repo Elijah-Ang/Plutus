@@ -1,10 +1,9 @@
 """Trusted portfolio-risk evidence for supervised Alpaca spot crypto.
 
-This lane deliberately stops before proposal or execution authority.  It reads
-the current paper account, positions, open orders, account loss evidence and
-hourly crypto bars, then combines those sources with durable SQLite intents and
-reservations in one ``BEGIN IMMEDIATE`` transaction.  The resulting immutable
-snapshot constrains canonical Decimal sizing but can never submit an order.
+This lane produces immutable account, market and risk evidence.  The separate
+``crypto_paper_lane`` may bind that evidence to a manually approved paper
+order when its explicit opt-in is enabled; this module itself never submits an
+order.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 from .approval_authority import canonical_json
-from .crypto_capabilities import CryptoCapabilityStore, CryptoCapabilitySnapshot
+from .crypto_capabilities import CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
 from .crypto_sizing import (
     CryptoSizingAuthority,

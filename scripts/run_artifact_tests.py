@@ -35,6 +35,8 @@ TARGETED_SUITES = (
     "tests/test_crypto_market_data.py",
     "tests/test_crypto_sizing_risk.py",
     "tests/test_crypto_research.py",
+    "tests/test_crypto_strategies_proposals.py",
+    "tests/test_crypto_paper_lane.py",
 )
 
 

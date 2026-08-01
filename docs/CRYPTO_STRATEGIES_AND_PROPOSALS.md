@@ -1,10 +1,12 @@
 # Crypto strategies and proposal authority
 
 This stage adds independently verifiable BTC/USD and ETH/USD strategy
-decisions and an immutable crypto proposal-preview record. It does **not**
-enable crypto proposals, Telegram approvals, intents, reservations, or broker
-submission. The installed configuration remains `research_only`, and the
-existing broker adapter continues to reject every crypto order before I/O.
+decisions and an immutable crypto proposal-preview record. The installed
+configuration remains `research_only`; the non-approvable preview path is
+unchanged. A separately reviewed opt-in is now available through
+`crypto.supervised_paper_lane`, which uses the isolated
+`CryptoPaperLaneStore` ledger for manual, paper-only limit orders. It never
+uses the equity adapter.
 
 ## Official Alpaca contract
 
@@ -115,12 +117,15 @@ fee component, and adverse stop slippage. Authority is loaded after a SQLite
 `BEGIN IMMEDIATE`, so verified strategy, risk, sizing, capability, and market
 evidence cannot change between display construction and preview persistence.
 
-## Enabling a later paper proposal stage
+## Supervised paper stage
 
-An executable crypto proposal requires a separate reviewed change that adds
-the complete ordinary authority chain: immutable Telegram display, reply
-target binding, one-use approval, final fresh broker/risk revalidation, durable
-intent and reservation, crypto-specific limit/GTC adapter, idempotent client
-identity, reconciliation, fills, fees, lot accounting, and Performance Lab
-outcomes. That later stage must remain paper-only, manual-only, long-only,
-cash-funded, and unable to retry an ambiguous submission automatically.
+`app/crypto_paper_lane.py` adds the separate authority chain: immutable
+Telegram display, reply-target binding, one-use approval, final fresh
+broker/risk revalidation, durable intent and reservation, a crypto-specific
+limit/GTC-or-IOC adapter, idempotent client identity, deterministic
+pre-submission recovery, fills, fees and FIFO lot accounting. The lane is opt-in only;
+the installed values keep `enabled=false` and `execution_enabled=false`.
+It remains paper-only, manual-only, long-only, cash-funded, and unable to retry
+an ambiguous submission automatically. See
+[`CRYPTO_SUPERVISED_PAPER_LANE.md`](CRYPTO_SUPERVISED_PAPER_LANE.md) for the
+exact controls and migration boundary.

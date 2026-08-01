@@ -4,7 +4,11 @@
 
 The cross-asset allocator compares equity, ETF, and crypto profitability evidence on one normalized basis. Its current mode is `research_advisory`. A plan is immutable and independently reproducible, but it is never proposal, approval, intent, reservation, or broker authority.
 
-The crypto lane remains `research_only`. A crypto candidate can receive hypothetical research allocation, but the allocator cannot make it approvable or executable. Enabling supervised crypto proposals or paper execution requires separate evidence, configuration, display-authority, approval, intent, recovery, and exact-head review work.
+The cross-asset allocator remains advisory and cannot make a crypto candidate
+approvable or executable. The crypto lane's separate supervised paper stage is
+controlled by `crypto.supervised_paper_lane`; enabling it requires the exact
+capability, market, risk, display, approval, intent and recovery evidence
+described in [`CRYPTO_SUPERVISED_PAPER_LANE.md`](CRYPTO_SUPERVISED_PAPER_LANE.md).
 
 ## Ranking model
 

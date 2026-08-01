@@ -6,9 +6,9 @@ hard-coded: they are re-read from the authenticated paper Trading API and
 persisted in an immutable, fingerprinted snapshot.
 
 This module is read-only with respect to Alpaca.  It cannot build or submit an
-order.  Crypto execution remains disabled until later, separately reviewed
-stages bind sizing, risk, display, approval, intent and reconciliation to this
-evidence.
+order.  The separately reviewed ``crypto_paper_lane`` binds sizing, risk,
+display, approval, intent and reconciliation to this evidence when explicitly
+enabled; the installed configuration keeps that lane disabled.
 """
 
 from __future__ import annotations

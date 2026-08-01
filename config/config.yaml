@@ -432,6 +432,8 @@ formula_versions:
   crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
   crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
+  crypto_paper_execution: crypto_supervised_paper_execution_v1_manual_limit_orders
+  crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v1
   cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
@@ -554,6 +556,21 @@ crypto:
     send_telegram: false
     manual_approval_enabled: false
     execution_enabled: false
+  # Explicitly separate from the research-only preview policy above.  This
+  # opt-in remains disabled in the installed configuration; enabling it is a
+  # separately reviewed paper/manual-only change that uses the isolated crypto
+  # proposal, approval, reservation and fill ledger.
+  supervised_paper_lane:
+    enabled: false
+    paper_only: true
+    manual_approval_required: true
+    autonomous_execution: false
+    live_enabled: false
+    execution_enabled: false
+    order_type: limit
+    time_in_force: gtc
+    proposal_expiry_minutes: 3
+    maximum_order_notional_usd: 5.00
   proposal_expiry_minutes: 3
   approval_max_price_age_seconds: 30
   approval_max_price_move_bps_base: 50

@@ -35,8 +35,8 @@ def _datetime(value: str | datetime | None) -> datetime:
     return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
 
 
-def _period_keys(value: str | datetime | None) -> tuple[str, str]:
-    local = _datetime(value).astimezone(ZoneInfo(ACCOUNTING_TIMEZONE))
+def _period_keys(value: str | datetime | None, timezone_name: str = ACCOUNTING_TIMEZONE) -> tuple[str, str]:
+    local = _datetime(value).astimezone(ZoneInfo(timezone_name))
     monday = local.date() - timedelta(days=local.weekday())
     return local.date().isoformat(), monday.isoformat()
 
@@ -89,6 +89,7 @@ class LotLedger:
         fees: Any = 0,
         adjustments: Any = 0,
         source: str = "broker_fill",
+        accounting_timezone: str | None = None,
     ) -> None:
         """Apply the deduplicated delta while the caller's fill transaction is open."""
         quantity = decimal_value(delta_quantity, "delta_quantity", minimum=ZERO)
@@ -104,7 +105,13 @@ class LotLedger:
         symbol = str(intent["symbol"]).upper()
         side = str(intent["side"]).lower()
         now = iso_now()
-        day, week = _period_keys(occurred_at)
+        # Equity outcomes use the exchange/session timezone.  Continuous
+        # crypto outcomes use an explicit UTC session so they cannot leak
+        # across the New York equity day boundary.
+        timezone_name = accounting_timezone or (
+            "UTC" if str(source).startswith("crypto_") else ACCOUNTING_TIMEZONE
+        )
+        day, week = _period_keys(occurred_at, timezone_name)
         status = conn.execute("SELECT * FROM pnl_ledger_status WHERE scope='prospective'").fetchone()
         base_confidence = str(status["confidence"]) if status else "unavailable"
         provenance = str(status["provenance"]) if status else "migration coverage not established"
@@ -359,7 +366,7 @@ class LotLedger:
                     legacy_float(quantity), legacy_float(proceeds),
                     legacy_float(basis) if known_qty > ZERO else None,
                     legacy_float(fee_amount), legacy_float(adjustment_amount), legacy_float(realized),
-                    legacy_float(remaining_position), occurred_at, day, week, ACCOUNTING_TIMEZONE,
+                    legacy_float(remaining_position), occurred_at, day, week, timezone_name,
                     source, provenance, confidence, now, decimal_text(quantity),
                     decimal_text(proceeds), decimal_text(basis) if known_qty > ZERO else None,
                     decimal_text(fee_amount), decimal_text(adjustment_amount),

@@ -4,11 +4,15 @@ import math
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .crypto_capabilities import CryptoCapabilitySnapshot, CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
 from .crypto_strategies import CryptoStrategyError, CryptoStrategyStore
+from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, format_crypto_paper_proposal
+from .crypto_risk import CryptoRiskError, CryptoRiskStore
+from .crypto_sizing import CryptoSizingRequest
 from .storage import Storage
 from .utils import json_dumps
 
@@ -22,7 +26,7 @@ CRYPTO_LANES = {
     "crypto_trade_proposal",
 }
 
-CRYPTO_MODES = {"research_only", "paper_watch", "paper_proposal"}
+CRYPTO_MODES = {"research_only", "paper_watch", "paper_proposal", "supervised_paper"}
 
 CRYPTO_BLOCKER_REASONS = {
     "crypto_research_only",
@@ -136,6 +140,8 @@ def format_crypto_digest(results: list[CryptoResearchResult]) -> str:
         suffix = "Paper-watch. Hypothetical candidates only. No proposals/orders."
     elif mode == "paper_proposal":
         suffix = "Stage 3 readiness-report only. No proposals/orders until a separate approved config-change commit."
+    elif mode == "supervised_paper":
+        suffix = "Supervised paper lane. Every order requires a fresh Telegram display and explicit manual approval."
     else:
         suffix = "Research-only. No proposals/orders."
     return f"Crypto research: {scores}. {suffix}"
@@ -307,6 +313,7 @@ class CryptoResearchEngine:
         )
         self._with_market_evidence(result, market_evidence)
         if market_evidence.authoritative:
+            decision = None
             try:
                 decision = CryptoStrategyStore(self.storage).evaluate(
                     self.config, self.run_id, research_run_id,
@@ -332,7 +339,91 @@ class CryptoResearchEngine:
             except CryptoStrategyError as exc:
                 result.strategy_blockers = ("crypto_strategy_evaluation_failed",)
                 result.risk_metrics["crypto_strategy_error"] = str(exc)
+            if decision is not None:
+                self._maybe_create_supervised_paper_proposal(
+                    result, capability, market_evidence, decision, now,
+                )
         return self._with_capability(result, capability)
+
+    def _maybe_create_supervised_paper_proposal(
+        self,
+        result: CryptoResearchResult,
+        capability: CryptoCapabilitySnapshot,
+        market_evidence: CryptoMarketEvidence,
+        strategy: Any,
+        now: datetime,
+    ) -> None:
+        """Create an executable paper proposal only for the explicit lane gate.
+
+        The default configuration never enters this method.  When the
+        separately reviewed supervised lane is enabled, risk authority is
+        rebuilt from the current broker account and the proposal is persisted
+        before (and independently of) any Telegram send.  A Telegram failure
+        therefore leaves an unapprovable, durable paper proposal rather than
+        inventing a fallback or submitting anything.
+        """
+
+        lane = (self.config.get("crypto") or {}).get("supervised_paper_lane") or {}
+        if lane.get("enabled") is not True or lane.get("execution_enabled") is not True:
+            return
+        asset = capability.asset(result.symbol)
+        if not capability.authoritative or asset is None or not asset.authoritative or not market_evidence.authoritative or not market_evidence.execution_eligible:
+            return
+        if not strategy.signal_eligible or strategy.action != "entry" or strategy.stop_price is None:
+            return
+        try:
+            account = self.broker.get_account() if self.broker is not None else None
+            equity = Decimal(str(getattr(account, "equity", None) or (account or {}).get("equity")))
+            stop_risk_pct = Decimal(str(((self.config.get("crypto") or {}).get("risk_policy") or {}).get("maximum_stop_risk_per_trade_pct_equity")))
+            requested_risk = equity * stop_risk_pct / Decimal("100")
+            if not requested_risk.is_finite() or requested_risk <= 0:
+                return
+            request = CryptoSizingRequest(
+                source_type="crypto_strategy_decision", source_id=str(strategy.id),
+                source_fingerprint=str(strategy.decision_fingerprint), symbol=str(strategy.symbol),
+                side="buy", action="entry", request_basis="notional",
+                requested_stop_risk_dollars=requested_risk, stop_price=str(strategy.stop_price),
+            )
+            evaluation = CryptoRiskStore(self.storage).evaluate(
+                self.config, self.broker, self.run_id, capability.id, market_evidence.id, request, now=now,
+            )
+            if not evaluation.risk_eligible:
+                result.risk_metrics["supervised_paper_blockers"] = list(evaluation.reasons)
+                return
+            proposal = CryptoPaperLaneStore(self.storage).create_proposal(
+                self.config, strategy.id, evaluation.decision_id, now=now,
+            )
+            result.risk_metrics["supervised_paper_proposal_id"] = proposal.id
+            result.status = "supervised_paper"
+            result.reason = "fresh_manual_approval_required"
+            if self.telegram is not None:
+                try:
+                    sent = self.telegram.send_message(format_crypto_paper_proposal(proposal))
+                    message_id = getattr(sent, "message_id", None)
+                    if message_id is None and isinstance(sent, dict):
+                        message_id = sent.get("message_id") or sent.get("id")
+                    if message_id is not None:
+                        CryptoPaperLaneStore(self.storage).bind_telegram_message(
+                            proposal.id, str(message_id), self.config, now=now,
+                        )
+                    else:
+                        self.storage.audit(
+                            self.run_id, "crypto_paper_proposal_telegram_identity_missing",
+                            {"proposal_id": proposal.id},
+                        )
+                except Exception as exc:
+                    self.storage.audit(
+                        self.run_id, "crypto_paper_proposal_telegram_send_failed",
+                        {"proposal_id": proposal.id, "error": type(exc).__name__},
+                    )
+        except (CryptoPaperLaneError, CryptoRiskError, InvalidOperation, TypeError, ValueError) as exc:
+            result.risk_metrics["supervised_paper_blockers"] = [type(exc).__name__]
+        except Exception as exc:
+            result.risk_metrics["supervised_paper_blockers"] = [f"unexpected_{type(exc).__name__}"]
+            self.storage.audit(
+                self.run_id, "crypto_supervised_paper_lane_failed_closed",
+                {"symbol": result.symbol, "error": type(exc).__name__},
+            )
 
     def _with_capability(
         self,
