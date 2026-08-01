@@ -53,7 +53,15 @@ class AIReviewer:
         self.calls_made = 0
 
     def review(self, proposal: dict[str, Any]) -> dict[str, Any]:
-        max_calls = self.config.get("max_calls_per_run", 5)
+        # The production configuration nests this value as
+        # ``ai_max_calls_per_run``.  Keep the older flat key as a compatibility
+        # fallback for isolated callers, but never silently widen the
+        # configured per-run cap to the historical default when the nested key
+        # is present.
+        max_calls = self.config.get(
+            "ai_max_calls_per_run",
+            self.config.get("max_calls_per_run", 5),
+        )
         if self.calls_made >= max_calls:
             return deterministic_review(proposal, f"AI review blocked: exceeded call limit of {max_calls}")
         self.calls_made += 1
