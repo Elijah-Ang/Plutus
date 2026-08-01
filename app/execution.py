@@ -1562,7 +1562,7 @@ class DurableExecutionStore:
             "invalid_crypto_strategy_authority": """SELECT COUNT(*) n
                 FROM crypto_strategy_decisions d
                 WHERE d.proposal_authorized<>0 OR d.execution_authorized<>0
-                   OR d.lifecycle<>'RESEARCH_ONLY'
+                   OR d.lifecycle NOT IN ('RESEARCH_ONLY','PAPER_ACTIVE')
                    OR json_valid(d.blockers_json)<>1
                    OR json_valid(d.decision_json)<>1
                    OR (d.signal_eligible=1 AND (
@@ -1623,7 +1623,8 @@ class DurableExecutionStore:
                 LEFT JOIN performance_setups ps ON ps.id=po.setup_id
                 LEFT JOIN fills f ON CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
                 LEFT JOIN orders o ON o.id=f.order_id
-                WHERE po.actual_or_shadow='actual'
+                WHERE COALESCE(ps.asset_class,'equity')<>'crypto'
+                  AND (po.actual_or_shadow='actual'
                    OR (po.actual_or_shadow='actual_fill' AND (
                          po.fill_id IS NULL OR f.id IS NULL
                          OR COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0
@@ -1634,11 +1635,11 @@ class DurableExecutionStore:
                          OR ABS(po.entry_qty-f.qty)>0.000000001
                          OR ABS(po.entry_price-f.price)>0.000000001
                          OR ABS(po.entry_notional-(f.qty*f.price))>0.000000001
-                       ))""",
+                       )))""",
             "performance_lab_fill_not_actual": """SELECT COUNT(*) n
                 FROM performance_outcomes po
                 JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE EXISTS(
+                WHERE ps.asset_class<>'crypto' AND EXISTS(
                         SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
                         WHERE o.proposal_id=ps.proposal_id AND f.qty>0 AND f.price>0
                       )
@@ -1652,7 +1653,7 @@ class DurableExecutionStore:
             "performance_lab_invalid_fill_evidence": """SELECT COUNT(*) n
                 FROM performance_outcomes po
                 JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE EXISTS(
+                WHERE ps.asset_class<>'crypto' AND EXISTS(
                   SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
                   WHERE o.proposal_id=ps.proposal_id
                     AND (COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0)
@@ -1660,7 +1661,7 @@ class DurableExecutionStore:
             "performance_lab_orphaned_proposal_link": """SELECT COUNT(*) n
                 FROM performance_setups ps
                 LEFT JOIN trade_proposals p ON p.id=ps.proposal_id
-                WHERE ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
+                WHERE ps.asset_class<>'crypto' AND ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
         }
         report = {
             name: int(self.storage.fetch_all(sql)[0]["n"])
@@ -1669,10 +1670,12 @@ class DurableExecutionStore:
         from .fixed_point_accounting import fixed_point_integrity_report
         from .allocation_authority import allocation_authority_integrity_report
         from .strategy_execution_registry import strategy_registry_integrity_report
+        from .crypto_paper_lane import CryptoPaperLaneStore
 
         report.update(fixed_point_integrity_report(self.storage))
         report.update(strategy_registry_integrity_report(self.storage))
         report.update(allocation_authority_integrity_report(self.storage))
+        report.update(CryptoPaperLaneStore(self.storage).integrity_report())
         return report
 
 

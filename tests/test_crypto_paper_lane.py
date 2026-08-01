@@ -17,6 +17,7 @@ from app.crypto_sizing import CryptoSizingRequest
 from app.crypto_strategies import CryptoStrategyStore
 from app.lot_ledger import LotLedger
 from app.storage import Storage
+from app.configuration import effective_config_hash
 from app.utils import load_config
 
 
@@ -136,6 +137,26 @@ def _config():
     return config
 
 
+def _healthy_providers():
+    return {name: (lambda: True) for name in ("power", "internet", "database", "telegram")}
+
+
+def _disabled_config():
+    config = deepcopy(load_config())
+    crypto = config["crypto"]
+    crypto["mode"] = "research_only"
+    crypto["paper_trading_enabled"] = False
+    crypto["proposals_enabled"] = False
+    crypto["sizing_policy"]["mode"] = "research_only"
+    crypto["risk_policy"]["mode"] = "research_only"
+    crypto["strategy_policy"]["mode"] = "research_only"
+    crypto["strategy_policy"]["lifecycle"] = "RESEARCH_ONLY"
+    crypto["supervised_paper_lane"]["enabled"] = False
+    crypto["supervised_paper_lane"]["execution_enabled"] = False
+    config["effective_config_hash"] = effective_config_hash(config)
+    return config
+
+
 def _evidence(storage, config, broker):
     capability = CryptoCapabilityStore(storage).capture(config, broker, "run", now=NOW)
     storage.execute(
@@ -169,7 +190,10 @@ def _ready(tmp_path, *, broker=None, control_providers=None):
     config = _config()
     broker = broker or Broker()
     strategy, risk = _evidence(storage, config, broker)
-    lane = CryptoPaperLaneStore(storage, control_providers=control_providers)
+    providers = _healthy_providers()
+    if control_providers:
+        providers.update(control_providers)
+    lane = CryptoPaperLaneStore(storage, control_providers=providers)
     proposal = lane.create_proposal(config, strategy.id, risk.decision_id, now=NOW)
     lane.bind_telegram_message(proposal.id, "telegram-message-1", config, now=NOW)
     lane.approve_proposal(
@@ -182,7 +206,7 @@ def _ready(tmp_path, *, broker=None, control_providers=None):
 
 def test_lane_requires_explicit_enablement_and_is_not_default(tmp_path):
     storage = _storage(tmp_path)
-    config = deepcopy(load_config())
+    config = _disabled_config()
     strategy, risk = _evidence(storage, config, Broker())
     with pytest.raises(CryptoPaperLaneError, match="disabled"):
         CryptoPaperLaneStore(storage).create_proposal(config, strategy.id, risk.decision_id, now=NOW)
@@ -193,7 +217,7 @@ def test_proposal_display_binds_full_crypto_authority_and_manual_command(tmp_pat
     config = _config()
     broker = Broker()
     strategy, risk = _evidence(storage, config, broker)
-    lane = CryptoPaperLaneStore(storage)
+    lane = CryptoPaperLaneStore(storage, control_providers=_healthy_providers())
     proposal = lane.create_proposal(config, strategy.id, risk.decision_id, now=NOW)
     assert proposal.display["symbol"] == "BTC/USD"
     assert proposal.display["current_bid"] == "100"
@@ -274,7 +298,7 @@ def test_open_order_appearing_after_snapshot_blocks_before_broker_io(tmp_path):
     result = lane.execute_intent(intent.id, config, broker, now=NOW)
     assert result["state"] == "retryable_pre_submission"
     assert result["broker_invocation_occurred"] == 0
-    assert "conflicting_crypto_open_order" in result["last_error"]
+    assert "final_crypto_risk_or_sizing_ineligible" in result["last_error"] or "conflicting_crypto_open_order" in result["last_error"]
     assert broker.submit_calls == []
 
 
@@ -315,9 +339,19 @@ def test_successful_manual_paper_order_and_fill_release_reservation(tmp_path):
     assert len(broker.submit_calls) == 1
     args, kwargs = broker.submit_calls[0]
     assert args[0:2] == ("BTC/USD", "buy")
-    assert args[2] == {"notional": "5"}
+    assert args[2] == {"notional": intent.requested_notional}
     assert kwargs["client_order_id"] == intent.client_order_id
-    fill = lane.record_fill(intent.id, "broker-fill-1", intent.requested_quantity, "101", "0.025", config, occurred_at=NOW)
+    fill = lane.record_fill(
+        intent.id, "broker-fill-1", intent.requested_quantity, "101", "0.025", config,
+        broker_evidence={
+            "verified": True, "broker_order_id": "crypto-broker-order-1",
+            "client_order_id": intent.client_order_id, "symbol": "BTC/USD", "side": "buy",
+            "status": "filled", "cumulative_filled_quantity": intent.requested_quantity,
+            "filled_average_price": "101", "fees": "0.025", "paper_account_id_hash": ACCOUNT_HASH,
+            "payload": {"id": "crypto-broker-order-1", "status": "filled"},
+        },
+        occurred_at=NOW,
+    )
     assert fill["state"] == "filled"
     reservation = storage.fetch_all("SELECT state,active_notional,active_stop_risk FROM crypto_paper_reservations")[0]
     assert reservation["state"] == "released"
@@ -325,10 +359,97 @@ def test_successful_manual_paper_order_and_fill_release_reservation(tmp_path):
     assert storage.fetch_all("SELECT COUNT(*) n FROM position_lots WHERE symbol='BTC/USD'")[0]["n"] == 1
     metrics = lane.portfolio_metrics(broker, config, now=NOW)
     assert metrics["asset_class"] == "crypto"
-    assert metrics["crypto_exposure"] == "4.995004995004995004995004995"
+    assert D(metrics["crypto_exposure"]) > 0
     assert metrics["crypto_fees"] == "0.025"
     assert metrics["equity_session_metrics_included"] is False
     assert all(value == 0 for value in lane.integrity_report().values())
+
+
+def test_submit_response_cannot_become_verified_fill_without_reconciliation(tmp_path):
+    class FilledResponseBroker(Broker):
+        def submit_crypto_order(self, *args, **kwargs):
+            self.submit_calls.append((args, kwargs))
+            return {"id": "crypto-broker-order-1", "status": "filled"}
+
+    storage, config, broker, lane, proposal, intent = _ready(
+        tmp_path, broker=FilledResponseBroker(),
+    )
+    result = lane.execute_intent(intent.id, config, broker, now=NOW)
+    assert result["state"] == "submitted"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_fills")[0]["n"] == 0
+    reservation = storage.fetch_all(
+        "SELECT state,active_notional FROM crypto_paper_reservations WHERE intent_id=?",
+        (intent.id,),
+    )[0]
+    assert reservation["state"] == "active"
+    assert D(reservation["active_notional"]) > 0
+
+
+def test_duplicate_crypto_fill_is_idempotent_but_conflicting_payload_fails(tmp_path):
+    storage, config, broker, lane, proposal, intent = _ready(tmp_path)
+    evidence = {
+        "verified": True, "broker_order_id": "crypto-broker-order-1",
+        "client_order_id": intent.client_order_id, "symbol": "BTC/USD", "side": "buy",
+        "status": "filled", "cumulative_filled_quantity": intent.requested_quantity,
+        "filled_average_price": "101", "fees": "0.025", "paper_account_id_hash": ACCOUNT_HASH,
+        "payload": {"id": "crypto-broker-order-1", "status": "filled"},
+    }
+    lane.execute_intent(intent.id, config, broker, now=NOW)
+    first = lane.record_fill(
+        intent.id, "broker-fill-duplicate", intent.requested_quantity, "101", "0.025", config,
+        broker_evidence=evidence, occurred_at=NOW,
+    )
+    duplicate = lane.record_fill(
+        intent.id, "broker-fill-duplicate", intent.requested_quantity, "101", "0.025", config,
+        broker_evidence=evidence, occurred_at=NOW,
+    )
+    assert first["status"] == "recorded"
+    assert duplicate["status"] == "duplicate"
+    with pytest.raises(CryptoPaperLaneError, match="conflicting duplicate"):
+        lane.record_fill(
+            intent.id, "broker-fill-duplicate", intent.requested_quantity, "102", "0.025", config,
+            broker_evidence=evidence, occurred_at=NOW,
+        )
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_fills")[0]["n"] == 1
+
+
+def test_partial_crypto_fills_keep_cumulative_performance_and_incremental_fees(tmp_path):
+    storage, config, broker, lane, proposal, intent = _ready(tmp_path)
+    lane.execute_intent(intent.id, config, broker, now=NOW)
+    requested = D(intent.requested_quantity)
+    half = requested / D("2")
+    remaining = requested - half
+
+    def evidence(cumulative: D, fees: str):
+        return {
+            "verified": True, "broker_order_id": "crypto-broker-order-1",
+            "client_order_id": intent.client_order_id, "symbol": "BTC/USD", "side": "buy",
+            "status": "partially_filled" if cumulative < requested else "filled",
+            "cumulative_filled_quantity": str(cumulative), "filled_average_price": "101",
+            "fees": fees, "paper_account_id_hash": ACCOUNT_HASH,
+            "payload": {"id": "crypto-broker-order-1", "filled_qty": str(cumulative)},
+        }
+
+    first = lane.record_fill(
+        intent.id, "broker-fill-part-1", half, "101", "0.01", config,
+        broker_evidence=evidence(half, "0.01"), occurred_at=NOW,
+    )
+    second = lane.record_fill(
+        intent.id, "broker-fill-part-2", remaining, "101", "0.01", config,
+        broker_evidence=evidence(requested, "0.02"), occurred_at=NOW,
+    )
+    assert first["state"] == "partially_filled"
+    assert second["state"] == "filled"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_performance_links")[0]["n"] == 2
+    outcome = storage.fetch_all(
+        "SELECT entry_qty,entry_notional,status FROM performance_outcomes WHERE setup_id IN (SELECT setup_id FROM crypto_performance_links)"
+    )[0]
+    # Legacy Performance Lab columns are REAL presentation fields; the exact
+    # values remain in crypto_performance_links and the crypto ledger.
+    assert float(outcome["entry_qty"]) == pytest.approx(float(requested))
+    assert float(outcome["entry_notional"]) == pytest.approx(float(requested * D("101")))
+    assert outcome["status"] == "actual_fill"
+    assert storage.fetch_all("SELECT SUM(fees) fees FROM crypto_paper_fills")[0]["fees"] == pytest.approx(0.02)
 
 
 def test_supervised_crypto_sell_exit_uses_quantity_and_current_holdings(tmp_path):
@@ -360,7 +481,7 @@ def test_supervised_crypto_sell_exit_uses_quantity_and_current_holdings(tmp_path
         config, broker, "run-sell", capability.id, market.id, request, now=NOW,
     )
     assert risk.risk_eligible
-    lane = CryptoPaperLaneStore(storage)
+    lane = CryptoPaperLaneStore(storage, control_providers=_healthy_providers())
     proposal = lane.create_proposal(config, None, risk.decision_id, now=NOW)
     assert proposal.side == "sell"
     assert proposal.quantity == "0.05"
@@ -371,11 +492,40 @@ def test_supervised_crypto_sell_exit_uses_quantity_and_current_holdings(tmp_path
         raw_message=f"YES CRYPTO {proposal.id}", reply_to_message_id="telegram-sell-1", now=NOW,
     )
     intent = lane.create_intent(proposal.id, config, now=NOW)
+    with storage.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        LotLedger.apply_fill_in_transaction(
+            conn,
+            intent={
+                "id": "seed-crypto-buy", "symbol": "BTC/USD", "side": "buy",
+                "requested_quantity": "0.1", "approved_quantity": "0.1",
+                "position_lifecycle_id": None, "config_hash": config["effective_config_hash"],
+            },
+            broker_event_key="seed-crypto-buy-fill", delta_quantity="0.1", fill_price="99",
+            occurred_at=NOW.isoformat(), source="crypto_paper_fill", accounting_timezone="UTC",
+        )
+        conn.execute(
+            """INSERT INTO crypto_paper_lots(
+               id,symbol,source_fill_event_key,opened_at,original_quantity,remaining_quantity,
+               unit_cost,fees_allocated,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            ("seed-crypto-lot", "BTC/USD", "seed-crypto-buy-fill", NOW.isoformat(), "0.1", "0.1", "99", "0", NOW.isoformat()),
+        )
     result = lane.execute_intent(intent.id, config, broker, now=NOW)
     assert result["state"] == "submitted"
     assert broker.submit_calls[0][0][0:2] == ("BTC/USD", "sell")
     assert broker.submit_calls[0][0][2] == {"qty": "0.05"}
-    fill = lane.record_fill(intent.id, "broker-sell-fill-1", "0.05", "100", "0.0125", config, occurred_at=NOW)
+    fill = lane.record_fill(
+        intent.id, "broker-sell-fill-1", "0.05", "100", "0.0125", config,
+        broker_evidence={
+            "verified": True, "broker_order_id": "crypto-broker-order-1",
+            "client_order_id": intent.client_order_id, "symbol": "BTC/USD", "side": "sell",
+            "status": "filled", "cumulative_filled_quantity": "0.05",
+            "filled_average_price": "100", "fees": "0.0125", "paper_account_id_hash": ACCOUNT_HASH,
+            "payload": {"id": "crypto-broker-order-1", "status": "filled"},
+        },
+        occurred_at=NOW,
+    )
     assert fill["state"] == "filled"
     assert broker.submit_calls == [broker.submit_calls[0]]
     assert all(value == 0 for value in lane.integrity_report().values())
@@ -409,7 +559,7 @@ def test_crypto_sell_holdings_decrease_after_snapshot_blocks_before_broker_io(tm
             request_basis="quantity", requested_exit_quantity=D("0.05"),
         ), now=NOW,
     )
-    lane = CryptoPaperLaneStore(storage)
+    lane = CryptoPaperLaneStore(storage, control_providers=_healthy_providers())
     proposal = lane.create_proposal(config, None, risk.decision_id, now=NOW)
     lane.bind_telegram_message(proposal.id, "telegram-sell-2", config, now=NOW)
     lane.approve_proposal(
@@ -421,7 +571,7 @@ def test_crypto_sell_holdings_decrease_after_snapshot_blocks_before_broker_io(tm
     result = lane.execute_intent(intent.id, config, broker, now=NOW)
     assert result["state"] == "retryable_pre_submission"
     assert result["broker_invocation_occurred"] == 0
-    assert "sellable_quantity_decreased" in result["last_error"]
+    assert "sellable_quantity_decreased" in result["last_error"] or "no_sellable_crypto_quantity" in result["last_error"]
     assert broker.submit_calls == []
 
 

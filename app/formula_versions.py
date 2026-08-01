@@ -40,7 +40,7 @@ CRYPTO_STRATEGY_SCHEMA_VERSION = "crypto_strategy_decisions_v1"
 CRYPTO_PROPOSAL_FORMULA_VERSION = "crypto_research_proposal_authority_v2_net_cost_target"
 CRYPTO_PROPOSAL_SCHEMA_VERSION = "crypto_research_proposal_previews_v1"
 CRYPTO_PAPER_EXECUTION_FORMULA_VERSION = "crypto_supervised_paper_execution_v1_manual_limit_orders"
-CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION = "crypto_supervised_paper_execution_schema_v1"
+CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION = "crypto_supervised_paper_execution_schema_v2"
 CROSS_ASSET_ALLOCATION_FORMULA_VERSION = "cross_asset_normalized_constrained_allocator_v1"
 CROSS_ASSET_ALLOCATION_SCHEMA_VERSION = "cross_asset_research_allocation_plans_v1"
 PERFORMANCE_LAB_CLASSIFICATION_FORMULA_VERSION = "performance_lab_fill_bound_classification_v1"
@@ -84,6 +84,7 @@ REQUIRED_SCHEMA_VERSIONS = frozenset(
         CRYPTO_RISK_SCHEMA_VERSION,
         CRYPTO_STRATEGY_SCHEMA_VERSION,
         CRYPTO_PROPOSAL_SCHEMA_VERSION,
+        CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION,
         CROSS_ASSET_ALLOCATION_SCHEMA_VERSION,
         PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION,
         FIXED_POINT_ACCOUNTING_SCHEMA_VERSION,

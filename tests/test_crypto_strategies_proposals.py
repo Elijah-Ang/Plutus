@@ -192,10 +192,10 @@ def _complete(tmp_path, *, positions=None):
     return storage, config, broker, strategy, risk, preview
 
 
-def test_default_config_keeps_strategy_and_proposal_stage_dormant():
+def test_default_config_keeps_strategy_active_but_preview_stage_non_executable():
     config = _config()
     assert validate_config(config) == []
-    assert config["crypto"]["strategy_policy"]["lifecycle"] == "RESEARCH_ONLY"
+    assert config["crypto"]["strategy_policy"]["lifecycle"] == "PAPER_ACTIVE"
     assert config["crypto"]["proposal_policy"]["manual_approval_enabled"] is False
     assert config["crypto"]["proposal_policy"]["execution_enabled"] is False
 
@@ -226,7 +226,7 @@ def test_four_crypto_strategies_are_evaluated_point_in_time(tmp_path):
     assert tuple(item["strategy"] for item in decision.payload["evaluations"]) == SUPPORTED_STRATEGIES
     assert decision.selected_strategy in SUPPORTED_STRATEGIES
     assert decision.signal_eligible is True
-    assert decision.lifecycle == "RESEARCH_ONLY"
+    assert decision.lifecycle == "PAPER_ACTIVE"
     assert decision.proposal_authorized is False
     assert decision.execution_authorized is False
 
@@ -249,7 +249,7 @@ def test_hourly_crypto_research_persists_strategy_decision_without_proposal(tmp_
     )[0]
     assert result.strategy_decision_id
     assert result.selected_strategy in SUPPORTED_STRATEGIES
-    assert result.strategy_lifecycle == "RESEARCH_ONLY"
+    assert result.strategy_lifecycle == "PAPER_ACTIVE"
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_strategy_decisions")[0]["n"] == 1
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0

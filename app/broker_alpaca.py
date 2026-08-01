@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .broker_interface import BrokerInterface
-from .capabilities import require_live_trading_support
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .utils import get_secret
 
@@ -26,17 +25,13 @@ class AlpacaBroker(BrokerInterface):
         self.config = config
         self.mode = config.get("mode", "paper")
         self.paper_requested = self.mode == "paper"
+        if self.mode != "paper":
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
         self.configured_trading_endpoint = str(
             config.get("alpaca", {}).get("paper_trading_endpoint", "https://paper-api.alpaca.markets")
-            if self.paper_requested
-            else config.get("alpaca", {}).get("live_trading_endpoint", "https://api.alpaca.markets")
         )
-        if self.paper_requested and "paper" not in self.configured_trading_endpoint.lower():
+        if "paper" not in self.configured_trading_endpoint.lower():
             raise RuntimeError("paper mode requires an explicitly paper Alpaca trading endpoint")
-        if self.mode != "paper":
-            # This build has no live capability. Fail before reading any key so
-            # live credentials cannot be selected through configuration alone.
-            require_live_trading_support()
         self.equity_realtime_data_feed = str(
             (config.get("alpaca", {}) or {}).get("equity_realtime_data_feed") or ""
         ).strip().lower()
@@ -280,7 +275,7 @@ class AlpacaBroker(BrokerInterface):
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":
-            require_live_trading_support()
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
         if self._looks_like_crypto_symbol(symbol):
             from .broker_interface import BrokerSubmissionNotAttempted
 
@@ -318,7 +313,7 @@ class AlpacaBroker(BrokerInterface):
         """
 
         if self.mode != "paper":
-            require_live_trading_support()
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
         raw = str(symbol or "").strip().upper().replace("-", "/")
         configured = {
             str(value or "").strip().upper().replace("-", "/")

@@ -194,18 +194,25 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     cfg = config.get("crypto") or {}
     policy = cfg.get("strategy_policy") or {}
     failures: list[str] = []
-    if policy.get("mode") != "research_only":
-        failures.append("strategy_policy_mode_not_research_only")
-    if policy.get("lifecycle") != "RESEARCH_ONLY":
-        failures.append("strategy_lifecycle_not_research_only")
+    supervised = cfg.get("mode") == "supervised_paper"
+    expected_mode = "supervised_paper" if supervised else "research_only"
+    expected_lifecycle = "PAPER_ACTIVE" if supervised else "RESEARCH_ONLY"
+    if policy.get("mode") != expected_mode:
+        failures.append("strategy_policy_mode_invalid")
+    if policy.get("lifecycle") != expected_lifecycle:
+        failures.append("strategy_lifecycle_invalid")
     if policy.get("formula_version") != CRYPTO_STRATEGY_FORMULA_VERSION:
         failures.append("strategy_formula_identity_mismatch")
     if policy.get("schema_version") != CRYPTO_STRATEGY_SCHEMA_VERSION:
         failures.append("strategy_schema_identity_mismatch")
     if str((config.get("formula_versions") or {}).get("crypto_strategy") or "") != CRYPTO_STRATEGY_FORMULA_VERSION:
         failures.append("configuration_strategy_formula_mismatch")
-    if cfg.get("mode") != "research_only" or cfg.get("paper_trading_enabled") is not False or cfg.get("proposals_enabled") is not False or cfg.get("live_enabled") is not False:
-        failures.append("global_crypto_lane_not_research_only_disabled")
+    if cfg.get("live_enabled") is not False or cfg.get("allow_margin") is not False or cfg.get("allow_shorting") is not False:
+        failures.append("global_crypto_safety_boundary_changed")
+    if supervised and (cfg.get("paper_trading_enabled") is not True or cfg.get("proposals_enabled") is not True):
+        failures.append("supervised_crypto_mode_requires_paper_proposals")
+    if not supervised and (cfg.get("mode") != "research_only" or cfg.get("paper_trading_enabled") is not False or cfg.get("proposals_enabled") is not False):
+        failures.append("research_crypto_mode_not_disabled")
     strategies = tuple(policy.get("strategies") or ())
     if strategies != SUPPORTED_STRATEGIES:
         failures.append("strategy_set_or_order_mismatch")
@@ -435,7 +442,7 @@ def evaluate_crypto_strategies(
         "evaluations": evaluations,
         "selected_strategy": selected["strategy"] if selected else None,
         "action": "entry" if selected else "hold",
-        "lifecycle": "RESEARCH_ONLY",
+        "lifecycle": "PAPER_ACTIVE" if (config.get("crypto") or {}).get("mode") == "supervised_paper" else "RESEARCH_ONLY",
         "signal_eligible": signal_eligible,
         "proposal_authorized": False,
         "execution_authorized": False,
@@ -454,7 +461,7 @@ def evaluate_crypto_strategies(
         id=str(decision_id), run_id=str(run_id), research_run_id=str(research_run_id),
         market_evidence_id=market.id, market_evidence_fingerprint=market.evidence_fingerprint,
         symbol=market.symbol, selected_strategy=payload["selected_strategy"], action=payload["action"],
-        lifecycle="RESEARCH_ONLY", signal_eligible=signal_eligible,
+        lifecycle=payload["lifecycle"], signal_eligible=signal_eligible,
         proposal_authorized=False, execution_authorized=False,
         stop_price=payload["stop_price"], target_price=payload["target_price"],
         expected_reward_r=payload["expected_reward_r"], blockers=tuple(blockers),

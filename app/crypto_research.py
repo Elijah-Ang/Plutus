@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import uuid
 from dataclasses import dataclass
@@ -214,6 +216,15 @@ class CryptoResearchEngine:
             result = self._research_symbol(symbol, research_run_id, now, provider, capability)
             results.append(result)
             self._persist_result(result, research_run_id, now)
+        if mode == "supervised_paper" and self.broker is not None:
+            try:
+                self._monitor_crypto_positions(results, capability, now)
+            except Exception as exc:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_position_management_failed_closed",
+                    {"error": type(exc).__name__},
+                )
         self.storage.execute(
             "UPDATE crypto_research_runs SET status=?, ended_at=?, error=? WHERE id=?",
             (status, datetime.now(UTC).isoformat(), error, research_run_id),
@@ -345,6 +356,197 @@ class CryptoResearchEngine:
                 )
         return self._with_capability(result, capability)
 
+    def _monitor_crypto_positions(
+        self,
+        results: list[CryptoResearchResult],
+        capability: CryptoCapabilitySnapshot,
+        now: datetime,
+    ) -> None:
+        """Continuously evaluate held crypto positions and stage approved exits.
+
+        This loop is deliberately one-way: it may persist an evidence-backed
+        SELL proposal, but it cannot approve, reserve, submit, add to, or
+        rotate a position.  The Telegram listener remains the only authority
+        that can turn one of these proposals into a paper intent.
+        """
+
+        lane_cfg = (self.config.get("crypto") or {}).get("supervised_paper_lane") or {}
+        if lane_cfg.get("enabled") is not True or lane_cfg.get("execution_enabled") is not True:
+            return
+        get_positions = getattr(self.broker, "get_positions", None)
+        if not callable(get_positions):
+            self.storage.audit(self.run_id, "crypto_position_management_blocked", {"reason": "positions_adapter_missing"})
+            return
+        positions = list(get_positions())
+        result_by_symbol = {str(result.symbol).upper().replace("-", "/"): result for result in results}
+        management_cfg = self.config.get("position_management") or {}
+        for raw_position in positions:
+            symbol = str(getattr(raw_position, "symbol", "") or (raw_position.get("symbol") if isinstance(raw_position, dict) else "")).upper().replace("-", "/")
+            if symbol not in {"BTC/USD", "ETH/USD"}:
+                continue
+            side = str(getattr(raw_position, "side", "long") or (raw_position.get("side") if isinstance(raw_position, dict) else "long")).lower()
+            if side not in {"", "long"}:
+                self.storage.audit(self.run_id, "crypto_position_management_blocked", {"symbol": symbol, "reason": "short_position_detected"})
+                continue
+            quantity = _crypto_decimal(getattr(raw_position, "qty", None) if not isinstance(raw_position, dict) else raw_position.get("qty"), "crypto position quantity")
+            if quantity <= Decimal("0"):
+                continue
+            result = result_by_symbol.get(symbol)
+            if result is None or not result.market_evidence_id or not result.market_execution_eligible or not result.capability_authoritative:
+                self.storage.audit(self.run_id, "crypto_position_management_blocked", {"symbol": symbol, "reason": "current_market_authority_missing"})
+                continue
+            quote = self.broker.get_crypto_latest_quote(symbol)
+            bid = _crypto_decimal(getattr(quote, "bid_price", None) if not isinstance(quote, dict) else quote.get("bid_price"), "crypto management bid")
+            if bid <= Decimal("0"):
+                continue
+            basis_rows = self.storage.fetch_all(
+                "SELECT remaining_quantity,unit_cost FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
+                (symbol,),
+            )
+            basis_quantity = sum((_crypto_decimal(row["remaining_quantity"], "crypto lot quantity") for row in basis_rows), Decimal("0"))
+            if basis_quantity < quantity:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_position_management_blocked",
+                    {"symbol": symbol, "reason": "verified_local_basis_below_broker_quantity", "broker_quantity": str(quantity), "verified_basis_quantity": str(basis_quantity)},
+                )
+                continue
+            weighted_cost = sum(
+                (_crypto_decimal(row["remaining_quantity"], "crypto lot quantity") * _crypto_decimal(row["unit_cost"], "crypto lot cost") for row in basis_rows),
+                Decimal("0"),
+            )
+            average_entry = weighted_cost / basis_quantity if basis_quantity > Decimal("0") else Decimal("0")
+            previous_rows = self.storage.fetch_all(
+                "SELECT * FROM crypto_paper_position_management WHERE symbol=?",
+                (symbol,),
+            )
+            previous = previous_rows[0] if previous_rows else None
+            prior_peak = _crypto_decimal(previous["peak_price"], "crypto position peak") if previous else Decimal("0")
+            peak = max(prior_peak, bid)
+            sizing_cfg = (self.config.get("crypto") or {}).get("sizing_policy") or {}
+            strategy_cfg = (self.config.get("crypto") or {}).get("strategy_policy") or {}
+            stop_distance = _crypto_decimal(sizing_cfg.get("minimum_stop_distance_pct"), "crypto minimum stop distance") / Decimal("100")
+            stop_price = average_entry * (Decimal("1") - stop_distance)
+            if previous and previous["stop_price"]:
+                stop_price = max(stop_price, _crypto_decimal(previous["stop_price"], "crypto persisted stop"))
+            target_r = _crypto_decimal(strategy_cfg.get("target_reward_r_multiple"), "crypto target reward")
+            profit_target = average_entry + (average_entry - stop_price) * target_r
+            created_at = previous["created_at"] if previous else now.isoformat()
+            created_dt = _parse_dt(created_at)
+            time_stop_cfg = management_cfg.get("time_stop") or {}
+            hold_days = _crypto_decimal(time_stop_cfg.get("min_hold_days_before_time_stop") or "3", "crypto time stop days")
+            time_stop_at = created_dt + timedelta(seconds=int(hold_days * Decimal("86400")))
+            gain_pct = (bid / average_entry - Decimal("1")) * Decimal("100") if average_entry > Decimal("0") else Decimal("0")
+            peak_gain_pct = (peak / average_entry - Decimal("1")) * Decimal("100") if average_entry > Decimal("0") else Decimal("0")
+            action: str | None = None
+            fraction = Decimal("1")
+            reason = ""
+            trailing_cfg = management_cfg.get("trailing_stop") or {}
+            profit_cfg = management_cfg.get("profit_taking") or {}
+            if bid <= stop_price:
+                action, fraction, reason = "exit", Decimal("1"), "protective_stop"
+            elif not result.strategy_signal_eligible and result.strategy_blockers:
+                action, fraction, reason = "exit", Decimal("1"), "thesis_invalidation"
+            elif now >= time_stop_at and gain_pct <= _crypto_decimal(time_stop_cfg.get("max_unrealized_gain_pct") or "0.5", "crypto time-stop gain"):
+                action, fraction, reason = "exit", _crypto_decimal(time_stop_cfg.get("sell_fraction") or "1", "crypto time-stop sell fraction"), "time_stop"
+            elif trailing_cfg.get("enabled") is True and peak_gain_pct >= _crypto_decimal(trailing_cfg.get("trailing_stop_start_gain_pct") or "2", "crypto trailing activation"):
+                giveback = _crypto_decimal(trailing_cfg.get("trailing_stop_giveback_pct") or "1.5", "crypto trailing giveback") / Decimal("100")
+                if bid <= peak * (Decimal("1") - giveback):
+                    action, fraction, reason = "reduce", _crypto_decimal(trailing_cfg.get("sell_fraction") or "0.5", "crypto trailing sell fraction"), "trailing_stop"
+            elif profit_cfg.get("enabled") is True and bid >= profit_target:
+                action, fraction, reason = "reduce", _crypto_decimal(profit_cfg.get("level_1_sell_fraction") or "0.25", "crypto profit sell fraction"), "profit_target"
+            fraction = min(Decimal("1"), max(Decimal("0"), fraction))
+            requested_quantity = quantity if fraction >= Decimal("1") else quantity * fraction
+            if action is not None and requested_quantity <= Decimal("0"):
+                action = None
+            thesis_fingerprint = result.strategy_decision_fingerprint or _sha256_text(f"{symbol}:{result.strategy_blockers}")
+            proposal_id: str | None = None
+            if action is not None:
+                # Include the current quantity and peak in the idempotency key.
+                # A partial/reduction fill changes the remaining quantity and
+                # must be eligible for a subsequent approved reduction, while
+                # an unchanged position must not be spammed with duplicates.
+                action_key = (
+                    f"{symbol}:{action}:{reason}:{thesis_fingerprint}:"
+                    f"{_decimal_text(requested_quantity)}:{_decimal_text(peak)}"
+                )
+                pending = self.storage.fetch_all(
+                    "SELECT id FROM crypto_paper_proposals WHERE symbol=? AND action=? AND status IN ('pending','approved','intent_created','submitted','partially_filled') LIMIT 1",
+                    (symbol, action),
+                )
+                if not pending and (previous is None or str(previous["last_action"] or "") != action_key):
+                    request = CryptoSizingRequest(
+                        source_type="crypto_position_management",
+                        source_id=action_key,
+                        source_fingerprint=_sha256_text(action_key),
+                        symbol=symbol,
+                        side="sell",
+                        action=action,
+                        request_basis="quantity",
+                        requested_exit_quantity=requested_quantity,
+                        close_entire_position=action == "exit" and fraction >= Decimal("1"),
+                    )
+                    evaluation = CryptoRiskStore(self.storage).evaluate(
+                        self.config,
+                        self.broker,
+                        self.run_id,
+                        capability.id,
+                        result.market_evidence_id,
+                        request,
+                        now=now,
+                    )
+                    if evaluation.risk_eligible:
+                        lane = CryptoPaperLaneStore(self.storage)
+                        proposal = lane.create_proposal(self.config, None, evaluation.decision_id, now=now)
+                        # The proposal itself remains immutable; the stable key
+                        # is persisted in the position-management state and in
+                        # the audit record for deduplication/recovery.
+                        proposal_id = proposal.id
+                        rendered = format_crypto_paper_proposal(proposal)
+                        if self.telegram is not None:
+                            sent = self.telegram.send_message(rendered)
+                            message_id = getattr(sent, "message_id", None)
+                            if message_id is None and isinstance(sent, dict):
+                                message_id = sent.get("message_id") or sent.get("id")
+                            if message_id is not None:
+                                lane.bind_telegram_message(
+                                    proposal.id,
+                                    str(message_id),
+                                    self.config,
+                                    chat_id=getattr(self.telegram, "chat_id", None),
+                                    rendered_text=rendered,
+                                    now=now,
+                                )
+                        self.storage.audit(
+                            self.run_id,
+                            "crypto_position_management_proposal_created",
+                            {"symbol": symbol, "action": action, "reason": reason, "proposal_id": proposal.id, "quantity": _decimal_text(requested_quantity)},
+                        )
+                    else:
+                        self.storage.audit(
+                            self.run_id,
+                            "crypto_position_management_blocked",
+                            {"symbol": symbol, "action": action, "reason": reason, "risk_reasons": list(evaluation.reasons)},
+                        )
+            self.storage.execute(
+                """INSERT INTO crypto_paper_position_management(
+                   id,symbol,quantity,average_entry_price,peak_price,stop_price,profit_target_price,
+                   time_stop_at,thesis_fingerprint,last_action,last_proposal_id,updated_at,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol) DO UPDATE SET quantity=excluded.quantity,
+                   average_entry_price=excluded.average_entry_price,peak_price=excluded.peak_price,
+                   stop_price=excluded.stop_price,profit_target_price=excluded.profit_target_price,
+                   time_stop_at=excluded.time_stop_at,thesis_fingerprint=excluded.thesis_fingerprint,
+                   last_action=COALESCE(excluded.last_action,crypto_paper_position_management.last_action),
+                   last_proposal_id=COALESCE(excluded.last_proposal_id,crypto_paper_position_management.last_proposal_id),
+                   updated_at=excluded.updated_at""",
+                (
+                    str(uuid.uuid4()), symbol, _decimal_text(quantity), _decimal_text(average_entry), _decimal_text(peak),
+                    _decimal_text(stop_price), _decimal_text(profit_target), time_stop_at.isoformat(), thesis_fingerprint,
+                    action_key if action else None, proposal_id, now.isoformat(), created_at,
+                ),
+            )
+
     def _maybe_create_supervised_paper_proposal(
         self,
         result: CryptoResearchResult,
@@ -390,7 +592,8 @@ class CryptoResearchEngine:
             if not evaluation.risk_eligible:
                 result.risk_metrics["supervised_paper_blockers"] = list(evaluation.reasons)
                 return
-            proposal = CryptoPaperLaneStore(self.storage).create_proposal(
+            lane_store = CryptoPaperLaneStore(self.storage)
+            proposal = lane_store.create_proposal(
                 self.config, strategy.id, evaluation.decision_id, now=now,
             )
             result.risk_metrics["supervised_paper_proposal_id"] = proposal.id
@@ -398,13 +601,21 @@ class CryptoResearchEngine:
             result.reason = "fresh_manual_approval_required"
             if self.telegram is not None:
                 try:
-                    sent = self.telegram.send_message(format_crypto_paper_proposal(proposal))
+                    rendered = format_crypto_paper_proposal(proposal)
+                    sent = self.telegram.send_message(rendered)
                     message_id = getattr(sent, "message_id", None)
                     if message_id is None and isinstance(sent, dict):
                         message_id = sent.get("message_id") or sent.get("id")
                     if message_id is not None:
-                        CryptoPaperLaneStore(self.storage).bind_telegram_message(
-                            proposal.id, str(message_id), self.config, now=now,
+                        chat_id = getattr(self.telegram, "chat_id", None)
+                        if chat_id is None and isinstance(sent, dict):
+                            chat = sent.get("chat") or {}
+                            chat_id = chat.get("id") if isinstance(chat, dict) else None
+                        lane_store.bind_telegram_message(
+                            proposal.id, str(message_id), self.config,
+                            chat_id=None if chat_id is None else str(chat_id),
+                            rendered_text=rendered,
+                            now=now,
                         )
                     else:
                         self.storage.audit(
@@ -995,6 +1206,28 @@ def _parse_dt(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _crypto_decimal(value: Any, label: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{label} is missing")
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is invalid") from exc
+    if not result.is_finite():
+        raise ValueError(f"{label} is not finite")
+    return result
+
+
+def _decimal_text(value: Decimal) -> str:
+    if value == Decimal("0"):
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
 def _iso_timestamp(value: Any) -> str | None:

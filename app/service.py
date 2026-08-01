@@ -436,6 +436,23 @@ class TradingService:
             lookup_reconciler=recover_lookup,
             max_items=100,
         )
+        crypto_recovery_count = 0
+        crypto_recovery_errors = 0
+        if self.broker is not None:
+            try:
+                from .crypto_paper_lane import CryptoPaperLaneStore
+
+                crypto_recovery = CryptoPaperLaneStore(self.storage).recover_pending(
+                    self.config, self.broker, now=datetime.now(UTC)
+                )
+                crypto_recovery_count = len(crypto_recovery)
+            except Exception as exc:
+                crypto_recovery_errors = 1
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_recovery_failed_closed",
+                    {"error": type(exc).__name__},
+                )
         consumed_without_intent = self.storage.fetch_all(
             """SELECT a.id,a.proposal_id FROM approvals a
                LEFT JOIN order_intents i ON i.approval_id=a.id
@@ -473,6 +490,8 @@ class TradingService:
             "approval_existing_intents_linked": local_recovery.existing_intent_linked,
             "approval_external_ambiguity": local_recovery.external_ambiguity,
             "approval_recovery_retryable_failures": local_recovery.failed_retryable,
+            "crypto_intents_reconciled": crypto_recovery_count,
+            "crypto_recovery_errors": crypto_recovery_errors,
         }
         state = "degraded" if any(detail.values()) else "healthy"
         self.storage.execute(
@@ -1608,7 +1627,152 @@ class TradingService:
             return None
         return match.group(1).lower(), match.group(2).upper().rstrip(".")
 
+    def _crypto_paper_control_providers(self) -> dict[str, Any]:
+        """Return measured fail-closed probes for the supervised crypto lane."""
+
+        telegram_health = getattr(self.telegram, "is_available", None)
+        return {
+            "power": lambda: get_power_status().connected is True,
+            "internet": lambda: internet_available() is True,
+            "database": lambda: self.storage.writable() is True,
+            "telegram": lambda: bool(telegram_health(force=True)) if callable(telegram_health) else False,
+        }
+
+    def _handle_crypto_telegram_update(
+        self,
+        *,
+        text: str,
+        sender: str,
+        chat_id: str | None,
+        reply_to_message_id: str | None,
+        update_id: Any,
+        message_id: Any,
+    ) -> bool:
+        """Route exact supervised-crypto commands before generic approvals.
+
+        Crypto proposals have a separate schema and authority chain.  Letting
+        them fall through to the equity parser would make an unbound or
+        malformed command look like an ordinary approval, so every syntactic
+        ``YES/NO CRYPTO <uuid>`` command is consumed here and receives a
+        fail-closed response.
+        """
+
+        match = re.fullmatch(r"(?i)(YES|NO) CRYPTO ([0-9a-f-]{36})", str(text))
+        if not match:
+            return False
+        action, proposal_id = match.group(1).upper(), match.group(2)
+        chat = None if chat_id is None else str(chat_id)
+        if not self.telegram.is_authorized(sender):
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {
+                    "update_id": update_id,
+                    "message_id": message_id,
+                    "proposal_id": proposal_id,
+                    "action": action,
+                    "reason": "unauthorized_sender",
+                },
+            )
+            self.telegram.send_message("Crypto paper command rejected: sender is not authorized.", chat)
+            return True
+        if reply_to_message_id is None:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {"update_id": update_id, "message_id": message_id, "proposal_id": proposal_id, "action": action, "reason": "reply_target_missing"},
+            )
+            self.telegram.send_message("Crypto paper command rejected: reply directly to the displayed proposal.", chat)
+            return True
+        from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore
+
+        lane = CryptoPaperLaneStore(
+            self.storage,
+            control_providers=self._crypto_paper_control_providers(),
+        )
+        try:
+            if action == "NO":
+                rejection = lane.reject_proposal(
+                    proposal_id,
+                    self.config,
+                    sender_id=sender,
+                    allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
+                    raw_message=str(text),
+                    reply_to_message_id=str(reply_to_message_id),
+                    chat_id=chat,
+                )
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_telegram_rejected",
+                    {"proposal_id": proposal_id, "rejection_fingerprint": rejection.get("rejection_fingerprint"), "message_id": message_id},
+                )
+                self.telegram.send_message("❌ Crypto paper proposal rejected. No order was placed.", chat)
+                return True
+
+            approval = lane.approve_proposal(
+                proposal_id,
+                self.config,
+                sender_id=sender,
+                allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
+                raw_message=str(text),
+                reply_to_message_id=str(reply_to_message_id),
+                chat_id=chat,
+            )
+            intent = lane.create_intent(proposal_id, self.config)
+            execution = lane.execute_intent(intent.id, self.config, self.broker)
+            state = str(execution.get("state") or "")
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_approved",
+                {
+                    "proposal_id": proposal_id,
+                    "approval_fingerprint": approval.get("approval_fingerprint"),
+                    "intent_id": intent.id,
+                    "state": state,
+                    "broker_invocation_occurred": bool(execution.get("broker_invocation_occurred")),
+                    "broker_order_id": execution.get("broker_order_id"),
+                    "message_id": message_id,
+                },
+            )
+            if state in {"submitted", "partially_filled", "filled"}:
+                self.telegram.send_message(
+                    f"✅ Crypto paper order {state}. Broker evidence/reconciliation remains authoritative; no live order was placed.",
+                    chat,
+                )
+            elif state in {"unknown", "reconciliation_required"}:
+                self.telegram.send_message(
+                    "⚠️ Crypto paper approval reached an ambiguous broker state. No retry will occur; reconciliation is required.",
+                    chat,
+                )
+            else:
+                self.telegram.send_message(
+                    f"⚠️ Crypto paper approval was recorded, but no order was placed. Reason: {execution.get('last_error') or state or 'final controls blocked'}.",
+                    chat,
+                )
+        except CryptoPaperLaneError as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_blocked",
+                {"proposal_id": proposal_id, "action": action, "error": type(exc).__name__, "message_id": message_id},
+            )
+            self.telegram.send_message(
+                "⚠️ Crypto paper command blocked. The proposal remains unchanged unless the durable ledger accepted the command.",
+                chat,
+            )
+        except Exception as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_failed_closed",
+                {"proposal_id": proposal_id, "action": action, "error": type(exc).__name__, "message_id": message_id},
+            )
+            self.telegram.send_message("⚠️ Crypto paper command failed closed. No retry or live order was issued.", chat)
+        return True
+
     def _approval_intent_from_text(self, text: str) -> tuple[str, str | None, str | None, tuple[str, str] | None]:
+        crypto_match = re.fullmatch(r"(?i)(YES|NO) CRYPTO ([0-9a-f-]{36})", str(text).strip())
+        if crypto_match:
+            action = "crypto_yes" if crypto_match.group(1).upper() == "YES" else "crypto_no"
+            return action, None, crypto_match.group(2), None
         batch_match = self._parse_batch_approval_command(text)
         if batch_match:
             action_word, target = batch_match
@@ -4024,6 +4188,16 @@ class TradingService:
 
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
+
+            if self._handle_crypto_telegram_update(
+                text=text,
+                sender=sender,
+                chat_id=str((message.get("chat") or {}).get("id")) if (message.get("chat") or {}).get("id") is not None else None,
+                reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
+                update_id=update_id,
+                message_id=message.get("message_id"),
+            ):
+                continue
 
             # Rotation commands are explicit group-targeted approvals and must
             # never fall through to the generic YES/single-proposal parser.

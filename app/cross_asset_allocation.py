@@ -4,7 +4,9 @@ This boundary compares exact profitability evidence on a common risk, capital,
 time, uncertainty, and portfolio-contribution basis.  It is deliberately not
 order authority: plans cannot create proposals, approvals, intents,
 reservations, or broker requests.  The distinction lets equity and crypto
-research share one portfolio model while crypto remains research-only.
+research share one portfolio model while crypto remains non-authoritative:
+supervised-paper candidates may be ranked, but the resulting plan can never
+authorize an order.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ ONE = Decimal("1")
 HUNDRED = Decimal("100")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ASSET_CLASSES = frozenset({"equity", "etf", "crypto"})
-EXECUTION_LANES = frozenset({"operational_paper", "research_only"})
+EXECUTION_LANES = frozenset({"operational_paper", "research_only", "supervised_paper"})
 ACTIONS = frozenset({"entry", "add", "rotation_entry"})
 SOURCE_TYPES = frozenset(
     {"candidate_profitability_decision", "crypto_profitability_research"}
@@ -226,9 +228,13 @@ class CrossAssetCandidate:
         action = _required_text(self.action, "action").lower()
         if action not in ACTIONS:
             raise CrossAssetAllocationError("action is unsupported")
-        if asset_class == "crypto" and lane != "research_only":
+        if asset_class == "crypto" and lane not in {"research_only", "supervised_paper"}:
             raise CrossAssetAllocationError(
-                "crypto must remain research_only at the current capability stage"
+                "crypto must remain research_only or supervised_paper in the advisory allocator"
+            )
+        if asset_class != "crypto" and lane == "supervised_paper":
+            raise CrossAssetAllocationError(
+                "supervised_paper execution lane is reserved for crypto"
             )
         evidence_time = _timestamp(self.evidence_as_of, "evidence_as_of")
         age = Decimal(str((evaluation_time - evidence_time).total_seconds()))
@@ -641,13 +647,24 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
             "cross-asset allocation requires paper/manual-only capability controls"
         )
     crypto = config.get("crypto") or {}
-    if (
-        not isinstance(crypto, Mapping)
-        or crypto.get("mode") != "research_only"
-        or crypto.get("paper_trading_enabled") is not False
-    ):
+    crypto_research = (
+        isinstance(crypto, Mapping)
+        and crypto.get("mode") == "research_only"
+        and crypto.get("paper_trading_enabled") is False
+    )
+    crypto_supervised = (
+        isinstance(crypto, Mapping)
+        and crypto.get("mode") == "supervised_paper"
+        and crypto.get("paper_trading_enabled") is True
+        and crypto.get("proposals_enabled") is True
+        and (crypto.get("supervised_paper_lane") or {}).get("enabled") is True
+        and (crypto.get("supervised_paper_lane") or {}).get("manual_approval_required") is True
+        and (crypto.get("supervised_paper_lane") or {}).get("autonomous_execution") is False
+        and (crypto.get("supervised_paper_lane") or {}).get("live_enabled") is False
+    )
+    if not (crypto_research or crypto_supervised):
         raise CrossAssetAllocationError(
-            "cross-asset allocation requires the crypto research-only capability"
+            "cross-asset allocation requires verified crypto research or supervised-paper capability"
         )
     raw = config.get("cross_asset_allocation") or {}
     if raw.get("enabled") is not True or raw.get("mode") != "research_advisory":
@@ -1137,11 +1154,12 @@ def optimize_cross_asset_allocation(
                 position_count += 1
                 asset_position_count[asset_key] = asset_position_count.get(asset_key, 0) + 1
                 planned_symbols.add(row["symbol"])
-            decision = (
-                "ALLOCATE_RESEARCH_ONLY"
-                if row["execution_lane"] == "research_only"
-                else "ALLOCATE_ADVISORY"
-            )
+            if row["asset_class"] == "crypto" and row["execution_lane"] == "supervised_paper":
+                decision = "ALLOCATE_SUPERVISED_PAPER_ADVISORY"
+            elif row["execution_lane"] == "research_only":
+                decision = "ALLOCATE_RESEARCH_ONLY"
+            else:
+                decision = "ALLOCATE_ADVISORY"
             if allocatable < requested_notional:
                 decision += "_PARTIAL"
         else:
@@ -1179,6 +1197,7 @@ def optimize_cross_asset_allocation(
                 "binding_constraints": list(binding),
                 "rejection_reasons": sorted(set(reasons)),
                 "order_authority": False,
+                "manual_approval_required": row["asset_class"] == "crypto" and row["execution_lane"] == "supervised_paper",
             }
         )
 

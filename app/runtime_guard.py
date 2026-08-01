@@ -221,6 +221,82 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
         "display_fingerprint", "proposal_json", "proposal_fingerprint",
         "config_hash", "formula_version", "schema_version",
     },
+    "crypto_paper_proposals": {
+        "id", "run_id", "strategy_decision_id", "strategy_decision_fingerprint",
+        "risk_decision_id", "risk_decision_fingerprint", "risk_snapshot_id",
+        "risk_snapshot_fingerprint", "sizing_decision_id", "sizing_decision_fingerprint",
+        "capability_snapshot_id", "capability_snapshot_fingerprint", "market_evidence_id",
+        "market_evidence_fingerprint", "symbol", "side", "action", "request_basis",
+        "quantity", "notional", "limit_price", "stop_price", "stop_risk", "status",
+        "created_at", "expires_at", "config_hash", "formula_versions_json",
+        "schema_version", "display_json", "display_fingerprint", "proposal_json",
+        "proposal_fingerprint", "telegram_message_id", "telegram_chat_id",
+        "telegram_display_text", "telegram_display_fingerprint", "telegram_bound_at",
+    },
+    "crypto_paper_approvals": {
+        "id", "proposal_id", "sender_id", "raw_message", "reply_to_message_id",
+        "parsed_action", "status", "approved_at", "consumed_at", "display_fingerprint",
+        "telegram_chat_id", "telegram_message_fingerprint", "approval_fingerprint",
+    },
+    "crypto_paper_reservations": {
+        "id", "intent_id", "symbol", "initial_notional", "active_notional",
+        "initial_stop_risk", "active_stop_risk", "state", "created_at", "updated_at",
+        "released_at", "release_reason",
+    },
+    "crypto_paper_intents": {
+        "id", "proposal_id", "approval_id", "logical_action_key", "client_order_id",
+        "symbol", "side", "request_basis", "requested_quantity", "requested_notional",
+        "limit_price", "stop_price", "reserved_notional", "reserved_stop_risk", "state",
+        "broker_invocation_occurred", "submission_attempt_count", "broker_order_id",
+        "last_error", "created_at", "updated_at", "first_submission_at", "terminal_at",
+    },
+    "crypto_paper_fills": {
+        "id", "intent_id", "broker_event_key", "quantity", "price", "fees", "occurred_at",
+        "received_at", "payload", "broker_order_id", "client_order_id", "evidence_id",
+        "evidence_fingerprint", "payload_fingerprint",
+    },
+    "crypto_paper_order_events": {
+        "id", "intent_id", "event_key", "from_state", "to_state", "event_type", "safe_detail", "created_at",
+    },
+    "crypto_paper_lots": {
+        "id", "symbol", "source_fill_event_key", "opened_at", "original_quantity",
+        "remaining_quantity", "unit_cost", "fees_allocated", "created_at",
+    },
+    "crypto_paper_realized_pnl": {
+        "id", "broker_event_key", "intent_id", "symbol", "quantity", "gross_proceeds",
+        "cost_basis", "fees", "realized_pl", "occurred_at", "created_at", "evidence_fingerprint", "confidence",
+    },
+    "crypto_paper_order_evidence": {
+        "id", "intent_id", "broker_order_id", "client_order_id", "symbol", "side", "status",
+        "requested_quantity", "requested_notional", "filled_quantity", "filled_average_price",
+        "fees", "payload", "payload_fingerprint", "captured_at", "verified", "verification_error",
+    },
+    "crypto_paper_reconciliation_events": {
+        "id", "intent_id", "event_type", "broker_order_id", "client_order_id", "payload",
+        "payload_fingerprint", "created_at",
+    },
+    "crypto_paper_rejections": {
+        "id", "proposal_id", "sender_id", "telegram_chat_id", "raw_message", "reply_to_message_id",
+        "telegram_message_fingerprint", "rejection_fingerprint", "rejected_at",
+    },
+    "crypto_paper_position_management": {
+        "id", "symbol", "quantity", "average_entry_price", "peak_price", "stop_price",
+        "profit_target_price", "time_stop_at", "thesis_fingerprint", "last_action",
+        "last_proposal_id", "updated_at", "created_at",
+    },
+    "crypto_performance_links": {
+        "id", "fill_id", "intent_id", "setup_id", "outcome_id", "broker_order_id",
+        "evidence_fingerprint", "realized_pl", "link_fingerprint", "created_at", "side",
+        "action", "quantity", "price", "fees", "fill_type",
+    },
+    "performance_setups": {
+        "id", "run_id", "symbol", "asset_class", "setup_type", "action_decision", "proposed",
+        "proposal_id", "broker_order_id", "fill_id", "order_status", "fill_price", "fill_qty",
+    },
+    "performance_outcomes": {
+        "id", "setup_id", "run_id", "symbol", "proposal_id", "broker_order_id", "fill_id",
+        "actual_or_shadow", "entry_time", "entry_price", "entry_notional", "entry_qty", "status",
+    },
     "cross_asset_allocation_plans": {
         "id", "run_id", "as_of", "expires_at", "portfolio_snapshot_id",
         "portfolio_snapshot_fingerprint", "candidate_set_json",

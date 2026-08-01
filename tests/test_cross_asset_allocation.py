@@ -151,8 +151,11 @@ def test_exact_configuration_remains_paper_manual_and_advisory_only():
     assert config["auto_execution_mode"] == "manual_only"
     assert config["cross_asset_allocation"]["mode"] == "research_advisory"
     assert config["cross_asset_allocation"]["produce_order_authority"] is False
-    assert config["crypto"]["mode"] == "research_only"
-    assert config["crypto"]["paper_trading_enabled"] is False
+    assert config["crypto"]["mode"] == "supervised_paper"
+    assert config["crypto"]["paper_trading_enabled"] is True
+    assert config["crypto"]["proposals_enabled"] is True
+    assert config["crypto"]["supervised_paper_lane"]["manual_approval_required"] is True
+    assert config["crypto"]["supervised_paper_lane"]["autonomous_execution"] is False
 
 
 def test_cross_asset_ranking_is_deterministic_and_input_order_independent():
