@@ -11367,7 +11367,15 @@ class TradingService:
             )
         quote = candidate.get("profitability_quote")
         if quote is None:
-            quote = self.broker.get_latest_quote(symbol)
+            # Profitability is an entry-admission control, so its market
+            # evidence must use the same feed, freshness, spread, and
+            # two-sided quote policy as proposal creation and final
+            # revalidation.  Calling the broker getter directly here would
+            # allow an invalid quote to influence ranking before the later
+            # proposal gate could reject it.
+            quote = validated_quote(
+                self.broker, symbol, self.config, now=datetime.now(UTC)
+            )
         bid = _value(quote, "bid_price", _value(quote, "bid"))
         ask = _value(quote, "ask_price", _value(quote, "ask"))
         quote_at = _value(quote, "timestamp")
