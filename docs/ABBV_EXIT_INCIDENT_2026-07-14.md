@@ -215,6 +215,39 @@ The production database was not remediated because the investigated failed propo
 was already terminal and later blocking came from fresh reproduced exit decisions,
 not a corrupt stuck flag.
 
+## Read-only follow-up state through 2026-07-31
+
+A later read-only query of the canonical paper database was used to separate the
+historical incident from subsequent ABBV lifecycle events. This query did not call
+the broker, change the database, clear a blocker, or submit an order.
+
+The original proposal `e1986bb1-a498-4111-843b-0090ecdeeb0d` still has the expected
+terminal evidence: approval `7ac91ac8-7d4b-4854-9301-c2c56c13096a` is consumed with
+`final_order_decision=blocked` and the exact legacy reason `Price refresh failed or
+price is unavailable`; its workflow is `blocked`, and there is no linked intent or
+order. The July 14 audit events also show that the *fresh current-cycle* ABBV
+`TIME_STOP_EXIT` decision suppressed unrelated IWM and XLV BUY candidates while
+that exit priority was active. This was intentional exit-first behavior, not an
+indefinite consequence of the failed quote refresh.
+
+The same database later records a separate, fresh ABBV exit proposal
+`f5e05f0b-6ad7-4f67-b340-89c854c87abc` (Telegram message `843`) that was manually
+approved and filled. Its paper order was `0.433314683` shares at an average fill of
+`258.46`, with a final quote timestamp of `2026-07-30T17:29:38.629776+00:00` and a
+`17.03` bps spread. The proposal, approval, intent, and workflow are all
+terminal. Later market-memory rows repeatedly record
+`proposal not sent: stale Alpaca price at proposal creation (price timestamp must
+be fresh)`, followed by a HOLD/no-entry result; those rows are safety suppressions,
+not approvals or broker ambiguity.
+
+The pre-migration production database still lacks the additive
+`exit_blocker_states` table, so this follow-up is evidence only and is not a
+deployment or migration gate. Current live positions and open orders were not
+re-read from Alpaca in this follow-up. The hardened runtime must therefore retain
+the documented rule: a genuinely fresh, position-backed exit decision may block
+new BUY proposals until it is resolved, while a terminal historical proposal or
+stale market-memory wording must never do so.
+
 ## Verification and rollout constraints
 
 The complete offline pytest suite and compile pass must be green on the PR head, and
