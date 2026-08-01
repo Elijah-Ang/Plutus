@@ -5004,14 +5004,20 @@ class TradingService:
                 market_open = False
 
         # Get the proposal price
-        proposal_price = (
+        raw_proposal_price = (
             proposal.get("proposal_price")
             or proposal.get("latest_price")
             or row.get("current_price")
             or row.get("price")
         )
-        if proposal_price is not None:
-            proposal_price = float(proposal_price)
+        proposal_price = None
+        if raw_proposal_price is not None:
+            try:
+                proposal_price = float(raw_proposal_price)
+            except (TypeError, ValueError, OverflowError):
+                block_reason = block_reason or "proposal reference price is invalid"
+            if proposal_price is not None and not math.isfinite(proposal_price):
+                block_reason = block_reason or "proposal reference price is invalid"
 
         if block_reason is None and (proposal_price is None or proposal_price <= 0):
             block_reason = "proposal reference price is unavailable"

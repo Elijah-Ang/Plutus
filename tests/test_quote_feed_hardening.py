@@ -251,6 +251,55 @@ def test_final_abbv_revalidation_blocks_with_evidence_and_zero_broker_calls(tmp_
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 
+@pytest.mark.parametrize("bad_price", [float("nan"), float("inf"), float("-inf")])
+def test_final_revalidation_rejects_nonfinite_proposal_reference_price(
+    tmp_path, bad_price
+) -> None:
+    storage = Storage(tmp_path / f"nonfinite-proposal-price-{str(bad_price)}.db")
+    storage.initialize()
+
+    class NarrowQuoteBroker(ScannerWideQuoteBroker):
+        def get_latest_quote(self, symbol: str):
+            return {
+                "bid_price": 251.79,
+                "ask_price": 251.81,
+                "timestamp": self.quote_timestamp,
+                "feed": "iex",
+            }
+
+    broker = NarrowQuoteBroker()
+    service = TradingService(quote_config(), storage, broker, "nonfinite-proposal-price-run")
+    proposal = {
+        "id": "nonfinite-proposal-price",
+        "symbol": "ABBV",
+        "side": "sell",
+        "action": "exit",
+        "qty": 5.0,
+        "notional": 1250.0,
+        "latest_price": bad_price,
+        "price_at": broker.quote_timestamp.isoformat(),
+    }
+    row = {
+        "id": "nonfinite-proposal-price",
+        "symbol": "ABBV",
+        "side": "sell",
+        "notional": 1250.0,
+        "current_price": bad_price,
+        "emergency_exit_triggered": 0,
+    }
+
+    result, *_ = service._execute_final_revalidation(
+        row, proposal, "ABBV", "sell", False, "nonfinite-proposal-price-approval"
+    )
+
+    assert result.submitted is False
+    assert result.status == "blocked"
+    assert result.reason == "proposal reference price is invalid"
+    assert broker.submission_calls == 0
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+
+
 def test_missing_broker_has_deterministic_pre_submission_reason(tmp_path) -> None:
     storage = Storage(tmp_path / "quote-no-broker.db")
     storage.initialize()
