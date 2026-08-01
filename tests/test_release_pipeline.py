@@ -20,7 +20,12 @@ from scripts.build_isolated_wheel import (
     verify_wheel_evidence,
 )
 from scripts.prune_release_runtime_state import prune_runtime_state
-from scripts.verify_release_artifact import REQUIRED_PYTHON, installed_app_package_digests, verify
+from scripts.verify_release_artifact import (
+    REQUIRED_PYTHON,
+    installed_app_package_digests,
+    verify,
+    verify_release_file_inventory,
+)
 from scripts.verify_source_tree import create_inventory, verify_inventory
 
 
@@ -359,6 +364,7 @@ def test_release_build_uses_external_verified_wheel_workspace_and_atomic_promoti
     assert script.rindex(source_verify) > script.index(final_inventory)
     assert 'rm -rf "$STAGING/.git" "$STAGING/data" "$STAGING/logs" "$STAGING/scratch"' not in script
     assert script.index('mv "$STAGING" "$DEST"') > script.index('scripts/verify_release_artifact.py')
+    assert '[[ ! -e "$DEST" && ! -L "$DEST" ]]' in script
 
 
 def test_release_state_pruning_preserves_tracked_placeholders_and_removes_generated_state(tmp_path) -> None:
@@ -703,6 +709,30 @@ def test_missing_tracked_file_fails(tmp_path) -> None:
     (tmp_path / "app.py").unlink()
     with pytest.raises(ValueError, match="missing"):
         verify_inventory(tmp_path, inventory, authority=authority)
+
+
+def test_changed_tracked_executable_bit_fails_source_authority(tmp_path) -> None:
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    authority = _source_authority(tmp_path)
+    inventory = create_inventory(tmp_path, commit="commit-a", authority=authority)
+    (tmp_path / "app.py").chmod(0o755)
+    with pytest.raises(ValueError, match="executable mode"):
+        verify_inventory(tmp_path, inventory, authority=authority)
+
+
+def test_release_file_inventory_rejects_symlink_before_resolution(tmp_path) -> None:
+    root, manifest = _artifact(tmp_path)
+    target = root / "app.py"
+    link = root / "generated-link"
+    link.symlink_to(target)
+    inventory = root / "release-file-inventory.sha256"
+    inventory.write_text(
+        f"{_digest(target)}  ./generated-link\n",
+        encoding="utf-8",
+    )
+    manifest["release_file_inventory_sha256"] = _digest(inventory)
+    with pytest.raises(ValueError, match="unsafe"):
+        verify_release_file_inventory(root, manifest)
 
 
 def test_generated_artifact_evidence_is_outside_tracked_source_inventory(tmp_path) -> None:

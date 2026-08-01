@@ -64,7 +64,13 @@ def verify_release_file_inventory(root: Path, manifest: dict[str, Any]) -> dict[
             raise ValueError("release file inventory contains an excluded generated file")
         if relative in entries:
             raise ValueError("release file inventory contains a duplicate path")
-        target = (root / candidate).resolve()
+        raw_target = root / candidate
+        # Inspect the path before resolving it.  Otherwise a symlink to a
+        # regular in-tree file would resolve to a safe-looking target and
+        # silently bypass the generated-artifact inventory's path check.
+        if raw_target.is_symlink():
+            raise ValueError(f"release file inventory target is missing or unsafe: {relative}")
+        target = raw_target.resolve()
         if not target.is_relative_to(root) or not target.is_file() or target.is_symlink():
             raise ValueError(f"release file inventory target is missing or unsafe: {relative}")
         actual = digest(target)

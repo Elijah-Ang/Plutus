@@ -37,7 +37,7 @@ RELEASE_ID="${RELEASE_ID:-${COMMIT:0:12}}"
   print -u2 -- "release id contains unsafe characters"; exit 2
 }
 DEST="$RELEASE_ROOT/$RELEASE_ID"
-[[ ! -e "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
+[[ ! -e "$DEST" && ! -L "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
 ELIGIBILITY=$(mktemp -t plutus-release-eligibility.XXXXXX)
 mkdir -p "$RELEASE_ROOT"
 LOCK="$DEST.building"
@@ -208,7 +208,7 @@ PY
 chmod 755 "$STAGING/scripts/run_once.sh" "$STAGING/scripts/run_telegram_listener.sh"
 find "$STAGING" -type d -exec chmod a-w {} +
 find "$STAGING" -type f -exec chmod a-w {} +
-[[ ! -e "$DEST" ]] || { print -u2 -- "release destination appeared during construction"; exit 2; }
+[[ ! -e "$DEST" && ! -L "$DEST" ]] || { print -u2 -- "release destination appeared during construction"; exit 2; }
 mv "$STAGING" "$DEST"
 STAGING=""
 rmdir "$LOCK"
