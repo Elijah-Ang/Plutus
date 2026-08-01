@@ -211,10 +211,8 @@ class ProfitabilityCandidateInput:
 
     def canonical(self, *, quote_max_age_seconds: Decimal) -> dict[str, Any]:
         asset_class = _required_text(self.asset_class, "asset_class").lower()
-        if asset_class not in {"equity", "etf"}:
-            raise ProfitabilityRankingError(
-                "profitability ranking v1 supports equities and ETFs only"
-            )
+        if asset_class not in {"equity", "etf", "crypto"}:
+            raise ProfitabilityRankingError("profitability ranking v1 supports equity, ETF, and crypto candidates")
         action = _required_text(self.action, "action").lower()
         if action not in {"entry", "add", "rotation_entry"}:
             raise ProfitabilityRankingError("candidate action is unsupported")
@@ -848,23 +846,36 @@ def calculate_candidate_profitability(
     estimation_uncertainty = notional * _model_decimal(
         model, "estimation_uncertainty_bps", minimum=ZERO
     ) / BPS
-    # Section 31 is assessed on the covered sale value. Use the displayed
-    # target sale notional rather than entry notional so profitable exits do
-    # not understate the regulatory drag.
-    sec_fee = quantity * target * _model_decimal(
-        model, "sec_sell_fee_rate", minimum=ZERO
-    )
-    taf_fee = min(
-        quantity
-        * _model_decimal(model, "finra_taf_per_share", minimum=ZERO),
-        _model_decimal(model, "finra_taf_max", minimum=ZERO),
-    )
-    cat_fee = (
-        quantity
-        * _model_decimal(model, "cat_fee_per_share_per_side", minimum=ZERO)
-        * Decimal("2")
-    )
-    regulatory = sec_fee + taf_fee + cat_fee
+    # Section 31/TAF/CAT are equity-market charges.  Crypto uses the
+    # configured Alpaca spot transaction fee instead and must not inherit
+    # equity regulatory arithmetic.
+    if data["asset_class"] == "crypto":
+        regulatory = ZERO
+    else:
+        sec_fee = quantity * target * _model_decimal(
+            model, "sec_sell_fee_rate", minimum=ZERO
+        )
+        taf_fee = min(
+            quantity
+            * _model_decimal(model, "finra_taf_per_share", minimum=ZERO),
+            _model_decimal(model, "finra_taf_max", minimum=ZERO),
+        )
+        cat_fee = (
+            quantity
+            * _model_decimal(model, "cat_fee_per_share_per_side", minimum=ZERO)
+            * Decimal("2")
+        )
+        regulatory = sec_fee + taf_fee + cat_fee
+    crypto_transaction = ZERO
+    if data["asset_class"] == "crypto":
+        crypto_fee_bps = _trusted_decimal(
+            ((config.get("crypto") or {}).get("sizing_policy") or {}).get(
+                "conservative_taker_fee_bps_per_side", "0"
+            ),
+            "crypto conservative taker fee bps",
+            minimum=ZERO,
+        )
+        crypto_transaction = notional * crypto_fee_bps * Decimal("2") / BPS
     worst_additional = notional * _model_decimal(
         model, "worst_additional_cost_bps", minimum=ZERO
     ) / BPS
@@ -873,6 +884,7 @@ def calculate_candidate_profitability(
             spread,
             slippage,
             regulatory,
+            crypto_transaction,
             market_impact,
             implementation_shortfall,
             adverse_selection,
@@ -909,7 +921,7 @@ def calculate_candidate_profitability(
         slippage=slippage,
         fees=ZERO,
         regulatory=regulatory,
-        crypto_transaction=ZERO,
+        crypto_transaction=crypto_transaction,
         market_impact=market_impact,
         implementation_shortfall=implementation_shortfall,
         adverse_selection=adverse_selection,

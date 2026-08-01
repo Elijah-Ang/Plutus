@@ -21,6 +21,24 @@ def test_release_eligibility_never_treats_skipped_local_or_remote_checks_as_pass
     assert report["release_eligible"] is False
 
 
+def test_release_local_gate_uses_invoking_interpreter(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return release_check.subprocess.CompletedProcess(args, 0, "candidate\n", "")
+        return release_check.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(release_check, "_run", fake_run)
+    report = build_report(run_tests=True, check_remote=False)
+
+    assert report["local_tests"]["passed"] is True
+    assert (release_check.sys.executable, "-m", "compileall", "app", "tests", "scripts") in calls
+    assert (release_check.sys.executable, "-m", "pytest", "-q") in calls
+    assert ("python", "-m", "pytest", "-q") not in calls
+
+
 class _Response(io.BytesIO):
     def __enter__(self):
         return self
@@ -57,6 +75,25 @@ def test_remote_ci_requires_named_jobs_to_pass(monkeypatch) -> None:
     result = _remote_ci("abc", "owner/repo", skip=False)
     assert result["passed"] is True
     assert result["required_jobs"] == ["offline-tests"]
+
+
+def test_remote_ci_rejects_duplicate_required_jobs(monkeypatch) -> None:
+    run_payload = {"workflow_runs": [
+        {"id": 8, "name": "CI", "head_sha": "abc", "created_at": "2026-07-14T08:00:00Z",
+         "status": "completed", "conclusion": "success"},
+    ]}
+    jobs_payload = {"jobs": [
+        {"name": "offline-tests", "status": "completed", "conclusion": "success"},
+        {"name": "offline-tests", "status": "completed", "conclusion": "success"},
+    ]}
+    payloads = iter((run_payload, jobs_payload))
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: _Response(json.dumps(next(payloads)).encode()),
+    )
+    result = _remote_ci("abc", "owner/repo", skip=False)
+    assert result["passed"] is False
+    assert result["required_jobs_duplicated"] == ["offline-tests"]
 
 
 def test_release_reachability_uses_exact_github_main_sha(monkeypatch) -> None:

@@ -213,8 +213,11 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     cfg = config.get("crypto") or {}
     policy = cfg.get("sizing_policy") or {}
     failures: list[str] = []
-    if policy.get("mode") != "research_only":
-        failures.append("sizing_policy_mode_not_research_only")
+    lane_enabled = (cfg.get("supervised_paper_lane") or {}).get("enabled") is True
+    if policy.get("mode") not in {"research_only", "supervised_paper"}:
+        failures.append("sizing_policy_mode_invalid")
+    if policy.get("mode") == "supervised_paper" and not lane_enabled:
+        failures.append("supervised_sizing_requires_enabled_paper_lane")
     if policy.get("formula_version") != CRYPTO_SIZING_FORMULA_VERSION:
         failures.append("sizing_formula_identity_mismatch")
     if policy.get("schema_version") != CRYPTO_SIZING_SCHEMA_VERSION:
@@ -250,10 +253,12 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     if policy.get("allow_full_position_dust_exit") is not True:
         failures.append("full_position_dust_exit_not_enabled")
     if decimals:
-        if decimals.get("minimum_buy_notional_usd") != Decimal("1"):
-            failures.append("minimum_buy_notional_must_be_one_usd")
-        if decimals.get("maximum_order_notional_usd", ZERO) > Decimal("5"):
-            failures.append("maximum_order_notional_exceeds_stage_ceiling")
+        if decimals.get("minimum_buy_notional_usd", ZERO) <= ZERO:
+            failures.append("minimum_buy_notional_must_be_positive")
+        if decimals.get("maximum_order_notional_usd", ZERO) > Decimal("50000"):
+            failures.append("maximum_order_notional_exceeds_operational_ceiling")
+        if decimals.get("maximum_order_notional_usd", ZERO) < decimals.get("minimum_buy_notional_usd", ZERO):
+            failures.append("crypto_notional_bounds_invalid")
         if decimals.get("conservative_taker_fee_bps_per_side") != Decimal("25"):
             failures.append("taker_fee_policy_not_conservative_tier_one")
         minimum_stop = decimals.get("minimum_stop_distance_pct", ZERO)

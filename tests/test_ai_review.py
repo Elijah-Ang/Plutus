@@ -22,3 +22,11 @@ def test_call_limit_falls_back():
     assert "JSONDecodeError" in r2["risks"][-1]
     r3 = reviewer.review({"symbol": "QQQ", "side": "buy", "notional": 5})
     assert "exceeded call limit" in r3["risks"][-1]
+
+
+def test_nested_production_call_limit_is_authoritative():
+    client = BadResponses()
+    reviewer = AIReviewer({"model": "test", "ai_max_calls_per_run": 1}, client)
+    reviewer.review({"symbol": "QQQ", "side": "buy", "notional": 5})
+    blocked = reviewer.review({"symbol": "QQQ", "side": "buy", "notional": 5})
+    assert "exceeded call limit of 1" in blocked["risks"][-1]

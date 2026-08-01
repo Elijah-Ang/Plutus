@@ -1,12 +1,11 @@
 """Immutable, non-executable proposal previews for supervised spot crypto.
 
-This is the proposal-authority half of the crypto strategy roadmap stage.  It
-binds an exact research setup to verified broker/capability/market/risk/sizing
-evidence and renders the complete future approval surface.  The current stage
-intentionally persists ``manual_approval_eligible=0`` and
-``execution_authorized=0`` and never writes ``trade_proposals`` or calls
-Telegram or Alpaca.  A later separately reviewed execution stage must replace
-that boundary; regenerating this local preview is never order authority.
+This is the non-approvable research-preview half of the crypto strategy lane.
+It binds an exact setup to verified evidence and renders a future approval
+surface.  It intentionally persists ``manual_approval_eligible=0`` and
+``execution_authorized=0`` and never writes ``trade_proposals``.  The separate
+``crypto_paper_lane`` owns the opt-in manual paper authority; regenerating this
+preview is never order authority.
 """
 
 from __future__ import annotations
@@ -110,8 +109,8 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         failures.append("manual_approval_not_disabled_in_preview_stage")
     if policy.get("execution_enabled") is not False:
         failures.append("execution_not_disabled_in_preview_stage")
-    if cfg.get("mode") != "research_only" or cfg.get("paper_trading_enabled") is not False or cfg.get("proposals_enabled") is not False or cfg.get("live_enabled") is not False:
-        failures.append("global_crypto_lane_not_research_only_disabled")
+    if cfg.get("live_enabled") is not False or cfg.get("allow_margin") is not False or cfg.get("allow_shorting") is not False:
+        failures.append("global_crypto_safety_boundary_changed")
     try:
         expiry_minutes = int(policy.get("preview_expiry_minutes"))
     except (TypeError, ValueError):

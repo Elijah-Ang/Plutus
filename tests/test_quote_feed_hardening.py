@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -100,6 +101,33 @@ class ScannerWideQuoteBroker(WideQuoteBroker):
             "daily_loss_confidence": "verified",
             "weekly_loss_confidence": "verified",
             "reference_equity": 10_000.0,
+        }
+
+
+class MixedQuoteBroker(ScannerWideQuoteBroker):
+    """Return the incident-wide quote only for ABBV and a valid quote elsewhere."""
+
+    def get_positions(self):
+        return []
+
+    def get_account(self):
+        return SimpleNamespace(
+            equity=10_000.0,
+            last_equity=10_000.0,
+            cash=10_000.0,
+            buying_power=10_000.0,
+            long_market_value=0.0,
+            short_market_value=0.0,
+        )
+
+    def get_latest_quote(self, symbol: str):
+        if str(symbol).upper() == "ABBV":
+            return super().get_latest_quote(symbol)
+        return {
+            "bid_price": 251.79,
+            "ask_price": 251.81,
+            "timestamp": self.quote_timestamp,
+            "feed": "iex",
         }
 
 
@@ -223,9 +251,104 @@ def test_final_abbv_revalidation_blocks_with_evidence_and_zero_broker_calls(tmp_
     assert storage.fetch_all("SELECT * FROM orders") == []
 
 
-def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("bad_price", [float("nan"), float("inf"), float("-inf")])
+def test_final_revalidation_rejects_nonfinite_proposal_reference_price(
+    tmp_path, bad_price
 ) -> None:
+    storage = Storage(tmp_path / f"nonfinite-proposal-price-{str(bad_price)}.db")
+    storage.initialize()
+
+    class NarrowQuoteBroker(ScannerWideQuoteBroker):
+        def get_latest_quote(self, symbol: str):
+            return {
+                "bid_price": 251.79,
+                "ask_price": 251.81,
+                "timestamp": self.quote_timestamp,
+                "feed": "iex",
+            }
+
+    broker = NarrowQuoteBroker()
+    service = TradingService(quote_config(), storage, broker, "nonfinite-proposal-price-run")
+    proposal = {
+        "id": "nonfinite-proposal-price",
+        "symbol": "ABBV",
+        "side": "sell",
+        "action": "exit",
+        "qty": 5.0,
+        "notional": 1250.0,
+        "latest_price": bad_price,
+        "price_at": broker.quote_timestamp.isoformat(),
+    }
+    row = {
+        "id": "nonfinite-proposal-price",
+        "symbol": "ABBV",
+        "side": "sell",
+        "notional": 1250.0,
+        "current_price": bad_price,
+        "emergency_exit_triggered": 0,
+    }
+
+    result, *_ = service._execute_final_revalidation(
+        row, proposal, "ABBV", "sell", False, "nonfinite-proposal-price-approval"
+    )
+
+    assert result.submitted is False
+    assert result.status == "blocked"
+    assert result.reason == "proposal reference price is invalid"
+    assert broker.submission_calls == 0
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+
+
+def test_missing_broker_has_deterministic_pre_submission_reason(tmp_path) -> None:
+    storage = Storage(tmp_path / "quote-no-broker.db")
+    storage.initialize()
+    service = TradingService(quote_config(), storage, None, "quote-no-broker-run")
+    proposal = {
+        "id": "no-broker-proposal",
+        "symbol": "ABBV",
+        "side": "sell",
+        "action": "exit",
+        "qty": 1.0,
+        "notional": 250.0,
+        "latest_price": 250.0,
+        "price_at": datetime.now(UTC).isoformat(),
+    }
+    row = {
+        "id": "no-broker-proposal",
+        "symbol": "ABBV",
+        "side": "sell",
+        "notional": 250.0,
+        "current_price": 250.0,
+        "emergency_exit_triggered": 0,
+    }
+
+    result, *_ = service._execute_final_revalidation(
+        row, proposal, "ABBV", "sell", False, "no-broker-approval"
+    )
+
+    assert result.submitted is False
+    assert result.status == "blocked"
+    assert result.intent_id is None
+    assert "broker was unavailable before final quote validation" in result.reason
+    assert "no broker request was attempted" in result.reason
+    assert "Price refresh failed or price is unavailable" not in result.reason
+    audits = storage.fetch_all(
+        "SELECT detail FROM audit_events WHERE event_type='final_execution_preflight_blocked'"
+    )
+    assert len(audits) == 1
+    detail = json.loads(audits[0]["detail"])
+    assert detail["code"] == "broker_unavailable_pre_submission"
+    assert detail["broker_invocation_occurred"] == 0
+    assert storage.fetch_all("SELECT * FROM order_intents") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+    assert storage.fetch_all("SELECT * FROM orders") == []
+
+
+def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    caplog.set_level(logging.INFO, logger="trading_agent")
     config = load_config()
     config["market_profiles"] = {
         "abbv_only": {
@@ -271,6 +394,13 @@ def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
     assert len(memory) == 1
     assert memory[0]["proposal_generated"] == 0
     assert "Alpaca IEX quote spread 606.6 bps" in memory[0]["no_action_reason"]
+    summary_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "Why no proposal was generated:" in record.getMessage()
+    ]
+    assert summary_records
+    assert "ABBV: proposal not sent: Alpaca IEX quote spread 606.6 bps" in summary_records[-1]
     audits = storage.fetch_all(
         "SELECT detail FROM audit_events WHERE event_type='proposal_quote_validation_blocked'"
     )
@@ -278,6 +408,69 @@ def test_wide_quote_blocks_abbv_before_proposal_insert_or_telegram_display(
     detail = json.loads(audits[0]["detail"])
     assert detail["proposal_inserted"] == 0
     assert detail["telegram_proposal_sent"] == 0
+
+
+def test_wide_abbv_quote_does_not_block_unrelated_valid_buy(
+    tmp_path, monkeypatch
+) -> None:
+    config = load_config()
+    config["market_profiles"] = {
+        "mixed_quotes": {
+            "status": "active",
+            "broker": "alpaca",
+            "watchlist": ["ABBV", "SPY"],
+            "observation_watchlist": [],
+            "proposals_enabled": True,
+            "execution_enabled": True,
+        }
+    }
+    config["position_management"]["enabled"] = False
+    config["trend_management"]["enabled"] = False
+    config["phase3"]["enabled"] = False
+    config["phase3"]["active"] = False
+    config["phase4"]["enabled"] = False
+    config["phase4"]["active"] = False
+    config["risk"]["use_gpt_for_exit_explanations"] = False
+    config["ai"]["ai_daily_call_limit"] = 0
+    config["crypto"]["enabled"] = False
+    storage = Storage(tmp_path / "quote-unrelated.db")
+    storage.initialize()
+    broker = MixedQuoteBroker()
+    service = TradingService(config, storage, broker, "quote-unrelated-run")
+    service.telegram = CapturingTelegram()
+    monkeypatch.setattr(service, "_dynamic_universe_scan_symbols", lambda: ([], []))
+    monkeypatch.setattr(
+        "app.service.evaluate_symbol",
+        lambda symbol, *args, **kwargs: Signal(
+            "ENTRY",
+            "buy",
+            symbol,
+            "valid unrelated entry",
+            0.95,
+            {"volatility_20": 0.20},
+        ),
+    )
+
+    service.scan()
+
+    abbv_memory = storage.fetch_all(
+        "SELECT proposal_generated,no_action_reason,candidate_suppression_reason "
+        "FROM market_memory WHERE symbol='ABBV'"
+    )
+    assert len(abbv_memory) == 1
+    assert abbv_memory[0]["proposal_generated"] == 0
+    assert abbv_memory[0]["candidate_suppression_reason"] == "blocked_by_quote_policy"
+    assert "Alpaca IEX quote spread 606.6 bps" in abbv_memory[0]["no_action_reason"]
+
+    spy_proposals = storage.fetch_all(
+        "SELECT symbol,side,status FROM trade_proposals WHERE symbol='SPY'"
+    )
+    assert spy_proposals
+    assert all(row["side"] == "buy" for row in spy_proposals)
+    assert not storage.fetch_all(
+        "SELECT 1 FROM market_memory WHERE symbol='SPY' "
+        "AND candidate_suppression_reason='suppressed_due_to_exit_priority'"
+    )
 
 
 @pytest.mark.parametrize("feed", ["iex", "sip"])

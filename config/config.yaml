@@ -432,19 +432,21 @@ formula_versions:
   crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
   crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
+  crypto_paper_execution: crypto_supervised_paper_execution_v1_manual_limit_orders
+  crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v2
   cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
   phase4_allocation: phase4_multi_strategy_allocation_v7_stop_risk_dollars
   strategy_registry: strategy_execution_registry_formula_v2_full_policy
 
-# Crypto research lane: research-only by default. This is intentionally
+# Crypto supervised paper lane: continuous research and manual execution are
 # isolated from equity proposal frequency, sizing, scanner, and execution.
 crypto:
   enabled: true
-  mode: research_only
-  paper_trading_enabled: false
-  proposals_enabled: false
+  mode: supervised_paper
+  paper_trading_enabled: true
+  proposals_enabled: true
   live_enabled: false
   symbols:
     - BTC/USD
@@ -477,11 +479,11 @@ crypto:
   max_spread_bps: 50
   minimum_top_of_book_notional_usd: 1000.00
   sizing_policy:
-    mode: research_only
+    mode: supervised_paper
     formula_version: alpaca_crypto_decimal_stop_risk_sizing_v1
     schema_version: alpaca_crypto_decimal_sizing_decisions_v1
     minimum_buy_notional_usd: 1.00
-    maximum_order_notional_usd: 5.00
+    maximum_order_notional_usd: 5000.00
     maximum_quantity_decimal_places: 9
     maximum_notional_decimal_places: 2
     conservative_taker_fee_bps_per_side: 25.0
@@ -491,7 +493,7 @@ crypto:
     require_quantity_basis_for_sells: true
     allow_full_position_dust_exit: true
   risk_policy:
-    mode: research_only
+    mode: supervised_paper
     formula_version: alpaca_crypto_portfolio_risk_authority_v1
     schema_version: alpaca_crypto_portfolio_risk_snapshots_v1
     snapshot_ttl_seconds: 60
@@ -522,8 +524,8 @@ crypto:
     correlation_clusters:
       crypto_major: [BTC/USD, ETH/USD]
   strategy_policy:
-    mode: research_only
-    lifecycle: RESEARCH_ONLY
+    mode: supervised_paper
+    lifecycle: PAPER_ACTIVE
     formula_version: crypto_multi_strategy_point_in_time_v2_hourly_cadence
     schema_version: crypto_strategy_decisions_v1
     strategies: [time_series_trend, breakout_continuation, pullback_in_trend, volatility_adjusted_momentum]
@@ -554,6 +556,19 @@ crypto:
     send_telegram: false
     manual_approval_enabled: false
     execution_enabled: false
+  # Explicitly separate from the non-executable research-preview policy above.
+  # Every risk-increasing order requires an exact Telegram approval.
+  supervised_paper_lane:
+    enabled: true
+    paper_only: true
+    manual_approval_required: true
+    autonomous_execution: false
+    live_enabled: false
+    execution_enabled: true
+    order_type: limit
+    time_in_force: gtc
+    proposal_expiry_minutes: 3
+    maximum_order_notional_usd: 5000.00
   proposal_expiry_minutes: 3
   approval_max_price_age_seconds: 30
   approval_max_price_move_bps_base: 50
@@ -652,6 +667,7 @@ data_providers:
   dynamic_universe_provider: eodhd
 
 alpaca:
+  paper_trading_endpoint: https://paper-api.alpaca.markets
   # This account currently has the Basic real-time feed. IEX is one exchange,
   # not consolidated NBBO, so wide quotes fail closed. Change to sip only after
   # Alpaca confirms current real-time SIP entitlement.

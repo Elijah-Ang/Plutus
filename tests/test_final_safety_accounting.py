@@ -122,6 +122,7 @@ def test_malformed_pending_buy_exposure_blocks_new_sizing(tmp_path):
     assert result["final_notional"] == 0.0
     assert result["pending_exposure_unknown"] is True
     assert "malformed" in result["pending_exposure_unknown_reason"]
+    assert "float() argument" not in result["pending_exposure_unknown_reason"]
 
 
 def test_all_returned_sizing_caps_are_monotonic_ceilings():

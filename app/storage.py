@@ -363,6 +363,7 @@ class Storage:
             from .crypto_risk import apply_crypto_risk_schema
             from .crypto_strategies import apply_crypto_strategy_schema
             from .crypto_proposals import apply_crypto_proposal_schema
+            from .crypto_paper_lane import apply_crypto_paper_lane_schema
             from .cross_asset_allocation import apply_cross_asset_allocation_schema
             from .performance_lab import apply_performance_lab_classification_schema
             from .fixed_point_accounting import apply_fixed_point_accounting_schema
@@ -395,6 +396,7 @@ class Storage:
             apply_crypto_risk_schema(conn)
             apply_crypto_strategy_schema(conn)
             apply_crypto_proposal_schema(conn)
+            apply_crypto_paper_lane_schema(conn)
             apply_cross_asset_allocation_schema(conn)
             apply_performance_lab_classification_schema(conn)
             apply_fixed_point_accounting_schema(conn)
@@ -480,7 +482,9 @@ class Storage:
                 from .crypto_strategies import apply_crypto_strategy_schema
                 apply_crypto_strategy_schema(conn, record_migration=False)
                 from .crypto_proposals import apply_crypto_proposal_schema
+                from .crypto_paper_lane import apply_crypto_paper_lane_schema
                 apply_crypto_proposal_schema(conn, record_migration=False)
+                apply_crypto_paper_lane_schema(conn, record_migration=False)
                 from .cross_asset_allocation import apply_cross_asset_allocation_schema
                 apply_cross_asset_allocation_schema(conn, record_migration=False)
                 from .performance_lab import apply_performance_lab_classification_schema

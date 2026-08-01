@@ -371,7 +371,14 @@ def _loss_controls(
         }
     if not isinstance(raw, Mapping):
         raise RuntimeError("trusted loss-control provider returned invalid evidence")
-    as_of_value = raw.get("captured_at") or raw.get("as_of") or now.isoformat()
+    as_of_value = raw.get("captured_at") or raw.get("as_of")
+    if not as_of_value:
+        if os.getenv("TRADING_AGENT_TESTING") == "1":
+            # Synthetic offline fixtures are allowed to use the capture time;
+            # production providers must emit their own freshness evidence.
+            as_of_value = now.isoformat()
+        else:
+            raise RuntimeError("trusted loss-control evidence timestamp is missing")
     try:
         as_of = _utc(as_of_value)
     except (TypeError, ValueError) as exc:
@@ -447,19 +454,44 @@ def _verified_context(
     symbol_orders = [order for order in active_orders if str(_value(order, "symbol", "")).upper() == symbol]
     conflicting_buy = any(_order_side(order) == "buy" for order in symbol_orders)
     conflicting_sell = any(_order_side(order) == "sell" for order in symbol_orders)
-    open_sell_quantity = sum(
-        _remaining_order_quantity(order)
-        for order in symbol_orders
-        if _order_side(order) == "sell"
+    open_sell_quantity = _finite(
+        sum(
+            _finite(
+                _remaining_order_quantity(order),
+                f"open {symbol} sell quantity",
+            )
+            for order in symbol_orders
+            if _order_side(order) == "sell"
+        ),
+        f"open {symbol} sell quantity",
     )
-    holdings = sum(
-        _position_quantity(position)
-        for position in positions
-        if str(_value(position, "symbol", "")).upper() == symbol
+    holdings = _finite(
+        sum(
+            _finite(
+                _position_quantity(position),
+                f"{symbol} holdings quantity",
+            )
+            for position in positions
+            if str(_value(position, "symbol", "")).upper() == symbol
+        ),
+        f"{symbol} holdings quantity",
     )
 
-    active_notional = sum(float(row.get("active_notional") or 0) for row in reservations)
-    active_stop_risk = sum(float(row.get("active_stop_risk") or 0) for row in reservations)
+    def reservation_value(row: Mapping[str, Any], field: str) -> float:
+        raw = row.get(field)
+        return _finite(
+            0.0 if raw in (None, "") else raw,
+            f"reservation {field}",
+        )
+
+    active_notional = _finite(
+        sum(reservation_value(row, "active_notional") for row in reservations),
+        "active reserved exposure",
+    )
+    active_stop_risk = _finite(
+        sum(reservation_value(row, "active_stop_risk") for row in reservations),
+        "active reserved stop risk",
+    )
     recovery_reservation = next(
         (
             row for row in reservations
@@ -468,32 +500,51 @@ def _verified_context(
         None,
     )
     candidate_already_reserved = recovery_reservation is not None
-    proposed_notional = float(candidate.get("notional") or 0)
+    raw_notional = candidate.get("notional")
+    proposed_notional = _finite(
+        0.0 if raw_notional in (None, "") else raw_notional,
+        "candidate notional",
+    )
     if proposed_notional <= 0 and candidate.get("qty") is not None:
-        proposed_notional = float(candidate.get("qty") or 0) * max(
-            float(candidate.get("latest_price") or 0),
-            float(candidate.get("reference_price") or 0),
-            float(candidate.get("limit_price") or 0),
+        quantity = _finite(candidate.get("qty"), "candidate quantity")
+        prices = [
+            _finite(candidate.get(field), f"candidate {field}")
+            for field in ("latest_price", "reference_price", "limit_price")
+            if candidate.get(field) not in (None, "")
+        ]
+        proposed_notional = _finite(
+            quantity * max(prices, default=0.0),
+            "candidate derived notional",
         )
     position_values: dict[str, float] = {}
     for position in positions:
         key = str(_value(position, "symbol", "")).upper()
         if key:
-            position_values[key] = position_values.get(key, 0.0) + _position_value(position)
-    current_total = sum(position_values.values())
+            position_values[key] = position_values.get(key, 0.0) + _finite(
+                _position_value(position),
+                f"position {key} market value",
+            )
+    current_total = _finite(sum(position_values.values()), "current portfolio exposure")
     candidate_increment = (
         proposed_notional
         if is_entry and side == "buy" and not candidate_already_reserved
         else 0.0
     )
-    proposed_total = current_total + active_notional + candidate_increment
-    symbol_reserved = sum(
-        float(row.get("active_notional") or 0)
-        for row in reservations
-        if str(row.get("symbol") or "").upper() == symbol
+    proposed_total = _finite(
+        current_total + active_notional + candidate_increment,
+        "proposed total exposure",
     )
-    proposed_symbol = position_values.get(symbol, 0.0) + symbol_reserved + (
-        candidate_increment
+    symbol_reserved = _finite(
+        sum(
+            reservation_value(row, "active_notional")
+            for row in reservations
+            if str(row.get("symbol") or "").upper() == symbol
+        ),
+        f"reserved {symbol} exposure",
+    )
+    proposed_symbol = _finite(
+        position_values.get(symbol, 0.0) + symbol_reserved + candidate_increment,
+        "proposed symbol exposure",
     )
 
     def cluster(value: str) -> str:
@@ -508,14 +559,23 @@ def _verified_context(
 
     target_cluster = cluster(symbol)
     cluster_symbols = {key for key in position_values if cluster(key) == target_cluster}
-    cluster_value = sum(position_values[key] for key in cluster_symbols)
-    cluster_value += sum(
-        float(row.get("active_notional") or 0)
-        for row in reservations
-        if cluster(str(row.get("symbol") or "").upper()) == target_cluster
+    cluster_value = _finite(
+        sum(position_values[key] for key in cluster_symbols),
+        "current cluster exposure",
+    )
+    cluster_value = _finite(
+        cluster_value + sum(
+            reservation_value(row, "active_notional")
+            for row in reservations
+            if cluster(str(row.get("symbol") or "").upper()) == target_cluster
+        ),
+        "reserved cluster exposure",
     )
     if is_entry and side == "buy" and not candidate_already_reserved:
-        cluster_value += proposed_notional
+        cluster_value = _finite(
+            cluster_value + proposed_notional,
+            "proposed cluster exposure",
+        )
 
     risk_budget = config.get("risk_budget", {}) or {}
     portfolio = config.get("portfolio_behavior", {}) or {}
@@ -523,16 +583,38 @@ def _verified_context(
     latest_risk = conn.execute(
         "SELECT held_open_stop_risk,calculated_at FROM risk_snapshots_v2 ORDER BY calculated_at DESC,id DESC LIMIT 1"
     ).fetchone()
-    held_open_risk = float(latest_risk["held_open_stop_risk"] or 0) if latest_risk else (0.0 if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
+    held_open_risk = (
+        _finite(latest_risk["held_open_stop_risk"], "held open stop risk")
+        if latest_risk and latest_risk["held_open_stop_risk"] not in (None, "")
+        else (0.0 if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
+    )
     try:
         candidate_sizing = canonical_sizing(candidate)
         candidate_stop_risk = candidate_sizing.stop_risk
     except (TypeError, ValueError):
         candidate_stop_risk = 0.0
-    total_ceiling = equity * float(portfolio.get("max_total_portfolio_exposure_pct", 6.0)) / 100.0
-    symbol_ceiling = equity * float(portfolio.get("max_single_symbol_exposure_pct", 2.5)) / 100.0
-    cluster_ceiling = equity * float(optimizer.get("max_same_cluster_exposure_pct", 5.0)) / 100.0
-    open_risk_ceiling = equity * float(risk_budget.get("max_open_risk_pct", 0.30)) / 100.0
+    total_exposure_pct = _finite(
+        portfolio.get("max_total_portfolio_exposure_pct", 6.0),
+        "maximum total portfolio exposure percentage",
+    )
+    symbol_exposure_pct = _finite(
+        portfolio.get("max_single_symbol_exposure_pct", 2.5),
+        "maximum single-symbol exposure percentage",
+    )
+    cluster_exposure_pct = _finite(
+        optimizer.get("max_same_cluster_exposure_pct", 5.0),
+        "maximum cluster exposure percentage",
+    )
+    open_risk_pct = _finite(
+        risk_budget.get("max_open_risk_pct", 0.30),
+        "maximum open-risk percentage",
+    )
+    if equity <= 0:
+        raise RuntimeError("authoritative account equity must be positive")
+    total_ceiling = equity * total_exposure_pct / 100.0
+    symbol_ceiling = equity * symbol_exposure_pct / 100.0
+    cluster_ceiling = equity * cluster_exposure_pct / 100.0
+    open_risk_ceiling = equity * open_risk_pct / 100.0
     reservation_limits = {
         "base_total_notional": current_total,
         "base_symbol_notional": position_values.get(symbol, 0.0),

@@ -79,6 +79,22 @@ def test_final_context_uses_authoritative_values(tmp_path, monkeypatch):
     assert context["database_writable"] is True
 
 
+def test_portfolio_exit_blocker_uses_the_same_authoritative_positions_snapshot(tmp_path, monkeypatch):
+    service, _ = make_service(tmp_path, AuthoritativeBroker())
+    observed = []
+    original = service._exit_blocker_context
+
+    def wrapped(orders=None, **kwargs):
+        observed.append(kwargs.get("positions"))
+        return original(orders, **kwargs)
+
+    monkeypatch.setattr(service, "_exit_blocker_context", wrapped)
+    service._portfolio_context(
+        {"symbol": "SPY", "side": "buy", "action": "entry"}, approval_valid=True
+    )
+    assert observed and observed[0] == []
+
+
 def test_unknown_weekly_loss_blocks_risk(tmp_path, monkeypatch, proposal, context):
     service, _ = make_service(tmp_path, AuthoritativeBroker(weekly_loss=None))
     monkeypatch.setattr(service_module, "internet_available", lambda: True)

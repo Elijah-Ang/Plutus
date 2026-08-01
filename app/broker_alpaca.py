@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .broker_interface import BrokerInterface
-from .capabilities import require_live_trading_support
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .utils import get_secret
 
@@ -17,7 +16,7 @@ class AlpacaBrokerError(RuntimeError):
         self.category = category
         self.operation = operation
         self.original = original
-        self.request_may_have_reached_broker = operation == "submit_order"
+        self.request_may_have_reached_broker = operation in {"submit_order", "submit_crypto_order"}
         super().__init__(f"{category}: Alpaca {operation} failed")
 
 
@@ -26,17 +25,13 @@ class AlpacaBroker(BrokerInterface):
         self.config = config
         self.mode = config.get("mode", "paper")
         self.paper_requested = self.mode == "paper"
+        if self.mode != "paper":
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
         self.configured_trading_endpoint = str(
             config.get("alpaca", {}).get("paper_trading_endpoint", "https://paper-api.alpaca.markets")
-            if self.paper_requested
-            else config.get("alpaca", {}).get("live_trading_endpoint", "https://api.alpaca.markets")
         )
-        if self.paper_requested and "paper" not in self.configured_trading_endpoint.lower():
+        if "paper" not in self.configured_trading_endpoint.lower():
             raise RuntimeError("paper mode requires an explicitly paper Alpaca trading endpoint")
-        if self.mode != "paper":
-            # This build has no live capability. Fail before reading any key so
-            # live credentials cannot be selected through configuration alone.
-            require_live_trading_support()
         self.equity_realtime_data_feed = str(
             (config.get("alpaca", {}) or {}).get("equity_realtime_data_feed") or ""
         ).strip().lower()
@@ -280,7 +275,7 @@ class AlpacaBroker(BrokerInterface):
 
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str = "market", limit_price: float | None = None, client_order_id: str | None = None) -> Any:
         if self.mode != "paper":
-            require_live_trading_support()
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
         if self._looks_like_crypto_symbol(symbol):
             from .broker_interface import BrokerSubmissionNotAttempted
 
@@ -297,6 +292,81 @@ class AlpacaBroker(BrokerInterface):
         except Exception as exc:
             raise BrokerSubmissionNotAttempted("order request validation failed before broker I/O") from exc
         return self._call("submit_order", "order_submission", lambda: self.trading.submit_order(order_data=request))
+
+    def submit_crypto_order(
+        self,
+        symbol: str,
+        side: str,
+        notional_or_qty: dict[str, Any],
+        order_type: str = "limit",
+        limit_price: Any | None = None,
+        client_order_id: str | None = None,
+        time_in_force: str = "gtc",
+    ) -> Any:
+        """Submit a bounded spot-crypto paper order through Alpaca's crypto path.
+
+        This method is intentionally separate from ``submit_order`` so a
+        crypto pair can never fall through the equity DAY-order adapter.  The
+        lane gate and caller must already have proved a current manual approval
+        and paper identity; this adapter still rechecks the hard paper boundary
+        before constructing an SDK request.
+        """
+
+        if self.mode != "paper":
+            raise PermissionError("live trading is not supported by this paper-only broker adapter")
+        raw = str(symbol or "").strip().upper().replace("-", "/")
+        configured = {
+            str(value or "").strip().upper().replace("-", "/")
+            for value in ((self.config.get("crypto") or {}).get("symbols") or ("BTC/USD", "ETH/USD"))
+        }
+        if raw not in configured:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto pair is not explicitly configured")
+        if str(side or "").lower() not in {"buy", "sell"}:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto side must be buy or sell")
+        if str(order_type or "").lower() != "limit":
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("the supervised crypto lane only permits limit orders")
+        tif = str(time_in_force or "").lower()
+        if tif not in {"gtc", "ioc"}:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("unsupported crypto time-in-force")
+        if not client_order_id:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto client order identity is required")
+        if limit_price is None:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto limit price is required")
+        if set(notional_or_qty) not in ({"qty"}, {"notional"}):
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto order must contain exactly qty or notional")
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.requests import LimitOrderRequest
+
+            tif_enum = TimeInForce.GTC if tif == "gtc" else TimeInForce.IOC
+            common = dict(
+                symbol=raw,
+                side=OrderSide.BUY if str(side or "").lower() == "buy" else OrderSide.SELL,
+                time_in_force=tif_enum,
+                limit_price=str(limit_price),
+                client_order_id=str(client_order_id),
+                **{key: str(value) for key, value in notional_or_qty.items()},
+            )
+            request = LimitOrderRequest(**common)
+        except Exception as exc:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto order request validation failed before broker I/O") from exc
+        return self._call("submit_crypto_order", "order_submission", lambda: self.trading.submit_order(order_data=request))
 
     def cancel_order(self, order_id: str) -> Any:
         return self._call("cancel_order", "order_submission", lambda: self.trading.cancel_order_by_id(order_id))
@@ -341,6 +411,7 @@ class AlpacaBroker(BrokerInterface):
             "weekly_loss_confidence": "verified" if weekly_loss is not None else "unavailable",
             "provenance": "alpaca_account_and_portfolio_history",
             "metrics_version": "loss_controls_v2",
+            "captured_at": datetime.now(UTC).isoformat(),
         }
 
     def is_market_open(self) -> bool:

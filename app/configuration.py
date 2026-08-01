@@ -19,6 +19,8 @@ from .formula_versions import (
     CRYPTO_RISK_FORMULA_VERSION,
     CRYPTO_RISK_SCHEMA_VERSION,
     CRYPTO_PROPOSAL_FORMULA_VERSION,
+    CRYPTO_PAPER_EXECUTION_FORMULA_VERSION,
+    CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION,
     CRYPTO_PROPOSAL_SCHEMA_VERSION,
     CRYPTO_SIZING_FORMULA_VERSION,
     CRYPTO_SIZING_SCHEMA_VERSION,
@@ -87,7 +89,7 @@ STRICT_TOP_LEVEL_KEYS = {
 STRICT_SECTION_KEYS = {
     "execution_capabilities": {"live_execution_enabled", "autonomous_entries_enabled", "autonomous_exits_enabled", "protective_paper_exit_enabled"},
     "alpaca": {
-        "paper_trading_endpoint", "live_trading_endpoint",
+        "paper_trading_endpoint",
         "equity_realtime_data_feed", "timeouts",
     },
     "quotes": {"max_age_seconds", "max_spread_bps", "max_limit_slippage_bps", "price_increment_usd"},
@@ -103,7 +105,11 @@ STRICT_SECTION_KEYS = {
         "default_order_type", "limit_price_source", "fallback_market_orders",
         "allow_new_entries", "allow_add_to_winner", "allow_exits", "eodhd_research_enabled",
         "data_source", "sizing_policy", "risk_policy", "strategy_policy", "proposal_policy",
-        "stage_transition_governance", "runtime_evidence_gate", "schedule",
+        "stage_transition_governance", "runtime_evidence_gate", "schedule", "supervised_paper_lane",
+    },
+    "supervised_paper_lane": {
+        "enabled", "paper_only", "manual_approval_required", "autonomous_execution", "live_enabled",
+        "execution_enabled", "order_type", "time_in_force", "proposal_expiry_minutes", "maximum_order_notional_usd",
     },
     "risk": {
         "max_trade_notional_paper", "max_trade_notional_live", "max_trades_per_day", "max_open_positions",
@@ -166,7 +172,7 @@ STRICT_SECTION_KEYS = {
         "risk_per_trade_pct", "max_open_risk_pct", "max_daily_realized_loss_pct", "max_total_portfolio_exposure_pct",
         "max_single_symbol_exposure_pct", "max_cluster_exposure_pct", "max_adds_only_if_profitable", "block_averaging_down",
     },
-    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "cross_asset_allocation", "adaptive_conviction", "adaptive_sizing", "phase4_allocation", "strategy_registry"},
+    "formula_versions": {"stop_policy", "sizing_policy", "risk_decision", "accounting", "evidence", "strategy_performance", "strategy_policy", "trade_economics", "profitability_ranking", "profitability_validation", "profit_attribution", "crypto_capability", "crypto_market_data", "crypto_sizing", "crypto_risk", "crypto_strategy", "crypto_proposal", "crypto_paper_execution", "crypto_paper_execution_schema", "cross_asset_allocation", "adaptive_conviction", "adaptive_sizing", "phase4_allocation", "strategy_registry"},
     "profitability_engine": {
         "enabled", "enforcement_enabled", "performance_version", "policy_version", "schema_version", "primary_horizon_sessions",
         "minimum_shadow_oos_samples", "minimum_actual_paper_for_throttled", "minimum_actual_paper_for_active",
@@ -364,6 +370,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "crypto_risk": CRYPTO_RISK_FORMULA_VERSION,
         "crypto_strategy": CRYPTO_STRATEGY_FORMULA_VERSION,
         "crypto_proposal": CRYPTO_PROPOSAL_FORMULA_VERSION,
+        "crypto_paper_execution": CRYPTO_PAPER_EXECUTION_FORMULA_VERSION,
+        "crypto_paper_execution_schema": CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION,
         "cross_asset_allocation": CROSS_ASSET_ALLOCATION_FORMULA_VERSION,
         "adaptive_conviction": ADAPTIVE_CONVICTION_FORMULA_VERSION,
         "adaptive_sizing": ADAPTIVE_SIZING_FORMULA_VERSION,
@@ -841,9 +849,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     crypto = config.get("crypto", {}) or {}
     require(crypto.get("live_enabled", False) is False, "crypto.live_enabled must be false")
-    require(crypto.get("paper_trading_enabled", False) is False, "crypto.paper_trading_enabled must remain false in Phase 0")
-    require(crypto.get("proposals_enabled", False) is False, "crypto.proposals_enabled must remain false in Phase 0")
-    require(crypto.get("mode", "research_only") == "research_only", "crypto.mode must remain research_only in Phase 0")
+    crypto_mode = crypto.get("mode", "research_only")
+    require(crypto_mode in {"research_only", "supervised_paper"}, "crypto.mode must be research_only or supervised_paper")
+    expected_crypto_policy_mode = "supervised_paper" if crypto_mode == "supervised_paper" else "research_only"
     require(crypto.get("broker") == "alpaca_paper_spot", "crypto.broker must be alpaca_paper_spot")
     require(crypto.get("data_source") == "alpaca", "crypto.data_source must be alpaca")
     require(crypto.get("market_profile") == "continuous_24_7", "crypto.market_profile must be continuous_24_7")
@@ -875,24 +883,24 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     _bounded(crypto.get("minimum_top_of_book_notional_usd"), "crypto minimum top-of-book notional", errors, 0.01, 100000000)
 
     crypto_sizing = crypto.get("sizing_policy") or {}
-    require(crypto_sizing.get("mode") == "research_only",
-            "crypto sizing policy must remain research_only in this stage")
+    require(crypto_sizing.get("mode") == expected_crypto_policy_mode,
+            f"crypto sizing policy must be {expected_crypto_policy_mode} for the selected crypto mode")
     require(crypto_sizing.get("formula_version") == CRYPTO_SIZING_FORMULA_VERSION,
             f"crypto sizing formula must be {CRYPTO_SIZING_FORMULA_VERSION}")
     require(crypto_sizing.get("schema_version") == CRYPTO_SIZING_SCHEMA_VERSION,
             f"crypto sizing schema must be {CRYPTO_SIZING_SCHEMA_VERSION}")
     minimum_crypto_notional = _bounded(
         crypto_sizing.get("minimum_buy_notional_usd"),
-        "crypto.sizing_policy.minimum_buy_notional_usd", errors, 1, 1,
+        "crypto.sizing_policy.minimum_buy_notional_usd", errors, 1, 50000,
     )
     maximum_crypto_notional = _bounded(
         crypto_sizing.get("maximum_order_notional_usd"),
-        "crypto.sizing_policy.maximum_order_notional_usd", errors, 1, 5,
+        "crypto.sizing_policy.maximum_order_notional_usd", errors, 1, 50000,
     )
     require(
         minimum_crypto_notional is not None and maximum_crypto_notional is not None
         and minimum_crypto_notional <= maximum_crypto_notional,
-        "crypto notional bounds must satisfy one-dollar minimum <= five-dollar maximum",
+        "crypto notional bounds (including maximum_order_notional_usd) must satisfy minimum <= maximum",
     )
     require(crypto_sizing.get("maximum_quantity_decimal_places") == 9,
             "crypto quantity precision must remain at most nine decimal places")
@@ -925,8 +933,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "crypto must permit an exact full-position dust exit")
 
     crypto_risk = crypto.get("risk_policy") or {}
-    require(crypto_risk.get("mode") == "research_only",
-            "crypto risk policy must remain research_only in this stage")
+    require(crypto_risk.get("mode") == expected_crypto_policy_mode,
+            f"crypto risk policy must be {expected_crypto_policy_mode} for the selected crypto mode")
     require(crypto_risk.get("formula_version") == CRYPTO_RISK_FORMULA_VERSION,
             f"crypto risk formula must be {CRYPTO_RISK_FORMULA_VERSION}")
     require(crypto_risk.get("schema_version") == CRYPTO_RISK_SCHEMA_VERSION,
@@ -1026,10 +1034,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     )
 
     crypto_strategy = crypto.get("strategy_policy") or {}
-    require(crypto_strategy.get("mode") == "research_only",
-            "crypto strategy policy must remain research_only in this stage")
-    require(crypto_strategy.get("lifecycle") == "RESEARCH_ONLY",
-            "crypto strategy lifecycle must remain RESEARCH_ONLY in this stage")
+    require(crypto_strategy.get("mode") == expected_crypto_policy_mode,
+            f"crypto strategy policy must be {expected_crypto_policy_mode} for the selected crypto mode")
+    expected_crypto_lifecycle = "PAPER_ACTIVE" if crypto_mode == "supervised_paper" else "RESEARCH_ONLY"
+    require(crypto_strategy.get("lifecycle") == expected_crypto_lifecycle,
+            f"crypto strategy lifecycle must be {expected_crypto_lifecycle} for the selected crypto mode")
     require(crypto_strategy.get("formula_version") == CRYPTO_STRATEGY_FORMULA_VERSION,
             f"crypto strategy formula must be {CRYPTO_STRATEGY_FORMULA_VERSION}")
     require(crypto_strategy.get("schema_version") == CRYPTO_STRATEGY_SCHEMA_VERSION,
@@ -1118,6 +1127,52 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     ):
         require(crypto_proposal.get(key) is False,
                 f"crypto.proposal_policy.{key} must remain false in this stage")
+
+    # The executable crypto lane is deliberately separate from the ordinary
+    # research-preview policy.  Its default remains disabled; an explicit
+    # paper/manual-only configuration may opt in after its own review without
+    # weakening the global live/autonomous boundary.
+    supervised_lane = crypto.get("supervised_paper_lane") or {}
+    if supervised_lane:
+        if supervised_lane.get("enabled") is True:
+            require(supervised_lane.get("paper_only") is True,
+                    "crypto.supervised_paper_lane.paper_only must be true")
+            require(supervised_lane.get("manual_approval_required") is True,
+                    "crypto.supervised_paper_lane.manual_approval_required must be true")
+            require(supervised_lane.get("autonomous_execution") is False,
+                    "crypto.supervised_paper_lane.autonomous_execution must be false")
+            require(supervised_lane.get("live_enabled") is False,
+                    "crypto.supervised_paper_lane.live_enabled must be false")
+            require(supervised_lane.get("execution_enabled") is True,
+                    "enabled crypto supervised lane must have execution_enabled=true")
+            require(supervised_lane.get("order_type") == "limit",
+                    "crypto.supervised_paper_lane.order_type must be limit")
+            require(supervised_lane.get("time_in_force") in {"gtc", "ioc"},
+                    "crypto.supervised_paper_lane.time_in_force must be gtc or ioc")
+            _bounded(supervised_lane.get("proposal_expiry_minutes"), "crypto supervised proposal expiry", errors, 1, 5)
+            maximum_lane_notional = _bounded(
+                supervised_lane.get("maximum_order_notional_usd"),
+                "crypto supervised maximum order notional", errors, 1, 50000,
+            )
+            require(maximum_lane_notional is not None, "crypto supervised maximum order notional is required")
+        else:
+            require(supervised_lane.get("execution_enabled") is False,
+                    "disabled crypto supervised lane must have execution_enabled=false")
+            require(supervised_lane.get("live_enabled") is False,
+                    "crypto supervised lane live_enabled must be false")
+
+    if crypto_mode == "supervised_paper":
+        require(crypto.get("paper_trading_enabled") is True,
+                "supervised crypto mode requires paper_trading_enabled=true")
+        require(crypto.get("proposals_enabled") is True,
+                "supervised crypto mode requires proposals_enabled=true")
+        require(supervised_lane.get("enabled") is True,
+                "supervised crypto mode requires the supervised paper lane")
+    else:
+        require(crypto.get("paper_trading_enabled") is False,
+                "research-only crypto mode requires paper_trading_enabled=false")
+        require(crypto.get("proposals_enabled") is False,
+                "research-only crypto mode requires proposals_enabled=false")
 
     expiry_default = _number(config, "proposal_expiry_default_minutes", errors, minimum=1, maximum=1440)
     expiry_min = _number(config, "proposal_expiry_min_minutes", errors, minimum=1, maximum=1440)

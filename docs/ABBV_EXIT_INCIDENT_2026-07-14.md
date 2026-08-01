@@ -96,6 +96,14 @@ spread, threshold, and failure code. Its operator message now states the exact I
 spread and safe next action: wait for fresh spread-valid data, then create a new
 proposal and obtain a new manual approval.
 
+The final-validation boundary also distinguishes a broker-unavailable preflight
+from a quote-quality failure. When no broker is present before validation, it
+records `broker_unavailable_pre_submission`, explicitly records zero broker
+invocation, and tells the operator to restore paper-broker connectivity before
+creating a fresh proposal. The historical generic sentence above remains a record
+of the legacy runtime's wording; it is no longer an emitted fallback in the
+audited source.
+
 ## Audit findings and implementation
 
 ### A. Approval authority was created at reply time
@@ -171,6 +179,16 @@ proposal/approval/workflow/intent/broker provenance plus required user action an
 safe automatic recovery. Digest text no longer says `No action needed` when an exit
 blocker is active.
 
+The follow-up lifecycle audit also fixed two fail-closed edges. Once all current
+broker and position evidence proves that no exit source remains, stale validation
+clears every durable blocker proven absent rather than only the first stale symbol;
+this prevents an unrelated historical row from keeping other BUYs blocked. If a
+broker order or position read is unavailable, the validator now preserves an
+existing durable blocker as explicitly unverified and records that evidence instead
+of interpreting an unavailable response as an empty order/position set. The
+operator wording identifies the unavailable broker evidence and requires
+revalidation before new orders.
+
 ### K. Rotation authorization normalization
 
 Fixed. Registry/allocation authorization accepts only non-empty, unique normalized
@@ -196,6 +214,44 @@ created one audit event, a second apply was a no-op, and SQLite remained `ok`.
 The production database was not remediated because the investigated failed proposal
 was already terminal and later blocking came from fresh reproduced exit decisions,
 not a corrupt stuck flag.
+
+## Read-only follow-up state through 2026-07-31
+
+A later read-only query of the canonical paper database was used to separate the
+historical incident from subsequent ABBV lifecycle events. This query did not call
+the broker, change the database, clear a blocker, or submit an order.
+
+The original proposal `e1986bb1-a498-4111-843b-0090ecdeeb0d` still has the expected
+terminal evidence: approval `7ac91ac8-7d4b-4854-9301-c2c56c13096a` is consumed with
+`final_order_decision=blocked` and the exact legacy reason `Price refresh failed or
+price is unavailable`; its workflow is `blocked`, and there is no linked intent or
+order. The July 14 audit events also show that the *fresh current-cycle* ABBV
+`TIME_STOP_EXIT` decision suppressed unrelated IWM and XLV BUY candidates while
+that exit priority was active. This was intentional exit-first behavior, not an
+indefinite consequence of the failed quote refresh.
+
+The same database later records a separate, fresh ABBV exit proposal
+`f5e05f0b-6ad7-4f67-b340-89c854c87abc` (Telegram message `843`) that was manually
+approved and filled. Its paper order was `0.433314683` shares at an average fill of
+`258.46`, with a final quote timestamp of `2026-07-30T17:29:38.629776+00:00` and a
+`17.03` bps spread. The proposal, approval, intent, and workflow are all
+terminal. Later market-memory rows repeatedly record
+`proposal not sent: stale Alpaca price at proposal creation (price timestamp must
+be fresh)`, followed by a HOLD/no-entry result; those rows are safety suppressions,
+not approvals or broker ambiguity.
+
+The pre-migration production database still lacks the additive
+`exit_blocker_states` table, so this follow-up is evidence only and is not a
+deployment or migration gate. Current live positions and open orders were not
+re-read from Alpaca in this follow-up. The hardened runtime must therefore retain
+the documented rule: a genuinely fresh, position-backed exit decision may block
+new BUY proposals until it is resolved, while a terminal historical proposal or
+stale market-memory wording must never do so.
+
+The scan-summary logger now carries the same `no_action_reason` as the durable
+`market_memory` row. Operational output therefore preserves actionable details—
+such as stale-price and exit-priority suppressions—instead of rendering them as
+`N/A`; proposal and execution decisions remain unchanged and fail closed.
 
 ## Verification and rollout constraints
 

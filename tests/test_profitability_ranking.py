@@ -658,6 +658,8 @@ def test_profitability_ranking_migration_is_additive_and_idempotent(tmp_path) ->
 
 
 class RankingBroker:
+    equity_realtime_data_feed = "iex"
+
     def get_latest_quote(self, symbol):
         now = datetime.now(UTC)
         if symbol == "SPY":
@@ -665,11 +667,23 @@ class RankingBroker:
                 "bid_price": 99.85,
                 "ask_price": 100.15,
                 "timestamp": now,
+                "feed": "iex",
             }
         return {
             "bid_price": 99.99,
             "ask_price": 100.01,
             "timestamp": now,
+            "feed": "iex",
+        }
+
+
+class WideRankingBroker(RankingBroker):
+    def get_latest_quote(self, symbol):
+        return {
+            "bid_price": 90.0,
+            "ask_price": 110.0,
+            "timestamp": datetime.now(UTC),
+            "feed": "iex",
         }
 
 
@@ -778,6 +792,33 @@ def test_service_stale_quote_fails_closed_without_candidate_or_order_state(
     assert (
         storage.fetch_all("SELECT * FROM candidate_profitability_decisions") == []
     )
+    assert storage.fetch_all("SELECT * FROM trade_proposals") == []
+    assert storage.fetch_all("SELECT * FROM risk_reservations") == []
+
+
+def test_service_profitability_rejects_wide_quote_before_ranking(
+    tmp_path, monkeypatch
+) -> None:
+    storage = Storage(tmp_path / "service-wide-quote.db")
+    storage.initialize()
+    exact_policy = policy()
+    install_authority(storage, exact_policy)
+    service = TradingService(
+        copy.deepcopy(CONFIG), storage, WideRankingBroker(), "run-wide-quote"
+    )
+    monkeypatch.setattr(
+        service, "_cycle_strategy_policy", lambda strategy: exact_policy
+    )
+
+    assert service._rank_candidates(
+        [service_candidate("SPY", 99.0)], service_snapshot()
+    ) == []
+    audit_rows = storage.fetch_all(
+        "SELECT detail FROM audit_events WHERE event_type='candidate_profitability_rejected'"
+    )
+    assert len(audit_rows) == 1
+    assert "spread" in json.loads(audit_rows[0]["detail"])["reason"].lower()
+    assert storage.fetch_all("SELECT * FROM candidate_profitability_decisions") == []
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
     assert storage.fetch_all("SELECT * FROM risk_reservations") == []
 

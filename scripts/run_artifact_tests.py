@@ -19,6 +19,9 @@ from pathlib import Path
 REQUIRED_PYTHON = "3.13.9"
 ROOT = Path(__file__).resolve().parents[1]
 TARGETED_SUITES = (
+    "tests/test_quote_feed_hardening.py",
+    "tests/test_exit_blocker_lifecycle.py",
+    "tests/test_recovery_prebroker_controls.py",
     "tests/test_final_hardening.py",
     "tests/test_phase0_execution_integrity.py",
     "tests/test_phase0_approval_recovery.py",
@@ -32,6 +35,8 @@ TARGETED_SUITES = (
     "tests/test_crypto_market_data.py",
     "tests/test_crypto_sizing_risk.py",
     "tests/test_crypto_research.py",
+    "tests/test_crypto_strategies_proposals.py",
+    "tests/test_crypto_paper_lane.py",
 )
 
 

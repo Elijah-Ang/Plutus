@@ -436,6 +436,23 @@ class TradingService:
             lookup_reconciler=recover_lookup,
             max_items=100,
         )
+        crypto_recovery_count = 0
+        crypto_recovery_errors = 0
+        if self.broker is not None:
+            try:
+                from .crypto_paper_lane import CryptoPaperLaneStore
+
+                crypto_recovery = CryptoPaperLaneStore(self.storage).recover_pending(
+                    self.config, self.broker, now=datetime.now(UTC)
+                )
+                crypto_recovery_count = len(crypto_recovery)
+            except Exception as exc:
+                crypto_recovery_errors = 1
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_recovery_failed_closed",
+                    {"error": type(exc).__name__},
+                )
         consumed_without_intent = self.storage.fetch_all(
             """SELECT a.id,a.proposal_id FROM approvals a
                LEFT JOIN order_intents i ON i.approval_id=a.id
@@ -473,6 +490,8 @@ class TradingService:
             "approval_existing_intents_linked": local_recovery.existing_intent_linked,
             "approval_external_ambiguity": local_recovery.external_ambiguity,
             "approval_recovery_retryable_failures": local_recovery.failed_retryable,
+            "crypto_intents_reconciled": crypto_recovery_count,
+            "crypto_recovery_errors": crypto_recovery_errors,
         }
         state = "degraded" if any(detail.values()) else "healthy"
         self.storage.execute(
@@ -633,11 +652,24 @@ class TradingService:
         positions_known = positions is not None
         if positions is None:
             try:
-                positions = list(self.broker.get_positions()) if self.broker is not None else []
+                if self.broker is None:
+                    raise RuntimeError("broker is unavailable")
+                positions = list(self.broker.get_positions())
                 positions_known = True
             except Exception:
                 positions = []
                 positions_known = False
+
+        broker_orders_known = broker_orders is not None
+        if broker_orders is None:
+            try:
+                if self.broker is None:
+                    raise RuntimeError("broker is unavailable")
+                broker_orders = list(self.broker.get_open_orders())
+                broker_orders_known = True
+            except Exception:
+                broker_orders = []
+                broker_orders_known = False
         position_symbols = {
             str(_value(position, "symbol", "")).upper()
             for position in positions or []
@@ -674,6 +706,46 @@ class TradingService:
             }
             self.storage.audit(self.run_id, "exit_blocker_validated", self._exit_blocker_audit_detail(source, "active", source.get("validation_reason")))
             return ExitBlockerStore(self.storage, self.run_id).observe(source)
+
+        def retained_unverified(reason: str) -> dict[str, Any] | None:
+            """Retain an existing blocker when current broker evidence is unavailable."""
+            rows = self.storage.fetch_all(
+                """SELECT * FROM exit_blocker_states
+                   WHERE active=1 ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1"""
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            detail: dict[str, Any] = {}
+            try:
+                parsed = json.loads(row.get("detail_json") or "{}")
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+            symbol = str(row.get("symbol") or detail.get("symbol") or "").upper()
+            result = {
+                **detail,
+                "active": True,
+                "stale": False,
+                "unverified": True,
+                "source_type": str(row.get("source_type") or detail.get("source_type") or ""),
+                "source_id": str(row.get("source_id") or detail.get("source_id") or ""),
+                "symbol": symbol,
+                "status": "unverified",
+                "reason": f"{symbol} exit blocker retained: {reason}".strip(),
+                "validation_reason": reason,
+                "latest_validation_at": now_iso,
+                "blocker_state_id": row.get("id"),
+                "blocker_state": row.get("state"),
+                "blocker_generation": row.get("generation"),
+            }
+            self.storage.audit(
+                self.run_id,
+                "exit_blocker_unverified",
+                self._exit_blocker_audit_detail(result, "unverified", reason),
+            )
+            return result
 
         # Broker state is the strongest current source. A sell order remains
         # blocking until reconciliation proves it terminal; elapsed wall-clock
@@ -887,9 +959,23 @@ class TradingService:
                 "validation_reason": "fresh current-cycle exit signal reproduced from current position and market data",
             })
 
+        # Without a complete broker/position snapshot, an active durable
+        # blocker cannot be proven stale. Preserve it for reconciliation.
+        if not broker_orders_known:
+            retained = retained_unverified("broker open orders could not be verified")
+            if retained:
+                return retained
+        if not positions_known:
+            retained = retained_unverified("broker positions could not be verified")
+            if retained:
+                return retained
+
         if stale_sources:
+            # This function evaluated all authoritative sources above. Once
+            # broker orders and positions are known and no active source was
+            # found, clear every durable blocker that is now proven absent,
+            # not only the first stale proposal encountered.
             ExitBlockerStore(self.storage, self.run_id).clear_absent(
-                observed_symbols={str(stale_sources[0].get("symbol") or "").upper()},
                 reason=str(stale_sources[0].get("stale_reason") or "stale blocker cleared"),
             )
             return stale_sources[0]
@@ -930,6 +1016,8 @@ class TradingService:
             except Exception:
                 pass
         if source_type == "broker_open_order":
+            if blocker.get("unverified"):
+                return f"{symbol} broker exit state unavailable; revalidate before new orders"
             return f"{symbol} sell order remains open"
         if source_type == "active_sell_proposal":
             if int(blocker.get("emergency_exit_triggered") or 0) == 1:
@@ -1539,7 +1627,152 @@ class TradingService:
             return None
         return match.group(1).lower(), match.group(2).upper().rstrip(".")
 
+    def _crypto_paper_control_providers(self) -> dict[str, Any]:
+        """Return measured fail-closed probes for the supervised crypto lane."""
+
+        telegram_health = getattr(self.telegram, "is_available", None)
+        return {
+            "power": lambda: get_power_status().connected is True,
+            "internet": lambda: internet_available() is True,
+            "database": lambda: self.storage.writable() is True,
+            "telegram": lambda: bool(telegram_health(force=True)) if callable(telegram_health) else False,
+        }
+
+    def _handle_crypto_telegram_update(
+        self,
+        *,
+        text: str,
+        sender: str,
+        chat_id: str | None,
+        reply_to_message_id: str | None,
+        update_id: Any,
+        message_id: Any,
+    ) -> bool:
+        """Route exact supervised-crypto commands before generic approvals.
+
+        Crypto proposals have a separate schema and authority chain.  Letting
+        them fall through to the equity parser would make an unbound or
+        malformed command look like an ordinary approval, so every syntactic
+        ``YES/NO CRYPTO <uuid>`` command is consumed here and receives a
+        fail-closed response.
+        """
+
+        match = re.fullmatch(r"(?i)(YES|NO) CRYPTO ([0-9a-f-]{36})", str(text))
+        if not match:
+            return False
+        action, proposal_id = match.group(1).upper(), match.group(2)
+        chat = None if chat_id is None else str(chat_id)
+        if not self.telegram.is_authorized(sender):
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {
+                    "update_id": update_id,
+                    "message_id": message_id,
+                    "proposal_id": proposal_id,
+                    "action": action,
+                    "reason": "unauthorized_sender",
+                },
+            )
+            self.telegram.send_message("Crypto paper command rejected: sender is not authorized.", chat)
+            return True
+        if reply_to_message_id is None:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {"update_id": update_id, "message_id": message_id, "proposal_id": proposal_id, "action": action, "reason": "reply_target_missing"},
+            )
+            self.telegram.send_message("Crypto paper command rejected: reply directly to the displayed proposal.", chat)
+            return True
+        from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore
+
+        lane = CryptoPaperLaneStore(
+            self.storage,
+            control_providers=self._crypto_paper_control_providers(),
+        )
+        try:
+            if action == "NO":
+                rejection = lane.reject_proposal(
+                    proposal_id,
+                    self.config,
+                    sender_id=sender,
+                    allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
+                    raw_message=str(text),
+                    reply_to_message_id=str(reply_to_message_id),
+                    chat_id=chat,
+                )
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_telegram_rejected",
+                    {"proposal_id": proposal_id, "rejection_fingerprint": rejection.get("rejection_fingerprint"), "message_id": message_id},
+                )
+                self.telegram.send_message("❌ Crypto paper proposal rejected. No order was placed.", chat)
+                return True
+
+            approval = lane.approve_proposal(
+                proposal_id,
+                self.config,
+                sender_id=sender,
+                allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
+                raw_message=str(text),
+                reply_to_message_id=str(reply_to_message_id),
+                chat_id=chat,
+            )
+            intent = lane.create_intent(proposal_id, self.config)
+            execution = lane.execute_intent(intent.id, self.config, self.broker)
+            state = str(execution.get("state") or "")
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_approved",
+                {
+                    "proposal_id": proposal_id,
+                    "approval_fingerprint": approval.get("approval_fingerprint"),
+                    "intent_id": intent.id,
+                    "state": state,
+                    "broker_invocation_occurred": bool(execution.get("broker_invocation_occurred")),
+                    "broker_order_id": execution.get("broker_order_id"),
+                    "message_id": message_id,
+                },
+            )
+            if state in {"submitted", "partially_filled", "filled"}:
+                self.telegram.send_message(
+                    f"✅ Crypto paper order {state}. Broker evidence/reconciliation remains authoritative; no live order was placed.",
+                    chat,
+                )
+            elif state in {"unknown", "reconciliation_required"}:
+                self.telegram.send_message(
+                    "⚠️ Crypto paper approval reached an ambiguous broker state. No retry will occur; reconciliation is required.",
+                    chat,
+                )
+            else:
+                self.telegram.send_message(
+                    f"⚠️ Crypto paper approval was recorded, but no order was placed. Reason: {execution.get('last_error') or state or 'final controls blocked'}.",
+                    chat,
+                )
+        except CryptoPaperLaneError as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_blocked",
+                {"proposal_id": proposal_id, "action": action, "error": type(exc).__name__, "message_id": message_id},
+            )
+            self.telegram.send_message(
+                "⚠️ Crypto paper command blocked. The proposal remains unchanged unless the durable ledger accepted the command.",
+                chat,
+            )
+        except Exception as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_failed_closed",
+                {"proposal_id": proposal_id, "action": action, "error": type(exc).__name__, "message_id": message_id},
+            )
+            self.telegram.send_message("⚠️ Crypto paper command failed closed. No retry or live order was issued.", chat)
+        return True
+
     def _approval_intent_from_text(self, text: str) -> tuple[str, str | None, str | None, tuple[str, str] | None]:
+        crypto_match = re.fullmatch(r"(?i)(YES|NO) CRYPTO ([0-9a-f-]{36})", str(text).strip())
+        if crypto_match:
+            action = "crypto_yes" if crypto_match.group(1).upper() == "YES" else "crypto_no"
+            return action, None, crypto_match.group(2), None
         batch_match = self._parse_batch_approval_command(text)
         if batch_match:
             action_word, target = batch_match
@@ -2530,7 +2763,9 @@ class TradingService:
             ):
                 excluded_rotation_group_id = relationship_group_id
         exit_blocker = self._exit_blocker_context(
-            orders, exclude_reconciled_rotation_group_id=excluded_rotation_group_id
+            orders,
+            positions=positions,
+            exclude_reconciled_rotation_group_id=excluded_rotation_group_id,
         )
         exit_pending = bool(exit_blocker.get("active"))
 
@@ -3954,6 +4189,16 @@ class TradingService:
             reply_to = message.get("reply_to_message") or {}
             reply_to_message_id = reply_to.get("message_id")
 
+            if self._handle_crypto_telegram_update(
+                text=text,
+                sender=sender,
+                chat_id=str((message.get("chat") or {}).get("id")) if (message.get("chat") or {}).get("id") is not None else None,
+                reply_to_message_id=str(reply_to_message_id) if reply_to_message_id is not None else None,
+                update_id=update_id,
+                message_id=message.get("message_id"),
+            ):
+                continue
+
             # Rotation commands are explicit group-targeted approvals and must
             # never fall through to the generic YES/single-proposal parser.
             if self._handle_rotation_command(
@@ -4829,7 +5074,28 @@ class TradingService:
         # Normal orders require a fresh authoritative two-sided quote. The
         # protective emergency path retains its separately validated paper
         # market-exit path.
-        if block_reason is None and self.broker is not None:
+        if block_reason is None and self.broker is None:
+            block_reason = (
+                f"No order placed for {prop_symbol}. The Alpaca paper broker was "
+                "unavailable before final quote validation; no broker request was "
+                "attempted. Restore paper-broker connectivity, wait for fresh "
+                "spread-valid data, then create a new proposal and obtain a new "
+                "manual approval."
+            )
+            self.storage.audit(
+                self.run_id,
+                "final_execution_preflight_blocked",
+                {
+                    "proposal_id": proposal.get("id") or row.get("id"),
+                    "approval_id": approval_id,
+                    "symbol": prop_symbol,
+                    "side": prop_side,
+                    "code": "broker_unavailable_pre_submission",
+                    "reason": block_reason,
+                    "broker_invocation_occurred": 0,
+                },
+            )
+        elif block_reason is None:
             try:
                 quote_data = validated_quote(self.broker, prop_symbol, self.config, now=now_dt)
                 refreshed_price_val = float(quote_data["ask"] if prop_side == "buy" else quote_data["bid"])
@@ -4912,14 +5178,20 @@ class TradingService:
                 market_open = False
 
         # Get the proposal price
-        proposal_price = (
+        raw_proposal_price = (
             proposal.get("proposal_price")
             or proposal.get("latest_price")
             or row.get("current_price")
             or row.get("price")
         )
-        if proposal_price is not None:
-            proposal_price = float(proposal_price)
+        proposal_price = None
+        if raw_proposal_price is not None:
+            try:
+                proposal_price = float(raw_proposal_price)
+            except (TypeError, ValueError, OverflowError):
+                block_reason = block_reason or "proposal reference price is invalid"
+            if proposal_price is not None and not math.isfinite(proposal_price):
+                block_reason = block_reason or "proposal reference price is invalid"
 
         if block_reason is None and (proposal_price is None or proposal_price <= 0):
             block_reason = "proposal reference price is unavailable"
@@ -4964,7 +5236,12 @@ class TradingService:
         if block_reason is None:
             if refresh_required:
                 if refreshed_price_val is None or refreshed_price_val <= 0:
-                    block_reason = "Price refresh failed or price is unavailable"
+                    block_reason = (
+                        f"No order placed for {prop_symbol}. Final validation did not "
+                        "produce a valid fresh Alpaca quote; no broker request was "
+                        "attempted. A new proposal and new manual approval are "
+                        "required."
+                    )
                 elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
                     block_reason = "No order placed for " + prop_symbol + ". Final validation could not get a fresh Alpaca price within the allowed window. A new proposal is required."
                 elif not market_open:
@@ -8142,6 +8419,12 @@ class TradingService:
                 res["proposal_allowed"] = proposal_allowed
                 res["proposal_generated"] = proposal_generated
                 res["proposal_id"] = proposal_id
+                # Keep the in-memory scan result aligned with the durable
+                # market_memory row.  The scan summary below reads this field
+                # to explain why a candidate was not proposed; without it the
+                # persisted reason was correct but the operational log showed
+                # an unhelpful ``N/A``.
+                res["no_action_reason"] = no_action_reason
                 res["performance_action_decision"] = (
                     "proposed" if proposal_generated else
                     ("failed_final_validation" if no_action_reason and "final validation" in no_action_reason.lower() else
@@ -8589,7 +8872,9 @@ class TradingService:
         try:
             current_orders = list(self.broker.get_open_orders())
         except Exception:
-            current_orders = []
+            # An unavailable broker order read is not evidence that no order
+            # exists. Preserve the unknown state through blocker validation.
+            current_orders = None
         digest_exit_blocker = self._digest_exit_blocker_context(
             current_orders,
             current_positions,
@@ -10183,11 +10468,15 @@ class TradingService:
 
     def _pending_execution_totals(self) -> dict[str, Any]:
         """Return unreserved pending BUY exposure, failing closed on unknowns."""
+        now_iso = iso_now()
         rows = self.storage.fetch_all(
-            """SELECT p.id,p.symbol,p.payload,p.notional,p.strategy_version,p.status
+            """SELECT p.id,p.symbol,p.payload,p.notional,p.strategy_version,p.status,p.expires_at
                FROM trade_proposals p
                LEFT JOIN order_intents i ON i.proposal_id=p.id
-               WHERE p.side='buy' AND p.status IN ('pending','approved') AND i.id IS NULL"""
+               WHERE p.side='buy' AND p.status IN ('pending','approved')
+                 AND (p.expires_at IS NULL OR p.expires_at>?)
+                 AND i.id IS NULL""",
+            (now_iso,),
         )
         total_notional = 0.0
         total_stop_risk = 0.0
@@ -10215,7 +10504,15 @@ class TradingService:
                 if not symbol or not math.isfinite(notional) or notional <= 0 or not math.isfinite(price) or price <= 0 or not math.isfinite(stop) or stop <= 0 or not math.isfinite(risk_dollars) or risk_dollars <= 0 or not cluster:
                     raise ValueError("pending buy exposure is incomplete")
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                unknown_rows.append({"proposal_id": row_id, "reason": str(exc) or "malformed pending buy exposure"})
+                # Keep the admission decision fail-closed, but do not expose
+                # implementation details such as ``float(None)`` in Telegram
+                # or scan summaries.  The proposal identity and exception
+                # type remain available for durable audit/debugging.
+                unknown_rows.append({
+                    "proposal_id": row_id,
+                    "reason": "pending buy exposure is incomplete or malformed",
+                    "error_type": type(exc).__name__,
+                })
                 continue
             total_notional += notional
             total_stop_risk += risk_dollars
@@ -11250,7 +11547,15 @@ class TradingService:
             )
         quote = candidate.get("profitability_quote")
         if quote is None:
-            quote = self.broker.get_latest_quote(symbol)
+            # Profitability is an entry-admission control, so its market
+            # evidence must use the same feed, freshness, spread, and
+            # two-sided quote policy as proposal creation and final
+            # revalidation.  Calling the broker getter directly here would
+            # allow an invalid quote to influence ranking before the later
+            # proposal gate could reject it.
+            quote = validated_quote(
+                self.broker, symbol, self.config, now=datetime.now(UTC)
+            )
         bid = _value(quote, "bid_price", _value(quote, "bid"))
         ask = _value(quote, "ask_price", _value(quote, "ask"))
         quote_at = _value(quote, "timestamp")

@@ -1,10 +1,9 @@
 """Trusted portfolio-risk evidence for supervised Alpaca spot crypto.
 
-This lane deliberately stops before proposal or execution authority.  It reads
-the current paper account, positions, open orders, account loss evidence and
-hourly crypto bars, then combines those sources with durable SQLite intents and
-reservations in one ``BEGIN IMMEDIATE`` transaction.  The resulting immutable
-snapshot constrains canonical Decimal sizing but can never submit an order.
+This lane produces immutable account, market and risk evidence.  The separate
+``crypto_paper_lane`` may bind that evidence to a manually approved paper
+order when its explicit opt-in is enabled; this module itself never submits an
+order.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 from .approval_authority import canonical_json
-from .crypto_capabilities import CryptoCapabilityStore, CryptoCapabilitySnapshot
+from .crypto_capabilities import CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
 from .crypto_sizing import (
     CryptoSizingAuthority,
@@ -123,8 +122,11 @@ def _risk_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     cfg = config.get("crypto") or {}
     policy = cfg.get("risk_policy") or {}
     failures: list[str] = []
-    if policy.get("mode") != "research_only":
-        failures.append("risk_policy_mode_not_research_only")
+    lane_enabled = (cfg.get("supervised_paper_lane") or {}).get("enabled") is True
+    if policy.get("mode") not in {"research_only", "supervised_paper"}:
+        failures.append("risk_policy_mode_invalid")
+    if policy.get("mode") == "supervised_paper" and not lane_enabled:
+        failures.append("supervised_risk_requires_enabled_paper_lane")
     if policy.get("formula_version") != CRYPTO_RISK_FORMULA_VERSION:
         failures.append("risk_formula_identity_mismatch")
     if policy.get("schema_version") != CRYPTO_RISK_SCHEMA_VERSION:
@@ -591,7 +593,14 @@ def _failed_derived() -> dict[str, Any]:
     }
 
 
-def _durable_evidence(conn: Any, config: Mapping[str, Any], broker_orders: Sequence[Mapping[str, Any]], failures: list[str]) -> dict[str, Any]:
+def _durable_evidence(
+    conn: Any,
+    config: Mapping[str, Any],
+    broker_orders: Sequence[Mapping[str, Any]],
+    failures: list[str],
+    *,
+    exclude_crypto_intent_id: str | None = None,
+) -> dict[str, Any]:
     configured = _configured_symbols(config)
     rows = conn.execute(
         """SELECT i.id,i.symbol,i.side,i.state,i.client_order_id,i.requested_quantity,
@@ -630,6 +639,42 @@ def _durable_evidence(conn: Any, config: Mapping[str, Any], broker_orders: Seque
                 "reservation_id": row["reservation_id"],
             }
         )
+    crypto_query = """SELECT i.id,i.symbol,i.side,i.state,i.client_order_id,i.requested_quantity,
+                  r.id reservation_id,r.state reservation_state,r.active_notional,r.active_stop_risk
+           FROM crypto_paper_intents i
+           LEFT JOIN crypto_paper_reservations r ON r.intent_id=i.id
+           WHERE i.state IN ('reserved','retryable_pre_submission','submitting','submitted',
+             'partially_filled','cancel_pending','unknown','reconciliation_required')"""
+    crypto_params: tuple[Any, ...] = ()
+    if exclude_crypto_intent_id:
+        crypto_query += " AND i.id<>?"
+        crypto_params = (exclude_crypto_intent_id,)
+    crypto_rows = conn.execute(crypto_query, crypto_params).fetchall()
+    for row in crypto_rows:
+        symbol = _normalize_crypto_symbol(row["symbol"], configured)
+        if symbol is None:
+            failures.append(f"unsupported_crypto_durable_intent:{row['id']}")
+            continue
+        state = str(row["state"] or "")
+        if not row["reservation_id"] or row["reservation_state"] != "active":
+            failures.append(f"active_crypto_intent_missing_active_reservation:{row['id']}")
+        requested = _decimal(row["requested_quantity"] or ZERO, "crypto durable intent quantity", minimum=ZERO)
+        fill_rows = conn.execute(
+            "SELECT quantity FROM crypto_paper_fills WHERE intent_id=? ORDER BY occurred_at,id",
+            (row["id"],),
+        ).fetchall()
+        filled = sum((_decimal(fill["quantity"], "crypto durable fill quantity", minimum=ZERO) for fill in fill_rows), ZERO)
+        active_notional = _decimal(row["active_notional"] or ZERO, "crypto durable reservation notional", minimum=ZERO)
+        active_stop = _decimal(row["active_stop_risk"] or ZERO, "crypto durable reservation stop risk", minimum=ZERO)
+        if state in AMBIGUOUS_INTENT_STATES:
+            failures.append(f"ambiguous_crypto_intent_requires_reconciliation:{row['id']}")
+        intents.append({
+            "intent_id": row["id"], "symbol": symbol, "side": str(row["side"] or "").lower(),
+            "state": state, "client_order_id": str(row["client_order_id"] or ""),
+            "remaining_quantity": _text(max(ZERO, requested - filled)),
+            "active_notional": _text(active_notional), "active_stop_risk": _text(active_stop),
+            "reservation_id": row["reservation_id"], "asset_class": "crypto",
+        })
     broker_client_ids = {str(order.get("client_order_id") or "") for order in broker_orders if order.get("client_order_id")}
     durable_client_ids = {str(intent["client_order_id"]) for intent in intents if intent["client_order_id"]}
     duplicate_links = sorted(broker_client_ids & durable_client_ids)
@@ -939,6 +984,7 @@ class CryptoRiskStore:
         request: CryptoSizingRequest,
         *,
         now: datetime | None = None,
+        exclude_crypto_intent_id: str | None = None,
     ) -> CryptoRiskEvaluation:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         policy = _risk_policy(config)
@@ -995,7 +1041,10 @@ class CryptoRiskStore:
                 or market_row["config_hash"] != config_hash
             ):
                 raise CryptoRiskError("crypto risk evidence changed before durable capture")
-            durable = _durable_evidence(conn, config, orders, failures)
+            durable = _durable_evidence(
+                conn, config, orders, failures,
+                exclude_crypto_intent_id=exclude_crypto_intent_id,
+            )
             loss = _loss_evidence(broker_loss_metrics, conn, current, failures, policy)
             aggregate = _aggregate(symbol=market.symbol, positions=positions, orders=orders, durable=durable)
             try:
@@ -1098,7 +1147,19 @@ class CryptoRiskStore:
                 [
                     {"name": "snapshot_authoritative", "passed": authoritative, "reason": "all broker, durable, loss and volatility evidence must be authoritative"},
                     {"name": "canonical_sizing", "passed": sizing.eligible and sizing.authoritative, "reason": "canonical Decimal sizing must pass every precision and capacity check"},
-                    {"name": "research_only_boundary", "passed": (config.get("crypto") or {}).get("mode") == "research_only" and (config.get("crypto") or {}).get("paper_trading_enabled") is False and (config.get("crypto") or {}).get("proposals_enabled") is False, "reason": "this stage must remain incapable of proposals or execution"},
+                    {"name": "manual_paper_authority_boundary", "passed": (
+                        ((config.get("crypto") or {}).get("mode") == "research_only"
+                         and (config.get("crypto") or {}).get("paper_trading_enabled") is False
+                         and (config.get("crypto") or {}).get("proposals_enabled") is False
+                         and (config.get("crypto") or {}).get("live_enabled") is False)
+                        or ((config.get("crypto") or {}).get("mode") == "supervised_paper"
+                            and (config.get("crypto") or {}).get("paper_trading_enabled") is True
+                            and (config.get("crypto") or {}).get("proposals_enabled") is True
+                            and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("enabled") is True
+                            and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("manual_approval_required") is True
+                            and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("autonomous_execution") is False
+                            and (config.get("crypto") or {}).get("live_enabled") is False)
+                    ), "reason": "crypto authority must be research-only or explicitly supervised paper with manual approval"},
                 ]
             )
             reasons = sorted(

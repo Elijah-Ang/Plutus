@@ -32,6 +32,16 @@ DEFAULT_LISTENER_STALE_SECONDS = 120.0
 REQUIRED_PYTHON = "3.13.9"
 SHA1_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+REQUIRED_ARTIFACT_EVIDENCE_HASHES = (
+    "requirements_lock_sha256",
+    "requirements_hash_lock_sha256",
+    "dependency_inventory_sha256",
+    "artifact_test_results_sha256",
+    "tracked_source_inventory_sha256",
+    "wheel_build_evidence_sha256",
+    "release_wheel_sha256",
+    "release_file_inventory_sha256",
+)
 ALLOWED_SCANNER_STATES = {"healthy", "blocked"}
 
 
@@ -181,6 +191,13 @@ def _load_runtime_authority(runtime_link: Path) -> tuple[Path, dict[str, Any]]:
         raise FreshnessError("active release Python identity is incompatible")
     if platform.python_version() != REQUIRED_PYTHON:
         raise FreshnessError("freshness check is not using the release Python")
+    for field in REQUIRED_ARTIFACT_EVIDENCE_HASHES:
+        if not SHA256_RE.fullmatch(str(manifest.get(field) or "").lower()):
+            raise FreshnessError(f"active release artifact evidence hash is missing or invalid: {field}")
+    if not str(manifest.get("release_wheel_filename") or "").strip():
+        raise FreshnessError("active release wheel filename evidence is missing")
+    if not str(manifest.get("distribution_name") or "").strip() or not str(manifest.get("distribution_version") or "").strip():
+        raise FreshnessError("active release distribution identity evidence is missing")
     if not str(manifest.get("schema_version") or ""):
         raise FreshnessError("active release schema identity is missing")
     if not manifest.get("required_schema_versions"):

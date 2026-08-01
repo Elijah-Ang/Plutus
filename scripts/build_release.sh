@@ -37,7 +37,7 @@ RELEASE_ID="${RELEASE_ID:-${COMMIT:0:12}}"
   print -u2 -- "release id contains unsafe characters"; exit 2
 }
 DEST="$RELEASE_ROOT/$RELEASE_ID"
-[[ ! -e "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
+[[ ! -e "$DEST" && ! -L "$DEST" ]] || { print -u2 -- "release already exists: $DEST"; exit 2; }
 ELIGIBILITY=$(mktemp -t plutus-release-eligibility.XXXXXX)
 mkdir -p "$RELEASE_ROOT"
 LOCK="$DEST.building"
@@ -184,16 +184,31 @@ manifest={
 Path("release-manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n",encoding="utf-8")
 PY
 
+# Bind the generated artifact inventory independently of the Git source-tree
+# inventory.  The manifest is deliberately excluded to avoid a circular
+# digest; its own authority and all generated evidence hashes are verified by
+# verify_release_artifact.py before promotion.
+find . -type f ! -name 'release-file-inventory.sha256' ! -name 'release-manifest.json' -print0 \
+  | LC_ALL=C sort -z | xargs -0 shasum -a 256 > "$STAGING/release-file-inventory.sha256"
+"$STAGING/.venv/bin/python" - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+inventory = Path("release-file-inventory.sha256")
+manifest_path = Path("release-manifest.json")
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["release_file_inventory_sha256"] = hashlib.sha256(inventory.read_bytes()).hexdigest()
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
 "$STAGING/.venv/bin/python" scripts/verify_release_artifact.py "$STAGING"
 "$STAGING/.venv/bin/python" scripts/verify_source_tree.py \
   --root "$STAGING" --inventory "$STAGING/tracked-source-inventory.json" \
   --repository Elijah-Ang/Plutus
-find . -type f ! -name 'release-file-inventory.sha256' -print0 \
-  | LC_ALL=C sort -z | xargs -0 shasum -a 256 > "$STAGING/release-file-inventory.sha256"
 chmod 755 "$STAGING/scripts/run_once.sh" "$STAGING/scripts/run_telegram_listener.sh"
 find "$STAGING" -type d -exec chmod a-w {} +
 find "$STAGING" -type f -exec chmod a-w {} +
-[[ ! -e "$DEST" ]] || { print -u2 -- "release destination appeared during construction"; exit 2; }
+[[ ! -e "$DEST" && ! -L "$DEST" ]] || { print -u2 -- "release destination appeared during construction"; exit 2; }
 mv "$STAGING" "$DEST"
 STAGING=""
 rmdir "$LOCK"

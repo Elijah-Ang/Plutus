@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -36,6 +37,16 @@ def _source_bytes(root: Path, path: str, mode: str) -> bytes:
         return os.readlink(target).encode("utf-8")
     if target.is_symlink() or not target.is_file():
         raise ValueError(f"tracked source type changed: {path}")
+    # ``git archive`` and the final immutable release intentionally make
+    # files read-only, so compare only the executable bit that Git records.
+    # Without this check a tracked executable could be replaced by a plain
+    # data file (or vice versa) while retaining the same content digest.
+    expected_executable = mode == "100755"
+    if mode not in {"100644", "100755"}:
+        raise ValueError(f"unsupported tracked file mode: {path}")
+    actual_executable = bool(target.stat().st_mode & stat.S_IXUSR)
+    if actual_executable != expected_executable:
+        raise ValueError(f"tracked source executable mode changed: {path}")
     return target.read_bytes()
 
 

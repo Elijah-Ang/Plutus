@@ -47,6 +47,20 @@ class BrokerInterface(ABC):
     @abstractmethod
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str, limit_price: float | None = None, client_order_id: str | None = None) -> Any: ...
 
+    def submit_crypto_order(
+        self,
+        symbol: str,
+        side: str,
+        notional_or_qty: dict[str, Any],
+        order_type: str = "limit",
+        limit_price: Any | None = None,
+        client_order_id: str | None = None,
+        time_in_force: str = "gtc",
+    ) -> Any:
+        """Separate paper-crypto adapter; equity adapters must not be reused."""
+
+        raise BrokerSubmissionNotAttempted("separate crypto paper submission adapter is unavailable")
+
     @abstractmethod
     def cancel_order(self, order_id: str) -> Any: ...
 

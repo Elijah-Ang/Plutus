@@ -453,7 +453,21 @@ class DurableExecutionStore:
 
                 def enforce(name: str, projected: float, ceiling_key: str) -> None:
                     ceiling = limits.get(ceiling_key)
-                    if ceiling is not None and projected > float(ceiling) + 1e-9:
+                    if ceiling in (None, ""):
+                        return
+                    try:
+                        ceiling_value = float(ceiling)
+                        projected_value = float(projected)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid") from exc
+                    if (
+                        not math.isfinite(ceiling_value)
+                        or ceiling_value < 0
+                        or not math.isfinite(projected_value)
+                        or projected_value < 0
+                    ):
+                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid")
+                    if projected_value > ceiling_value + 1e-9:
                         raise RuntimeError(f"atomic reservation blocked by {name}")
 
                 enforce(
@@ -1548,7 +1562,7 @@ class DurableExecutionStore:
             "invalid_crypto_strategy_authority": """SELECT COUNT(*) n
                 FROM crypto_strategy_decisions d
                 WHERE d.proposal_authorized<>0 OR d.execution_authorized<>0
-                   OR d.lifecycle<>'RESEARCH_ONLY'
+                   OR d.lifecycle NOT IN ('RESEARCH_ONLY','PAPER_ACTIVE')
                    OR json_valid(d.blockers_json)<>1
                    OR json_valid(d.decision_json)<>1
                    OR (d.signal_eligible=1 AND (
@@ -1609,7 +1623,8 @@ class DurableExecutionStore:
                 LEFT JOIN performance_setups ps ON ps.id=po.setup_id
                 LEFT JOIN fills f ON CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
                 LEFT JOIN orders o ON o.id=f.order_id
-                WHERE po.actual_or_shadow='actual'
+                WHERE COALESCE(ps.asset_class,'equity')<>'crypto'
+                  AND (po.actual_or_shadow='actual'
                    OR (po.actual_or_shadow='actual_fill' AND (
                          po.fill_id IS NULL OR f.id IS NULL
                          OR COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0
@@ -1620,11 +1635,11 @@ class DurableExecutionStore:
                          OR ABS(po.entry_qty-f.qty)>0.000000001
                          OR ABS(po.entry_price-f.price)>0.000000001
                          OR ABS(po.entry_notional-(f.qty*f.price))>0.000000001
-                       ))""",
+                       )))""",
             "performance_lab_fill_not_actual": """SELECT COUNT(*) n
                 FROM performance_outcomes po
                 JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE EXISTS(
+                WHERE ps.asset_class<>'crypto' AND EXISTS(
                         SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
                         WHERE o.proposal_id=ps.proposal_id AND f.qty>0 AND f.price>0
                       )
@@ -1638,7 +1653,7 @@ class DurableExecutionStore:
             "performance_lab_invalid_fill_evidence": """SELECT COUNT(*) n
                 FROM performance_outcomes po
                 JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE EXISTS(
+                WHERE ps.asset_class<>'crypto' AND EXISTS(
                   SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
                   WHERE o.proposal_id=ps.proposal_id
                     AND (COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0)
@@ -1646,7 +1661,7 @@ class DurableExecutionStore:
             "performance_lab_orphaned_proposal_link": """SELECT COUNT(*) n
                 FROM performance_setups ps
                 LEFT JOIN trade_proposals p ON p.id=ps.proposal_id
-                WHERE ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
+                WHERE ps.asset_class<>'crypto' AND ps.proposed=1 AND ps.proposal_id IS NOT NULL AND p.id IS NULL""",
         }
         report = {
             name: int(self.storage.fetch_all(sql)[0]["n"])
@@ -1655,10 +1670,12 @@ class DurableExecutionStore:
         from .fixed_point_accounting import fixed_point_integrity_report
         from .allocation_authority import allocation_authority_integrity_report
         from .strategy_execution_registry import strategy_registry_integrity_report
+        from .crypto_paper_lane import CryptoPaperLaneStore
 
         report.update(fixed_point_integrity_report(self.storage))
         report.update(strategy_registry_integrity_report(self.storage))
         report.update(allocation_authority_integrity_report(self.storage))
+        report.update(CryptoPaperLaneStore(self.storage).integrity_report())
         return report
 
 
@@ -1950,17 +1967,65 @@ class Executor:
             )
             if rows:
                 existing = rows[0]
-                self.storage.execute(
-                    "UPDATE order_intents SET broker_invocation_occurred=0,updated_at=? WHERE id=? AND COALESCE(broker_invocation_occurred,0)=0",
-                    (iso_now(), existing["id"]),
-                )
-                if str(existing.get("state")) == OrderState.RESERVED.value:
+                existing_state = str(existing.get("state") or "")
+                invocation_occurred = int(existing.get("broker_invocation_occurred") or 0)
+                # A missing broker client proves that this call cannot have
+                # performed I/O, but it does not erase ambiguity recorded by a
+                # prior attempt. UNKNOWN/reconciliation-required intents and
+                # any intent with an invocation marker remain lookup/manual-
+                # review only and are never relabelled retryable.
+                if invocation_occurred or existing_state in {
+                    OrderState.UNKNOWN.value,
+                    OrderState.RECONCILIATION_REQUIRED.value,
+                }:
+                    return ExecutionResult(
+                        False,
+                        existing_state or OrderState.UNKNOWN.value,
+                        str(existing.get("client_order_id") or client_order_id),
+                        reason=(
+                            "existing durable intent requires reconciliation; broker was unavailable before this call"
+                            if existing_state in {OrderState.UNKNOWN.value, OrderState.RECONCILIATION_REQUIRED.value}
+                            else "existing intent records a prior broker invocation; automatic resubmission is disabled"
+                        ),
+                        intent_id=str(existing.get("id") or "") or None,
+                    )
+                if existing_state in {
+                    OrderState.CREATED.value,
+                    OrderState.RESERVED.value,
+                }:
                     existing = DurableExecutionStore(self.storage).transition(
                         str(existing["id"]),
                         OrderState.RETRYABLE_PRE_SUBMISSION,
                         event_type="broker_unavailable_before_submission",
-                        expected_state=OrderState.RESERVED,
+                        expected_state=OrderState(existing_state),
                         safe_summary="broker unavailable before any invocation; reservation preserved",
+                    )
+                elif existing_state == OrderState.SUBMITTING.value:
+                    if not self.recovery_proven_no_submit:
+                        return ExecutionResult(
+                            False,
+                            existing_state,
+                            str(existing.get("client_order_id") or client_order_id),
+                            reason="submission state requires explicit proof of no prior broker invocation before retry",
+                            intent_id=str(existing.get("id") or "") or None,
+                        )
+                    existing = DurableExecutionStore(self.storage).transition(
+                        str(existing["id"]),
+                        OrderState.RETRYABLE_PRE_SUBMISSION,
+                        event_type="broker_unavailable_recovery_deferred_before_submission",
+                        expected_state=OrderState.SUBMITTING,
+                        safe_summary="broker unavailable; explicit no-invocation proof preserved retryable recovery",
+                    )
+                elif existing_state not in {
+                    OrderState.CREATED.value,
+                    OrderState.RETRYABLE_PRE_SUBMISSION.value,
+                }:
+                    return ExecutionResult(
+                        False,
+                        existing_state or OrderState.RETRYABLE_PRE_SUBMISSION.value,
+                        str(existing.get("client_order_id") or client_order_id),
+                        reason="existing durable intent is not eligible for pre-submission recovery",
+                        intent_id=str(existing.get("id") or "") or None,
                     )
                 return ExecutionResult(
                     False,

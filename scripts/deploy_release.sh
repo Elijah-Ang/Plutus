@@ -66,12 +66,19 @@ if [[ -L "$RUNTIME" && -e "${RUNTIME:A}/config/KILL_SWITCH" && ! -e "$STATE_ROOT
 fi
 [[ ! -L "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist" ]] || { print -u2 -- "scanner plist target is a symlink"; exit 2; }
 [[ ! -L "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist" ]] || { print -u2 -- "listener plist target is a symlink"; exit 2; }
+# Validate and install both launchd definitions while the old runtime pointer
+# is still active.  A failed install or lint therefore cannot leave the
+# pointer aimed at a release whose writers cannot be started safely.
+for name in com.elijah.tradingagent.plist com.elijah.tradingagent.telegram.plist; do
+  plutil -lint "$RELEASE/launchd/$name" >/dev/null
+  /usr/bin/install -m 600 "$RELEASE/launchd/$name" "$HOME/Library/LaunchAgents/$name"
+  plutil -lint "$HOME/Library/LaunchAgents/$name" >/dev/null
+  cmp -s "$RELEASE/launchd/$name" "$HOME/Library/LaunchAgents/$name" || {
+    print -u2 -- "installed $name differs from the release"; exit 2
+  }
+done
 ln -sfn "$RELEASE" "$RUNTIME"
 [[ "$(readlink "$RUNTIME")" == "$RELEASE" ]] || { print -u2 -- "runtime pointer switch failed"; exit 2; }
-/usr/bin/install -m 600 "$RELEASE/launchd/com.elijah.tradingagent.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
-/usr/bin/install -m 600 "$RELEASE/launchd/com.elijah.tradingagent.telegram.plist" "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
-plutil -lint "$HOME/Library/LaunchAgents/com.elijah.tradingagent.plist"
-plutil -lint "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
 mkdir -p "$STATE_ROOT/release"
 chmod 700 "$STATE_ROOT/release"
 cp "$RELEASE/release-manifest.json" "$STATE_ROOT/release/active-release.json"

@@ -200,7 +200,8 @@ def test_authoritative_decimal_crypto_size_is_bounded_and_never_execution_author
     assert result.sizing.authoritative is True
     assert result.sizing.execution_authorized is False
     assert result.sizing.request_basis == "notional"
-    assert D(result.sizing.canonical_notional) == D("5")
+    assert D(config["crypto"]["sizing_policy"]["minimum_buy_notional_usd"]) <= D(result.sizing.canonical_notional)
+    assert D(result.sizing.canonical_notional) <= D(config["crypto"]["sizing_policy"]["maximum_order_notional_usd"])
     assert D(result.sizing.canonical_stop_risk) <= D("1")
     assert D(result.sizing.estimated_fees) > 0
     assert D(result.sizing.estimated_stop_slippage) > 0
@@ -435,7 +436,7 @@ def test_adversarial_stop_risk_boundaries_never_round_up_authority(tmp_path, ris
 
     if result.sizing.canonical_stop_risk is not None:
         assert D(result.sizing.canonical_stop_risk) <= D(risk)
-        assert D(result.sizing.canonical_notional) <= D("5")
+        assert D(result.sizing.canonical_notional) <= D("5000")
     assert result.sizing.execution_authorized is False
 
 
@@ -717,7 +718,7 @@ def test_regenerated_local_risk_digest_cannot_bless_changed_portfolio_aggregate(
     ("path", "value", "message"),
     [
         (("formula_versions", "crypto_sizing"), "old", "formula_versions.crypto_sizing"),
-        (("crypto", "sizing_policy", "maximum_order_notional_usd"), 6.0, "maximum_order_notional_usd"),
+        (("crypto", "sizing_policy", "maximum_order_notional_usd"), 0.5, "maximum_order_notional_usd"),
         (("crypto", "risk_policy", "maximum_stop_heat_pct_equity"), 0.001, "stop-risk limits"),
         (("crypto", "risk_policy", "loss_session_timezone"), "America/New_York", "must use UTC"),
         (("crypto", "risk_policy", "require_cash_funded"), False, "cash-funded"),
@@ -815,17 +816,21 @@ def test_same_symbol_open_buy_still_blocks_a_sell_while_pending_sell_is_capacity
 
 
 def test_volatility_throttle_reduces_notional_without_exceeding_any_cap(tmp_path):
-    storage, _, _, _, _, result = _evaluate(
+    storage, config, _, _, _, result = _evaluate(
         tmp_path, broker=Broker(volatility_step=D("0.01")),
         request=_request(requested_stop_risk_dollars=D("10")),
     )
+    baseline = _evaluate(
+        tmp_path / "baseline", request=_request(requested_stop_risk_dollars=D("10")),
+    )[-1]
     snapshot = json.loads(storage.fetch_all(
         "SELECT snapshot_json FROM crypto_risk_snapshots WHERE id=?", (result.snapshot_id,)
     )[0]["snapshot_json"])
 
     assert D("0.8") <= D(snapshot["volatility_evidence"]["annualized_volatility"]) < D("1.5")
     assert snapshot["derived_authority"]["volatility_multiplier"] == "0.5"
-    assert D(result.sizing.canonical_notional) <= D("2.5")
+    assert D(result.sizing.canonical_notional) <= D(baseline.sizing.canonical_notional)
+    assert D(result.sizing.canonical_notional) <= D(config["crypto"]["sizing_policy"]["maximum_order_notional_usd"])
 
 
 def test_crypto_loss_control_uses_net_realized_pnl_not_sum_of_losing_legs(tmp_path):

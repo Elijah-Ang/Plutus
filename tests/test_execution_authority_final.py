@@ -111,6 +111,24 @@ def test_caller_holdings_kill_switch_and_loss_hints_are_not_authority(tmp_path):
         capture(storage, Broker(), trusted_providers={"loss_controls": stale})
 
 
+def test_missing_loss_timestamp_is_not_authoritative_outside_test_mode(tmp_path, monkeypatch):
+    class MissingTimestampBroker(Broker):
+        def get_loss_metrics(self):
+            return {
+                "daily_loss_dollars": 0.0,
+                "weekly_loss_dollars": 0.0,
+                "daily_loss_confidence": "verified",
+                "weekly_loss_confidence": "verified",
+                "reference_equity": 100_000.0,
+            }
+
+    monkeypatch.delenv("TRADING_AGENT_TESTING", raising=False)
+    storage = Storage(tmp_path / "missing-loss-timestamp.sqlite3")
+    storage.initialize()
+    with pytest.raises(RuntimeError, match="timestamp is missing"):
+        capture(storage, MissingTimestampBroker())
+
+
 def test_account_identity_is_stable_nonempty_and_not_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("TRADING_AGENT_TESTING", raising=False)
     storage = Storage(tmp_path / "account.sqlite3"); storage.initialize()
@@ -158,4 +176,31 @@ def test_missing_config_or_formula_versions_fail_closed(tmp_path, monkeypatch):
         capture_execution_risk_snapshot(
             storage, Broker(), proposal_id="proposal", approval_id="approval", run_id="run",
             context={}, config={"effective_config_hash": "cfg"}, candidate=candidate(),
+        )
+
+
+@pytest.mark.parametrize("kind", ["candidate", "configuration"])
+def test_nonfinite_risk_evidence_fails_closed(tmp_path, kind):
+    storage = Storage(tmp_path / f"nonfinite-{kind}.sqlite3")
+    storage.initialize()
+    value = candidate()
+    current_config = config()
+    if kind == "candidate":
+        value["notional"] = float("nan")
+        expected = "candidate notional"
+    else:
+        current_config["portfolio_behavior"] = {
+            "max_total_portfolio_exposure_pct": float("nan"),
+        }
+        expected = "maximum total portfolio exposure"
+    with pytest.raises(RuntimeError, match=expected):
+        capture_execution_risk_snapshot(
+            storage,
+            Broker(),
+            proposal_id="proposal",
+            approval_id="approval",
+            run_id="run",
+            context={},
+            candidate=value,
+            config=current_config,
         )

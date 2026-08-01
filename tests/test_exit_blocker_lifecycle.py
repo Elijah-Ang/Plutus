@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from app.service import TradingService
 from app.storage import Storage
+from app.exit_blocker import ExitBlockerStore
 from app.strategy_rule_based import Signal
 
 
@@ -291,3 +292,89 @@ def test_digest_names_current_blocker_source_symbol_and_status(tmp_path):
     assert status["event"] == "exit_blocked"
     assert "ABBV exit proposal pending" in status["status"]
     assert "until" in status["status"]
+
+
+def test_stale_validation_clears_all_durable_blocker_symbols(tmp_path):
+    service, storage, broker = make_service(tmp_path, positions=[])
+    for symbol in ("ABBV", "MSFT"):
+        ExitBlockerStore(storage, "prior-run").observe({
+            "symbol": symbol,
+            "source_type": "active_sell_proposal",
+            "source_id": f"{symbol.lower()}-proposal",
+            "status": "pending",
+            "reason": f"old {symbol} exit proposal",
+        })
+    insert_proposal(
+        storage,
+        proposal_id="stale-iwm",
+        symbol="IWM",
+        status="expired",
+        expires_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+    )
+
+    blocker = service._exit_blocker_context([], positions=broker.positions)
+
+    assert blocker["active"] is False
+    assert blocker["stale"] is True
+    rows = storage.fetch_all("SELECT symbol,active,state FROM exit_blocker_states ORDER BY symbol")
+    assert rows == [
+        {"symbol": "ABBV", "active": 0, "state": "cleared"},
+        {"symbol": "MSFT", "active": 0, "state": "cleared"},
+    ]
+
+
+def test_failed_broker_order_read_retains_existing_blocker(tmp_path):
+    class OrdersUnavailableBroker(ExitBroker):
+        def get_open_orders(self):
+            raise RuntimeError("broker order endpoint unavailable")
+
+    storage = Storage(tmp_path / "exit-blocker.db")
+    storage.initialize()
+    broker = OrdersUnavailableBroker(positions=[])
+    service = TradingService({"mode": "paper", "live_enabled": False}, storage, broker, "digest-run")
+    ExitBlockerStore(storage, "prior-run").observe({
+        "symbol": "ABBV",
+        "source_type": "broker_open_order",
+        "source_id": "broker-sell-1",
+        "status": "open",
+        "reason": "ABBV SELL order open",
+    })
+
+    blocker = service._exit_blocker_context()
+
+    assert blocker["active"] is True
+    assert blocker["unverified"] is True
+    assert blocker["source_type"] == "broker_open_order"
+    assert "could not be verified" in blocker["reason"]
+    assert service._exit_blocker_display_reason(blocker) == (
+        "ABBV broker exit state unavailable; revalidate before new orders"
+    )
+    row = storage.fetch_all("SELECT active,state FROM exit_blocker_states WHERE symbol='ABBV'")[0]
+    assert row == {"active": 1, "state": "broker_order_open"}
+
+
+def test_failed_broker_position_read_retains_existing_blocker(tmp_path):
+    class PositionsUnavailableBroker(ExitBroker):
+        def get_positions(self):
+            raise RuntimeError("broker position endpoint unavailable")
+
+    storage = Storage(tmp_path / "exit-blocker.db")
+    storage.initialize()
+    broker = PositionsUnavailableBroker(positions=[])
+    service = TradingService({"mode": "paper", "live_enabled": False}, storage, broker, "digest-run")
+    ExitBlockerStore(storage, "prior-run").observe({
+        "symbol": "ABBV",
+        "source_type": "active_sell_proposal",
+        "source_id": "abbv-proposal",
+        "status": "pending",
+        "reason": "ABBV exit proposal pending",
+    })
+
+    blocker = service._exit_blocker_context([])
+
+    assert blocker["active"] is True
+    assert blocker["unverified"] is True
+    assert blocker["source_type"] == "active_sell_proposal"
+    assert "positions could not be verified" in blocker["reason"]
+    row = storage.fetch_all("SELECT active,state FROM exit_blocker_states WHERE symbol='ABBV'")[0]
+    assert row == {"active": 1, "state": "awaiting_manual_approval"}

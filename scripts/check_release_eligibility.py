@@ -149,15 +149,26 @@ def _remote_ci(sha: str, repository: str | None, *, skip: bool) -> dict[str, Any
             jobs_payload = json.load(response)
     except (OSError, urllib.error.URLError, ValueError) as exc:
         return {**result, "status": "unverified", "reason": f"GitHub jobs lookup failed: {type(exc).__name__}"}
-    jobs = {str(job.get("name") or ""): job for job in jobs_payload.get("jobs", [])}
-    missing = sorted(REQUIRED_CI_JOBS - jobs.keys())
+    job_rows = [job for job in jobs_payload.get("jobs", []) if isinstance(job, dict)]
+    jobs = {str(job.get("name") or ""): job for job in job_rows}
+    job_counts = {
+        name: sum(1 for job in job_rows if str(job.get("name") or "") == name)
+        for name in REQUIRED_CI_JOBS
+    }
+    missing = sorted(name for name, count in job_counts.items() if count == 0)
+    duplicated = sorted(name for name, count in job_counts.items() if count != 1 and count > 1)
     unsuccessful = sorted(
         name for name in REQUIRED_CI_JOBS
         if name in jobs and (jobs[name].get("status") != "completed" or jobs[name].get("conclusion") != "success")
     )
-    if missing or unsuccessful:
-        return {**result, "required_jobs_missing": missing, "required_jobs_unsuccessful": unsuccessful,
-                "reason": "required CI jobs are missing or unsuccessful"}
+    if missing or duplicated or unsuccessful:
+        return {
+            **result,
+            "required_jobs_missing": missing,
+            "required_jobs_duplicated": duplicated,
+            "required_jobs_unsuccessful": unsuccessful,
+            "reason": "required CI jobs must exist exactly once and complete successfully",
+        }
     return {**result, "status": "passed", "passed": True, "required_jobs": sorted(REQUIRED_CI_JOBS)}
 
 
@@ -471,8 +482,12 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
             runtime_schema_reason = str(exc)
     migration_compatible = first_signature == second_signature and not missing_versions and runtime_schema_compatible
     if run_tests:
-        compile_result = _run("python", "-m", "compileall", "app", "tests", "scripts")
-        pytest_result = _run("python", "-m", "pytest", "-q")
+        # Keep the release gate bound to the interpreter that invoked this
+        # script.  A bare ``python`` can resolve to a different installation
+        # (and dependency inventory) than the explicitly selected 3.13.9
+        # release environment.
+        compile_result = _run(sys.executable, "-m", "compileall", "app", "tests", "scripts")
+        pytest_result = _run(sys.executable, "-m", "pytest", "-q")
         local_tests = {
             "status": "passed" if compile_result.returncode == 0 and pytest_result.returncode == 0 else "failed",
             "passed": compile_result.returncode == 0 and pytest_result.returncode == 0,

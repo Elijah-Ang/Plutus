@@ -31,6 +31,57 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def verify_release_file_inventory(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Verify the generated artifact inventory independently of source authority.
+
+    The tracked-source inventory proves the Git tree.  This separate inventory
+    covers generated release evidence and the installed artifact files.  Its
+    own digest is bound by the manifest so a locally regenerated list cannot
+    bless a changed generated file.
+    """
+    inventory_path = root / "release-file-inventory.sha256"
+    expected_digest = str(manifest.get("release_file_inventory_sha256") or "")
+    if not inventory_path.is_file() or not expected_digest:
+        raise ValueError("release file inventory evidence is missing")
+    if digest(inventory_path) != expected_digest:
+        raise ValueError("release file inventory digest mismatch")
+
+    entries: dict[str, str] = {}
+    for raw_line in inventory_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        expected, separator, relative_text = line.partition("  ")
+        if not separator or len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected.lower()):
+            raise ValueError("release file inventory entry is malformed")
+        relative = relative_text.strip()
+        if relative.startswith("./"):
+            relative = relative[2:]
+        candidate = Path(relative)
+        if not relative or candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("release file inventory path is unsafe")
+        if relative in {"release-file-inventory.sha256", "release-manifest.json"}:
+            raise ValueError("release file inventory contains an excluded generated file")
+        if relative in entries:
+            raise ValueError("release file inventory contains a duplicate path")
+        raw_target = root / candidate
+        # Inspect the path before resolving it.  Otherwise a symlink to a
+        # regular in-tree file would resolve to a safe-looking target and
+        # silently bypass the generated-artifact inventory's path check.
+        if raw_target.is_symlink():
+            raise ValueError(f"release file inventory target is missing or unsafe: {relative}")
+        target = raw_target.resolve()
+        if not target.is_relative_to(root) or not target.is_file() or target.is_symlink():
+            raise ValueError(f"release file inventory target is missing or unsafe: {relative}")
+        actual = digest(target)
+        if actual != expected.lower():
+            raise ValueError(f"release file inventory content changed: {relative}")
+        entries[relative] = expected.lower()
+    if not entries:
+        raise ValueError("release file inventory is empty")
+    return {"verified": True, "file_count": len(entries), "digest": expected_digest}
+
+
 def installed_app_package_digests(distribution: Any) -> dict[str, str]:
     """Hash the installed app tree while rejecting non-source install payloads."""
     installed_package_root = Path(distribution.locate_file("app"))
@@ -245,12 +296,14 @@ def verify(
         raise ValueError("artifact required schema versions changed")
     if manifest.get("formula_versions") != formula_versions:
         raise ValueError("artifact formula versions changed")
+    release_inventory = verify_release_file_inventory(root, manifest)
     return {
         "verified": True,
         "python_version": current_python,
         "configuration_hash": effective_config_hash,
         "schema_version_count": len(set(required_schema_versions or [])),
         "formula_version_count": len(formula_versions or {}),
+        "release_file_count": release_inventory["file_count"],
     }
 
 
