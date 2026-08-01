@@ -795,6 +795,37 @@ def test_stale_approved_expired_sell_proposal_does_not_block_buys(tmp_path):
     assert blocker["reason"] == "stale SPY exit flag ignored"
 
 
+def test_expired_approved_buy_proposal_does_not_consume_pending_exposure(tmp_path):
+    service, storage = make_service(tmp_path)
+    now = datetime.now(UTC)
+    payload = {
+        "symbol": "DIA",
+        "notional": 50.0,
+        "latest_price": 100.0,
+        "stop_distance_dollars": 5.0,
+        "stop_risk_dollars": 2.5,
+        "cluster_name": "broad",
+    }
+    storage.execute(
+        """INSERT INTO trade_proposals(
+               id,run_id,signal_id,symbol,side,notional,status,created_at,expires_at,
+               strategy_version,payload
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "expired-daily-buy", "run", "sig-expired-daily-buy", "DIA", "buy", 50.0,
+            "approved", now.isoformat(), (now - timedelta(minutes=1)).isoformat(),
+            "rule_based_v1", json.dumps(payload),
+        ),
+    )
+
+    totals = service._pending_execution_totals()
+
+    assert totals["unknown"] is False
+    assert totals["total_notional"] == 0.0
+    assert totals["total_stop_risk"] == 0.0
+    assert totals["by_symbol"] == {}
+
+
 def test_active_pending_exit_proposal_blocks_buys(tmp_path):
     service, storage = make_service(tmp_path)
     future = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()

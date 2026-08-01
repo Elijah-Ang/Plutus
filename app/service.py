@@ -10288,11 +10288,15 @@ class TradingService:
 
     def _pending_execution_totals(self) -> dict[str, Any]:
         """Return unreserved pending BUY exposure, failing closed on unknowns."""
+        now_iso = iso_now()
         rows = self.storage.fetch_all(
-            """SELECT p.id,p.symbol,p.payload,p.notional,p.strategy_version,p.status
+            """SELECT p.id,p.symbol,p.payload,p.notional,p.strategy_version,p.status,p.expires_at
                FROM trade_proposals p
                LEFT JOIN order_intents i ON i.proposal_id=p.id
-               WHERE p.side='buy' AND p.status IN ('pending','approved') AND i.id IS NULL"""
+               WHERE p.side='buy' AND p.status IN ('pending','approved')
+                 AND (p.expires_at IS NULL OR p.expires_at>?)
+                 AND i.id IS NULL""",
+            (now_iso,),
         )
         total_notional = 0.0
         total_stop_risk = 0.0
