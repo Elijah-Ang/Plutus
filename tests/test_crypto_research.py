@@ -27,14 +27,16 @@ from app.formula_versions import (
 
 
 class CryptoBroker:
-    def __init__(self, *, stale: bool = False) -> None:
+    def __init__(self, *, stale: bool = False, bar_age_hours: int = 0) -> None:
         self.stale = stale
+        self.bar_age_hours = bar_age_hours
         self.submitted_orders = []
 
     def get_crypto_historical_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 500):
         end = datetime(2026, 7, 3, 10, 0, tzinfo=UTC)
         if self.stale:
-            end -= timedelta(hours=2)
+            end -= timedelta(hours=3)
+        end -= timedelta(hours=self.bar_age_hours)
         start = end - timedelta(hours=limit - 1)
         rows = []
         base = 100.0 if symbol == "BTC/USD" else 50.0
@@ -342,6 +344,17 @@ def test_stale_crypto_data_blocks_future_proposal_path_and_records_shadow_only(t
     assert {row["asset_class"] for row in perf} == {"crypto"}
     assert {row["action_decision"] for row in perf} == {"research_only"}
     assert {row["proposed"] for row in perf} == {0}
+
+
+def test_hourly_crypto_bar_within_strategy_age_window_remains_fresh(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    config["crypto"]["strategy_policy"] = {"maximum_latest_bar_age_seconds": 7200}
+    results = CryptoResearchEngine(
+        config, storage, CryptoBroker(bar_age_hours=1), TelegramSink(), "run-hourly-fresh"
+    ).run_research(now=datetime(2026, 7, 3, 10, 0, tzinfo=UTC))
+
+    assert {result.data_freshness for result in results} == {"fresh"}
 
 
 def test_crypto_provider_failure_records_data_unavailable_blocker_and_no_orders(tmp_path):

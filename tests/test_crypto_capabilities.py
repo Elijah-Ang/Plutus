@@ -324,9 +324,11 @@ def test_generic_equity_adapter_rejects_crypto_before_any_broker_call():
 def test_alpaca_crypto_read_adapter_uses_explicit_us_feed_and_assets_filter():
     broker = AlpacaBroker(_config(), "paper-key", "paper-secret")
     calls = []
+    bar_requests = []
 
     class CryptoData:
         def get_crypto_bars(self, request, *, feed):
+            bar_requests.append(request)
             calls.append(("bars", request.symbol_or_symbols, feed.value))
             return SimpleNamespace(df="bars-frame")
 
@@ -348,6 +350,11 @@ def test_alpaca_crypto_read_adapter_uses_explicit_us_feed_and_assets_filter():
     )
 
     assert broker.get_crypto_historical_bars("BTC/USD", "1Hour", 3) == "bars-frame"
+    assert len(bar_requests) == 1
+    request = bar_requests[0]
+    assert request.limit == 3
+    assert request.end - request.start == timedelta(hours=3)
+    assert request.start < request.end <= datetime.now(UTC)
     assert broker.get_crypto_latest_quote("BTC/USD") == "quote"
     assert broker.get_crypto_latest_trade("BTC/USD") == "trade"
     assert broker.get_crypto_latest_orderbook("BTC/USD") == "book"

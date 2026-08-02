@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import uuid
 from dataclasses import dataclass
@@ -270,7 +269,18 @@ class CryptoResearchEngine:
         price = closes[-1] if closes else None
         price_ts = rows[-1].get("timestamp")
         price_timestamp = _iso_timestamp(price_ts)
-        max_age_seconds = float((self.config.get("crypto") or {}).get("max_price_age_seconds", 300) or 300)
+        crypto_cfg = self.config.get("crypto") or {}
+        strategy_cfg = crypto_cfg.get("strategy_policy") or {}
+        # ``max_price_age_seconds`` is the quote/evidence freshness gate. The
+        # research series is hourly, so its latest-bar gate must come from the
+        # strategy cadence policy; otherwise an hourly bar is marked stale
+        # after five minutes and the supervised lane can never become
+        # proposal-eligible between bar boundaries.
+        max_age_seconds = float(
+            strategy_cfg.get("maximum_latest_bar_age_seconds")
+            or crypto_cfg.get("max_price_age_seconds", 300)
+            or 300
+        )
         data_freshness = _freshness(price_ts, now, max_age_seconds)
 
         returns = {
