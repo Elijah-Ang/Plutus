@@ -18,6 +18,7 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   set +e
   LOCK_STATE=$("$ROOT/.venv/bin/python" -m app.run_lock "$LOCKDIR" \
     --expected-command "run_telegram_listener.sh" \
+    --expected-command "--mode listener" \
     --expected-repository "$ROOT" --expected-commit "$CURRENT_COMMIT" 2>/dev/null)
   LOCK_RC=$?
   set -e

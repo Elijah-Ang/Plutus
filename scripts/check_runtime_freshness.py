@@ -355,7 +355,7 @@ def _validate_listener_lock(
 ) -> dict[str, Any]:
     inspection = lock_probe(
         lockdir,
-        expected_command="run_telegram_listener.sh",
+        expected_commands=("run_telegram_listener.sh", "--mode listener"),
         expected_repository=release_root,
         expected_commit=commit,
     )

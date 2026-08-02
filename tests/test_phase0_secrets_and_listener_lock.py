@@ -239,6 +239,21 @@ def test_listener_live_expected_process_is_active(tmp_path, monkeypatch):
     assert run_lock.inspect_lock(lock, expected_command="run_telegram_listener.sh").state == "active"
 
 
+def test_exec_replaced_listener_identity_is_active(tmp_path, monkeypatch):
+    lock = tmp_path / "listener.lockdir"
+    _write_lock(lock, 42, command="/release/.venv/bin/python -m app.main --mode listener", start="same")
+    monkeypatch.setattr(run_lock, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(
+        run_lock,
+        "_process_identity",
+        lambda pid: run_lock.ProcessIdentity("/release/.venv/bin/python -m app.main --mode listener", "same"),
+    )
+    assert run_lock.inspect_lock(
+        lock,
+        expected_commands=("run_telegram_listener.sh", "--mode listener"),
+    ).state == "active"
+
+
 def test_listener_live_wrong_command_is_stale_after_grace(tmp_path, monkeypatch):
     lock = tmp_path / "listener.lockdir"
     _write_lock(lock, 42, command="unrelated", start="same")
