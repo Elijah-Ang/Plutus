@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    decimal_text,
+    legacy_float,
+    row_decimal,
+)
 from .utils import iso_now, json_dumps
+
+
+ZERO = Decimal("0")
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -21,13 +32,13 @@ class PositionLifecycleManager:
         current: dict[str, dict[str, Any]] = {}
         for position in positions:
             symbol = str(_value(position, "symbol", "")).upper()
-            quantity = float(_value(position, "qty", 0) or 0)
-            if symbol and abs(quantity) > 1e-12:
+            quantity = _decimal_or_none(_value(position, "qty", 0)) or ZERO
+            if symbol and abs(quantity) > ZERO:
                 current[symbol] = {
                     "quantity": quantity,
-                    "side": "long" if quantity > 0 else "short",
+                    "side": "long" if quantity > ZERO else "short",
                     "broker_position_id": str(_value(position, "asset_id", "") or _value(position, "id", "") or "") or None,
-                    "average_entry_price": _float_or_none(_value(position, "avg_entry_price")),
+                    "average_entry_price": _decimal_or_none(_value(position, "avg_entry_price")),
                 }
 
         def refresh_opening_quantity(conn: Any, lifecycle: Any) -> None:
@@ -38,19 +49,26 @@ class PositionLifecycleManager:
             the cumulative fill ledger of its first lifecycle-bound ENTRY
             intent, never from later ADD intents or from a reduced position.
             """
-            entry = conn.execute(
-                """SELECT id,state,filled_quantity
+            entry = None
+            for candidate in conn.execute(
+                """SELECT *
                    FROM order_intents
                    WHERE position_lifecycle_id=? AND symbol=? AND lower(side)='buy'
-                     AND lower(intended_action)='entry' AND filled_quantity>0
-                   ORDER BY created_at,id LIMIT 1""",
+                     AND lower(intended_action)='entry'
+                   ORDER BY created_at,id""",
                 (lifecycle["id"], lifecycle["symbol"]),
-            ).fetchone()
+            ).fetchall():
+                try:
+                    if (row_decimal(dict(candidate), "filled_quantity_decimal", "filled_quantity") or ZERO) > ZERO:
+                        entry = candidate
+                        break
+                except (TypeError, ValueError):
+                    continue
             if not entry:
                 return
             try:
-                cumulative_filled = float(entry["filled_quantity"] or 0.0)
-                prior_opening = float(lifecycle["opening_quantity"] or 0.0)
+                cumulative_filled = row_decimal(dict(entry), "filled_quantity_decimal", "filled_quantity") or ZERO
+                prior_opening = row_decimal(dict(lifecycle), "opening_quantity_decimal", "opening_quantity") or ZERO
             except (TypeError, ValueError):
                 return
             if int(lifecycle["opening_quantity_frozen"] or 0) == 1:
@@ -61,14 +79,65 @@ class PositionLifecycleManager:
             if entry_terminal:
                 conn.execute(
                     """UPDATE position_lifecycles
-                       SET opening_quantity=?,opening_quantity_frozen=1,updated_at=?
+                       SET opening_quantity=?,opening_quantity_decimal=?,opening_quantity_frozen=1,
+                           decimal_provenance=?,decimal_accounting_version=?,updated_at=?
                        WHERE id=?""",
-                    (max(prior_opening, cumulative_filled), now, lifecycle["id"]),
+                    (
+                        legacy_float(max(prior_opening, cumulative_filled)),
+                        decimal_text(max(prior_opening, cumulative_filled)),
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                        now, lifecycle["id"],
+                    ),
                 )
-            elif cumulative_filled > prior_opening + 1e-12:
+            elif cumulative_filled > prior_opening:
                 conn.execute(
-                    "UPDATE position_lifecycles SET opening_quantity=?,updated_at=? WHERE id=? AND opening_quantity<=?",
-                    (cumulative_filled, now, lifecycle["id"], cumulative_filled + 1e-12),
+                    """UPDATE position_lifecycles
+                       SET opening_quantity=?,opening_quantity_decimal=?,decimal_provenance=?,
+                           decimal_accounting_version=?,updated_at=? WHERE id=?""",
+                    (
+                        legacy_float(cumulative_filled), decimal_text(cumulative_filled),
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                        now, lifecycle["id"],
+                    ),
+                )
+
+        def bind_filled_entry_intents(
+            conn: Any,
+            *,
+            lifecycle_id: str,
+            symbol: str,
+            boundary: str | None,
+        ) -> None:
+            """Bind filled entry intents without SQLite REAL comparison.
+
+            ``filled_quantity`` remains a compatibility projection for older
+            readers.  Lifecycle identity is an accounting boundary, so the
+            positive-fill test must happen after loading the canonical
+            decimal projection in Python rather than in SQLite's REAL
+            arithmetic/comparison engine.
+            """
+            candidates = conn.execute(
+                """SELECT id,filled_quantity,filled_quantity_decimal,created_at
+                   FROM order_intents
+                   WHERE symbol=? AND lower(side)='buy'
+                     AND lower(intended_action)='entry'
+                     AND position_lifecycle_id IS NULL
+                     AND (? IS NULL OR created_at>?)
+                   ORDER BY created_at,id""",
+                (symbol, boundary, boundary),
+            ).fetchall()
+            for candidate in candidates:
+                try:
+                    filled = row_decimal(
+                        dict(candidate), "filled_quantity_decimal", "filled_quantity"
+                    ) or ZERO
+                except (TypeError, ValueError, InvalidOperation):
+                    continue
+                if filled <= ZERO:
+                    continue
+                conn.execute(
+                    "UPDATE order_intents SET position_lifecycle_id=?,updated_at=? WHERE id=? AND position_lifecycle_id IS NULL",
+                    (lifecycle_id, now, candidate["id"]),
                 )
 
         with self.storage.connect() as conn:
@@ -82,8 +151,9 @@ class PositionLifecycleManager:
                     archive = json_dumps(dict(pm_state)) if pm_state else None
                     conn.execute(
                         """UPDATE position_lifecycles SET state='closed',current_quantity=0,closed_at=?,updated_at=?,
-                           management_state_archive=? WHERE id=?""",
-                        (now, now, archive, lifecycle["id"]),
+                           management_state_archive=?,current_quantity_decimal='0',
+                           decimal_provenance=?,decimal_accounting_version=? WHERE id=?""",
+                        (now, now, archive, EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, lifecycle["id"]),
                     )
                     conn.execute("DELETE FROM position_management_state WHERE symbol=?", (symbol,))
                     conn.execute(
@@ -102,17 +172,20 @@ class PositionLifecycleManager:
                         (symbol,),
                     ).fetchone()
                     boundary = boundary_row["boundary"] if boundary_row else None
-                    conn.execute(
-                        """UPDATE order_intents SET position_lifecycle_id=?,updated_at=?
-                           WHERE symbol=? AND lower(side)='buy' AND lower(intended_action)='entry'
-                             AND filled_quantity>0 AND position_lifecycle_id IS NULL
-                             AND (? IS NULL OR created_at>?)""",
-                        (lifecycle["id"], now, symbol, boundary, boundary),
+                    bind_filled_entry_intents(
+                        conn, lifecycle_id=lifecycle["id"], symbol=symbol, boundary=boundary
                     )
                     conn.execute(
                         """UPDATE position_lifecycles SET broker_position_id=COALESCE(?,broker_position_id),
-                           current_quantity=?,average_entry_price=COALESCE(?,average_entry_price),updated_at=? WHERE id=?""",
-                        (observed["broker_position_id"], observed["quantity"], observed["average_entry_price"], now, lifecycle["id"]),
+                           current_quantity=?,current_quantity_decimal=?,average_entry_price=COALESCE(?,average_entry_price),
+                           average_entry_price_decimal=COALESCE(?,average_entry_price_decimal),
+                           decimal_provenance=?,decimal_accounting_version=?,updated_at=? WHERE id=?""",
+                        (
+                            observed["broker_position_id"], legacy_float(observed["quantity"]),
+                            decimal_text(observed["quantity"]), legacy_float(observed["average_entry_price"]),
+                            decimal_text(observed["average_entry_price"]) if observed["average_entry_price"] is not None else None,
+                            EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, now, lifecycle["id"],
+                        ),
                     )
                     refresh_opening_quantity(conn, lifecycle)
                     conn.execute(
@@ -124,21 +197,26 @@ class PositionLifecycleManager:
                     conn.execute(
                         """INSERT INTO position_lifecycles(
                                id,symbol,broker_position_id,side,state,opened_at,opening_quantity,current_quantity,
-                               average_entry_price,source,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (lifecycle_id, symbol, observed["broker_position_id"], observed["side"], "active", now, observed["quantity"], observed["quantity"], observed["average_entry_price"], source, now, now),
+                               average_entry_price,source,created_at,updated_at,
+                               opening_quantity_decimal,current_quantity_decimal,average_entry_price_decimal,
+                               decimal_provenance,decimal_accounting_version)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            lifecycle_id, symbol, observed["broker_position_id"], observed["side"], "active", now,
+                            legacy_float(observed["quantity"]), legacy_float(observed["quantity"]),
+                            legacy_float(observed["average_entry_price"]), source, now, now,
+                            decimal_text(observed["quantity"]), decimal_text(observed["quantity"]),
+                            decimal_text(observed["average_entry_price"]) if observed["average_entry_price"] is not None else None,
+                            EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                        ),
                     )
                     boundary_row = conn.execute(
                         "SELECT MAX(closed_at) boundary FROM position_lifecycles WHERE symbol=? AND state='closed'",
                         (symbol,),
                     ).fetchone()
                     boundary = boundary_row["boundary"] if boundary_row else None
-                    conn.execute(
-                        """UPDATE order_intents SET position_lifecycle_id=?,updated_at=?
-                           WHERE symbol=? AND lower(side)='buy' AND lower(intended_action)='entry'
-                             AND filled_quantity>0 AND position_lifecycle_id IS NULL
-                             AND (? IS NULL OR created_at>?)""",
-                        (lifecycle_id, now, symbol, boundary, boundary),
+                    bind_filled_entry_intents(
+                        conn, lifecycle_id=lifecycle_id, symbol=symbol, boundary=boundary
                     )
                     conn.execute(
                         """UPDATE position_lots SET position_lifecycle_id=?,updated_at=?
@@ -164,8 +242,11 @@ class PositionLifecycleManager:
         return str(rows[0]["id"]) if rows else None
 
 
-def _float_or_none(value: Any) -> float | None:
-    try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
         return None
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None

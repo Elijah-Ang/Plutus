@@ -127,10 +127,10 @@ class Broker:
         raise AssertionError("crypto sizing/risk must never call submit_order")
 
 
-def _position(symbol="BTCUSD", qty="0.02", value="2", price="100"):
+def _position(symbol="BTCUSD", qty="0.02", value="2", price="100", avg_entry_price=None):
     return SimpleNamespace(
         symbol=symbol, asset_class="crypto", qty=qty, market_value=value,
-        current_price=price, side="long",
+        current_price=price, side="long", avg_entry_price=avg_entry_price,
     )
 
 
@@ -745,12 +745,41 @@ def test_existing_position_cannot_be_mislabeled_as_a_new_entry(tmp_path):
     assert broker.submit_calls == 0
 
 
-def test_add_requires_existing_position_and_remains_disabled(tmp_path):
+def test_add_requires_existing_position_and_is_not_authorized_without_a_winner(tmp_path):
     _, _, broker, _, _, result = _evaluate(tmp_path, request=_request(action="add"))
 
     assert result.risk_eligible is False
     assert any("ADD requires an existing" in reason for reason in result.reasons)
-    assert any("ADDs remain disabled" in reason for reason in result.reasons)
+    assert any("ADD requires verified current bid above" in reason for reason in result.reasons)
+    assert broker.submit_calls == 0
+
+
+def test_add_to_profitable_winner_is_exactly_risk_eligible_but_never_execution_authority(tmp_path):
+    broker = Broker(positions=[_position(qty="0.02", value="2", avg_entry_price="90")])
+    _, _, _, _, _, result = _evaluate(
+        tmp_path,
+        broker=broker,
+        request=_request(action="add"),
+    )
+
+    assert result.risk_eligible is True
+    assert result.sizing.eligible is True
+    assert result.execution_authorized is False
+    assert "profitable_winner" not in result.reasons
+    assert broker.submit_calls == 0
+
+
+def test_add_to_losing_position_fails_closed_even_when_add_policy_is_enabled(tmp_path):
+    broker = Broker(positions=[_position(qty="0.02", value="2", avg_entry_price="110")])
+    _, _, _, _, _, result = _evaluate(
+        tmp_path,
+        broker=broker,
+        request=_request(action="add"),
+    )
+
+    assert result.risk_eligible is False
+    assert result.sizing.eligible is False
+    assert any("ADD requires verified current bid above" in reason for reason in result.reasons)
     assert broker.submit_calls == 0
 
 
@@ -837,16 +866,19 @@ def test_crypto_loss_control_uses_net_realized_pnl_not_sum_of_losing_legs(tmp_pa
     storage = _storage(tmp_path)
     for identifier, pnl in (("gain", 100), ("loss", -150)):
         storage.execute(
-            """INSERT INTO realized_pnl_events(
-              id,broker_event_key,symbol,side,quantity,fees,adjustments,realized_pl,
-              occurred_at,trading_day,trading_week,accounting_timezone,source,
-              provenance,confidence,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                identifier, f"event-{identifier}", "BTC/USD", "sell", 0.1, 0, 0, pnl,
-                NOW.isoformat(), NOW.date().isoformat(), "2026-W29", "UTC",
-                "paper_fill", "verified_test_fill", "verified", NOW.isoformat(),
-            ),
+                """INSERT INTO realized_pnl_events(
+                  id,broker_event_key,symbol,side,quantity,fees,adjustments,realized_pl,
+                  quantity_decimal,fees_decimal,adjustments_decimal,realized_pl_decimal,
+                  occurred_at,trading_day,trading_week,accounting_timezone,source,
+                  provenance,confidence,created_at,decimal_provenance,decimal_accounting_version
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    identifier, f"event-{identifier}", "BTC/USD", "sell", 0.1, 0, 0, pnl,
+                    "0.1", "0", "0", str(pnl),
+                    NOW.isoformat(), NOW.date().isoformat(), "2026-W29", "UTC",
+                    "paper_fill", "verified_test_fill", "verified", NOW.isoformat(),
+                    "exact_source_decimal", "fixed_point_fifo_accounting_v1",
+                ),
         )
     config = _config()
     broker = Broker()
@@ -861,3 +893,27 @@ def test_crypto_loss_control_uses_net_realized_pnl_not_sum_of_losing_legs(tmp_pa
     assert snapshot["loss_evidence"]["daily_crypto_realized_pnl_dollars"] == "-50"
     assert snapshot["loss_evidence"]["daily_crypto_realized_loss_dollars"] == "50"
     assert result.risk_eligible is True
+
+
+def test_crypto_loss_control_fails_closed_when_exact_realized_pnl_is_missing(tmp_path):
+    storage = _storage(tmp_path)
+    storage.execute(
+        """INSERT INTO realized_pnl_events(
+          id,broker_event_key,symbol,side,quantity,fees,adjustments,realized_pl,
+          occurred_at,trading_day,trading_week,accounting_timezone,source,
+          provenance,confidence,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "legacy-loss", "event-legacy-loss", "BTC/USD", "sell", 0.1, 0, 0, -100,
+            NOW.isoformat(), NOW.date().isoformat(), "2026-W29", "UTC",
+            "paper_fill", "legacy_projection_only", "verified", NOW.isoformat(),
+        ),
+    )
+    config = _config()
+    broker = Broker()
+    capability, market = _evidence(storage, config, broker)
+    result = CryptoRiskStore(storage).evaluate(
+        config, broker, "run", capability.id, market.id, _request(), now=NOW
+    )
+    assert result.risk_eligible is False
+    assert "crypto_realized_loss_exact_evidence_missing" in result.reasons

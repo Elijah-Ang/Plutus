@@ -1176,6 +1176,7 @@ def optimize_cross_asset_allocation(
                 "symbol": row["symbol"],
                 "cluster": row["cluster"],
                 "strategy_version": row["strategy_version"],
+                "action": row["action"],
                 "execution_lane": row["execution_lane"],
                 "decision": decision,
                 "ranking_score": _text(score),

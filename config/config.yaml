@@ -433,7 +433,7 @@ formula_versions:
   crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
   crypto_paper_execution: crypto_supervised_paper_execution_v1_manual_limit_orders
-  crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v2
+  crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v3_fingerprinted_lifecycle
   cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
@@ -577,7 +577,10 @@ crypto:
   limit_price_source: midpoint_or_last_with_slippage_cap
   fallback_market_orders: false
   allow_new_entries: true
-  allow_add_to_winner: false
+  # Adds are permitted only as manually approved supervised-paper proposals.
+  # The crypto risk authority proves current bid > broker average entry before
+  # an ADD can become proposal-eligible; no autonomous add is permitted.
+  allow_add_to_winner: true
   allow_exits: true
   eodhd_research_enabled: true
   data_source: alpaca

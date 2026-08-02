@@ -376,6 +376,16 @@ class AlpacaBroker(BrokerInterface):
             raise BrokerSubmissionNotAttempted("crypto order request validation failed before broker I/O") from exc
         return self._call("submit_crypto_order", "order_submission", lambda: self.trading.submit_order(order_data=request))
 
+    def crypto_submission_available(self) -> bool:
+        """Prove the paper crypto adapter exists before durable invocation marking."""
+
+        return bool(
+            self.mode == "paper"
+            and self.paper_requested
+            and callable(getattr(self, "submit_crypto_order", None))
+            and callable(getattr(self.trading, "submit_order", None))
+        )
+
     def cancel_order(self, order_id: str) -> Any:
         return self._call("cancel_order", "order_submission", lambda: self.trading.cancel_order_by_id(order_id))
 

@@ -69,6 +69,69 @@ def _valid_hash(value: Any) -> bool:
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
+def _reservation_fingerprint(row: Mapping[str, Any]) -> str:
+    """Fingerprint the complete mutable reservation authority envelope."""
+
+    return _hash(
+        {
+            "id": str(row.get("id") or ""),
+            "intent_id": str(row.get("intent_id") or ""),
+            "symbol": str(row.get("symbol") or "").upper(),
+            "initial_notional": str(row.get("initial_notional") or ""),
+            "active_notional": str(row.get("active_notional") or ""),
+            "initial_stop_risk": str(row.get("initial_stop_risk") or ""),
+            "active_stop_risk": str(row.get("active_stop_risk") or ""),
+            "state": str(row.get("state") or ""),
+            "created_at": str(row.get("created_at") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
+            "released_at": row.get("released_at"),
+            "release_reason": row.get("release_reason"),
+        }
+    )
+
+
+def _crypto_lot_fingerprint(row: Mapping[str, Any]) -> str:
+    """Fingerprint one crypto-lane FIFO lot, including its lifecycle binding."""
+
+    return _hash(
+        {
+            "id": str(row.get("id") or ""),
+            "symbol": str(row.get("symbol") or "").upper(),
+            "source_fill_event_key": str(row.get("source_fill_event_key") or ""),
+            "opened_at": str(row.get("opened_at") or ""),
+            "original_quantity": str(row.get("original_quantity") or ""),
+            "remaining_quantity": str(row.get("remaining_quantity") or ""),
+            "unit_cost": str(row.get("unit_cost") or ""),
+            "fees_allocated": str(row.get("fees_allocated") or ""),
+            "created_at": str(row.get("created_at") or ""),
+            "position_lifecycle_id": str(row.get("position_lifecycle_id") or ""),
+        }
+    )
+
+
+def _crypto_pnl_fingerprint(row: Mapping[str, Any]) -> str:
+    """Fingerprint the exact realised-P&L projection and its authority links."""
+
+    return _hash(
+        {
+            "id": str(row.get("id") or ""),
+            "broker_event_key": str(row.get("broker_event_key") or ""),
+            "intent_id": str(row.get("intent_id") or ""),
+            "position_lifecycle_id": str(row.get("position_lifecycle_id") or ""),
+            "symbol": str(row.get("symbol") or "").upper(),
+            "quantity": str(row.get("quantity") or ""),
+            "gross_proceeds": str(row.get("gross_proceeds") or ""),
+            "cost_basis": str(row.get("cost_basis") or ""),
+            "fees": str(row.get("fees") or ""),
+            "realized_pl": str(row.get("realized_pl") or ""),
+            "occurred_at": str(row.get("occurred_at") or ""),
+            "created_at": str(row.get("created_at") or ""),
+            "evidence_fingerprint": str(row.get("evidence_fingerprint") or ""),
+            "confidence": str(row.get("confidence") or ""),
+        }
+    )
+
+
 def _decimal(value: Any, label: str, *, minimum: Decimal = ZERO, positive: bool = False) -> Decimal:
     if isinstance(value, bool) or value is None:
         raise CryptoPaperLaneError(f"{label} is missing or invalid")
@@ -207,7 +270,8 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
           id TEXT PRIMARY KEY,intent_id TEXT NOT NULL UNIQUE,symbol TEXT NOT NULL,
           initial_notional TEXT NOT NULL,active_notional TEXT NOT NULL,initial_stop_risk TEXT NOT NULL,
           active_stop_risk TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('active','released')),
-          created_at TEXT NOT NULL,updated_at TEXT NOT NULL,released_at TEXT,release_reason TEXT
+          created_at TEXT NOT NULL,updated_at TEXT NOT NULL,released_at TEXT,release_reason TEXT,
+          reservation_fingerprint TEXT
         )
         """
     )
@@ -219,6 +283,7 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
           symbol TEXT NOT NULL,side TEXT NOT NULL CHECK(side IN ('buy','sell')),request_basis TEXT NOT NULL,
           requested_quantity TEXT,requested_notional TEXT,limit_price TEXT NOT NULL,stop_price TEXT,
           reserved_notional TEXT NOT NULL,reserved_stop_risk TEXT NOT NULL,state TEXT NOT NULL,
+          position_lifecycle_id TEXT,
           broker_invocation_occurred INTEGER NOT NULL DEFAULT 0 CHECK(broker_invocation_occurred IN (0,1)),
           submission_attempt_count INTEGER NOT NULL DEFAULT 0,broker_order_id TEXT,last_error TEXT,
           created_at TEXT NOT NULL,updated_at TEXT NOT NULL,first_submission_at TEXT,terminal_at TEXT,
@@ -251,7 +316,8 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
         CREATE TABLE IF NOT EXISTS crypto_paper_lots(
           id TEXT PRIMARY KEY,symbol TEXT NOT NULL,source_fill_event_key TEXT NOT NULL UNIQUE,
           opened_at TEXT NOT NULL,original_quantity TEXT NOT NULL,remaining_quantity TEXT NOT NULL,
-          unit_cost TEXT NOT NULL,fees_allocated TEXT NOT NULL DEFAULT '0',created_at TEXT NOT NULL
+          unit_cost TEXT NOT NULL,fees_allocated TEXT NOT NULL DEFAULT '0',created_at TEXT NOT NULL,
+          position_lifecycle_id TEXT,lot_fingerprint TEXT
         )
         """
     )
@@ -261,7 +327,8 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
           id TEXT PRIMARY KEY,broker_event_key TEXT NOT NULL UNIQUE,intent_id TEXT NOT NULL,
           symbol TEXT NOT NULL,quantity TEXT NOT NULL,gross_proceeds TEXT NOT NULL,
           cost_basis TEXT NOT NULL,fees TEXT NOT NULL,realized_pl TEXT NOT NULL,
-          occurred_at TEXT NOT NULL,created_at TEXT NOT NULL,evidence_fingerprint TEXT,confidence TEXT
+          occurred_at TEXT NOT NULL,created_at TEXT NOT NULL,evidence_fingerprint TEXT,confidence TEXT,
+          position_lifecycle_id TEXT,pnl_fingerprint TEXT
         )
         """
     )
@@ -283,7 +350,22 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
             "evidence_fingerprint": "TEXT",
             "payload_fingerprint": "TEXT",
         },
-        "crypto_paper_realized_pnl": {"evidence_fingerprint": "TEXT", "confidence": "TEXT"},
+        "crypto_paper_intents": {
+            "position_lifecycle_id": "TEXT",
+        },
+        "crypto_paper_reservations": {
+            "reservation_fingerprint": "TEXT",
+        },
+        "crypto_paper_lots": {
+            "position_lifecycle_id": "TEXT",
+            "lot_fingerprint": "TEXT",
+        },
+        "crypto_paper_realized_pnl": {
+            "evidence_fingerprint": "TEXT",
+            "confidence": "TEXT",
+            "position_lifecycle_id": "TEXT",
+            "pnl_fingerprint": "TEXT",
+        },
     }
     for table, columns in additions.items():
         existing_columns = {str(item[1]) for item in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -291,6 +373,30 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
             if column not in existing_columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
                 existing_columns.add(column)
+    # Existing paper rows predate the explicit lane fingerprints.  Backfill
+    # them from their immutable text fields during the additive migration; all
+    # subsequent state transitions refresh the same digest transactionally.
+    for raw in conn.execute("SELECT * FROM crypto_paper_reservations").fetchall():
+        row = dict(raw)
+        if not row.get("reservation_fingerprint"):
+            conn.execute(
+                "UPDATE crypto_paper_reservations SET reservation_fingerprint=? WHERE id=?",
+                (_reservation_fingerprint(row), row["id"]),
+            )
+    for raw in conn.execute("SELECT * FROM crypto_paper_lots").fetchall():
+        row = dict(raw)
+        if not row.get("lot_fingerprint"):
+            conn.execute(
+                "UPDATE crypto_paper_lots SET lot_fingerprint=? WHERE id=?",
+                (_crypto_lot_fingerprint(row), row["id"]),
+            )
+    for raw in conn.execute("SELECT * FROM crypto_paper_realized_pnl").fetchall():
+        row = dict(raw)
+        if not row.get("pnl_fingerprint"):
+            conn.execute(
+                "UPDATE crypto_paper_realized_pnl SET pnl_fingerprint=? WHERE id=?",
+                (_crypto_pnl_fingerprint(row), row["id"]),
+            )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS crypto_paper_order_evidence(
@@ -344,6 +450,7 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
           setup_id TEXT,outcome_id TEXT,broker_order_id TEXT NOT NULL,
           evidence_fingerprint TEXT NOT NULL,realized_pl TEXT,link_fingerprint TEXT NOT NULL UNIQUE,
           created_at TEXT NOT NULL,
+          position_lifecycle_id TEXT,order_status TEXT,
           FOREIGN KEY(fill_id) REFERENCES crypto_paper_fills(id),
           FOREIGN KEY(intent_id) REFERENCES crypto_paper_intents(id)
         )
@@ -356,6 +463,8 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
         "price": "TEXT",
         "fees": "TEXT",
         "fill_type": "TEXT",
+        "position_lifecycle_id": "TEXT",
+        "order_status": "TEXT",
     }
     existing_link_columns = {
         str(item[1])
@@ -398,6 +507,20 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
         CREATE TRIGGER IF NOT EXISTS trg_crypto_paper_fills_immutable_delete
         BEFORE DELETE ON crypto_paper_fills
         BEGIN SELECT RAISE(ABORT,'crypto paper fills are immutable'); END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_crypto_paper_realized_pnl_immutable_update
+        BEFORE UPDATE ON crypto_paper_realized_pnl
+        BEGIN SELECT RAISE(ABORT,'crypto paper realised P&L is immutable'); END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_crypto_paper_realized_pnl_immutable_delete
+        BEFORE DELETE ON crypto_paper_realized_pnl
+        BEGIN SELECT RAISE(ABORT,'crypto paper realised P&L is immutable'); END
         """
     )
     conn.execute(
@@ -558,6 +681,7 @@ class CryptoPaperLaneStore:
     def __init__(self, storage: Any, *, control_providers: Mapping[str, Any] | None = None) -> None:
         self.storage = storage
         self.control_providers = dict(control_providers or {})
+        self._last_final_risk_snapshot_id: str | None = None
 
     def _load_proposal_row(self, proposal_id: str) -> dict[str, Any]:
         rows = self.storage.fetch_all("SELECT * FROM crypto_paper_proposals WHERE id=?", (proposal_id,))
@@ -1035,8 +1159,21 @@ class CryptoPaperLaneStore:
             conn.execute(
                 """INSERT INTO crypto_paper_reservations(
                   id,intent_id,symbol,initial_notional,active_notional,initial_stop_risk,active_stop_risk,state,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (reservation_id, intent_id, row["symbol"], row["notional"], row["notional"], row["stop_risk"], row["stop_risk"], "active", current.isoformat(), current.isoformat()),
+                  ,reservation_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    reservation_id, intent_id, row["symbol"], row["notional"], row["notional"],
+                    row["stop_risk"], row["stop_risk"], "active", current.isoformat(),
+                    current.isoformat(),
+                    _reservation_fingerprint({
+                        "id": reservation_id, "intent_id": intent_id, "symbol": row["symbol"],
+                        "initial_notional": row["notional"], "active_notional": row["notional"],
+                        "initial_stop_risk": row["stop_risk"], "active_stop_risk": row["stop_risk"],
+                        "state": "active", "created_at": current.isoformat(),
+                        "updated_at": current.isoformat(), "released_at": None,
+                        "release_reason": None,
+                    }),
+                ),
             )
             conn.execute(
                 "INSERT INTO crypto_paper_order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1258,15 +1395,24 @@ class CryptoPaperLaneStore:
                     "UPDATE crypto_paper_reservations SET active_notional='0',active_stop_risk='0',state='released',released_at=?,release_reason=?,updated_at=? WHERE intent_id=? AND state='active'",
                     (current.isoformat(), mapped, current.isoformat(), intent_id),
                 )
+                self._refresh_reservation_fingerprint_locked(conn, intent_id)
             self._record_reconciliation_event_locked(conn, intent=intent, event_type="order_verified", evidence={**evidence, "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint}, now=current)
         cumulative = _decimal(evidence["cumulative_filled_quantity"], "reconciled cumulative quantity")
         with self.storage.connect() as conn:
             fill_totals = conn.execute(
-                "SELECT quantity,fees FROM crypto_paper_fills WHERE intent_id=? ORDER BY occurred_at,id",
+                "SELECT quantity,price,fees FROM crypto_paper_fills WHERE intent_id=? ORDER BY occurred_at,id",
                 (intent_id,),
             ).fetchall()
             total = sum(
                 (_decimal(item["quantity"], "crypto persisted fill quantity", minimum=ZERO) for item in fill_totals),
+                ZERO,
+            )
+            prior_notional = sum(
+                (
+                    _decimal(item["quantity"], "crypto persisted fill quantity", minimum=ZERO)
+                    * _decimal(item["price"], "crypto persisted fill price", positive=True)
+                    for item in fill_totals
+                ),
                 ZERO,
             )
             prior_fees = sum((_decimal(item["fees"], "crypto persisted fill fees") for item in fill_totals), ZERO)
@@ -1280,6 +1426,11 @@ class CryptoPaperLaneStore:
                         error="broker fill quantity is present without average fill price", now=current,
                     )
                 return {**result, "state": "reconciliation_required", "reconciliation": "fill_price_missing"}
+            cumulative_average = _decimal(
+                evidence["filled_average_price"],
+                "reconciled cumulative average fill price",
+                positive=True,
+            )
             reported_fees = _decimal(evidence.get("fees") or "0", "reconciled cumulative fees")
             if reported_fees < prior_fees:
                 with self.storage.connect() as conn:
@@ -1298,10 +1449,28 @@ class CryptoPaperLaneStore:
                 return {**result, "state": "reconciliation_required", "reconciliation": "fee_accounting_regressed"}
             fee_delta = reported_fees - prior_fees
             delta = cumulative - total
+            cumulative_notional = cumulative * cumulative_average
+            delta_notional = cumulative_notional - prior_notional
+            if delta_notional <= ZERO:
+                with self.storage.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._record_reconciliation_event_locked(
+                        conn,
+                        intent=intent,
+                        event_type="fill_notional_regressed",
+                        evidence={**evidence, "prior_notional": _text(prior_notional)},
+                        now=current,
+                    )
+                    self._mark_reconciliation_required_locked(
+                        conn, intent_id=intent_id, proposal_id=str(intent["proposal_id"]),
+                        error="broker cumulative fill notional regressed", now=current,
+                    )
+                return {**result, "state": "reconciliation_required", "reconciliation": "fill_notional_regressed"}
+            delta_price = delta_notional / delta
             event_key = f"{evidence['broker_order_id']}:cumulative:{_text(cumulative)}"
             try:
                 fill = self.record_verified_fill(
-                    intent_id, event_key, delta, evidence["filled_average_price"], fee_delta, config,
+                    intent_id, event_key, delta, delta_price, fee_delta, config,
                     broker_evidence=evidence, occurred_at=current,
                 )
             except CryptoPaperLaneError as exc:
@@ -1380,6 +1549,7 @@ class CryptoPaperLaneStore:
             "SELECT snapshot_json,snapshot_fingerprint,authoritative,expires_at FROM crypto_risk_snapshots WHERE id=(SELECT risk_snapshot_id FROM crypto_paper_proposals WHERE id=?)",
             (row["proposal_id"],),
         ).fetchone()
+        fresh_snapshot_payload: dict[str, Any] | None = None
         if snapshot_row is None or int(snapshot_row["authoritative"] or 0) != 1:
             failures.append("crypto_risk_authority_missing_at_final_check")
         else:
@@ -1394,10 +1564,36 @@ class CryptoPaperLaneStore:
                     failures.append("crypto_risk_snapshot_expired_at_final_check")
             except (TypeError, ValueError, json.JSONDecodeError, CryptoPaperLaneError):
                 failures.append("crypto_risk_snapshot_invalid_at_final_check")
+        if self._last_final_risk_snapshot_id:
+            fresh_rows = conn.execute(
+                "SELECT snapshot_json,snapshot_fingerprint,authoritative FROM crypto_risk_snapshots WHERE id=?",
+                (self._last_final_risk_snapshot_id,),
+            ).fetchall()
+            if len(fresh_rows) != 1:
+                failures.append("fresh_crypto_risk_snapshot_missing_at_final_check")
+            else:
+                try:
+                    fresh_snapshot_payload = json.loads(fresh_rows[0]["snapshot_json"])
+                    if (
+                        not isinstance(fresh_snapshot_payload, dict)
+                        or int(fresh_rows[0]["authoritative"] or 0) != 1
+                        or _hash(fresh_snapshot_payload) != fresh_rows[0]["snapshot_fingerprint"]
+                    ):
+                        failures.append("fresh_crypto_risk_snapshot_invalid_at_final_check")
+                        fresh_snapshot_payload = None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    failures.append("fresh_crypto_risk_snapshot_invalid_at_final_check")
         try:
             account = broker.get_account()
             if _enum(_value(account, "status", default="")) != "active" or str(_value(account, "currency", default="")).upper() != "USD":
                 failures.append("paper_account_not_active_or_usd")
+            if fresh_snapshot_payload is not None:
+                expected_account = fresh_snapshot_payload.get("account") or {}
+                for name in ("equity", "cash", "non_marginable_buying_power"):
+                    current_value = _decimal(_value(account, name, default=None), f"final account {name}")
+                    expected_value = _decimal(expected_account.get(name), f"fresh snapshot account {name}")
+                    if current_value != expected_value:
+                        failures.append(f"final_account_{name}_changed_after_risk_rebuild")
         except Exception as exc:
             failures.append(f"paper_account_unavailable:{type(exc).__name__}")
         try:
@@ -1418,6 +1614,20 @@ class CryptoPaperLaneStore:
             quote_at = _value(current_quote, "timestamp", default=None)
             if quote_at is None or (now - _utc(quote_at, "final crypto quote" )).total_seconds() > float((config.get("crypto") or {}).get("max_price_age_seconds", 300)):
                 failures.append("final_crypto_quote_stale")
+            if fresh_snapshot_payload is not None:
+                market_id = str(fresh_snapshot_payload.get("market_evidence_id") or "")
+                market_rows = conn.execute(
+                    "SELECT bid_price,ask_price FROM crypto_market_data_evidence WHERE id=?",
+                    (market_id,),
+                ).fetchall()
+                if len(market_rows) != 1:
+                    failures.append("fresh_crypto_market_evidence_missing_at_final_check")
+                else:
+                    if (
+                        _decimal(market_rows[0]["bid_price"], "fresh crypto bid", positive=True) != bid
+                        or _decimal(market_rows[0]["ask_price"], "fresh crypto ask", positive=True) != ask
+                    ):
+                        failures.append("final_crypto_quote_changed_after_risk_rebuild")
         except Exception as exc:
             failures.append(f"final_crypto_quote_unavailable:{type(exc).__name__}")
         try:
@@ -1428,6 +1638,33 @@ class CryptoPaperLaneStore:
                 status = _enum(_value(order, "status", default=""))
                 if symbol == str(row["symbol"]).upper() and client_id != str(row["client_order_id"]) and status not in {"filled", "canceled", "cancelled", "rejected", "expired"}:
                     failures.append("conflicting_crypto_open_order")
+            if fresh_snapshot_payload is not None:
+                expected_orders = fresh_snapshot_payload.get("open_orders") or []
+                current_orders = []
+                for order in open_orders:
+                    current_orders.append({
+                        "broker_order_id": str(_value(order, "id", "order_id", default="") or ""),
+                        "client_order_id": str(_value(order, "client_order_id", default="") or ""),
+                        "symbol": str(_value(order, "symbol", default="") or "").upper().replace("-", "/"),
+                        "side": _enum(_value(order, "side", default="")),
+                        "status": _enum(_value(order, "status", default="")),
+                        "quantity": _text(_decimal(_value(order, "qty", "quantity", default="0"), "final open-order quantity")),
+                        "filled_quantity": _text(_decimal(_value(order, "filled_qty", "filled_quantity", default="0"), "final open-order filled quantity")),
+                        "notional": None if _value(order, "notional", default=None) in (None, "") else _text(_decimal(_value(order, "notional"), "final open-order notional")),
+                        "limit_price": None if _value(order, "limit_price", default=None) in (None, "") else _text(_decimal(_value(order, "limit_price"), "final open-order limit price")),
+                    })
+                expected_orders_simple = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "broker_order_id", "client_order_id", "symbol", "side", "status",
+                            "quantity", "filled_quantity", "notional", "limit_price",
+                        )
+                    }
+                    for item in expected_orders
+                ]
+                if sorted(current_orders, key=lambda item: (item["symbol"], item["client_order_id"], item["broker_order_id"])) != sorted(expected_orders_simple, key=lambda item: (str(item.get("symbol") or ""), str(item.get("client_order_id") or ""), str(item.get("broker_order_id") or ""))):
+                    failures.append("final_open_orders_changed_after_risk_rebuild")
         except Exception as exc:
             failures.append(f"crypto_open_orders_unavailable:{type(exc).__name__}")
         try:
@@ -1451,6 +1688,34 @@ class CryptoPaperLaneStore:
                 requested_quantity = _decimal(row["requested_quantity"], "final crypto sell quantity", positive=True)
                 if same_symbol_quantity < requested_quantity:
                     failures.append("crypto_sellable_quantity_decreased_after_snapshot")
+            if fresh_snapshot_payload is not None:
+                expected_positions = fresh_snapshot_payload.get("positions") or []
+                current_positions = []
+                for position in positions:
+                    raw_symbol = str(_value(position, "symbol", default="") or "").upper().replace("-", "/")
+                    qty = _decimal(_value(position, "qty", "quantity", default="0"), "final position quantity")
+                    market_value = _decimal(_value(position, "market_value", default="0"), "final position market value")
+                    current_price = _decimal(_value(position, "current_price", default="0"), "final position current price")
+                    raw_average = _value(position, "avg_entry_price", "average_entry_price", "average_price", default=None)
+                    current_positions.append({
+                        "symbol": raw_symbol,
+                        "quantity": _text(qty),
+                        "market_value": _text(market_value),
+                        "current_price": _text(current_price),
+                        "average_entry_price": None if raw_average in (None, "") else _text(_decimal(raw_average, "final position average entry")),
+                    })
+                expected_positions_simple = [
+                    {
+                        "symbol": str(item.get("symbol") or "").upper().replace("-", "/"),
+                        "quantity": str(item.get("quantity") or ""),
+                        "market_value": str(item.get("market_value") or ""),
+                        "current_price": str(item.get("current_price") or ""),
+                        "average_entry_price": item.get("average_entry_price"),
+                    }
+                    for item in expected_positions
+                ]
+                if sorted(current_positions, key=lambda item: item["symbol"]) != sorted(expected_positions_simple, key=lambda item: item["symbol"]):
+                    failures.append("final_positions_changed_after_risk_rebuild")
         except Exception as exc:
             failures.append(f"crypto_positions_unavailable:{type(exc).__name__}")
         other_intent = conn.execute(
@@ -1489,15 +1754,15 @@ class CryptoPaperLaneStore:
                 if parsed_loss["weekly_loss_dollars"] >= weekly_limit:
                     failures.append("crypto_weekly_account_loss_threshold_reached")
                 local_rows = conn.execute(
-                    "SELECT realized_pl FROM realized_pnl_events WHERE source='crypto_paper_fill' AND trading_day>=? AND trading_day<=? ORDER BY trading_day,id",
+                    "SELECT realized_pl_decimal FROM realized_pnl_events WHERE source='crypto_paper_fill' AND trading_day>=? AND trading_day<=? ORDER BY trading_day,id",
                     ((now.date() - timedelta(days=now.weekday())).isoformat(), now.date().isoformat()),
                 ).fetchall()
-                local_weekly_loss = sum((max(ZERO, -_decimal(item["realized_pl"], "crypto realized loss")) for item in local_rows), ZERO)
+                local_weekly_loss = sum((max(ZERO, -_decimal(item["realized_pl_decimal"], "crypto realized loss")) for item in local_rows), ZERO)
                 daily_rows = conn.execute(
-                    "SELECT realized_pl FROM realized_pnl_events WHERE source='crypto_paper_fill' AND trading_day=? ORDER BY id",
+                    "SELECT realized_pl_decimal FROM realized_pnl_events WHERE source='crypto_paper_fill' AND trading_day=? ORDER BY id",
                     (now.date().isoformat(),),
                 ).fetchall()
-                local_daily_loss = sum((max(ZERO, -_decimal(item["realized_pl"], "crypto realized loss")) for item in daily_rows), ZERO)
+                local_daily_loss = sum((max(ZERO, -_decimal(item["realized_pl_decimal"], "crypto realized loss")) for item in daily_rows), ZERO)
                 daily_crypto_limit = reference * _decimal(risk_policy.get("daily_crypto_loss_halt_pct_equity"), "daily crypto loss threshold") / Decimal("100")
                 weekly_crypto_limit = reference * _decimal(risk_policy.get("weekly_crypto_loss_halt_pct_equity"), "weekly crypto loss threshold") / Decimal("100")
                 if local_daily_loss >= daily_crypto_limit:
@@ -1606,6 +1871,7 @@ class CryptoPaperLaneStore:
                WHERE intent_id=? AND state='active'""",
             (timestamp, timestamp, intent_id),
         )
+        CryptoPaperLaneStore._refresh_reservation_fingerprint_locked(conn, intent_id)
         conn.execute(
             """INSERT OR IGNORE INTO crypto_paper_order_events(
                  id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at
@@ -1635,6 +1901,7 @@ class CryptoPaperLaneStore:
         """Rebuild capability → market → risk → sizing immediately pre-submit."""
 
         failures: list[str] = []
+        self._last_final_risk_snapshot_id = None
         try:
             proposal_rows = self.storage.fetch_all(
                 "SELECT risk_snapshot_id,sizing_decision_id,config_hash FROM crypto_paper_proposals WHERE id=?",
@@ -1672,6 +1939,7 @@ class CryptoPaperLaneStore:
                 now=now,
                 exclude_crypto_intent_id=str(row["id"]),
             )
+            self._last_final_risk_snapshot_id = str(evaluation.snapshot_id)
             if not evaluation.risk_eligible or not evaluation.sizing.eligible or not evaluation.sizing.authoritative:
                 failures.append("final_crypto_risk_or_sizing_ineligible")
                 failures.extend(f"final_crypto_risk:{reason}" for reason in evaluation.reasons)
@@ -1709,7 +1977,18 @@ class CryptoPaperLaneStore:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         _policy(config)
         submit = getattr(broker, "submit_crypto_order", None)
-        if not callable(submit):
+        adapter_available = callable(submit)
+        availability_probe = getattr(broker, "crypto_submission_available", None)
+        if availability_probe is None:
+            availability_probe = getattr(broker, "is_crypto_submission_available", None)
+        if not callable(availability_probe):
+            adapter_available = False
+        else:
+            try:
+                adapter_available = adapter_available and availability_probe() is True
+            except Exception:
+                adapter_available = False
+        if not adapter_available:
             with self.storage.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute("SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)).fetchone()
@@ -1801,6 +2080,7 @@ class CryptoPaperLaneStore:
             conn.execute("UPDATE crypto_paper_proposals SET status=? WHERE id=?", (mapped_state, row["proposal_id"]))
             if mapped_state in TERMINAL_INTENT_STATES:
                 conn.execute("UPDATE crypto_paper_reservations SET active_notional='0',active_stop_risk='0',state='released',released_at=?,release_reason=?,updated_at=? WHERE intent_id=?", (current.isoformat(), mapped_state, current.isoformat(), intent_id))
+                self._refresh_reservation_fingerprint_locked(conn, intent_id)
         return {
             **row, "state": mapped_state, "broker_invocation_occurred": 1,
             "broker_order_id": broker_order_id, "broker_call": True,
@@ -1814,6 +2094,232 @@ class CryptoPaperLaneStore:
             (intent_id,),
         ).fetchall()
         return sum((_decimal(row["quantity"], "crypto persisted fill quantity", minimum=ZERO) for row in rows), ZERO)
+
+    @staticmethod
+    def _refresh_reservation_fingerprint_locked(conn: Any, intent_id: str) -> None:
+        row = conn.execute(
+            "SELECT * FROM crypto_paper_reservations WHERE intent_id=?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise CryptoPaperLaneError("crypto paper reservation is missing")
+        payload = dict(row)
+        conn.execute(
+            "UPDATE crypto_paper_reservations SET reservation_fingerprint=? WHERE id=?",
+            (_reservation_fingerprint(payload), payload["id"]),
+        )
+
+    @staticmethod
+    def _refresh_lot_fingerprint_locked(conn: Any, lot_id: str) -> None:
+        row = conn.execute(
+            "SELECT * FROM crypto_paper_lots WHERE id=?", (lot_id,)
+        ).fetchone()
+        if row is None:
+            raise CryptoPaperLaneError("crypto paper lot is missing")
+        payload = dict(row)
+        conn.execute(
+            "UPDATE crypto_paper_lots SET lot_fingerprint=? WHERE id=?",
+            (_crypto_lot_fingerprint(payload), payload["id"]),
+        )
+
+    @staticmethod
+    def _position_lot_decimal(row: Mapping[str, Any], canonical: str, legacy: str) -> Decimal:
+        value = row.get(canonical)
+        if value in (None, ""):
+            raise CryptoPaperLaneError(
+                f"crypto lifecycle exact field is missing: {canonical}"
+            )
+        return _decimal(value, f"crypto lifecycle {canonical}")
+
+    @classmethod
+    def _crypto_lot_geometry_locked(
+        cls, conn: Any, symbol: str, *, lifecycle_id: str | None = None
+    ) -> tuple[Decimal, Decimal, Decimal, str | None]:
+        """Read the shared exact FIFO lots that define a crypto holding."""
+
+        if lifecycle_id:
+            rows = conn.execute(
+                "SELECT * FROM position_lots WHERE symbol=? AND position_lifecycle_id=? ORDER BY opened_at,id",
+                (symbol, lifecycle_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM position_lots WHERE symbol=? ORDER BY opened_at,id",
+                (symbol,),
+            ).fetchall()
+        original = ZERO
+        remaining = ZERO
+        remaining_cost = ZERO
+        original_cost = ZERO
+        opened_at: str | None = None
+        for raw in rows:
+            row = dict(raw)
+            lot_original = cls._position_lot_decimal(row, "original_quantity_decimal", "original_quantity")
+            lot_remaining = cls._position_lot_decimal(row, "remaining_quantity_decimal", "remaining_quantity")
+            lot_cost = cls._position_lot_decimal(row, "unit_cost_decimal", "unit_cost")
+            if lot_original <= ZERO or lot_remaining < ZERO or lot_remaining > lot_original or lot_cost <= ZERO:
+                raise CryptoPaperLaneError("crypto lifecycle FIFO lot geometry is invalid")
+            original += lot_original
+            remaining += lot_remaining
+            original_cost += lot_original * lot_cost
+            remaining_cost += lot_remaining * lot_cost
+            if opened_at is None or str(row.get("opened_at") or "") < opened_at:
+                opened_at = str(row.get("opened_at") or "")
+        average = (remaining_cost / remaining) if remaining > ZERO else (
+            original_cost / original if original > ZERO else ZERO
+        )
+        return original, remaining, average, opened_at
+
+    @classmethod
+    def _ensure_crypto_position_lifecycle_locked(
+        cls,
+        conn: Any,
+        *,
+        intent: Mapping[str, Any],
+        quantity: Decimal,
+        price: Decimal,
+        occurred_at: datetime,
+    ) -> str:
+        """Bind a verified crypto fill to one exact shared position lifecycle.
+
+        The lifecycle is created or recovered before the FIFO write so the lot
+        and its later consumption carry the same identity atomically.  A
+        missing or contradictory basis is rejected; this helper never invents
+        a holding from a broker quote or an unverified position.
+        """
+
+        symbol = str(intent["symbol"]).upper().replace("-", "/")
+        side = str(intent["side"]).lower()
+        if side not in {"buy", "sell"}:
+            raise CryptoPaperLaneError("crypto lifecycle side is invalid")
+        active_rows = conn.execute(
+            "SELECT * FROM position_lifecycles WHERE symbol=? AND state='active' ORDER BY id",
+            (symbol,),
+        ).fetchall()
+        if len(active_rows) > 1:
+            raise CryptoPaperLaneError("crypto symbol has duplicate active position lifecycles")
+        lifecycle: dict[str, Any] | None = dict(active_rows[0]) if active_rows else None
+
+        if side == "sell" and lifecycle is None:
+            # Recovery for a pre-lifecycle crypto lot is allowed only when the
+            # shared exact FIFO ledger supplies a positive, unambiguous basis.
+            lot_rows = conn.execute(
+                "SELECT * FROM position_lots WHERE symbol=? AND COALESCE(remaining_quantity_decimal,'0')<>'0' ORDER BY opened_at,id",
+                (symbol,),
+            ).fetchall()
+            if not lot_rows:
+                raise CryptoPaperLaneError("crypto sell fill has no verified active FIFO basis")
+            lifecycle_ids = {str(row["position_lifecycle_id"]) for row in lot_rows if row["position_lifecycle_id"]}
+            if len(lifecycle_ids) > 1:
+                raise CryptoPaperLaneError("crypto sell fill has conflicting FIFO lifecycle identities")
+            if lifecycle_ids:
+                recovered = conn.execute(
+                    "SELECT * FROM position_lifecycles WHERE id=?", (next(iter(lifecycle_ids)),)
+                ).fetchone()
+                if recovered is None or str(recovered["state"]) != "active":
+                    raise CryptoPaperLaneError("crypto sell fill references a non-active FIFO lifecycle")
+                lifecycle = dict(recovered)
+            else:
+                original, remaining, average, opened_at = cls._crypto_lot_geometry_locked(conn, symbol)
+                if remaining <= ZERO or not opened_at:
+                    raise CryptoPaperLaneError("crypto sell fill has no positive recoverable holding")
+                lifecycle_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO position_lifecycles(
+                       id,symbol,broker_position_id,side,state,opened_at,opening_quantity,current_quantity,
+                       average_entry_price,source,created_at,updated_at,
+                       opening_quantity_decimal,current_quantity_decimal,average_entry_price_decimal,
+                       decimal_provenance,decimal_accounting_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        lifecycle_id, symbol, None, "long", "active", opened_at,
+                        float(original), float(remaining), float(average), "crypto_paper_recovered",
+                        occurred_at.isoformat(), occurred_at.isoformat(),
+                        _text(original), _text(remaining), _text(average),
+                        "exact_source_decimal", "fixed_point_fifo_accounting_v1",
+                    ),
+                )
+                conn.execute(
+                    "UPDATE position_lots SET position_lifecycle_id=?,updated_at=? WHERE symbol=? AND position_lifecycle_id IS NULL AND COALESCE(remaining_quantity_decimal,'0')<>'0'",
+                    (lifecycle_id, occurred_at.isoformat(), symbol),
+                )
+                conn.execute(
+                    "UPDATE crypto_paper_lots SET position_lifecycle_id=? WHERE symbol=? AND position_lifecycle_id IS NULL",
+                    (lifecycle_id, symbol),
+                )
+                for raw_lot in conn.execute(
+                    "SELECT id FROM crypto_paper_lots WHERE symbol=? AND position_lifecycle_id=?",
+                    (symbol, lifecycle_id),
+                ).fetchall():
+                    cls._refresh_lot_fingerprint_locked(conn, str(raw_lot["id"]))
+                lifecycle = dict(conn.execute("SELECT * FROM position_lifecycles WHERE id=?", (lifecycle_id,)).fetchone())
+
+        if lifecycle is None:
+            # A new entry starts a lifecycle.  The exact values are updated
+            # again after the FIFO insert, but the identity is already present
+            # when the lot is written.
+            lifecycle_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO position_lifecycles(
+                   id,symbol,broker_position_id,side,state,opened_at,opening_quantity,current_quantity,
+                   average_entry_price,source,created_at,updated_at,
+                   opening_quantity_decimal,current_quantity_decimal,average_entry_price_decimal,
+                   decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    lifecycle_id, symbol, None, "long", "active", occurred_at.isoformat(),
+                    float(quantity), float(quantity), float(price), "crypto_paper_lane",
+                    occurred_at.isoformat(), occurred_at.isoformat(),
+                    _text(quantity), _text(quantity), _text(price),
+                    "exact_source_decimal", "fixed_point_fifo_accounting_v1",
+                ),
+            )
+            lifecycle = dict(conn.execute("SELECT * FROM position_lifecycles WHERE id=?", (lifecycle_id,)).fetchone())
+        elif str(lifecycle.get("side") or "").lower() != "long":
+            raise CryptoPaperLaneError("crypto lifecycle is not long-only")
+
+        lifecycle_id = str(lifecycle["id"])
+        if side == "sell":
+            _original, current_quantity, _average, _opened_at = cls._crypto_lot_geometry_locked(
+                conn, symbol, lifecycle_id=lifecycle_id
+            )
+            if current_quantity < quantity:
+                raise CryptoPaperLaneError("crypto sell fill exceeds lifecycle quantity")
+        conn.execute(
+            "UPDATE crypto_paper_intents SET position_lifecycle_id=?,updated_at=? WHERE id=?",
+            (lifecycle_id, occurred_at.isoformat(), intent["id"]),
+        )
+        return lifecycle_id
+
+    @classmethod
+    def _refresh_crypto_position_lifecycle_locked(
+        cls, conn: Any, *, lifecycle_id: str, symbol: str, occurred_at: datetime
+    ) -> dict[str, Any]:
+        lifecycle_row = conn.execute(
+            "SELECT * FROM position_lifecycles WHERE id=?", (lifecycle_id,)
+        ).fetchone()
+        if lifecycle_row is None:
+            raise CryptoPaperLaneError("crypto lifecycle disappeared during fill accounting")
+        original, remaining, average, _opened_at = cls._crypto_lot_geometry_locked(
+            conn, symbol, lifecycle_id=lifecycle_id
+        )
+        if original <= ZERO:
+            raise CryptoPaperLaneError("crypto lifecycle has no FIFO lots")
+        state = "active" if remaining > ZERO else "closed"
+        closed_at = None if state == "active" else occurred_at.isoformat()
+        conn.execute(
+            """UPDATE position_lifecycles
+               SET state=?,closed_at=?,opening_quantity=?,current_quantity=?,average_entry_price=?,updated_at=?,
+                   opening_quantity_decimal=?,current_quantity_decimal=?,average_entry_price_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=?
+               WHERE id=?""",
+            (
+                state, closed_at, float(original), float(remaining), float(average), occurred_at.isoformat(),
+                _text(original), _text(remaining), _text(average),
+                "exact_source_decimal", "fixed_point_fifo_accounting_v1", lifecycle_id,
+            ),
+        )
+        refreshed = conn.execute("SELECT * FROM position_lifecycles WHERE id=?", (lifecycle_id,)).fetchone()
+        return dict(refreshed)
 
     @staticmethod
     def _evidence_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -1940,7 +2446,7 @@ class CryptoPaperLaneStore:
         # stores the cumulative actual execution for the intent, while the
         # immutable crypto_performance_links table retains one row per fill.
         fill_rows = conn.execute(
-            "SELECT quantity,price FROM crypto_paper_fills WHERE intent_id=? ORDER BY occurred_at,id",
+            "SELECT quantity,price FROM crypto_paper_fills WHERE intent_id=? ORDER BY received_at,id",
             (intent["id"],),
         ).fetchall()
         cumulative_quantity = sum(
@@ -2052,6 +2558,7 @@ class CryptoPaperLaneStore:
             "price": _text(price),
             "fees": _text(fees),
             "fill_type": fill_type,
+            "position_lifecycle_id": str(intent.get("position_lifecycle_id") or ""),
             "realized_pl": realized_pl,
             "order_status": order_status,
         }
@@ -2068,18 +2575,20 @@ class CryptoPaperLaneStore:
             str(item[1])
             for item in conn.execute("PRAGMA table_info(crypto_performance_links)").fetchall()
         }
-        if not {"side", "action", "quantity", "price", "fees", "fill_type"}.issubset(columns):
+        if not {"side", "action", "quantity", "price", "fees", "fill_type", "position_lifecycle_id", "order_status"}.issubset(columns):
             raise CryptoPaperLaneError("crypto Performance Lab link schema is incomplete")
         conn.execute(
             """INSERT INTO crypto_performance_links(
                id,fill_id,intent_id,setup_id,outcome_id,broker_order_id,evidence_fingerprint,
-               realized_pl,link_fingerprint,created_at,side,action,quantity,price,fees,fill_type
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               realized_pl,link_fingerprint,created_at,side,action,quantity,price,fees,fill_type,position_lifecycle_id,order_status
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 str(uuid.uuid4()), fill_id, intent["id"], setup_id, outcome_id,
                 str(intent.get("broker_order_id") or ""), evidence_fingerprint,
                 realized_pl, link_fingerprint, occurred_at.isoformat(), side, action,
                 _text(quantity), _text(price), _text(fees), fill_type,
+                str(intent.get("position_lifecycle_id") or "") or None,
+                order_status,
             ),
         )
 
@@ -2105,6 +2614,9 @@ class CryptoPaperLaneStore:
         client_order_id = str(evidence.get("client_order_id") or "")
         symbol = str(evidence.get("symbol") or "").upper().replace("-", "/")
         side = str(evidence.get("side") or "").lower()
+        evidence_status = _enum(evidence.get("status"))
+        if evidence_status not in {"partially_filled", "partial_fill", "filled"}:
+            raise CryptoPaperLaneError("crypto fill evidence is not a broker fill event")
         if not broker_order_id or not client_order_id:
             raise CryptoPaperLaneError("crypto fill broker order identity is missing")
         if client_order_id != str(intent["client_order_id"]):
@@ -2188,8 +2700,16 @@ class CryptoPaperLaneStore:
         # broker evidence available only as a reconciliation failure.
         from .lot_ledger import LotLedger
 
+        lifecycle_id = self._ensure_crypto_position_lifecycle_locked(
+            conn,
+            intent=intent,
+            quantity=quantity_d,
+            price=price_d,
+            occurred_at=occurred_at,
+        )
+        intent["position_lifecycle_id"] = lifecycle_id
         ledger_intent = dict(intent)
-        ledger_intent.setdefault("position_lifecycle_id", None)
+        ledger_intent["position_lifecycle_id"] = lifecycle_id
         ledger_intent.setdefault("approved_quantity", ledger_intent.get("requested_quantity"))
         try:
             proposal_display = json.loads(proposal_row["display_json"])
@@ -2208,8 +2728,8 @@ class CryptoPaperLaneStore:
         if str(intent["side"]).lower() == "sell":
             remaining_to_consume = quantity_d
             lots = conn.execute(
-                "SELECT id,remaining_quantity FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
-                (intent["symbol"],),
+                "SELECT id,remaining_quantity FROM crypto_paper_lots WHERE symbol=? AND position_lifecycle_id=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
+                (intent["symbol"], lifecycle_id),
             ).fetchall()
             for lot in lots:
                 if remaining_to_consume <= ZERO:
@@ -2217,39 +2737,83 @@ class CryptoPaperLaneStore:
                 lot_remaining = _decimal(lot["remaining_quantity"], "crypto paper lot remaining quantity", positive=True)
                 consumed = min(remaining_to_consume, lot_remaining)
                 conn.execute("UPDATE crypto_paper_lots SET remaining_quantity=? WHERE id=?", (_text(lot_remaining - consumed), lot["id"]))
+                self._refresh_lot_fingerprint_locked(conn, str(lot["id"]))
                 remaining_to_consume -= consumed
             if remaining_to_consume != ZERO:
                 raise CryptoPaperLaneError("crypto sell fill exceeds verified local lot quantity")
             realized_row = conn.execute(
-                """SELECT symbol,quantity,gross_proceeds,cost_basis,fees,realized_pl,occurred_at
+                """SELECT symbol,quantity_decimal,gross_proceeds_decimal,cost_basis_decimal,
+                          fees_decimal,realized_pl_decimal,occurred_at
                    FROM realized_pnl_events WHERE broker_event_key=?""",
                 (broker_event_key,),
             ).fetchone()
-            if realized_row is None or realized_row["cost_basis"] is None or realized_row["realized_pl"] is None:
+            if (
+                realized_row is None
+                or realized_row["cost_basis_decimal"] is None
+                or realized_row["realized_pl_decimal"] is None
+            ):
                 raise CryptoPaperLaneError("crypto sell fill lacks verified realized P&L basis")
+            pnl_id = str(uuid.uuid4())
+            pnl_created_at = iso_now()
+            pnl_payload = {
+                "id": pnl_id,
+                "broker_event_key": broker_event_key,
+                "intent_id": intent["id"],
+                "position_lifecycle_id": lifecycle_id,
+                "symbol": realized_row["symbol"],
+                "quantity": realized_row["quantity_decimal"],
+                "gross_proceeds": realized_row["gross_proceeds_decimal"],
+                "cost_basis": realized_row["cost_basis_decimal"],
+                "fees": realized_row["fees_decimal"],
+                "realized_pl": realized_row["realized_pl_decimal"],
+                "occurred_at": realized_row["occurred_at"],
+                "created_at": pnl_created_at,
+                "evidence_fingerprint": evidence_fingerprint,
+                "confidence": "verified",
+            }
             conn.execute(
                 """INSERT INTO crypto_paper_realized_pnl(
                    id,broker_event_key,intent_id,symbol,quantity,gross_proceeds,cost_basis,
-                   fees,realized_pl,occurred_at,created_at,evidence_fingerprint,confidence
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   fees,realized_pl,occurred_at,created_at,evidence_fingerprint,confidence,
+                   position_lifecycle_id,pnl_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    str(uuid.uuid4()), broker_event_key, intent["id"], realized_row["symbol"],
-                    realized_row["quantity"], realized_row["gross_proceeds"], realized_row["cost_basis"],
-                    realized_row["fees"], realized_row["realized_pl"], realized_row["occurred_at"],
-                    iso_now(), evidence_fingerprint, "verified",
+                    pnl_id, broker_event_key, intent["id"], realized_row["symbol"],
+                    realized_row["quantity_decimal"], realized_row["gross_proceeds_decimal"], realized_row["cost_basis_decimal"],
+                    realized_row["fees_decimal"], realized_row["realized_pl_decimal"], realized_row["occurred_at"],
+                    pnl_created_at, evidence_fingerprint, "verified", lifecycle_id,
+                    _crypto_pnl_fingerprint(pnl_payload),
                 ),
             )
         else:
+            lot_id = str(uuid.uuid4())
+            lot_created_at = iso_now()
+            lot_payload = {
+                "id": lot_id,
+                "symbol": intent["symbol"],
+                "source_fill_event_key": broker_event_key,
+                "opened_at": occurred_at.isoformat(),
+                "original_quantity": _text(quantity_d),
+                "remaining_quantity": _text(quantity_d),
+                "unit_cost": _text(price_d),
+                "fees_allocated": _text(fees_d),
+                "created_at": lot_created_at,
+                "position_lifecycle_id": lifecycle_id,
+            }
             conn.execute(
                 """INSERT INTO crypto_paper_lots(
                    id,symbol,source_fill_event_key,opened_at,original_quantity,remaining_quantity,
-                   unit_cost,fees_allocated,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                   unit_cost,fees_allocated,created_at,position_lifecycle_id,lot_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    str(uuid.uuid4()), intent["symbol"], broker_event_key, occurred_at.isoformat(),
-                    _text(quantity_d), _text(quantity_d), _text(price_d), _text(fees_d), iso_now(),
+                    lot_id, intent["symbol"], broker_event_key, occurred_at.isoformat(),
+                    _text(quantity_d), _text(quantity_d), _text(price_d), _text(fees_d),
+                    lot_created_at, lifecycle_id, _crypto_lot_fingerprint(lot_payload),
                 ),
             )
+        self._refresh_crypto_position_lifecycle_locked(
+            conn, lifecycle_id=lifecycle_id, symbol=str(intent["symbol"]).upper(), occurred_at=occurred_at,
+        )
         new_state = "filled" if expected_cumulative == requested else "partially_filled"
         realized_pl_text: str | None = None
         if str(intent["side"]).lower() == "sell":
@@ -2296,6 +2860,9 @@ class CryptoPaperLaneStore:
                 "UPDATE crypto_paper_reservations SET active_notional=?,active_stop_risk=?,updated_at=? WHERE intent_id=? AND state='active'",
                 (_text(active_notional), _text(active_stop), occurred_at.isoformat(), intent["id"]),
             )
+            self._refresh_reservation_fingerprint_locked(conn, str(intent["id"]))
+        if new_state == "filled":
+            self._refresh_reservation_fingerprint_locked(conn, str(intent["id"]))
         conn.execute("UPDATE crypto_paper_proposals SET status=? WHERE id=?", (new_state, intent["proposal_id"]))
         conn.execute(
             """INSERT INTO crypto_paper_order_events(
@@ -2310,6 +2877,7 @@ class CryptoPaperLaneStore:
             "status": "recorded", "fill_id": fill_id, "state": new_state,
             "quantity": _text(quantity_d), "price": _text(price_d), "fees": _text(fees_d),
             "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint,
+            "position_lifecycle_id": lifecycle_id,
         }
 
     def record_verified_fill(
@@ -2331,10 +2899,34 @@ class CryptoPaperLaneStore:
             intent = conn.execute("SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)).fetchone()
             if intent is None:
                 raise CryptoPaperLaneError("crypto paper intent is missing")
-            return self._record_verified_fill_locked(
+            result = self._record_verified_fill_locked(
                 conn, intent=intent, broker_event_key=str(broker_event_key), quantity=quantity,
                 price=price, fees=fees, evidence=broker_evidence, config=config, occurred_at=current,
             )
+        # Attribution is a post-commit projection over the now-authoritative
+        # lifecycle and FIFO rows.  A fill remains durable if a report writer
+        # is temporarily unavailable; the next strategy-performance refresh
+        # deterministically retries the same lifecycle fingerprint.
+        lifecycle_id = str(result.get("position_lifecycle_id") or "")
+        if lifecycle_id:
+            try:
+                from .profit_attribution import ProfitAttributionEngine
+
+                lifecycle_rows = self.storage.fetch_all(
+                    "SELECT * FROM position_lifecycles WHERE id=? AND state='closed'",
+                    (lifecycle_id,),
+                )
+                if lifecycle_rows:
+                    ProfitAttributionEngine(self.storage).refresh_lifecycle(lifecycle_rows[0])
+            except Exception as exc:
+                self.storage.execute(
+                    "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(NULL,?,?,?,?)",
+                    (
+                        "crypto_attribution_refresh_deferred", "crypto_paper_lane",
+                        json_dumps({"lifecycle_id": lifecycle_id, "error_type": type(exc).__name__}), iso_now(),
+                    ),
+                )
+        return result
 
     def record_fill(
         self,
@@ -2390,7 +2982,7 @@ class CryptoPaperLaneStore:
                 strategy = str(display.get("strategy") or "unknown")
                 by_strategy.setdefault(strategy, ZERO)
             realized_rows = conn.execute(
-                """SELECT e.symbol,e.realized_pl,e.realized_pl_decimal,e.fees,e.fees_decimal,e.confidence,
+                """SELECT e.symbol,e.realized_pl_decimal,e.fees_decimal,e.confidence,
                           p.display_json
                    FROM realized_pnl_events e
                    LEFT JOIN crypto_paper_fills f ON f.broker_event_key=e.broker_event_key
@@ -2401,7 +2993,9 @@ class CryptoPaperLaneStore:
             for row in realized_rows:
                 if str(row["confidence"] or "") not in {"verified", "reconstructed"}:
                     raise CryptoPaperLaneError("crypto realized P&L confidence is not verified")
-                value = row["realized_pl_decimal"] or row["realized_pl"]
+                value = row["realized_pl_decimal"]
+                if value in (None, ""):
+                    raise CryptoPaperLaneError("crypto realized P&L exact evidence is missing")
                 realized += _decimal(value, "crypto realized P&L")
                 symbol = str(row["symbol"] or "").upper()
                 by_symbol.setdefault(symbol, {"realized": ZERO, "unrealized": ZERO, "exposure": ZERO})
@@ -2476,6 +3070,16 @@ class CryptoPaperLaneStore:
             "crypto_paper_fills_without_performance_link": "SELECT COUNT(*) n FROM crypto_paper_fills f LEFT JOIN crypto_performance_links l ON l.fill_id=f.id WHERE l.fill_id IS NULL",
             "crypto_paper_performance_link_without_fill": "SELECT COUNT(*) n FROM crypto_performance_links l LEFT JOIN crypto_paper_fills f ON f.id=l.fill_id WHERE f.id IS NULL",
             "crypto_paper_performance_link_evidence_mismatch": "SELECT COUNT(*) n FROM crypto_performance_links l JOIN crypto_paper_fills f ON f.id=l.fill_id WHERE l.evidence_fingerprint<>f.evidence_fingerprint",
+            "crypto_paper_fill_without_position_lifecycle": "SELECT COUNT(*) n FROM crypto_paper_fills f JOIN crypto_paper_intents i ON i.id=f.intent_id WHERE i.position_lifecycle_id IS NULL",
+            "crypto_paper_lot_without_position_lifecycle": "SELECT COUNT(*) n FROM crypto_paper_lots l JOIN crypto_paper_fills f ON f.broker_event_key=l.source_fill_event_key WHERE l.position_lifecycle_id IS NULL",
+            "crypto_paper_realized_pnl_lifecycle_mismatch": "SELECT COUNT(*) n FROM crypto_paper_realized_pnl p JOIN crypto_paper_intents i ON i.id=p.intent_id WHERE p.position_lifecycle_id IS NULL OR i.position_lifecycle_id IS NULL OR p.position_lifecycle_id<>i.position_lifecycle_id",
+            "crypto_paper_closed_lifecycle_with_open_fifo_lots": "SELECT COUNT(*) n FROM position_lifecycles l JOIN position_lots p ON p.position_lifecycle_id=l.id WHERE l.source LIKE 'crypto_paper%' AND l.state='closed' AND COALESCE(p.remaining_quantity_decimal,'0')<>'0'",
+            "crypto_paper_active_lifecycle_without_open_fifo_lots": "SELECT COUNT(*) n FROM position_lifecycles l WHERE l.source LIKE 'crypto_paper%' AND l.state='active' AND NOT EXISTS (SELECT 1 FROM position_lots p WHERE p.position_lifecycle_id=l.id AND COALESCE(p.remaining_quantity_decimal,'0')<>'0')",
+            "crypto_paper_closed_lifecycle_without_attribution": "SELECT COUNT(*) n FROM position_lifecycles l LEFT JOIN profit_attribution_records a ON a.position_lifecycle_id=l.id WHERE l.source LIKE 'crypto_paper%' AND l.state='closed' AND a.id IS NULL",
+            "crypto_paper_performance_link_lifecycle_mismatch": "SELECT COUNT(*) n FROM crypto_performance_links l JOIN crypto_paper_intents i ON i.id=l.intent_id WHERE COALESCE(l.position_lifecycle_id,'')<>COALESCE(i.position_lifecycle_id,'')",
+            "crypto_paper_reservation_without_intent": "SELECT COUNT(*) n FROM crypto_paper_reservations r LEFT JOIN crypto_paper_intents i ON i.id=r.intent_id WHERE i.id IS NULL",
+            "crypto_paper_active_reservation_symbol_mismatch": "SELECT COUNT(*) n FROM crypto_paper_reservations r JOIN crypto_paper_intents i ON i.id=r.intent_id WHERE r.symbol<>i.symbol",
+            "crypto_paper_approval_display_mismatch": "SELECT COUNT(*) n FROM crypto_paper_approvals a JOIN crypto_paper_proposals p ON p.id=a.proposal_id WHERE a.raw_message<>('YES CRYPTO '||p.id) OR a.display_fingerprint<>p.display_fingerprint OR a.telegram_message_fingerprint<>p.telegram_display_fingerprint OR a.reply_to_message_id<>p.telegram_message_id",
             "crypto_paper_pending_telegram_binding_missing": "SELECT COUNT(*) n FROM crypto_paper_proposals WHERE status='pending' AND (telegram_message_id IS NULL OR telegram_display_text IS NULL OR telegram_display_fingerprint IS NULL)",
         }
         result: dict[str, int] = {}
@@ -2484,7 +3088,13 @@ class CryptoPaperLaneStore:
                 row = conn.execute(query).fetchone()
                 result[name] = int(row["n"] or 0) if row is not None and "n" in row.keys() else 0
             fill_rows = conn.execute(
-                "SELECT f.*,i.requested_quantity,i.symbol AS intent_symbol,i.side AS intent_side,i.client_order_id AS intent_client_order_id,i.broker_order_id AS intent_broker_order_id FROM crypto_paper_fills f JOIN crypto_paper_intents i ON i.id=f.intent_id ORDER BY f.intent_id,f.occurred_at,f.id"
+                """SELECT f.*,i.requested_quantity,i.symbol AS intent_symbol,i.side AS intent_side,
+                          i.client_order_id AS intent_client_order_id,i.broker_order_id AS intent_broker_order_id,
+                          e.status AS evidence_status,e.verified AS evidence_verified
+                   FROM crypto_paper_fills f
+                   JOIN crypto_paper_intents i ON i.id=f.intent_id
+                   LEFT JOIN crypto_paper_order_evidence e ON e.id=f.evidence_id
+                   ORDER BY f.intent_id,f.occurred_at,f.id"""
             ).fetchall()
             fills_by_intent: dict[str, Decimal] = {}
             for fill in fill_rows:
@@ -2500,6 +3110,63 @@ class CryptoPaperLaneStore:
                     result["crypto_paper_fill_order_identity_mismatch"] = result.get("crypto_paper_fill_order_identity_mismatch", 0) + 1
                 if str(fill["client_order_id"] or "") != str(fill["intent_client_order_id"] or ""):
                     result["crypto_paper_fill_client_identity_mismatch"] = result.get("crypto_paper_fill_client_identity_mismatch", 0) + 1
+                if str(fill["evidence_status"] or "").lower() not in {"partially_filled", "partial_fill", "filled"}:
+                    result["crypto_paper_fill_evidence_status_invalid"] = result.get("crypto_paper_fill_evidence_status_invalid", 0) + 1
+                try:
+                    payload = json.loads(fill["payload"] or "{}")
+                    if _hash(payload) != str(fill["payload_fingerprint"] or ""):
+                        result["crypto_paper_fill_payload_fingerprint_mismatch"] = result.get("crypto_paper_fill_payload_fingerprint_mismatch", 0) + 1
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result["crypto_paper_fill_payload_invalid"] = result.get("crypto_paper_fill_payload_invalid", 0) + 1
+            link_rows = conn.execute(
+                """SELECT l.*,f.evidence_fingerprint AS fill_evidence_fingerprint,
+                          i.client_order_id AS intent_client_order_id,
+                          i.broker_order_id AS intent_broker_order_id,
+                          i.position_lifecycle_id AS intent_lifecycle_id
+                   FROM crypto_performance_links l
+                   JOIN crypto_paper_fills f ON f.id=l.fill_id
+                   JOIN crypto_paper_intents i ON i.id=l.intent_id"""
+            ).fetchall()
+            for link in link_rows:
+                if str(link["evidence_fingerprint"]) != str(link["fill_evidence_fingerprint"]):
+                    result["crypto_paper_performance_link_evidence_mismatch"] = result.get("crypto_paper_performance_link_evidence_mismatch", 0) + 1
+                if str(link["position_lifecycle_id"] or "") != str(link["intent_lifecycle_id"] or ""):
+                    result["crypto_paper_performance_link_lifecycle_mismatch"] = result.get("crypto_paper_performance_link_lifecycle_mismatch", 0) + 1
+                if link["order_status"]:
+                    expected_link_fingerprint = _hash({
+                        "fill_id": str(link["fill_id"]),
+                        "intent_id": str(link["intent_id"]),
+                        "setup_id": str(link["setup_id"] or ""),
+                        "outcome_id": str(link["outcome_id"] or ""),
+                        "broker_order_id": str(link["broker_order_id"] or ""),
+                        "evidence_fingerprint": str(link["evidence_fingerprint"] or ""),
+                        "side": str(link["side"] or ""),
+                        "action": str(link["action"] or ""),
+                        "quantity": str(link["quantity"] or ""),
+                        "price": str(link["price"] or ""),
+                        "fees": str(link["fees"] or ""),
+                        "fill_type": str(link["fill_type"] or ""),
+                        "position_lifecycle_id": str(link["position_lifecycle_id"] or ""),
+                        "realized_pl": link["realized_pl"],
+                        "order_status": str(link["order_status"] or ""),
+                    })
+                    if expected_link_fingerprint != str(link["link_fingerprint"] or ""):
+                        result["crypto_paper_performance_link_fingerprint_mismatch"] = result.get("crypto_paper_performance_link_fingerprint_mismatch", 0) + 1
+            proposal_rows = conn.execute(
+                "SELECT id,display_json,display_fingerprint,proposal_json,proposal_fingerprint FROM crypto_paper_proposals ORDER BY id"
+            ).fetchall()
+            for proposal in proposal_rows:
+                try:
+                    display = json.loads(proposal["display_json"] or "{}")
+                    payload = json.loads(proposal["proposal_json"] or "{}")
+                    if not isinstance(display, dict) or not isinstance(payload, dict):
+                        raise ValueError("proposal authority JSON must be an object")
+                    if _hash(display) != str(proposal["display_fingerprint"] or ""):
+                        result["crypto_paper_display_fingerprint_mismatch"] = result.get("crypto_paper_display_fingerprint_mismatch", 0) + 1
+                    if _hash(payload) != str(proposal["proposal_fingerprint"] or "") or payload.get("display") != display:
+                        result["crypto_paper_proposal_fingerprint_mismatch"] = result.get("crypto_paper_proposal_fingerprint_mismatch", 0) + 1
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result["crypto_paper_proposal_payload_invalid"] = result.get("crypto_paper_proposal_payload_invalid", 0) + 1
             pending_rows = conn.execute(
                 "SELECT id,telegram_message_id,telegram_chat_id,telegram_display_text,telegram_display_fingerprint FROM crypto_paper_proposals WHERE telegram_message_id IS NOT NULL OR telegram_display_text IS NOT NULL OR telegram_display_fingerprint IS NOT NULL"
             ).fetchall()
@@ -2508,8 +3175,31 @@ class CryptoPaperLaneStore:
                 stored_fingerprint = str(proposal["telegram_display_fingerprint"] or "")
                 if not text_value or not stored_fingerprint or _sha256(text_value) != stored_fingerprint:
                     result["crypto_paper_telegram_binding_mismatch"] = result.get("crypto_paper_telegram_binding_mismatch", 0) + 1
+            reservation_rows = conn.execute(
+                "SELECT * FROM crypto_paper_reservations ORDER BY id"
+            ).fetchall()
+            for reservation in reservation_rows:
+                try:
+                    initial_notional = _decimal(
+                        reservation["initial_notional"], "crypto integrity initial reservation notional", positive=True
+                    )
+                    active_notional = _decimal(
+                        reservation["active_notional"], "crypto integrity active reservation notional"
+                    )
+                    initial_stop = _decimal(
+                        reservation["initial_stop_risk"], "crypto integrity initial reservation stop risk"
+                    )
+                    active_stop = _decimal(
+                        reservation["active_stop_risk"], "crypto integrity active reservation stop risk"
+                    )
+                    if active_notional < ZERO or active_notional > initial_notional or active_stop < ZERO or active_stop > initial_stop:
+                        result["crypto_paper_reservation_geometry_invalid"] = result.get("crypto_paper_reservation_geometry_invalid", 0) + 1
+                    if str(reservation["reservation_fingerprint"] or "") != _reservation_fingerprint(dict(reservation)):
+                        result["crypto_paper_reservation_fingerprint_mismatch"] = result.get("crypto_paper_reservation_fingerprint_mismatch", 0) + 1
+                except CryptoPaperLaneError:
+                    result["crypto_paper_malformed_reservation_decimal"] = result.get("crypto_paper_malformed_reservation_decimal", 0) + 1
             lot_rows = conn.execute(
-                "SELECT remaining_quantity,original_quantity,unit_cost,fees_allocated FROM crypto_paper_lots"
+                "SELECT * FROM crypto_paper_lots"
             ).fetchall()
             for lot in lot_rows:
                 try:
@@ -2519,8 +3209,34 @@ class CryptoPaperLaneStore:
                     _decimal(lot["fees_allocated"], "crypto integrity lot fees")
                     if remaining < ZERO or remaining > original:
                         result["crypto_paper_lot_quantity_invalid"] = result.get("crypto_paper_lot_quantity_invalid", 0) + 1
+                    if str(lot["lot_fingerprint"] or "") != _crypto_lot_fingerprint(dict(lot)):
+                        result["crypto_paper_lot_fingerprint_mismatch"] = result.get("crypto_paper_lot_fingerprint_mismatch", 0) + 1
                 except CryptoPaperLaneError:
                     result["crypto_paper_malformed_lot_decimal"] = result.get("crypto_paper_malformed_lot_decimal", 0) + 1
+            pnl_rows = conn.execute(
+                "SELECT * FROM crypto_paper_realized_pnl"
+            ).fetchall()
+            for pnl in pnl_rows:
+                if str(pnl["pnl_fingerprint"] or "") != _crypto_pnl_fingerprint(dict(pnl)):
+                    result["crypto_paper_realized_pnl_fingerprint_mismatch"] = result.get("crypto_paper_realized_pnl_fingerprint_mismatch", 0) + 1
+            approval_rows = conn.execute(
+                "SELECT * FROM crypto_paper_approvals ORDER BY id"
+            ).fetchall()
+            for approval in approval_rows:
+                expected_approval = _hash({
+                    "id": approval["id"],
+                    "proposal_id": approval["proposal_id"],
+                    "sender_id": approval["sender_id"],
+                    "raw_message": approval["raw_message"],
+                    "reply_to_message_id": approval["reply_to_message_id"],
+                    "parsed_action": approval["parsed_action"],
+                    "display_fingerprint": approval["display_fingerprint"],
+                    "telegram_message_fingerprint": approval["telegram_message_fingerprint"],
+                    "telegram_chat_id": approval["telegram_chat_id"],
+                    "approved_at": approval["approved_at"],
+                })
+                if str(approval["approval_fingerprint"] or "") != expected_approval:
+                    result["crypto_paper_approval_fingerprint_mismatch"] = result.get("crypto_paper_approval_fingerprint_mismatch", 0) + 1
         return result
 
 

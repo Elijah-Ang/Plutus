@@ -156,7 +156,12 @@ class CryptoResearchEngine:
         self.telegram = telegram
         self.run_id = run_id or str(uuid.uuid4())
 
-    def run_due(self, now: datetime | None = None) -> list[CryptoResearchResult]:
+    def run_due(
+        self,
+        now: datetime | None = None,
+        *,
+        defer_entry_proposals: bool = False,
+    ) -> list[CryptoResearchResult]:
         now = now or datetime.now(UTC)
         cfg = self.config.get("crypto") or {}
         schedule = cfg.get("schedule") or {}
@@ -164,14 +169,23 @@ class CryptoResearchEngine:
             return []
         if not self._research_due(now):
             return []
-        results = self.run_research(now=now)
+        results = self.run_research(
+            now=now,
+            defer_entry_proposals=defer_entry_proposals,
+        )
         if self._digest_due(now) and not crypto_quiet_hours_active(self.config, now):
             self._send_digest(results, now)
         elif crypto_quiet_hours_active(self.config, now):
             self._set_state("crypto_last_digest_suppressed_at", now.isoformat())
         return results
 
-    def run_research(self, symbols: list[str] | None = None, now: datetime | None = None) -> list[CryptoResearchResult]:
+    def run_research(
+        self,
+        symbols: list[str] | None = None,
+        now: datetime | None = None,
+        *,
+        defer_entry_proposals: bool = False,
+    ) -> list[CryptoResearchResult]:
         now = now or datetime.now(UTC)
         cfg = self.config.get("crypto") or {}
         mode = _crypto_mode(self.config)
@@ -212,7 +226,14 @@ class CryptoResearchEngine:
         status = "completed"
         error = None
         for symbol in enabled_symbols:
-            result = self._research_symbol(symbol, research_run_id, now, provider, capability)
+            result = self._research_symbol(
+                symbol,
+                research_run_id,
+                now,
+                provider,
+                capability,
+                defer_entry_proposals=defer_entry_proposals,
+            )
             results.append(result)
             self._persist_result(result, research_run_id, now)
         if mode == "supervised_paper" and self.broker is not None:
@@ -238,6 +259,8 @@ class CryptoResearchEngine:
         now: datetime,
         provider: str,
         capability: CryptoCapabilitySnapshot,
+        *,
+        defer_entry_proposals: bool = False,
     ) -> CryptoResearchResult:
         normalized = normalize_crypto_symbol(symbol)
         if not normalized:
@@ -360,11 +383,162 @@ class CryptoResearchEngine:
             except CryptoStrategyError as exc:
                 result.strategy_blockers = ("crypto_strategy_evaluation_failed",)
                 result.risk_metrics["crypto_strategy_error"] = str(exc)
-            if decision is not None:
+            if decision is not None and not defer_entry_proposals:
                 self._maybe_create_supervised_paper_proposal(
                     result, capability, market_evidence, decision, now,
                 )
         return self._with_capability(result, capability)
+
+    def create_deferred_supervised_entry_proposals(
+        self,
+        results: list[CryptoResearchResult],
+        allocation_decisions: Any,
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Materialise only crypto entries allocated by the current advisory plan.
+
+        The allocator is intentionally non-authoritative.  This method is the
+        narrow bridge back into the existing crypto risk/proposal lane: every
+        candidate must have a positive supervised-paper allocation from the
+        same scan, and the risk engine still rebuilds its own current broker
+        authority before a proposal is persisted.
+        """
+
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        by_source: dict[str, Any] = {}
+        for raw in allocation_decisions or ():
+            if not isinstance(raw, dict):
+                continue
+            decision = str(raw.get("decision") or "")
+            if not decision.startswith("ALLOCATE_SUPERVISED_PAPER_ADVISORY"):
+                continue
+            if raw.get("order_authority") is not False:
+                continue
+            try:
+                allocated = Decimal(str(raw.get("allocated_notional")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if not allocated.is_finite() or allocated <= Decimal("0"):
+                continue
+            source_id = str(raw.get("source_id") or "").strip()
+            if source_id:
+                by_source[source_id] = raw
+
+        proposal_ids: list[str] = []
+        for result in results:
+            source_id = str(result.strategy_decision_id or "").strip()
+            allocation = by_source.get(source_id)
+            if allocation is None or not result.strategy_signal_eligible:
+                continue
+            if not result.capability_snapshot_id or not result.market_evidence_id:
+                continue
+            try:
+                capability = CryptoCapabilityStore(self.storage).load_verified(
+                    result.capability_snapshot_id,
+                    self.config,
+                    now=current,
+                )
+                market_evidence = CryptoMarketDataStore(self.storage).load_verified(
+                    result.market_evidence_id,
+                    self.config,
+                )
+                strategy = CryptoStrategyStore(self.storage).load_verified(
+                    source_id,
+                    self.config,
+                )
+                allocation_action = str(allocation.get("action") or "").strip().lower()
+                if allocation_action not in {"entry", "add"}:
+                    continue
+                if (
+                    str(allocation.get("asset_class") or "").lower() != "crypto"
+                    or str(allocation.get("execution_lane") or "").lower() != "supervised_paper"
+                    or str(allocation.get("symbol") or "").upper().replace("-", "/")
+                    != str(strategy.symbol).upper().replace("-", "/")
+                    or str(allocation.get("strategy_version") or "")
+                    != str(strategy.selected_strategy)
+                    or str(allocation.get("candidate_id") or "")
+                    != f"crypto:{strategy.symbol}:{strategy.id}:{allocation_action}"
+                    or allocation.get("manual_approval_required") is not True
+                    or allocation.get("order_authority") is not False
+                ):
+                    continue
+                expected_source_fingerprint = hashlib.sha256(
+                    json_dumps(
+                        {
+                            "strategy": strategy.decision_fingerprint,
+                            "market": market_evidence.evidence_fingerprint,
+                            "capability": capability.snapshot_fingerprint,
+                            "config": self.config.get("effective_config_hash"),
+                            "action": allocation_action,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                if str(allocation.get("source_fingerprint") or "") != expected_source_fingerprint:
+                    self.storage.audit(
+                        self.run_id,
+                        "crypto_deferred_proposal_failed_closed",
+                        {"symbol": result.symbol, "error": "allocation_source_fingerprint_mismatch"},
+                    )
+                    continue
+                requested = Decimal(str(allocation["requested_notional"]))
+                allocated = Decimal(str(allocation["allocated_notional"]))
+                if (
+                    not requested.is_finite()
+                    or requested <= Decimal("0")
+                    or not allocated.is_finite()
+                    or allocated <= Decimal("0")
+                    or allocated > requested
+                ):
+                    continue
+                fraction = min(Decimal("1"), max(Decimal("0"), allocated / requested))
+                if fraction <= Decimal("0"):
+                    continue
+                positive_position_symbols: set[str] = set()
+                for position in self.broker.get_positions():
+                    position_symbol = str(
+                        position.get("symbol", "")
+                        if isinstance(position, dict)
+                        else getattr(position, "symbol", "")
+                    ).strip().upper().replace("-", "/")
+                    raw_quantity = (
+                        position.get("qty", position.get("quantity"))
+                        if isinstance(position, dict)
+                        else getattr(position, "qty", getattr(position, "quantity", None))
+                    )
+                    try:
+                        position_quantity = Decimal(str(raw_quantity))
+                    except (InvalidOperation, TypeError, ValueError) as exc:
+                        raise CryptoPaperLaneError("allocation position quantity is invalid") from exc
+                    if not position_quantity.is_finite() or position_quantity < Decimal("0"):
+                        raise CryptoPaperLaneError("allocation position quantity is outside its safe range")
+                    if position_quantity > Decimal("0"):
+                        positive_position_symbols.add(position_symbol)
+                expected_action = (
+                    "add"
+                    if str(strategy.symbol).upper().replace("-", "/") in positive_position_symbols
+                    else "entry"
+                )
+                if allocation_action != expected_action:
+                    continue
+                self._maybe_create_supervised_paper_proposal(
+                    result,
+                    capability,
+                    market_evidence,
+                    strategy,
+                    current,
+                    risk_fraction=fraction,
+                )
+                proposal_id = str(result.risk_metrics.get("supervised_paper_proposal_id") or "")
+                if proposal_id:
+                    proposal_ids.append(proposal_id)
+            except Exception as exc:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_deferred_proposal_failed_closed",
+                    {"symbol": result.symbol, "error": type(exc).__name__},
+                )
+        return proposal_ids
 
     def _monitor_crypto_positions(
         self,
@@ -564,6 +738,8 @@ class CryptoResearchEngine:
         market_evidence: CryptoMarketEvidence,
         strategy: Any,
         now: datetime,
+        *,
+        risk_fraction: Decimal | None = None,
     ) -> None:
         """Create an executable paper proposal only for the explicit lane gate.
 
@@ -584,16 +760,57 @@ class CryptoResearchEngine:
         if not strategy.signal_eligible or strategy.action != "entry" or strategy.stop_price is None:
             return
         try:
+            action = "entry"
+            positions = list(self.broker.get_positions()) if self.broker is not None else []
+            matching_positions = []
+            for position in positions:
+                raw_symbol = str(
+                    position.get("symbol") if isinstance(position, dict) else getattr(position, "symbol", "")
+                ).strip().upper().replace("-", "/")
+                if raw_symbol.replace("/", "") != str(result.symbol).replace("/", ""):
+                    continue
+                raw_quantity = position.get("qty", position.get("quantity")) if isinstance(position, dict) else getattr(position, "qty", getattr(position, "quantity", None))
+                try:
+                    quantity = Decimal(str(raw_quantity))
+                except (InvalidOperation, TypeError, ValueError):
+                    quantity = Decimal("0")
+                if quantity > 0:
+                    matching_positions.append(position)
+            if len(matching_positions) > 1:
+                result.risk_metrics["supervised_paper_blockers"] = ["duplicate_crypto_position_evidence"]
+                return
+            if matching_positions:
+                if (self.config.get("crypto") or {}).get("allow_add_to_winner") is not True:
+                    result.risk_metrics["supervised_paper_blockers"] = ["crypto_add_to_winner_disabled"]
+                    return
+                position = matching_positions[0]
+                raw_average = (
+                    position.get("avg_entry_price", position.get("average_entry_price"))
+                    if isinstance(position, dict)
+                    else getattr(position, "avg_entry_price", getattr(position, "average_entry_price", None))
+                )
+                average_entry = Decimal(str(raw_average))
+                bid = Decimal(str(market_evidence.bid_price))
+                if not average_entry.is_finite() or average_entry <= 0 or not bid.is_finite() or bid <= average_entry:
+                    result.risk_metrics["supervised_paper_blockers"] = ["crypto_add_requires_profitable_winner"]
+                    return
+                action = "add"
+            result.risk_metrics["supervised_paper_action"] = action
             account = self.broker.get_account() if self.broker is not None else None
             equity = Decimal(str(getattr(account, "equity", None) or (account or {}).get("equity")))
             stop_risk_pct = Decimal(str(((self.config.get("crypto") or {}).get("risk_policy") or {}).get("maximum_stop_risk_per_trade_pct_equity")))
             requested_risk = equity * stop_risk_pct / Decimal("100")
+            if risk_fraction is not None:
+                if not risk_fraction.is_finite() or risk_fraction <= Decimal("0"):
+                    return
+                requested_risk *= min(Decimal("1"), risk_fraction)
             if not requested_risk.is_finite() or requested_risk <= 0:
                 return
             request = CryptoSizingRequest(
-                source_type="crypto_strategy_decision", source_id=str(strategy.id),
-                source_fingerprint=str(strategy.decision_fingerprint), symbol=str(strategy.symbol),
-                side="buy", action="entry", request_basis="notional",
+                source_type="crypto_strategy_decision",
+                source_id=f"{strategy.id}:{action}",
+                source_fingerprint=hashlib.sha256(f"{strategy.decision_fingerprint}:{action}".encode("utf-8")).hexdigest(),
+                symbol=str(strategy.symbol), side="buy", action=action, request_basis="notional",
                 requested_stop_risk_dollars=requested_risk, stop_price=str(strategy.stop_price),
             )
             evaluation = CryptoRiskStore(self.storage).evaluate(

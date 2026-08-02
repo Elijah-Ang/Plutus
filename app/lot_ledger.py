@@ -176,10 +176,9 @@ class LotLedger:
                 ).fetchall()
                 prior_risk = sum(
                     (
-                        row_decimal(
-                            dict(row),
-                            "initial_risk_dollars_decimal",
-                            "initial_risk_dollars",
+                        decimal_value(
+                            dict(row).get("initial_risk_dollars_decimal"),
+                            "position_lot.initial_risk_dollars_decimal",
                             allow_none=True,
                         )
                         or ZERO
@@ -223,7 +222,7 @@ class LotLedger:
             allocated_adjustments_total = ZERO
             lots = conn.execute(
                 """SELECT * FROM position_lots WHERE symbol=?
-                   AND (COALESCE(remaining_quantity_decimal,'0')<>'0' OR remaining_quantity>0)
+                   AND COALESCE(remaining_quantity_decimal,'0')<>'0'
                    ORDER BY opened_at,id""",
                 (symbol,),
             ).fetchall()
@@ -231,15 +230,21 @@ class LotLedger:
                 if remaining == ZERO:
                     break
                 lot_row = dict(lot)
-                lot_remaining = row_decimal(
-                    lot_row, "remaining_quantity_decimal", "remaining_quantity"
+                lot_remaining = decimal_value(
+                    lot_row.get("remaining_quantity_decimal"),
+                    "position_lot.remaining_quantity_decimal",
                 )
-                lot_original = row_decimal(
-                    lot_row, "original_quantity_decimal", "original_quantity"
+                lot_original = decimal_value(
+                    lot_row.get("original_quantity_decimal"),
+                    "position_lot.original_quantity_decimal",
                 )
-                lot_unit_cost = row_decimal(lot_row, "unit_cost_decimal", "unit_cost")
-                lot_fees = row_decimal(
-                    lot_row, "fees_allocated_decimal", "fees_allocated"
+                lot_unit_cost = decimal_value(
+                    lot_row.get("unit_cost_decimal"),
+                    "position_lot.unit_cost_decimal",
+                )
+                lot_fees = decimal_value(
+                    lot_row.get("fees_allocated_decimal"),
+                    "position_lot.fees_allocated_decimal",
                 )
                 assert (
                     lot_remaining is not None
@@ -270,13 +275,12 @@ class LotLedger:
                 allocated_cost_basis = consumed * lot_unit_cost
                 prior_buy_fees = ZERO
                 for prior_consumption in conn.execute(
-                    "SELECT allocated_buy_fees_decimal,allocated_buy_fees FROM lot_consumptions WHERE lot_id=?",
+                    "SELECT allocated_buy_fees_decimal FROM lot_consumptions WHERE lot_id=?",
                     (lot["id"],),
                 ).fetchall():
-                    prior_buy_fees += row_decimal(
-                        dict(prior_consumption),
-                        "allocated_buy_fees_decimal",
-                        "allocated_buy_fees",
+                    prior_buy_fees += decimal_value(
+                        prior_consumption["allocated_buy_fees_decimal"],
+                        "lot_consumption.allocated_buy_fees_decimal",
                     ) or ZERO
                 remaining_buy_fees = max(ZERO, lot_fees - prior_buy_fees)
                 # Give the final consumption the exact residual so fractional
@@ -344,7 +348,10 @@ class LotLedger:
             )
             remaining_position = sum(
                 (
-                    row_decimal(dict(row), "remaining_quantity_decimal", "remaining_quantity")
+                    decimal_value(
+                        row["remaining_quantity_decimal"],
+                        "position_lot.remaining_quantity_decimal",
+                    )
                     or ZERO
                     for row in conn.execute(
                         "SELECT * FROM position_lots WHERE symbol=?", (symbol,)

@@ -60,7 +60,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "phase3_risk_decisions": {"run_id", "requested_notional", "binding_caps_json", "evidence_version", "formula_version", "performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct"},
     "phase3_strategy_allocations": {"run_id", "strategy_version", "allocation_weight", "state", "reason", "profile_version", "created_at"},
     "phase3_strategy_states": {"strategy_version", "sleeve", "state", "reason", "completed_oos_n", "qualifying_regimes", "health_status", "state_version", "evaluated_at", "payload"},
-    "account_equity_watermarks": {"account_key", "peak_equity", "latest_equity", "drawdown_pct", "source", "updated_at"},
+    "account_equity_watermarks": {"account_key", "peak_equity", "latest_equity", "drawdown_pct", "source", "updated_at", "peak_equity_decimal", "latest_equity_decimal", "drawdown_pct_decimal", "decimal_provenance", "decimal_accounting_version"},
     "phase4_strategy_estimates": {"run_id", "strategy_version", "estimated_at", "state", "estimator_version", "evidence_fingerprint", "payload"},
     "phase4_covariance_snapshots": {"run_id", "calculated_at", "strategy_order_json", "covariance_json", "correlation_json", "observation_counts_json", "method", "fallback_used", "payload"},
     "phase4_strategy_states": {"strategy_version", "state", "reason", "estimate_id", "state_version", "evaluated_at", "payload"},
@@ -69,6 +69,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "trade_proposals": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version", "trade_economics_id", "strategy_registry_snapshot_id", "strategy_sleeve", "sleeve_allocation_id", "sleeve_notional_ceiling", "sleeve_stop_risk_ceiling", "winner_expansion_decision_id", "pyramiding_milestone_id", "pyramiding_milestone_key", "rotation_group_id", "rotation_step_id", "relationship_type"},
     "position_sizing_decisions": {"performance_snapshot_id", "policy_decision_id", "strategy_state", "permitted_stop_risk_pct", "strategy_policy_version"},
     "cash_snapshots": {"equity", "realized_fifo_pnl", "account_equity_change", "unrealized_change", "external_cash_flow", "accounting_version", "equity_decimal", "cash_decimal", "settled_cash_decimal", "realized_fifo_pnl_decimal", "unrealized_pl_decimal", "account_equity_change_decimal", "unrealized_change_decimal", "external_cash_flow_decimal", "decimal_provenance", "decimal_accounting_version"},
+    "position_lifecycles": {"symbol", "side", "state", "opened_at", "opening_quantity", "current_quantity", "average_entry_price", "source", "opening_quantity_frozen", "opening_quantity_decimal", "current_quantity_decimal", "average_entry_price_decimal", "decimal_provenance", "decimal_accounting_version"},
     "position_lots": {"strategy_version", "entry_proposal_id", "entry_intent_id", "entry_regime", "entry_score", "initial_risk_dollars", "config_hash", "evidence_version", "formula_version", "original_quantity_decimal", "remaining_quantity_decimal", "unit_cost_decimal", "fees_allocated_decimal", "initial_risk_dollars_decimal", "decimal_provenance", "decimal_accounting_version"},
     "realized_pnl_events": {"quantity_decimal", "gross_proceeds_decimal", "cost_basis_decimal", "fees_decimal", "adjustments_decimal", "realized_pl_decimal", "remaining_position_quantity_decimal", "decimal_provenance", "decimal_accounting_version"},
     "lot_consumptions": {"broker_event_key", "sell_intent_id", "position_lifecycle_id", "lot_id", "allocated_proceeds", "allocated_cost_basis", "allocated_buy_fees", "allocated_sell_fees", "allocated_adjustments", "realized_pnl", "accounting_version", "quantity_decimal", "allocated_proceeds_decimal", "allocated_cost_basis_decimal", "allocated_buy_fees_decimal", "allocated_sell_fees_decimal", "allocated_adjustments_decimal", "realized_pnl_decimal", "decimal_provenance", "decimal_accounting_version"},
@@ -241,14 +242,14 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "crypto_paper_reservations": {
         "id", "intent_id", "symbol", "initial_notional", "active_notional",
         "initial_stop_risk", "active_stop_risk", "state", "created_at", "updated_at",
-        "released_at", "release_reason",
+        "released_at", "release_reason", "reservation_fingerprint",
     },
     "crypto_paper_intents": {
         "id", "proposal_id", "approval_id", "logical_action_key", "client_order_id",
         "symbol", "side", "request_basis", "requested_quantity", "requested_notional",
         "limit_price", "stop_price", "reserved_notional", "reserved_stop_risk", "state",
         "broker_invocation_occurred", "submission_attempt_count", "broker_order_id",
-        "last_error", "created_at", "updated_at", "first_submission_at", "terminal_at",
+        "last_error", "created_at", "updated_at", "first_submission_at", "terminal_at", "position_lifecycle_id",
     },
     "crypto_paper_fills": {
         "id", "intent_id", "broker_event_key", "quantity", "price", "fees", "occurred_at",
@@ -260,11 +261,12 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     },
     "crypto_paper_lots": {
         "id", "symbol", "source_fill_event_key", "opened_at", "original_quantity",
-        "remaining_quantity", "unit_cost", "fees_allocated", "created_at",
+        "remaining_quantity", "unit_cost", "fees_allocated", "created_at", "position_lifecycle_id", "lot_fingerprint",
     },
     "crypto_paper_realized_pnl": {
         "id", "broker_event_key", "intent_id", "symbol", "quantity", "gross_proceeds",
         "cost_basis", "fees", "realized_pl", "occurred_at", "created_at", "evidence_fingerprint", "confidence",
+        "position_lifecycle_id", "pnl_fingerprint",
     },
     "crypto_paper_order_evidence": {
         "id", "intent_id", "broker_order_id", "client_order_id", "symbol", "side", "status",
@@ -287,7 +289,7 @@ REQUIRED_RUNTIME_TABLE_COLUMNS = {
     "crypto_performance_links": {
         "id", "fill_id", "intent_id", "setup_id", "outcome_id", "broker_order_id",
         "evidence_fingerprint", "realized_pl", "link_fingerprint", "created_at", "side",
-        "action", "quantity", "price", "fees", "fill_type",
+        "action", "quantity", "price", "fees", "fill_type", "position_lifecycle_id", "order_status",
     },
     "performance_setups": {
         "id", "run_id", "symbol", "asset_class", "setup_type", "action_decision", "proposed",

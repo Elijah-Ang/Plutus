@@ -103,9 +103,7 @@ def run_once(config_path: str | Path | None = None) -> int:
             recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight", config_hash=config.get("effective_config_hash")),
         )
         crypto_results = []
-        if research_result.passed:
-            crypto_results = service.run_crypto_research_due()
-        else:
+        if not research_result.passed:
             skipped_reasons = [c.name for c in research_result.checks if not c.passed]
             storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
 
@@ -120,7 +118,15 @@ def run_once(config_path: str | Path | None = None) -> int:
 
         research_results = []
         if trading_result.passed:
+            if research_result.passed:
+                # Collect continuous crypto evidence after the trading branch
+                # is known. TradingService carries this exact result set into
+                # scan(), where it is compared with current equity candidates
+                # before any manual crypto proposal can be materialized.
+                crypto_results = service.run_crypto_research_due()
             service.run_cycle(run_dynamic_universe=False)
+            if not crypto_results:
+                crypto_results = list(getattr(service, "_last_crypto_research_results", []) or [])
             if research_result.passed:
                 runtime_cfg = config.get("runtime_orchestration") or config.get("dynamic_universe", {}).get("runtime_orchestration", {})
                 research_results = service.run_dynamic_universe_research_only(
@@ -152,6 +158,16 @@ def run_once(config_path: str | Path | None = None) -> int:
             )
             storage.finish_run(run_id, "completed", "bounded paper cycle complete")
             return 0
+
+        if research_result.passed:
+            # Crypto remains continuous when equities are closed or a trading
+            # preflight blocks the equity branch. Finalize the same evidence
+            # set here so deferred risk-increasing proposals are not stranded.
+            crypto_results = service.run_crypto_research_due()
+            if crypto_results:
+                finalize_crypto = getattr(service, "finalize_crypto_research_cycle", None)
+                if callable(finalize_crypto):
+                    finalize_crypto()
 
         if research_result.passed:
             research_results = service.run_dynamic_universe_research_only(label="market_closed_dynamic_universe_research")
