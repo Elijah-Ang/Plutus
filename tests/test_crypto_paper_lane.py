@@ -321,6 +321,32 @@ def test_real_telegram_listener_routes_exact_crypto_yes_to_paper_lane(tmp_path, 
     assert any("Crypto paper order submitted" in message for message, _chat in telegram.sent)
 
 
+def test_real_telegram_listener_routes_plain_yes_reply_to_crypto_proposal(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake([_crypto_listener_update("YES")])
+    service = TradingService(config, storage, broker, "listener-plain-yes-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    approval = storage.fetch_all(
+        "SELECT raw_message,reply_to_message_id FROM crypto_paper_approvals WHERE proposal_id=?",
+        (proposal.id,),
+    )[0]
+    intent = storage.fetch_all(
+        "SELECT state FROM crypto_paper_intents WHERE proposal_id=?", (proposal.id,)
+    )[0]
+    assert approval["raw_message"] == "YES"
+    assert approval["reply_to_message_id"] == "telegram-message-1"
+    assert intent["state"] == "submitted"
+    assert len(broker.submit_calls) == 1
+    assert any("Crypto paper order submitted" in message for message, _chat in telegram.sent)
+
+
 def test_real_telegram_listener_routes_exact_crypto_no_without_execution(tmp_path, monkeypatch):
     storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
         tmp_path, monkeypatch
@@ -343,6 +369,86 @@ def test_real_telegram_listener_routes_exact_crypto_no_without_execution(tmp_pat
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_reservations")[0]["n"] == 0
     assert broker.submit_calls == []
     assert any("rejected" in message.lower() for message, _chat in telegram.sent)
+
+
+def test_real_telegram_listener_routes_plain_no_reply_without_execution(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake([_crypto_listener_update("NO")])
+    service = TradingService(config, storage, broker, "listener-plain-no-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    assert storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?", (proposal.id,)
+    )[0]["status"] == "rejected"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_approvals")[0]["n"] == 0
+    assert broker.submit_calls == []
+    assert any("rejected" in message.lower() for message, _chat in telegram.sent)
+
+
+def test_crypto_listener_requires_reply_and_explains_buy_sell_text(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake([_crypto_listener_update("BUY ENTRY ETH/USD", reply_to=None)])
+    service = TradingService(config, storage, broker, "listener-buy-text-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    assert storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?", (proposal.id,)
+    )[0]["status"] == "pending"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_approvals")[0]["n"] == 0
+    assert broker.submit_calls == []
+    assert any("not initiated by BUY/SELL text" in message for message, _chat in telegram.sent)
+
+
+def test_crypto_listener_requires_direct_reply_for_plain_yes(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake([_crypto_listener_update("YES", reply_to=None)])
+    service = TradingService(config, storage, broker, "listener-missing-reply-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    assert storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?", (proposal.id,)
+    )[0]["status"] == "pending"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_approvals")[0]["n"] == 0
+    assert broker.submit_calls == []
+    assert any("requires a direct reply" in message for message, _chat in telegram.sent)
+
+
+def test_crypto_listener_explains_symbol_suffixed_reply_without_acting(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake([_crypto_listener_update("YES ETH/USD")])
+    service = TradingService(config, storage, broker, "listener-symbol-reply-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    assert storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?", (proposal.id,)
+    )[0]["status"] == "pending"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_approvals")[0]["n"] == 0
+    assert broker.submit_calls == []
+    assert any("Reply directly with YES to approve or NO to reject" in message for message, _chat in telegram.sent)
 
 
 def test_lane_requires_explicit_enablement_and_is_not_default(tmp_path):
@@ -370,6 +476,10 @@ def test_proposal_display_binds_full_crypto_authority_and_manual_command(tmp_pat
     assert "expected reward" in rendered
     assert "Expected execution cost" in rendered
     assert "Total portfolio exposure" in rendered
+    assert "Reply to this message with:" in rendered
+    assert "YES = approve this Buy BTC/USD paper trade" in rendered
+    assert "NO = reject this Buy BTC/USD paper trade" in rendered
+    assert proposal.id not in rendered
     assert proposal.display["paper_only_warning"].startswith("PAPER ONLY")
     assert proposal.display["approval_command"] == f"YES CRYPTO {proposal.id}"
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0
