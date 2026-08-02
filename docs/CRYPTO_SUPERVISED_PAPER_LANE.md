@@ -5,9 +5,12 @@ the equity `DAY` order adapter.  The separate `CryptoPaperLaneStore` is an
 explicit, opt-in stage for the two initially supported pairs, `BTC/USD` and
 `ETH/USD`.
 
-The installed configuration keeps `crypto.supervised_paper_lane.enabled` and
-`execution_enabled` false.  Enabling them is a separate reviewed
-configuration/commit operation.  The lane still requires all of the following:
+The lane was enabled by the separately reviewed configuration change in PR
+#26 (merge commit `9f3ca6e30fce0a3df58a26e28c4a851b37048a47`), after the
+paper-only capability and safety prechecks. The active configuration keeps
+`crypto.supervised_paper_lane.enabled` and `execution_enabled` true while
+the separate `crypto.proposal_policy` remains a non-executable research
+preview. The lane still requires all of the following:
 
 - Alpaca paper identity and a current Assets API capability snapshot;
 - current US quote, trade, order-book and risk evidence;
@@ -23,7 +26,7 @@ The lane is long-only spot crypto: BUY entry/add orders may use a quantity or
 notional basis, while risk-reducing SELL exit/reduce orders must use an exact
 quantity and are checked against current holdings immediately before I/O.  It
 permits only limit orders with Alpaca's documented `gtc` or `ioc` time-in-force
-values and caps risk-increasing orders at USD 5.  Live trading, margin,
+values and caps risk-increasing orders at USD 5,000.  Live trading, margin,
 shorting, autonomous execution and equity-adapter fall-through are rejected.
 
 `retryable_pre_submission` means the adapter was unavailable or rejected the
