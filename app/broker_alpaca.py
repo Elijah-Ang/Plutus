@@ -208,11 +208,19 @@ class AlpacaBroker(BrokerInterface):
         from alpaca.data.timeframe import TimeFrame
 
         tf = TimeFrame.Day if timeframe.lower() in {"1day", "day", "1d"} else TimeFrame.Hour
-        lookback_days = max(30, int(limit / 24) + 5) if tf != TimeFrame.Day else max(limit + 5, 30)
+        # Alpaca returns the first page in ascending time order. A broad
+        # lookback with a smaller limit therefore returns old bars and can
+        # make the strategy appear stale even while latest quotes are live.
+        # Bound the request to the latest requested intervals and provide an
+        # explicit end so the first page is the current page.
+        interval = timedelta(days=1) if tf == TimeFrame.Day else timedelta(hours=1)
+        bar_count = max(int(limit), 1)
+        end = datetime.now(UTC)
         request = CryptoBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
-            start=datetime.now(UTC) - timedelta(days=lookback_days),
+            start=end - interval * bar_count,
+            end=end,
             limit=limit,
         )
         return self._call(
