@@ -1656,19 +1656,119 @@ class TradingService:
         update_id: Any,
         message_id: Any,
     ) -> bool:
-        """Route exact supervised-crypto commands before generic approvals.
+        """Route crypto replies before the generic equity approval parser.
 
-        Crypto proposals have a separate schema and authority chain.  Letting
-        them fall through to the equity parser would make an unbound or
-        malformed command look like an ordinary approval, so every syntactic
-        ``YES/NO CRYPTO <uuid>`` command is consumed here and receives a
-        fail-closed response.
+        A direct Telegram reply identifies the crypto proposal, so the normal
+        stock-style ``YES``/``NO`` commands are the primary UX.  The legacy
+        ``YES/NO CRYPTO <uuid>`` form remains accepted only when it is also a
+        direct reply to the bound message.  Any other crypto-looking text is
+        consumed and answered with an explicit instruction rather than being
+        allowed to fall through to an unrelated equity proposal.
         """
 
-        match = re.fullmatch(r"(?i)(YES|NO) CRYPTO ([0-9a-f-]{36})", str(text))
-        if not match:
+        raw_text = str(text).strip()
+        normalized = " ".join(raw_text.upper().split())
+        explicit_match = re.fullmatch(r"(?i)(YES|NO)\s+CRYPTO\s+([0-9a-f-]{36})", raw_text)
+        direct_crypto_rows: list[dict[str, Any]] = []
+        if reply_to_message_id is not None:
+            direct_crypto_rows = self.storage.fetch_all(
+                """
+                SELECT id,symbol,side,action,status,expires_at,telegram_message_id
+                FROM crypto_paper_proposals
+                WHERE telegram_message_id=?
+                """,
+                (str(reply_to_message_id),),
+            )
+            if len(direct_crypto_rows) > 1:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_telegram_command_rejected",
+                    {
+                        "update_id": update_id,
+                        "message_id": message_id,
+                        "reply_to_message_id": reply_to_message_id,
+                        "reason": "ambiguous_reply_target",
+                    },
+                )
+                self.telegram.send_message(
+                    "Crypto paper command rejected: the Telegram reply target is bound to more than one proposal.",
+                    None if chat_id is None else str(chat_id),
+                )
+                return True
+
+        direct_crypto_row = direct_crypto_rows[0] if direct_crypto_rows else None
+        plain_approve = normalized in {"YES", "APPROVE", "APPROVED", "YES PLEASE"}
+        plain_reject = normalized in {"NO", "REJECT", "REJECTED", "NO THANKS"}
+        crypto_trade_text = re.fullmatch(
+            r"(?i)(BUY|SELL)(?:\s+(ENTRY|EXIT|ADD|REDUCE))?\s+([A-Z0-9]+/[A-Z]{3,5})[.!]?",
+            raw_text,
+        )
+
+        if explicit_match:
+            action, proposal_id = explicit_match.group(1).upper(), explicit_match.group(2).lower()
+        elif direct_crypto_row is not None and (plain_approve or plain_reject):
+            action = "YES" if plain_approve else "NO"
+            proposal_id = str(direct_crypto_row["id"])
+        elif direct_crypto_row is not None:
+            trade_label = f"{str(direct_crypto_row.get('side') or '').upper()} {str(direct_crypto_row.get('symbol') or '').upper()}".strip()
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {
+                    "update_id": update_id,
+                    "message_id": message_id,
+                    "proposal_id": direct_crypto_row.get("id"),
+                    "reply_to_message_id": reply_to_message_id,
+                    "reason": "reply_is_not_yes_or_no",
+                },
+            )
+            self.telegram.send_message(
+                f"Crypto reply not understood for {trade_label or 'this proposal'}. Reply directly with YES to approve or NO to reject. No order was placed.",
+                None if chat_id is None else str(chat_id),
+            )
+            return True
+        elif crypto_trade_text:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_command_rejected",
+                {
+                    "update_id": update_id,
+                    "message_id": message_id,
+                    "reply_to_message_id": reply_to_message_id,
+                    "raw_message": raw_text,
+                    "reason": "buy_sell_text_is_not_an_approval",
+                },
+            )
+            self.telegram.send_message(
+                "Crypto paper actions are not initiated by BUY/SELL text. Reply directly to the displayed proposal with YES to approve or NO to reject. No order was placed.",
+                None if chat_id is None else str(chat_id),
+            )
+            return True
+        elif reply_to_message_id is None and (plain_approve or plain_reject) and not self.storage.active_proposals():
+            pending_crypto = self.storage.fetch_all(
+                "SELECT id FROM crypto_paper_proposals WHERE status='pending' AND expires_at>?",
+                (iso_now(),),
+            )
+            if pending_crypto:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_telegram_command_rejected",
+                    {
+                        "update_id": update_id,
+                        "message_id": message_id,
+                        "raw_message": raw_text,
+                        "reason": "reply_target_missing",
+                    },
+                )
+                self.telegram.send_message(
+                    "Crypto paper approval requires a direct reply to the displayed proposal. Reply YES to approve or NO to reject; no order was placed.",
+                    None if chat_id is None else str(chat_id),
+                )
+                return True
             return False
-        action, proposal_id = match.group(1).upper(), match.group(2)
+        else:
+            return False
+
         chat = None if chat_id is None else str(chat_id)
         if not self.telegram.is_authorized(sender):
             self.storage.audit(
@@ -1698,6 +1798,14 @@ class TradingService:
             self.storage,
             control_providers=self._crypto_paper_control_providers(),
         )
+        proposal_rows = self.storage.fetch_all(
+            "SELECT symbol,side,action FROM crypto_paper_proposals WHERE id=?",
+            (proposal_id,),
+        )
+        if proposal_rows:
+            trade_label = f"{str(proposal_rows[0].get('side') or '').upper()} {str(proposal_rows[0].get('symbol') or '').upper()}".strip()
+        else:
+            trade_label = "crypto paper proposal"
         try:
             if action == "NO":
                 rejection = lane.reject_proposal(
@@ -1712,9 +1820,14 @@ class TradingService:
                 self.storage.audit(
                     self.run_id,
                     "crypto_paper_telegram_rejected",
-                    {"proposal_id": proposal_id, "rejection_fingerprint": rejection.get("rejection_fingerprint"), "message_id": message_id},
+                    {
+                        "proposal_id": proposal_id,
+                        "rejection_fingerprint": rejection.get("rejection_fingerprint"),
+                        "message_id": message_id,
+                        "reply_command": normalized,
+                    },
                 )
-                self.telegram.send_message("❌ Crypto paper proposal rejected. No order was placed.", chat)
+                self.telegram.send_message(f"❌ Crypto paper {trade_label} rejected. No order was placed.", chat)
                 return True
 
             approval = lane.approve_proposal(
@@ -1740,11 +1853,13 @@ class TradingService:
                     "broker_invocation_occurred": bool(execution.get("broker_invocation_occurred")),
                     "broker_order_id": execution.get("broker_order_id"),
                     "message_id": message_id,
+                    "reply_command": normalized,
                 },
             )
             if state in {"submitted", "partially_filled", "filled"}:
+                state_label = state.replace("_", " ")
                 self.telegram.send_message(
-                    f"✅ Crypto paper order {state}. Broker evidence/reconciliation remains authoritative; no live order was placed.",
+                    f"✅ Crypto paper order {state_label}: {trade_label}. Broker evidence/reconciliation remains authoritative; no live order was placed.",
                     chat,
                 )
             elif state in {"unknown", "reconciliation_required"}:

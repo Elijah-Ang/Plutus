@@ -41,7 +41,7 @@ from .formula_versions import (
     CRYPTO_SIZING_FORMULA_VERSION,
     CRYPTO_STRATEGY_FORMULA_VERSION,
 )
-from .utils import iso_now, json_dumps
+from .utils import format_sgt, iso_now, json_dumps
 from .utils import kill_switch_active
 
 
@@ -150,6 +150,58 @@ def _text(value: Decimal | None) -> str | None:
     if value == ZERO:
         return "0"
     return format(value.normalize(), "f")
+
+
+_CRYPTO_APPROVAL_REPLIES = frozenset({"YES", "APPROVE", "APPROVED", "YES PLEASE"})
+_CRYPTO_REJECTION_REPLIES = frozenset({"NO", "REJECT", "REJECTED", "NO THANKS"})
+
+
+def _normalized_command(value: Any) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def _matches_crypto_command(raw_message: Any, *, action: str, proposal_id: str) -> bool:
+    """Accept stock-style direct replies plus the legacy UUID command.
+
+    The caller still has to prove the Telegram reply target and chat identity.
+    The short replies are therefore only an ergonomic command surface; they do
+    not weaken the immutable proposal binding.
+    """
+
+    normalized = _normalized_command(raw_message)
+    action = str(action).strip().lower()
+    proposal_token = str(proposal_id).strip().upper()
+    if action == "approve":
+        return normalized in _CRYPTO_APPROVAL_REPLIES or normalized == f"YES CRYPTO {proposal_token}"
+    if action == "reject":
+        return normalized in _CRYPTO_REJECTION_REPLIES or normalized == f"NO CRYPTO {proposal_token}"
+    return False
+
+
+def _display_number(value: Any, places: int, *, fixed: bool = False, commas: bool = False) -> str:
+    """Render authority values for humans without changing persisted values."""
+
+    if value in (None, ""):
+        return "—"
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+        if not number.is_finite():
+            return str(value)
+        quantum = Decimal("1").scaleb(-places)
+        rendered = format(number.quantize(quantum), ",.{}f".format(places) if commas else ".{}f".format(places))
+        if not fixed:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return rendered or "0"
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+
+
+def _display_money(value: Any) -> str:
+    return f"${_display_number(value, 2, fixed=True, commas=True)}"
+
+
+def _display_quantity(value: Any) -> str:
+    return _display_number(value, 8, commas=False)
 
 
 def _utc(value: Any, label: str) -> datetime:
@@ -653,25 +705,69 @@ def _display_from_authority(
         "projected_total_portfolio_exposure_usd": _text(projected_total_exposure),
         "paper_account_equity_usd": account.get("equity"),
         "expires_at": expires_at.isoformat(),
+        # Keep the UUID form as a durable/auditable compatibility alias.  The
+        # human-facing Telegram surface uses the direct-reply YES/NO form.
         "approval_command": f"YES CRYPTO {preview_id}",
+        "rejection_command": f"NO CRYPTO {preview_id}",
+        "approval_reply": "YES",
+        "rejection_reply": "NO",
         "paper_only_warning": "PAPER ONLY • MANUAL APPROVAL REQUIRED • NO LIVE OR AUTONOMOUS EXECUTION",
     }
 
 
 def format_crypto_paper_proposal(proposal: CryptoPaperProposal) -> str:
     d = proposal.display
+    symbol = str(d.get("symbol") or proposal.symbol).upper()
+    action_parts = str(d.get("action") or f"{proposal.side} {proposal.action}").split(maxsplit=1)
+    side_label = action_parts[0].title()
+    action_label = action_parts[1].lower() if len(action_parts) == 2 else proposal.action.lower()
+    trade_label = f"{side_label} {symbol}"
+    base_asset = symbol.split("/", 1)[0]
+    quantity = _display_quantity(d.get("quantity"))
+    notional = _display_money(d.get("notional_usd"))
+    bid = _display_money(d.get("current_bid"))
+    ask = _display_money(d.get("current_ask"))
+    spread = _display_number(d.get("spread_bps"), 1)
+    limit_price = _display_money(d.get("limit_price"))
+    stop_price = _display_money(d.get("stop_price"))
+    expected_reward = _display_money(d.get("expected_reward_usd"))
+    maximum_loss = _display_money(d.get("maximum_loss_usd"))
+    execution_cost = _display_money(d.get("expected_execution_cost_usd"))
+    volatility_value = d.get("annualized_volatility")
+    volatility = _display_number(volatility_value, 1)
+    if volatility != "—":
+        try:
+            volatility = f"{_display_number(Decimal(str(volatility_value)) * Decimal('100'), 1, fixed=True)}%"
+        except (InvalidOperation, TypeError, ValueError):
+            volatility = str(volatility_value)
+    existing_crypto = _display_money(d.get("existing_crypto_exposure_usd"))
+    projected_crypto = _display_money(d.get("projected_crypto_exposure_usd"))
+    existing_total = _display_money(d.get("total_portfolio_exposure_usd"))
+    projected_total = _display_money(d.get("projected_total_portfolio_exposure_usd"))
+    expiry = format_sgt(d["expires_at"])
+    amount_line = (
+        f"Amount: {notional} | Quantity: {quantity} {base_asset}"
+        if str(d.get("side") or proposal.side).lower() == "buy"
+        else f"Quantity to sell: {quantity} {base_asset} | Estimated value: {notional}"
+    )
     return (
-        "🪙 CRYPTO PAPER ORDER — MANUAL APPROVAL REQUIRED\n\n"
-        f"{d['action']} {d['symbol']} | {d['strategy']}\n"
-        f"Basis: {d['request_basis']} | qty {d['quantity']} | ${d['notional_usd']}\n"
-        f"Bid ${d['current_bid']} | ask ${d['current_ask']} | spread {d['spread_bps']} bps\n"
-        f"Limit ${d['limit_price']} | stop ${d['stop_price']} | expected reward ${d['expected_reward_usd']} | max loss ${d['maximum_loss_usd']}\n"
-        f"Expected execution cost ${d['expected_execution_cost_usd']} | volatility {d['annualized_volatility']}\n"
-        f"Existing crypto exposure ${d['existing_crypto_exposure_usd']} → ${d['projected_crypto_exposure_usd']}\n"
-        f"Total portfolio exposure ${d['total_portfolio_exposure_usd']} → ${d['projected_total_portfolio_exposure_usd']}\n"
-        f"Expires {d['expires_at']}\n"
-        f"Approve only by replying: {d['approval_command']}\n\n"
-        f"{d['paper_only_warning']}"
+        "🪙 Paper crypto trade proposal — MANUAL APPROVAL REQUIRED\n\n"
+        f"{trade_label} — {action_label} | Paper only\n"
+        f"Strategy: {d.get('strategy') or 'position management'}\n"
+        f"{amount_line}\n"
+        f"Quote: bid {bid} | ask {ask} | spread {spread} bps\n"
+        f"Limit: {limit_price} | Stop: {stop_price}\n"
+        f"expected reward: {expected_reward} | Max loss: {maximum_loss}\n"
+        f"Expected execution cost: {execution_cost} | Volatility: {volatility}\n"
+        f"Existing crypto exposure: {existing_crypto} → {projected_crypto}\n"
+        f"Total portfolio exposure: {existing_total} → {projected_total}\n"
+        f"Expires: {expiry}\n\n"
+        "Reply to this message with:\n"
+        f"YES = approve this {trade_label} paper trade\n"
+        f"NO = reject this {trade_label} paper trade\n\n"
+        "No reply = expires and no order is placed.\n"
+        "YES means permission to attempt; final safety checks still run before placement.\n\n"
+        f"{d.get('paper_only_warning') or 'PAPER ONLY • MANUAL APPROVAL REQUIRED • NO LIVE OR AUTONOMOUS EXECUTION'}"
     )
 
 
@@ -975,9 +1071,8 @@ class CryptoPaperLaneStore:
             raise CryptoPaperLaneError("crypto paper Telegram display binding is missing or changed")
         if stored_message is not None and str(reply_to_message_id) != str(stored_message):
             raise CryptoPaperLaneError("crypto paper approval reply target does not match displayed Telegram message")
-        expected_message = f"YES CRYPTO {proposal.id}"
-        if raw_message is None or str(raw_message) != expected_message:
-            raise CryptoPaperLaneError("crypto paper approval command is not exact")
+        if not _matches_crypto_command(raw_message, action="approve", proposal_id=proposal.id):
+            raise CryptoPaperLaneError("crypto paper approval command is not an allowed direct reply")
         approval_id = str(uuid.uuid4())
         body = {
             "id": approval_id, "proposal_id": proposal.id, "sender_id": str(sender_id),
@@ -1045,9 +1140,8 @@ class CryptoPaperLaneStore:
             raise CryptoPaperLaneError("crypto paper Telegram display binding is missing or changed")
         if str(reply_to_message_id) != message_id:
             raise CryptoPaperLaneError("crypto paper rejection reply target does not match displayed Telegram message")
-        expected = f"NO CRYPTO {proposal.id}"
-        if raw_message is None or str(raw_message) != expected:
-            raise CryptoPaperLaneError("crypto paper rejection command is not exact")
+        if not _matches_crypto_command(raw_message, action="reject", proposal_id=proposal.id):
+            raise CryptoPaperLaneError("crypto paper rejection command is not an allowed direct reply")
         rejection_id = str(uuid.uuid4())
         body = {
             "id": rejection_id, "proposal_id": proposal.id, "sender_id": str(sender_id),
