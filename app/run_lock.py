@@ -85,6 +85,7 @@ def inspect_lock(
     malformed_grace_seconds: float = 1200.0,
     *,
     expected_command: str | None = None,
+    expected_commands: tuple[str, ...] | None = None,
     expected_repository: str | Path | None = None,
     expected_commit: str | None = None,
 ) -> LockInspection:
@@ -111,7 +112,14 @@ def inspect_lock(
                 return LockInspection("stale", pid, age, "PID was reused by a different process start")
             return LockInspection("recent_unknown", pid, age, "PID start identity changed inside grace period")
         command = identity.command if identity else recorded_command
-        if expected_command and command not in (None, "unknown") and expected_command not in command:
+        command_tokens = tuple(expected_commands or ())
+        if expected_command:
+            command_tokens += (expected_command,)
+        if (
+            command_tokens
+            and command not in (None, "unknown")
+            and not any(token in command for token in command_tokens)
+        ):
             if age >= dead_pid_grace_seconds:
                 return LockInspection("stale", pid, age, "PID command does not identify the listener")
             return LockInspection("recent_unknown", pid, age, "PID command mismatch inside grace period")
@@ -140,7 +148,7 @@ def _read(path: Path) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("lockdir", type=Path)
-    parser.add_argument("--expected-command")
+    parser.add_argument("--expected-command", action="append")
     parser.add_argument("--expected-repository")
     parser.add_argument("--expected-commit")
     parser.add_argument("--write-owner", action="store_true")
@@ -153,7 +161,7 @@ def main() -> None:
         return
     result = inspect_lock(
         args.lockdir,
-        expected_command=args.expected_command,
+        expected_commands=tuple(args.expected_command or ()),
         expected_repository=args.expected_repository,
         expected_commit=args.expected_commit,
     )
