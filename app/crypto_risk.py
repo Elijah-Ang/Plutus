@@ -318,6 +318,23 @@ def _position_evidence(
         reconciliation_tolerance = max(Decimal("0.01"), calculated_market_value * Decimal("0.01"))
         if abs(broker_market_value - calculated_market_value) > reconciliation_tolerance:
             failures.append(f"broker_position_value_reconciliation_mismatch:{canonical}")
+        average_entry_raw = _value(
+            raw,
+            "avg_entry_price",
+            "average_entry_price",
+            "average_price",
+            default=None,
+        )
+        average_entry: Decimal | None = None
+        if average_entry_raw not in (None, ""):
+            try:
+                average_entry = _decimal(
+                    average_entry_raw,
+                    f"{label}.average_entry_price",
+                    minimum=Decimal("0.000000001"),
+                )
+            except CryptoRiskError as exc:
+                failures.append(str(exc).replace(" ", "_"))
         positions.append(
             {
                 "raw_symbol": raw_symbol,
@@ -329,6 +346,7 @@ def _position_evidence(
                 "broker_market_value": _text(broker_market_value),
                 "calculated_market_value": _text(calculated_market_value),
                 "current_price": _text(current_price),
+                "average_entry_price": _text(average_entry),
                 # Until the crypto position-management stage persists a tighter
                 # stop, heat treats the full crypto market value as downside.
                 "conservative_open_stop_risk": _text(market_value if is_crypto else ZERO),
@@ -534,7 +552,7 @@ def _loss_evidence(metrics: Mapping[str, Any], conn: Any, now: datetime, failure
     day = now.date().isoformat()
     week_start = (now.date() - timedelta(days=now.weekday())).isoformat()
     rows = conn.execute(
-        """SELECT symbol,trading_day,realized_pl,confidence FROM realized_pnl_events
+        """SELECT symbol,trading_day,realized_pl_decimal,confidence FROM realized_pnl_events
            WHERE trading_day>=? AND trading_day<=?""",
         (week_start, day),
     ).fetchall()
@@ -546,7 +564,10 @@ def _loss_evidence(metrics: Mapping[str, Any], conn: Any, now: datetime, failure
             continue
         if str(row["confidence"] or "") != "verified":
             failures.append("crypto_realized_loss_evidence_not_verified")
-        pnl = _decimal(row["realized_pl"] or ZERO, "durable crypto realized PnL")
+        if row["realized_pl_decimal"] in (None, ""):
+            failures.append("crypto_realized_loss_exact_evidence_missing")
+            continue
+        pnl = _decimal(row["realized_pl_decimal"], "durable crypto realized PnL")
         weekly_crypto_pnl += pnl
         if row["trading_day"] == day:
             daily_crypto_pnl += pnl
@@ -696,6 +717,25 @@ def _aggregate(
     crypto_gross = sum((_decimal(item["market_value"], "crypto market value", minimum=ZERO) for item in crypto_positions), ZERO)
     symbol_gross = sum((_decimal(item["market_value"], "symbol market value", minimum=ZERO) for item in crypto_positions if item["symbol"] == symbol), ZERO)
     position_quantity = sum((_decimal(item["quantity"], "position quantity", minimum=ZERO) for item in crypto_positions if item["symbol"] == symbol), ZERO)
+    weighted_entry_numerator = ZERO
+    weighted_entry_quantity = ZERO
+    for item in crypto_positions:
+        if item["symbol"] != symbol:
+            continue
+        quantity = _decimal(item["quantity"], "position quantity", minimum=ZERO)
+        average_entry = item.get("average_entry_price")
+        if quantity > ZERO and average_entry not in (None, ""):
+            weighted_entry_numerator += quantity * _decimal(
+                average_entry,
+                "position average entry price",
+                minimum=Decimal("0.000000001"),
+            )
+            weighted_entry_quantity += quantity
+    symbol_average_entry = (
+        weighted_entry_numerator / weighted_entry_quantity
+        if weighted_entry_quantity > ZERO
+        else None
+    )
     open_stop_risk = sum((_decimal(item["conservative_open_stop_risk"], "open stop risk", minimum=ZERO) for item in crypto_positions), ZERO)
 
     # Broker orders and matching durable reservations represent one economic
@@ -737,6 +777,7 @@ def _aggregate(
         "crypto_position_gross": crypto_gross,
         "symbol_position_gross": symbol_gross,
         "position_quantity": position_quantity,
+        "symbol_average_entry_price": symbol_average_entry,
         "crypto_open_stop_risk": open_stop_risk,
         "pending_crypto_buy_notional": pending_crypto_buy,
         "pending_all_buy_notional": pending_all_buy,
@@ -752,16 +793,25 @@ def _aggregate(
 
 def _peak_equity(conn: Any, equity: Decimal) -> tuple[Decimal, str]:
     values: list[tuple[Decimal, str]] = [(equity, "current_paper_account_equity")]
-    for query, source in (
-        ("SELECT MAX(equity) value FROM cash_snapshots WHERE equity IS NOT NULL", "durable_cash_snapshots"),
-        ("SELECT MAX(peak_equity) value FROM account_equity_watermarks WHERE peak_equity IS NOT NULL", "durable_account_equity_watermarks"),
+    for query, source, field in (
+        (
+            "SELECT equity_decimal value FROM cash_snapshots WHERE equity_decimal IS NOT NULL",
+            "durable_cash_snapshots",
+            "equity_decimal",
+        ),
+        (
+            "SELECT peak_equity_decimal value FROM account_equity_watermarks WHERE peak_equity_decimal IS NOT NULL",
+            "durable_account_equity_watermarks",
+            "peak_equity_decimal",
+        ),
     ):
-        row = conn.execute(query).fetchone()
-        if row and row["value"] is not None:
+        for row in conn.execute(query).fetchall():
+            if row["value"] is None:
+                continue
             try:
-                values.append((_decimal(row["value"], source, minimum=ZERO), source))
+                values.append((_decimal(row["value"], f"{source}.{field}", minimum=ZERO), source))
             except CryptoRiskError:
-                pass
+                continue
     return max(values, key=lambda item: item[0])
 
 
@@ -774,6 +824,7 @@ def _derive(
     loss: Mapping[str, Any],
     volatility: Mapping[str, Any],
     peak_equity: Decimal,
+    market_bid: Any = None,
 ) -> dict[str, Any]:
     policy = _risk_policy(config)
     equity = _decimal(account["equity"], "account equity", minimum=Decimal("0.000000001"))
@@ -837,6 +888,21 @@ def _derive(
         hard_notional = ZERO
     if side == "buy" and action == "add" and (config.get("crypto") or {}).get("allow_add_to_winner") is not True:
         hard_notional = ZERO
+    profitable_winner = False
+    if side == "buy" and action == "add":
+        average_entry_raw = aggregate.get("symbol_average_entry_price")
+        try:
+            average_entry = (
+                _decimal(average_entry_raw, "symbol average entry price", minimum=Decimal("0.000000001"))
+                if average_entry_raw not in (None, "")
+                else None
+            )
+            bid = _decimal(market_bid, "verified market bid", minimum=Decimal("0.000000001"))
+            profitable_winner = average_entry is not None and bid > average_entry
+        except CryptoRiskError:
+            profitable_winner = False
+        if not profitable_winner:
+            hard_notional = ZERO
     if side == "buy" and policy.get("block_on_any_open_crypto_order") is True and int(aggregate["open_crypto_order_count"]) > 0:
         hard_notional = ZERO
     if side == "buy" and int(aggregate["active_crypto_intent_count"]) > 0:
@@ -861,7 +927,8 @@ def _derive(
         {"name": "maximum_positions", "passed": side == "sell" or symbol_has_position or int(aggregate["crypto_position_count"]) < int(policy["maximum_positions"]), "reason": "crypto maximum-position ceiling"},
         {"name": "entry_position_state", "passed": side != "buy" or action != "entry" or not symbol_has_position, "reason": "crypto entry requires no existing same-symbol position"},
         {"name": "add_position_state", "passed": side != "buy" or action != "add" or symbol_has_position, "reason": "crypto ADD requires an existing same-symbol position"},
-        {"name": "add_policy", "passed": action != "add" or (config.get("crypto") or {}).get("allow_add_to_winner") is True, "reason": "crypto ADDs remain disabled in this stage"},
+        {"name": "add_policy", "passed": action != "add" or (config.get("crypto") or {}).get("allow_add_to_winner") is True, "reason": "crypto ADDs require the explicit supervised-paper policy"},
+        {"name": "profitable_winner", "passed": side != "buy" or action != "add" or profitable_winner, "reason": "crypto ADD requires verified current bid above the broker average entry price"},
         {"name": "notional_capacity", "passed": side == "sell" or hard_notional > ZERO, "reason": "positive portfolio, sleeve, symbol, cluster, cash and buying-power capacity is required"},
         {"name": "stop_risk_capacity", "passed": side == "sell" or hard_stop_risk > ZERO, "reason": "positive per-trade and portfolio stop-risk capacity is required"},
     ]
@@ -1053,6 +1120,7 @@ class CryptoRiskStore:
                 derived = _derive(
                     config=config, request=request_payload, account=account, aggregate=aggregate,
                     loss=loss, volatility=volatility, peak_equity=peak,
+                    market_bid=market.bid_price,
                 )
             except CryptoRiskError as exc:
                 failures.append("risk_derivation_failed:" + str(exc).replace(" ", "_"))
@@ -1084,6 +1152,7 @@ class CryptoRiskStore:
                 "volatility_evidence": volatility,
                 "volatility_evidence_fingerprint": _hash(volatility),
                 "aggregate": {key: _text(value) if isinstance(value, Decimal) else value for key, value in sorted(aggregate.items())},
+                "market_bid_price": str(market.bid_price) if market.bid_price is not None else None,
                 "peak_equity": _text(peak),
                 "peak_equity_source": peak_source,
                 "derived_authority": derived,
@@ -1312,6 +1381,7 @@ class CryptoRiskStore:
                 loss=payload["loss_evidence"],
                 volatility=payload["volatility_evidence"],
                 peak_equity=_decimal(payload["peak_equity"], "peak equity", minimum=Decimal("0.000000001")),
+                market_bid=payload.get("market_bid_price"),
             )
         if derived != payload.get("derived_authority") or json.loads(row["derived_authority_json"]) != derived:
             raise CryptoRiskError("crypto risk derived authority mismatch")

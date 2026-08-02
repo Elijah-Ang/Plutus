@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
@@ -15,9 +16,12 @@ from app.crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, fo
 from app.crypto_risk import CryptoRiskStore
 from app.crypto_sizing import CryptoSizingRequest
 from app.crypto_strategies import CryptoStrategyStore
+from app.fixed_point_accounting import fixed_point_integrity_report
 from app.lot_ledger import LotLedger
 from app.storage import Storage
+from app.strategy_performance import StrategyPerformanceEngine
 from app.configuration import effective_config_hash
+from app.service import TradingService
 from app.utils import load_config
 
 
@@ -107,6 +111,9 @@ class Broker:
             raise TimeoutError("network timeout after invocation")
         return {"id": "crypto-broker-order-1", "status": "accepted"}
 
+    def crypto_submission_available(self):
+        return True
+
 
 def _bars(count: int = 168):
     rows = []
@@ -157,7 +164,7 @@ def _disabled_config():
     return config
 
 
-def _evidence(storage, config, broker):
+def _evidence(storage, config, broker, *, request_basis="notional"):
     capability = CryptoCapabilityStore(storage).capture(config, broker, "run", now=NOW)
     storage.execute(
         """INSERT INTO crypto_research_runs(
@@ -176,7 +183,7 @@ def _evidence(storage, config, broker):
     request = CryptoSizingRequest(
         source_type="crypto_strategy_decision", source_id=strategy.id,
         source_fingerprint=strategy.decision_fingerprint, symbol="BTC/USD", side="buy", action="entry",
-        request_basis="notional", requested_stop_risk_dollars=D("10"), stop_price=strategy.stop_price,
+        request_basis=request_basis, requested_stop_risk_dollars=D("10"), stop_price=strategy.stop_price,
     )
     risk = CryptoRiskStore(storage).evaluate(
         config, broker, "run", capability.id, market.id, request, now=NOW,
@@ -185,11 +192,11 @@ def _evidence(storage, config, broker):
     return strategy, risk
 
 
-def _ready(tmp_path, *, broker=None, control_providers=None):
+def _ready(tmp_path, *, broker=None, control_providers=None, config=None, request_basis="notional"):
     storage = _storage(tmp_path)
-    config = _config()
+    config = config or _config()
     broker = broker or Broker()
-    strategy, risk = _evidence(storage, config, broker)
+    strategy, risk = _evidence(storage, config, broker, request_basis=request_basis)
     providers = _healthy_providers()
     if control_providers:
         providers.update(control_providers)
@@ -202,6 +209,140 @@ def _ready(tmp_path, *, broker=None, control_providers=None):
     )
     intent = lane.create_intent(proposal.id, config, now=NOW)
     return storage, config, broker, lane, proposal, intent
+
+
+class _TelegramListenerFake:
+    """Small real-listener-shaped Telegram double for route integration tests."""
+
+    is_mock = False
+    allowed_user_id = "operator"
+    chat_id = "123"
+
+    def __init__(self, updates):
+        self._updates = list(updates)
+        self.sent: list[tuple[str, str | None]] = []
+
+    def is_authorized(self, sender_id):
+        return str(sender_id) == self.allowed_user_id
+
+    def is_available(self, force=False):
+        return True
+
+    def get_updates(self, timeout=0, offset=None):
+        updates, self._updates = self._updates, []
+        return updates
+
+    def send_message(self, text, chat_id=None):
+        self.sent.append((str(text), None if chat_id is None else str(chat_id)))
+        return SimpleNamespace(message_id=f"response-{len(self.sent)}")
+
+
+def _listener_pending_crypto_proposal(tmp_path, monkeypatch):
+    # The production route uses wall-clock ``now`` for recovery, approval, and
+    # final controls.  Rebind the fixture's deterministic broker timestamps to
+    # the current test instant so this exercises the real freshness/expiry path.
+    current = datetime.now(UTC).replace(microsecond=0)
+    monkeypatch.setitem(globals(), "NOW", current)
+    original_bars = globals()["_bars"]
+
+    def aligned_bars(count=168):
+        original_now = globals()["NOW"]
+        monkeypatch.setitem(
+            globals(),
+            "NOW",
+            current.replace(minute=0, second=0, microsecond=0),
+        )
+        try:
+            return original_bars(count)
+        finally:
+            monkeypatch.setitem(globals(), "NOW", original_now)
+
+    monkeypatch.setitem(globals(), "_bars", aligned_bars)
+    storage = _storage(tmp_path)
+    config = _config()
+    broker = Broker()
+    strategy, risk = _evidence(storage, config, broker)
+    lane = CryptoPaperLaneStore(storage, control_providers=_healthy_providers())
+    proposal = lane.create_proposal(config, strategy.id, risk.decision_id, now=current)
+    rendered = format_crypto_paper_proposal(proposal)
+    lane.bind_telegram_message(
+        proposal.id,
+        "telegram-message-1",
+        config,
+        chat_id="123",
+        rendered_text=rendered,
+        now=current,
+    )
+    return storage, config, broker, proposal, rendered
+
+
+def _crypto_listener_update(text, *, update_id=1, reply_to="telegram-message-1"):
+    message = {
+        "message_id": "telegram-command-1",
+        "date": time.time(),
+        "from": {"id": "operator"},
+        "chat": {"id": "123"},
+        "text": text,
+    }
+    if reply_to is not None:
+        message["reply_to_message"] = {"message_id": reply_to}
+    return {"update_id": update_id, "message": message}
+
+
+def test_real_telegram_listener_routes_exact_crypto_yes_to_paper_lane(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake(
+        [_crypto_listener_update(f"YES CRYPTO {proposal.id}")]
+    )
+    service = TradingService(config, storage, broker, "listener-integration-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    approval = storage.fetch_all(
+        "SELECT status,reply_to_message_id,telegram_chat_id FROM crypto_paper_approvals WHERE proposal_id=?",
+        (proposal.id,),
+    )[0]
+    intent = storage.fetch_all(
+        "SELECT state,broker_invocation_occurred FROM crypto_paper_intents WHERE proposal_id=?",
+        (proposal.id,),
+    )[0]
+    assert approval["status"] == "consumed"
+    assert approval["reply_to_message_id"] == "telegram-message-1"
+    assert approval["telegram_chat_id"] == "123"
+    assert intent["state"] == "submitted"
+    assert intent["broker_invocation_occurred"] == 1
+    assert len(broker.submit_calls) == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_fills")[0]["n"] == 0
+    assert any("Crypto paper order submitted" in message for message, _chat in telegram.sent)
+
+
+def test_real_telegram_listener_routes_exact_crypto_no_without_execution(tmp_path, monkeypatch):
+    storage, config, broker, proposal, _rendered = _listener_pending_crypto_proposal(
+        tmp_path, monkeypatch
+    )
+    telegram = _TelegramListenerFake(
+        [_crypto_listener_update(f"NO CRYPTO {proposal.id}")]
+    )
+    service = TradingService(config, storage, broker, "listener-integration-run")
+    service.telegram = telegram
+    service.listener_started_at = time.time() - 5
+    service._crypto_paper_control_providers = lambda: _healthy_providers()
+
+    service.process_telegram()
+
+    proposal_row = storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?", (proposal.id,)
+    )[0]
+    assert proposal_row["status"] == "rejected", telegram.sent
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_intents")[0]["n"] == 0
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_reservations")[0]["n"] == 0
+    assert broker.submit_calls == []
+    assert any("rejected" in message.lower() for message, _chat in telegram.sent)
 
 
 def test_lane_requires_explicit_enablement_and_is_not_default(tmp_path):
@@ -357,6 +498,23 @@ def test_successful_manual_paper_order_and_fill_release_reservation(tmp_path):
     assert reservation["state"] == "released"
     assert reservation["active_notional"] == "0"
     assert storage.fetch_all("SELECT COUNT(*) n FROM position_lots WHERE symbol='BTC/USD'")[0]["n"] == 1
+    lifecycle = storage.fetch_all(
+        "SELECT id,state,current_quantity,current_quantity_decimal,average_entry_price_decimal,source FROM position_lifecycles WHERE symbol='BTC/USD'"
+    )[0]
+    lot = storage.fetch_all(
+        "SELECT position_lifecycle_id,remaining_quantity_decimal,decimal_provenance FROM position_lots WHERE symbol='BTC/USD'"
+    )[0]
+    intent_row = storage.fetch_all(
+        "SELECT position_lifecycle_id FROM crypto_paper_intents WHERE id=?", (intent.id,)
+    )[0]
+    assert lifecycle["state"] == "active"
+    assert lifecycle["current_quantity_decimal"] == intent.requested_quantity
+    assert lifecycle["average_entry_price_decimal"] == "101"
+    assert lifecycle["source"] == "crypto_paper_lane"
+    assert lot["position_lifecycle_id"] == lifecycle["id"]
+    assert lot["remaining_quantity_decimal"] == intent.requested_quantity
+    assert lot["decimal_provenance"] == "exact_source_decimal"
+    assert intent_row["position_lifecycle_id"] == lifecycle["id"]
     metrics = lane.portfolio_metrics(broker, config, now=NOW)
     assert metrics["asset_class"] == "crypto"
     assert D(metrics["crypto_exposure"]) > 0
@@ -450,6 +608,159 @@ def test_partial_crypto_fills_keep_cumulative_performance_and_incremental_fees(t
     assert float(outcome["entry_notional"]) == pytest.approx(float(requested * D("101")))
     assert outcome["status"] == "actual_fill"
     assert storage.fetch_all("SELECT SUM(fees) fees FROM crypto_paper_fills")[0]["fees"] == pytest.approx(0.02)
+
+
+def test_reconciliation_derives_each_partial_fill_price_from_cumulative_average(tmp_path):
+    class ReconcileBroker(Broker):
+        def __init__(self):
+            super().__init__()
+            self.order_response = None
+
+        def get_order_by_client_order_id(self, client_order_id):
+            return self.order_response
+
+    storage, config, broker, lane, proposal, intent = _ready(
+        tmp_path, broker=ReconcileBroker(), request_basis="quantity"
+    )
+    lane.execute_intent(intent.id, config, broker, now=NOW)
+    requested = D(intent.requested_quantity)
+    half = requested / D("2")
+
+    def order(cumulative: str, average: str, fees: str, status: str):
+        return {
+            "id": "crypto-broker-order-1",
+            "client_order_id": intent.client_order_id,
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "status": status,
+            "qty": intent.requested_quantity,
+            "filled_qty": cumulative,
+            "filled_avg_price": average,
+            "fees": fees,
+            "limit_price": "100.1",
+        }
+
+    broker.order_response = order(str(half), "100", "0.01", "partially_filled")
+    first = lane.reconcile_intent(intent.id, config, broker, now=NOW)
+    broker.order_response = order(intent.requested_quantity, "101", "0.02", "filled")
+    second = lane.reconcile_intent(intent.id, config, broker, now=NOW)
+
+    assert first["state"] == "partially_filled"
+    assert second["state"] == "filled"
+    fills = storage.fetch_all(
+        "SELECT quantity,price FROM crypto_paper_fills WHERE intent_id=? ORDER BY received_at,id",
+        (intent.id,),
+    )
+    assert [D(row["quantity"]) for row in fills] == [half, half]
+    assert [D(row["price"]) for row in fills] == [D("100"), D("102")]
+
+
+def test_crypto_round_trip_closes_lifecycle_and_enters_attribution_and_strategy_evidence(tmp_path):
+    config = _config()
+    config["crypto"]["sizing_policy"]["maximum_order_notional_usd"] = "10.10"
+    config["effective_config_hash"] = effective_config_hash(config)
+    storage, config, broker, lane, _entry_proposal, entry_intent = _ready(
+        tmp_path, config=config, request_basis="quantity"
+    )
+    lane.execute_intent(entry_intent.id, config, broker, now=NOW)
+    entry_fill = lane.record_fill(
+        entry_intent.id, "broker-roundtrip-buy", entry_intent.requested_quantity, "101", "0.025", config,
+        broker_evidence={
+            "verified": True, "broker_order_id": "crypto-broker-order-1",
+            "client_order_id": entry_intent.client_order_id, "symbol": "BTC/USD", "side": "buy",
+            "status": "filled", "cumulative_filled_quantity": entry_intent.requested_quantity,
+            "filled_average_price": "101", "fees": "0.025", "paper_account_id_hash": ACCOUNT_HASH,
+            "payload": {"id": "crypto-broker-order-1", "status": "filled"},
+        },
+        occurred_at=NOW,
+    )
+    assert entry_fill["state"] == "filled"
+    quantity = D(entry_intent.requested_quantity)
+    broker.positions = [SimpleNamespace(
+        symbol="BTC/USD", asset_class="crypto", side="long", qty=str(quantity),
+        market_value=str(quantity * D("101")), current_price="101", avg_entry_price="101",
+    )]
+    capability = CryptoCapabilityStore(storage).capture(config, broker, "roundtrip-exit", now=NOW)
+    storage.execute(
+        """INSERT INTO crypto_research_runs(
+          id,run_id,status,started_at,symbols,provider,capability_snapshot_id,
+          capability_snapshot_fingerprint,capability_authoritative,payload
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "roundtrip-exit-research", "roundtrip-exit", "running", NOW.isoformat(),
+            '["BTC/USD"]', "alpaca", capability.id, capability.snapshot_fingerprint,
+            int(capability.authoritative), "{}",
+        ),
+    )
+    market = CryptoMarketDataStore(storage).capture(
+        config, broker, capability, "roundtrip-exit", "roundtrip-exit-research", "BTC/USD", now=NOW,
+    )
+    risk = CryptoRiskStore(storage).evaluate(
+        config, broker, "roundtrip-exit", capability.id, market.id,
+        CryptoSizingRequest(
+            source_type="crypto_position_management", source_id="roundtrip-lifecycle",
+            source_fingerprint="d" * 64, symbol="BTC/USD", side="sell", action="exit",
+            request_basis="quantity", close_entire_position=True,
+        ),
+        now=NOW,
+    )
+    assert risk.sizing.eligible, risk.sizing.blockers
+    assert risk.risk_eligible, risk.reasons
+    sell_proposal = lane.create_proposal(config, None, risk.decision_id, now=NOW)
+    lane.bind_telegram_message(sell_proposal.id, "roundtrip-sell-message", config, now=NOW)
+    lane.approve_proposal(
+        sell_proposal.id, config, sender_id="operator", allowed_sender_id="operator",
+        raw_message=f"YES CRYPTO {sell_proposal.id}", reply_to_message_id="roundtrip-sell-message", now=NOW,
+    )
+    sell_intent = lane.create_intent(sell_proposal.id, config, now=NOW)
+    lane.execute_intent(sell_intent.id, config, broker, now=NOW)
+    sell_fill = lane.record_fill(
+        sell_intent.id, "broker-roundtrip-sell", sell_intent.requested_quantity, "103", "0.025", config,
+        broker_evidence={
+            "verified": True, "broker_order_id": "crypto-broker-order-1",
+            "client_order_id": sell_intent.client_order_id, "symbol": "BTC/USD", "side": "sell",
+            "status": "filled", "cumulative_filled_quantity": sell_intent.requested_quantity,
+            "filled_average_price": "103", "fees": "0.025", "paper_account_id_hash": ACCOUNT_HASH,
+            "payload": {"id": "crypto-broker-order-1", "status": "filled"},
+        },
+        occurred_at=NOW + timedelta(minutes=1),
+    )
+    assert sell_fill["state"] == "filled"
+    lifecycle = storage.fetch_all(
+        "SELECT id,state,current_quantity_decimal,closed_at FROM position_lifecycles WHERE symbol='BTC/USD'"
+    )[0]
+    assert lifecycle["state"] == "closed"
+    assert lifecycle["current_quantity_decimal"] == "0"
+    assert lifecycle["closed_at"]
+    assert storage.fetch_all(
+        "SELECT COUNT(*) n FROM lot_consumptions WHERE position_lifecycle_id=?", (lifecycle["id"],)
+    )[0]["n"] == 1
+    attribution = storage.fetch_all(
+        "SELECT position_lifecycle_id,status,confidence,realized_net_pnl,actual_r_multiple FROM profit_attribution_records WHERE position_lifecycle_id=?",
+        (lifecycle["id"],),
+    )
+    assert len(attribution) == 1
+    assert attribution[0]["status"] == "partial"
+    assert attribution[0]["confidence"] == "verified_actual_only"
+    assert D(attribution[0]["realized_net_pnl"]) > 0
+    snapshots = StrategyPerformanceEngine(storage, config, as_of=NOW + timedelta(minutes=1)).refresh_all()
+    assert snapshots
+    records = storage.fetch_all(
+        "SELECT evidence_class,attribution_status,profit_attribution_id,strategy_version FROM strategy_trade_records WHERE position_lifecycle_id=?",
+        (lifecycle["id"],),
+    )
+    assert len(records) == 1
+    assert records[0]["evidence_class"] == "actual_paper"
+    assert records[0]["attribution_status"] == "partial"
+    assert records[0]["profit_attribution_id"]
+    assert records[0]["strategy_version"]
+    links = storage.fetch_all(
+        "SELECT fill_id,position_lifecycle_id,fill_type FROM crypto_performance_links ORDER BY created_at,fill_id"
+    )
+    assert len(links) == 2
+    assert {row["position_lifecycle_id"] for row in links} == {lifecycle["id"]}
+    assert {row["fill_type"] for row in links} == {"entry", "exit"}
+    assert all(value == 0 for value in fixed_point_integrity_report(storage).values())
 
 
 def test_supervised_crypto_sell_exit_uses_quantity_and_current_holdings(tmp_path):
@@ -585,6 +896,21 @@ def test_broker_absent_before_invocation_is_retryable_not_unknown(tmp_path):
     assert result["state"] == "retryable_pre_submission"
     assert result["broker_invocation_occurred"] == 0
     assert storage.fetch_all("SELECT state FROM crypto_paper_intents")[0]["state"] == "retryable_pre_submission"
+
+
+def test_callable_broker_adapter_without_explicit_availability_proof_is_retryable(tmp_path):
+    storage, config, broker, lane, proposal, intent = _ready(tmp_path)
+
+    class UnavailableCryptoAdapter(Broker):
+        def crypto_submission_available(self):
+            return False
+
+    unavailable = UnavailableCryptoAdapter()
+    result = lane.execute_intent(intent.id, config, unavailable, now=NOW)
+    assert result["state"] == "retryable_pre_submission"
+    assert result["broker_invocation_occurred"] == 0
+    assert result["broker_call"] is False
+    assert unavailable.submit_calls == []
 
 
 def test_expired_approval_terminalises_and_releases_without_broker_io(tmp_path):

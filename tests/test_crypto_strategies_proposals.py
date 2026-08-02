@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.approval_authority import canonical_json
-from app.configuration import ConfigurationError, validate_config
+from app.configuration import ConfigurationError, effective_config_hash, validate_config
 from app.crypto_capabilities import CryptoCapabilityStore
 from app.crypto_market_data import CryptoMarketDataStore
 from app.crypto_proposals import (
@@ -19,6 +19,7 @@ from app.crypto_proposals import (
     format_crypto_proposal_preview,
 )
 from app.crypto_research import CryptoResearchEngine
+from app.cross_asset_runtime import CrossAssetRuntimeCoordinator
 from app.crypto_risk import CryptoRiskError, CryptoRiskStore
 from app.crypto_sizing import CryptoSizingRequest
 from app.crypto_strategies import CryptoStrategyError, CryptoStrategyStore, SUPPORTED_STRATEGIES
@@ -253,6 +254,111 @@ def test_hourly_crypto_research_persists_strategy_decision_without_proposal(tmp_
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_strategy_decisions")[0]["n"] == 1
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0
+    assert broker.submit_calls == 0
+
+
+def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp_path, monkeypatch):
+    storage = _storage(tmp_path)
+    config = _config()
+    monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
+    monkeypatch.setattr(
+        "app.cross_asset_runtime.get_power_status",
+        lambda: SimpleNamespace(connected=True),
+    )
+
+    class ResearchBroker(Broker):
+        def get_crypto_historical_bars(self, symbol, timeframe="1Hour", limit=500):
+            rows = _bars(count=max(168, limit))
+            for row in rows:
+                row["symbol"] = symbol
+                row["volume"] = "1000"
+            return rows
+
+    broker = ResearchBroker()
+    engine = CryptoResearchEngine(config, storage, broker=broker, run_id="run-cross-asset")
+    results = engine.run_research(
+        symbols=["BTC/USD"],
+        now=NOW,
+        defer_entry_proposals=True,
+    )
+    assert results[0].strategy_decision_id
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_proposals")[0]["n"] == 0
+
+    plan = CrossAssetRuntimeCoordinator(
+        storage, config, broker, run_id="run-cross-asset"
+    ).create_plan(
+        crypto_results=results,
+        positions=broker.get_positions(),
+        orders=broker.get_open_orders(),
+        account=broker.get_account(),
+        now=NOW,
+    )
+    assert plan.execution_authorized is False
+    assert plan.summary["candidate_count"] == 1
+    assert plan.decisions[0]["decision"] == "REJECT"
+    assert storage.fetch_all("SELECT COUNT(*) n FROM cross_asset_allocation_plans")[0]["n"] == 1
+
+    assert engine.create_deferred_supervised_entry_proposals(
+        results, plan.decisions, now=NOW
+    ) == []
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_proposals")[0]["n"] == 0
+
+
+def test_positive_cross_asset_advisory_materializes_only_a_manual_crypto_proposal(tmp_path, monkeypatch):
+    storage = _storage(tmp_path)
+    config = _config()
+    # The synthetic rising series needs a wider target to make the
+    # cost-adjusted candidate positive under the production fee/slippage tier.
+    config["crypto"]["strategy_policy"]["target_reward_r_multiple"] = 8
+    config["effective_config_hash"] = effective_config_hash(config)
+    monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
+    monkeypatch.setattr(
+        "app.cross_asset_runtime.get_power_status",
+        lambda: SimpleNamespace(connected=True),
+    )
+
+    class ResearchBroker(Broker):
+        def get_crypto_historical_bars(self, symbol, timeframe="1Hour", limit=500):
+            rows = _bars(count=max(168, limit))
+            for row in rows:
+                row["symbol"] = symbol
+                row["volume"] = "1000"
+            return rows
+
+    broker = ResearchBroker()
+    engine = CryptoResearchEngine(config, storage, broker=broker, run_id="run-positive-cross-asset")
+    results = engine.run_research(
+        symbols=["BTC/USD"],
+        now=NOW,
+        defer_entry_proposals=True,
+    )
+    plan = CrossAssetRuntimeCoordinator(
+        storage, config, broker, run_id="run-positive-cross-asset"
+    ).create_plan(
+        crypto_results=results,
+        positions=broker.get_positions(),
+        orders=broker.get_open_orders(),
+        account=broker.get_account(),
+        now=NOW,
+    )
+    assert plan.execution_authorized is False
+    assert plan.summary["allocated_candidate_count"] == 1
+    assert plan.decisions[0]["decision"].startswith(
+        "ALLOCATE_SUPERVISED_PAPER_ADVISORY"
+    )
+    assert plan.decisions[0]["action"] == "entry"
+    assert plan.decisions[0]["order_authority"] is False
+
+    proposal_ids = engine.create_deferred_supervised_entry_proposals(
+        results, plan.decisions, now=NOW
+    )
+    assert len(proposal_ids) == 1
+    proposal = storage.fetch_all(
+        "SELECT id,action,status FROM crypto_paper_proposals WHERE id=?",
+        (proposal_ids[0],),
+    )[0]
+    assert proposal["action"] == "entry"
+    assert proposal["status"] == "pending"
     assert broker.submit_calls == 0
 
 

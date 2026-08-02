@@ -1025,6 +1025,17 @@ class StrategyPerformanceEngine:
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM position_lots WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM order_intents WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
         versions.update(str(row["strategy_version"]) for row in self.storage.fetch_all("SELECT DISTINCT strategy_version FROM trade_proposals WHERE strategy_version IS NOT NULL") if row.get("strategy_version"))
+        # Crypto strategy decisions are durable research authority even before
+        # the first paper fill.  Materialize their versions so the Performance
+        # Lab can keep an explicit RESEARCH_ONLY/PAPER_ACTIVE policy record and
+        # later attach verified lifecycle outcomes to the same version.
+        versions.update(
+            str(row["selected_strategy"])
+            for row in self.storage.fetch_all(
+                "SELECT DISTINCT selected_strategy FROM crypto_strategy_decisions WHERE selected_strategy IS NOT NULL"
+            )
+            if row.get("selected_strategy")
+        )
         return sorted(versions)
 
     def _validation_enforced(self) -> bool:

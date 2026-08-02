@@ -61,6 +61,11 @@ class BrokerInterface(ABC):
 
         raise BrokerSubmissionNotAttempted("separate crypto paper submission adapter is unavailable")
 
+    def crypto_submission_available(self) -> bool:
+        """Return an explicit pre-invocation proof for the crypto adapter."""
+
+        return False
+
     @abstractmethod
     def cancel_order(self, order_id: str) -> Any: ...
 

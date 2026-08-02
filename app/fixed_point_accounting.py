@@ -37,6 +37,13 @@ TABLE_DECIMAL_COLUMNS: dict[str, dict[str, str]] = {
         "decimal_provenance": "TEXT",
         "decimal_accounting_version": "TEXT",
     },
+    "account_equity_watermarks": {
+        "peak_equity_decimal": "TEXT",
+        "latest_equity_decimal": "TEXT",
+        "drawdown_pct_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
     "order_intents": {
         "filled_quantity_decimal": "TEXT",
         "average_fill_price_decimal": "TEXT",
@@ -64,6 +71,13 @@ TABLE_DECIMAL_COLUMNS: dict[str, dict[str, str]] = {
         "unit_cost_decimal": "TEXT",
         "fees_allocated_decimal": "TEXT",
         "initial_risk_dollars_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "position_lifecycles": {
+        "opening_quantity_decimal": "TEXT",
+        "current_quantity_decimal": "TEXT",
+        "average_entry_price_decimal": "TEXT",
         "decimal_provenance": "TEXT",
         "decimal_accounting_version": "TEXT",
     },
@@ -103,6 +117,11 @@ BACKFILL_FIELDS: dict[str, dict[str, str]] = {
         "unrealized_change_decimal": "unrealized_change",
         "external_cash_flow_decimal": "external_cash_flow",
     },
+    "account_equity_watermarks": {
+        "peak_equity_decimal": "peak_equity",
+        "latest_equity_decimal": "latest_equity",
+        "drawdown_pct_decimal": "drawdown_pct",
+    },
     "order_intents": {
         "filled_quantity_decimal": "filled_quantity",
         "average_fill_price_decimal": "average_fill_price",
@@ -123,6 +142,11 @@ BACKFILL_FIELDS: dict[str, dict[str, str]] = {
         "unit_cost_decimal": "unit_cost",
         "fees_allocated_decimal": "fees_allocated",
         "initial_risk_dollars_decimal": "initial_risk_dollars",
+    },
+    "position_lifecycles": {
+        "opening_quantity_decimal": "opening_quantity",
+        "current_quantity_decimal": "current_quantity",
+        "average_entry_price_decimal": "average_entry_price",
     },
     "realized_pnl_events": {
         "quantity_decimal": "quantity",
@@ -149,6 +173,9 @@ NONNEGATIVE_FIELDS: dict[str, frozenset[str]] = {
     "cash_snapshots": frozenset(
         {"equity_decimal", "cash_decimal", "settled_cash_decimal"}
     ),
+    "account_equity_watermarks": frozenset(
+        {"peak_equity_decimal", "latest_equity_decimal", "drawdown_pct_decimal"}
+    ),
     "order_intents": frozenset({"filled_quantity_decimal", "average_fill_price_decimal"}),
     "broker_fill_events": frozenset(
         {
@@ -166,6 +193,13 @@ NONNEGATIVE_FIELDS: dict[str, frozenset[str]] = {
             "unit_cost_decimal",
             "fees_allocated_decimal",
             "initial_risk_dollars_decimal",
+        }
+    ),
+    "position_lifecycles": frozenset(
+        {
+            "opening_quantity_decimal",
+            "current_quantity_decimal",
+            "average_entry_price_decimal",
         }
     ),
     "realized_pnl_events": frozenset(
@@ -396,6 +430,10 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
                         "remaining_quantity_decimal",
                         "unit_cost_decimal",
                         "fees_allocated_decimal",
+                    },
+                    "position_lifecycles": {
+                        "opening_quantity_decimal",
+                        "current_quantity_decimal",
                     },
                     "realized_pnl_events": {
                         "quantity_decimal",

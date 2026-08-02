@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from .execution import DurableExecutionStore
 from .evidence import SHADOW_OUTCOME, classify_evidence_type, is_operational_evidence
+from .fixed_point_accounting import decimal_text
 from .formula_versions import EVIDENCE_VERSION, PHASE3_DECISION_VERSION
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_execution_registry import StrategyExecutionRegistry, persist as persist_strategy_registry
@@ -87,7 +88,9 @@ def apply_phase3_schema(conn: Any, *, record_migration: bool = True) -> None:
       UNIQUE(run_id,strategy_version));
     CREATE TABLE IF NOT EXISTS account_equity_watermarks(
       account_key TEXT PRIMARY KEY, peak_equity REAL NOT NULL, latest_equity REAL NOT NULL,
-      drawdown_pct REAL NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+      drawdown_pct REAL NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL,
+      peak_equity_decimal TEXT, latest_equity_decimal TEXT, drawdown_pct_decimal TEXT,
+      decimal_provenance TEXT, decimal_accounting_version TEXT);
     CREATE TABLE IF NOT EXISTS phase3_activation_events(
       id TEXT PRIMARY KEY, release_commit TEXT NOT NULL, activated_at TEXT NOT NULL,
       status TEXT NOT NULL, paper_identity_json TEXT NOT NULL, account_json TEXT NOT NULL,
@@ -105,6 +108,17 @@ def apply_phase3_schema(conn: Any, *, record_migration: bool = True) -> None:
     for name, definition in additions.items():
         if name not in present:
             conn.execute(f"ALTER TABLE phase3_risk_decisions ADD COLUMN {name} {definition}")
+    watermark_columns = {
+        "peak_equity_decimal": "TEXT",
+        "latest_equity_decimal": "TEXT",
+        "drawdown_pct_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    }
+    watermark_present = {row[1] for row in conn.execute("PRAGMA table_info(account_equity_watermarks)")}
+    for name, definition in watermark_columns.items():
+        if name not in watermark_present:
+            conn.execute(f"ALTER TABLE account_equity_watermarks ADD COLUMN {name} {definition}")
     if record_migration:
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
                      (PHASE3_SCHEMA_VERSION, iso_now(), "additive Phase 3 strategy states, allocations, risk decisions, and equity watermark"))
@@ -137,18 +151,51 @@ class Phase3Controller:
         self.registry_snapshot_id: str | None = None
         self.authorized_strategy_versions: tuple[str, ...] = ()
 
-    def update_equity(self, equity: float, account_key: str = "alpaca-paper") -> float:
-        if not math.isfinite(equity) or equity <= 0: raise ValueError("authoritative positive equity required")
-        rows = self.storage.fetch_all("SELECT peak_equity FROM account_equity_watermarks WHERE account_key=?", (account_key,))
-        historical = self.storage.fetch_all("SELECT MAX(equity) peak FROM cash_snapshots WHERE equity IS NOT NULL")
-        historical_peak = float(historical[0]["peak"]) if historical and historical[0].get("peak") is not None else equity
-        peak = max(equity, historical_peak, float(rows[0]["peak_equity"]) if rows else equity)
-        drawdown = max(0.0, (peak - equity) / peak * 100.0)
+    def update_equity(self, equity: float | Decimal, account_key: str = "alpaca-paper") -> float:
+        try:
+            current_equity = equity if isinstance(equity, Decimal) else Decimal(str(equity))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("authoritative positive equity required") from exc
+        if not current_equity.is_finite() or current_equity <= 0:
+            raise ValueError("authoritative positive equity required")
+        rows = self.storage.fetch_all(
+            "SELECT peak_equity_decimal FROM account_equity_watermarks WHERE account_key=?",
+            (account_key,),
+        )
+        historical = self.storage.fetch_all(
+            "SELECT equity_decimal FROM cash_snapshots WHERE equity_decimal IS NOT NULL"
+        )
+        historical_values = [
+            Decimal(str(row["equity_decimal"]))
+            for row in historical
+            if row.get("equity_decimal") not in (None, "")
+        ]
+        prior_values = [
+            Decimal(str(row["peak_equity_decimal"]))
+            for row in rows
+            if row.get("peak_equity_decimal") not in (None, "")
+        ]
+        if any(not value.is_finite() or value <= 0 for value in [*historical_values, *prior_values]):
+            raise ValueError("persisted equity watermark evidence is invalid")
+        peak = max([current_equity, *historical_values, *prior_values])
+        drawdown = max(Decimal("0"), (peak - current_equity) / peak * Decimal("100"))
         self.storage.execute("""INSERT INTO account_equity_watermarks(account_key,peak_equity,latest_equity,drawdown_pct,source,updated_at)
           VALUES(?,?,?,?,?,?) ON CONFLICT(account_key) DO UPDATE SET peak_equity=excluded.peak_equity,
           latest_equity=excluded.latest_equity,drawdown_pct=excluded.drawdown_pct,source=excluded.source,updated_at=excluded.updated_at""",
-          (account_key, peak, equity, drawdown, "authoritative_alpaca_paper_account", iso_now()))
-        return drawdown
+          (account_key, float(peak), float(current_equity), float(drawdown), "authoritative_alpaca_paper_account", iso_now()))
+        self.storage.execute(
+            """UPDATE account_equity_watermarks
+               SET peak_equity_decimal=?,latest_equity_decimal=?,drawdown_pct_decimal=?,
+                   decimal_provenance='exact_source_decimal',decimal_accounting_version='fixed_point_fifo_accounting_v1'
+               WHERE account_key=?""",
+            (decimal_text(peak), decimal_text(current_equity), decimal_text(drawdown), account_key),
+        )
+        # The legacy Phase 3/4 allocator persists a REAL compatibility
+        # projection and expects this public return value to be float-like.
+        # Canonical watermark and drawdown authority remains the Decimal text
+        # written above; this conversion is only the bounded compatibility
+        # boundary into that older reporting path.
+        return float(drawdown)
 
     def reconciliation_health(self) -> tuple[bool, dict[str, int]]:
         report = DurableExecutionStore(self.storage).integrity_report()

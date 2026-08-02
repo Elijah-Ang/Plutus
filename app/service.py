@@ -254,6 +254,14 @@ class TradingService:
         self._strategy_policy_map: dict[str, Any] | None = None
         self._strategy_registry_snapshot_id: str | None = None
         self._current_cycle_exit_blocker: dict[str, Any] | None = None
+        self._crypto_research_engine: CryptoResearchEngine | None = None
+        self._last_crypto_research_results: list[Any] = []
+        # main.run_once may collect the continuous crypto lane before the
+        # equity trading branch is known. Carry that exact result set into the
+        # following scanner pass so cross-asset allocation compares one crypto
+        # evidence set with the current equity candidates.
+        self._crypto_research_preloaded_for_run = False
+        self._cross_asset_plan: Any | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
@@ -7506,6 +7514,14 @@ class TradingService:
 
             buy_candidates = self._rank_candidates(buy_candidates, snapshot)
 
+            self._cross_asset_plan = self._create_cross_asset_plan(
+                buy_candidates,
+                positions=positions,
+                orders=orders,
+                account=account,
+                now=now,
+            )
+
             risk_snapshot = self._record_risk_budget_snapshot(snapshot, account, now)
             ranked_budget_reasons: dict[str, str] = {}
             if batch_mode_enabled:
@@ -13043,19 +13059,132 @@ class TradingService:
         )
         self._sync_performance_lab_order_links()
 
-    def _run_crypto_research_due(self) -> list[Any]:
+    def _create_cross_asset_plan(
+        self,
+        equity_candidates: list[dict[str, Any]],
+        *,
+        positions: list[Any],
+        orders: list[Any],
+        account: Any | None,
+        now: datetime,
+    ) -> Any | None:
+        """Persist one same-cycle cross-asset advisory plan before crypto entries."""
+
+        self._cross_asset_plan = None
+        if not self._last_crypto_research_results or account is None:
+            return None
+        try:
+            from .cross_asset_runtime import CrossAssetRuntimeCoordinator
+
+            coordinator = CrossAssetRuntimeCoordinator(
+                self.storage,
+                self.config,
+                self.broker,
+                cluster_resolver=self._get_symbol_cluster,
+                run_id=self.run_id,
+            )
+            plan = coordinator.create_plan(
+                equity_candidates=equity_candidates,
+                crypto_results=self._last_crypto_research_results,
+                positions=positions,
+                orders=orders,
+                account=account,
+                now=now,
+            )
+            proposal_ids: list[str] = []
+            if self._crypto_research_engine is not None:
+                proposal_ids = self._crypto_research_engine.create_deferred_supervised_entry_proposals(
+                    self._last_crypto_research_results,
+                    plan.decisions,
+                    now=now,
+                )
+            self.storage.audit(
+                self.run_id,
+                "cross_asset_allocation_plan_created",
+                {
+                    "plan_id": plan.id,
+                    "candidate_count": plan.summary.get("candidate_count"),
+                    "allocated_candidate_count": plan.summary.get("allocated_candidate_count"),
+                    "crypto_proposal_ids": proposal_ids,
+                    "execution_authorized": plan.execution_authorized,
+                },
+            )
+            return plan
+        except Exception as exc:
+            # Cross-asset advice is never allowed to widen the ordinary paper
+            # pipeline.  A failed or unavailable comparison therefore leaves
+            # crypto entry proposals absent and records the closed failure.
+            self.storage.audit(
+                self.run_id,
+                "cross_asset_allocation_failed_closed",
+                {"error": type(exc).__name__},
+            )
+            logger.warning("cross_asset_allocation_failed_closed: %s", exc)
+            return None
+
+    def _run_crypto_research_due(self, *, preload: bool = False) -> list[Any]:
+        if not preload and self._crypto_research_preloaded_for_run:
+            self._crypto_research_preloaded_for_run = False
+            return list(self._last_crypto_research_results)
+        self._crypto_research_engine = None
+        self._last_crypto_research_results = []
         crypto_cfg = self.config.get("crypto") or {}
         if not crypto_cfg.get("enabled", False):
             return []
         try:
-            return CryptoResearchEngine(self.config, self.storage, self.broker, self.telegram, self.run_id).run_due(datetime.now(UTC))
+            engine = CryptoResearchEngine(
+                self.config,
+                self.storage,
+                self.broker,
+                self.telegram,
+                self.run_id,
+            )
+            self._crypto_research_engine = engine
+            results = engine.run_due(
+                datetime.now(UTC),
+                defer_entry_proposals=True,
+            )
+            self._last_crypto_research_results = results
+            self._crypto_research_preloaded_for_run = bool(preload)
+            return results
         except Exception as exc:
             logger.warning("crypto_research_due_failed: %s", exc)
             self.storage.audit(self.run_id, "crypto_research_due_failed", {"error": type(exc).__name__})
+            self._crypto_research_preloaded_for_run = bool(preload)
             return []
 
     def run_crypto_research_due(self) -> list[Any]:
-        return self._run_crypto_research_due()
+        return self._run_crypto_research_due(preload=True)
+
+    def finalize_crypto_research_cycle(self, *, now: datetime | None = None) -> Any | None:
+        """Compare a standalone 24/7 crypto research run before its entries.
+
+        The launchd scanner performs this finalization even when the equity
+        market preflight is closed.  Crypto exits are already risk-reducing;
+        this bridge exists for risk-increasing entry/add proposals and keeps
+        the same cross-asset advisory gate in both market-session branches.
+        """
+
+        if not self._last_crypto_research_results or self.broker is None:
+            return None
+        try:
+            positions = self.broker.get_positions()
+            orders = self.broker.get_open_orders()
+            account = self.broker.get_account()
+        except Exception as exc:
+            self.storage.audit(
+                self.run_id,
+                "cross_asset_allocation_failed_closed",
+                {"error": type(exc).__name__, "stage": "standalone_crypto_research_finalization"},
+            )
+            return None
+        return self._create_cross_asset_plan(
+            [],
+            positions=positions,
+            orders=orders,
+            account=account,
+            now=(now or datetime.now(UTC)).astimezone(UTC),
+        )
 
     def _performance_lab_blockers(self, res: dict[str, Any], signal: Any, reason: str | None, active_set: set[str], data_freshness: str) -> list[tuple[str, str]]:
         blockers: list[tuple[str, str]] = []
