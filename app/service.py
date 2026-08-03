@@ -5133,6 +5133,7 @@ class TradingService:
         batch_row: dict[str, Any] = None,
         *,
         rotation_dependency_authorized: bool = False,
+        now: datetime | None = None,
     ) -> tuple[Any, float | None, Any, str | None, float | None, float | None]:
         refreshed_price_val = None
         refreshed_price_at = None
@@ -5141,7 +5142,15 @@ class TradingService:
         price_move_bps_since_proposal = None
         quote_data = None
         block_reason = None
-        now_dt = datetime.now(UTC)
+        # Keep the safety-boundary clock explicit for deterministic tests. In
+        # production callers omit it and the revalidation uses the current UTC
+        # time at entry; tests can bind it to the fixture quote timestamp
+        # without measuring unrelated setup latency as quote age.
+        now_dt = now or datetime.now(UTC)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        else:
+            now_dt = now_dt.astimezone(UTC)
 
         # General safety pre-flights
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
