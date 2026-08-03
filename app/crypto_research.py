@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Mapping
 
 from .crypto_capabilities import CryptoCapabilitySnapshot, CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore, CryptoMarketEvidence
@@ -14,6 +15,7 @@ from .crypto_strategies import CryptoStrategyError, CryptoStrategyStore
 from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, format_crypto_paper_proposal
 from .crypto_risk import CryptoRiskError, CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest
+from .crypto_outcomes import CryptoCostModel, calculate_shadow_outcome, persist_observation
 from .storage import Storage
 from .utils import json_dumps
 
@@ -117,6 +119,22 @@ def configured_crypto_symbols(config: dict[str, Any]) -> list[str]:
         if symbol and symbol not in symbols:
             symbols.append(symbol)
     return symbols[:max_symbols]
+
+
+def _telegram_sent_identity(sent: Any, telegram: Any) -> tuple[str | None, str | None]:
+    """Extract the exact Telegram message and chat identities for binding."""
+
+    message_id = getattr(sent, "message_id", None)
+    chat_id = getattr(sent, "chat_id", None)
+    if isinstance(sent, Mapping):
+        message_id = message_id or sent.get("message_id") or sent.get("id")
+        chat = sent.get("chat") or {}
+        if isinstance(chat, Mapping):
+            chat_id = chat_id or chat.get("id")
+    chat_id = chat_id or getattr(telegram, "chat_id", None)
+    if message_id in (None, "") or chat_id in (None, ""):
+        return None, None
+    return str(message_id), str(chat_id)
 
 
 def crypto_quiet_hours_active(config: dict[str, Any], now: datetime | None = None) -> bool:
@@ -383,6 +401,19 @@ class CryptoResearchEngine:
             except CryptoStrategyError as exc:
                 result.strategy_blockers = ("crypto_strategy_evaluation_failed",)
                 result.risk_metrics["crypto_strategy_error"] = str(exc)
+            try:
+                self._settle_crypto_shadow_outcomes(
+                    normalized,
+                    rows,
+                    now=now,
+                    exclude_strategy_decision_id=None if decision is None else decision.id,
+                )
+            except Exception as exc:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_shadow_outcome_settlement_failed_closed",
+                    {"symbol": normalized, "error": type(exc).__name__},
+                )
             if decision is not None and not defer_entry_proposals:
                 self._maybe_create_supervised_paper_proposal(
                     result, capability, market_evidence, decision, now,
@@ -687,20 +718,7 @@ class CryptoResearchEngine:
                         # the audit record for deduplication/recovery.
                         proposal_id = proposal.id
                         rendered = format_crypto_paper_proposal(proposal)
-                        if self.telegram is not None:
-                            sent = self.telegram.send_message(rendered)
-                            message_id = getattr(sent, "message_id", None)
-                            if message_id is None and isinstance(sent, dict):
-                                message_id = sent.get("message_id") or sent.get("id")
-                            if message_id is not None:
-                                lane.bind_telegram_message(
-                                    proposal.id,
-                                    str(message_id),
-                                    self.config,
-                                    chat_id=getattr(self.telegram, "chat_id", None),
-                                    rendered_text=rendered,
-                                    now=now,
-                                )
+                        self._deliver_crypto_proposal(lane, proposal, rendered, now=now)
                         self.storage.audit(
                             self.run_id,
                             "crypto_position_management_proposal_created",
@@ -826,34 +844,8 @@ class CryptoResearchEngine:
             result.risk_metrics["supervised_paper_proposal_id"] = proposal.id
             result.status = "supervised_paper"
             result.reason = "fresh_manual_approval_required"
-            if self.telegram is not None:
-                try:
-                    rendered = format_crypto_paper_proposal(proposal)
-                    sent = self.telegram.send_message(rendered)
-                    message_id = getattr(sent, "message_id", None)
-                    if message_id is None and isinstance(sent, dict):
-                        message_id = sent.get("message_id") or sent.get("id")
-                    if message_id is not None:
-                        chat_id = getattr(self.telegram, "chat_id", None)
-                        if chat_id is None and isinstance(sent, dict):
-                            chat = sent.get("chat") or {}
-                            chat_id = chat.get("id") if isinstance(chat, dict) else None
-                        lane_store.bind_telegram_message(
-                            proposal.id, str(message_id), self.config,
-                            chat_id=None if chat_id is None else str(chat_id),
-                            rendered_text=rendered,
-                            now=now,
-                        )
-                    else:
-                        self.storage.audit(
-                            self.run_id, "crypto_paper_proposal_telegram_identity_missing",
-                            {"proposal_id": proposal.id},
-                        )
-                except Exception as exc:
-                    self.storage.audit(
-                        self.run_id, "crypto_paper_proposal_telegram_send_failed",
-                        {"proposal_id": proposal.id, "error": type(exc).__name__},
-                    )
+            rendered = format_crypto_paper_proposal(proposal)
+            self._deliver_crypto_proposal(lane_store, proposal, rendered, now=now)
         except (CryptoPaperLaneError, CryptoRiskError, InvalidOperation, TypeError, ValueError) as exc:
             result.risk_metrics["supervised_paper_blockers"] = [type(exc).__name__]
         except Exception as exc:
@@ -909,6 +901,190 @@ class CryptoResearchEngine:
         if self.broker is None or not hasattr(self.broker, "get_crypto_historical_bars"):
             raise RuntimeError("crypto data provider unavailable")
         return self.broker.get_crypto_historical_bars(symbol, "1Hour", 500)
+
+    def _deliver_crypto_proposal(
+        self,
+        lane: CryptoPaperLaneStore,
+        proposal: Any,
+        rendered: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Use a durable exactly-once send claim and bind its returned identity."""
+
+        if self.telegram is None:
+            lane.mark_unbound_manual_review(
+                proposal.id, reason="Telegram client is unavailable", now=now
+            )
+            return False
+        chat_id = str(getattr(self.telegram, "chat_id", "") or "")
+        if not chat_id:
+            lane.mark_unbound_manual_review(
+                proposal.id, reason="Telegram chat identity is unavailable", now=now
+            )
+            return False
+        outbox = lane.queue_telegram_display(
+            proposal.id,
+            self.config,
+            chat_id=chat_id,
+            rendered_text=rendered,
+            now=now,
+        )
+        status = str(outbox.get("status") or "")
+        if status == "sent":
+            message_id = str(outbox.get("telegram_message_id") or "")
+            sent_chat = str(outbox.get("telegram_chat_id") or chat_id)
+            if not message_id:
+                lane.mark_unbound_manual_review(
+                    proposal.id, reason="sent Telegram outbox has no message identity", now=now
+                )
+                return False
+            lane.bind_telegram_message(
+                proposal.id,
+                message_id,
+                self.config,
+                chat_id=sent_chat,
+                rendered_text=rendered,
+                now=now,
+            )
+            return True
+        if status != "queued" or not lane.claim_telegram_display(proposal.id, now=now):
+            lane.mark_unbound_manual_review(
+                proposal.id,
+                reason=f"Telegram outbox is not safely sendable ({status})",
+                now=now,
+            )
+            return False
+        try:
+            sent = self.telegram.send_message(rendered)
+            message_id, returned_chat_id = _telegram_sent_identity(sent, self.telegram)
+            if message_id is None or returned_chat_id is None:
+                lane.mark_telegram_failed(
+                    proposal.id,
+                    reason="Telegram send did not return both message and chat identity",
+                    now=now,
+                )
+                lane.mark_unbound_manual_review(
+                    proposal.id,
+                    reason="Telegram send did not return both message and chat identity",
+                    now=now,
+                )
+                return False
+            lane.mark_telegram_sent(
+                proposal.id,
+                message_id=message_id,
+                chat_id=returned_chat_id,
+                now=now,
+            )
+            lane.bind_telegram_message(
+                proposal.id,
+                message_id,
+                self.config,
+                chat_id=returned_chat_id,
+                rendered_text=rendered,
+                now=now,
+            )
+            return True
+        except Exception as exc:
+            lane.mark_telegram_failed(
+                proposal.id, reason=f"Telegram send failed:{type(exc).__name__}", now=now
+            )
+            lane.mark_unbound_manual_review(
+                proposal.id, reason=f"Telegram display binding failed:{type(exc).__name__}", now=now
+            )
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_proposal_telegram_send_failed",
+                {"proposal_id": proposal.id, "error": type(exc).__name__},
+            )
+            return False
+
+    def _settle_crypto_shadow_outcomes(
+        self,
+        symbol: str,
+        rows: list[dict[str, Any]],
+        *,
+        now: datetime,
+        exclude_strategy_decision_id: str | None,
+    ) -> None:
+        """Settle prior signal setups against newly observed hourly bars.
+
+        These are real forward shadow observations from the provider's bars;
+        no outcome is created when the future horizon is not yet observable.
+        The sidecar remains append-only, so a later bar set naturally produces
+        a new evidence fingerprint for a maturing setup.
+        """
+
+        policy = (self.config.get("crypto") or {}).get("profitability_policy") or {}
+        horizon_hours = int(policy.get("outcome_horizon_hours") or 0)
+        if horizon_hours <= 0:
+            raise ValueError("crypto outcome horizon policy is unavailable")
+        sizing = (self.config.get("crypto") or {}).get("sizing_policy") or {}
+        cost_model = CryptoCostModel(
+            version="crypto_round_trip_cost_v1",
+            fee_bps=Decimal(str(sizing.get("conservative_taker_fee_bps_per_side"))),
+            spread_bps=Decimal(str((self.config.get("crypto") or {}).get("max_spread_bps"))),
+            slippage_bps=Decimal(str(sizing.get("stop_execution_slippage_bps"))),
+        )
+        bar_evidence = [
+            {
+                "timestamp": row["timestamp"],
+                "high": str(row["high"]),
+                "low": str(row["low"]),
+                "close": str(row["close"]),
+            }
+            for row in rows
+            if row.get("timestamp") is not None and row.get("high") is not None
+            and row.get("low") is not None and row.get("close") is not None
+        ]
+        decisions = self.storage.fetch_all(
+            """
+            SELECT id,decision_fingerprint,symbol,selected_strategy,stop_price,target_price,
+                   as_of,decision_json
+            FROM crypto_strategy_decisions
+            WHERE symbol=? AND selected_strategy IS NOT NULL
+            ORDER BY created_at DESC LIMIT 200
+            """,
+            (symbol,),
+        )
+        for row in decisions:
+            if exclude_strategy_decision_id and row["id"] == exclude_strategy_decision_id:
+                continue
+            try:
+                payload = json.loads(row["decision_json"])
+                metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+                if not isinstance(metrics, Mapping):
+                    continue
+                entry = metrics.get("close")
+                stop = row["stop_price"]
+                target = row["target_price"]
+                if entry in (None, "") or stop in (None, "") or target in (None, ""):
+                    continue
+                setup = {
+                    "symbol": symbol,
+                    "strategy_decision_id": str(row["id"]),
+                    "strategy_decision_fingerprint": str(row["decision_fingerprint"]),
+                    "research_timestamp": row["as_of"],
+                    "entry_price": str(entry),
+                    "stop_price": str(stop),
+                    "target_price": str(target),
+                    "horizon_hours": horizon_hours,
+                    "cost_model": cost_model.to_payload(),
+                    "side": "long",
+                }
+                observation = calculate_shadow_outcome(
+                    setup,
+                    bar_evidence,
+                    horizon_hours=horizon_hours,
+                    cost_model=cost_model,
+                )
+                persist_observation(self.storage, observation)
+            except Exception as exc:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_shadow_outcome_rejected",
+                    {"symbol": symbol, "strategy_decision_id": row["id"], "error": type(exc).__name__},
+                )
 
     def _persist_result(self, result: CryptoResearchResult, research_run_id: str, now: datetime) -> None:
         setup_id = self._record_performance_lab(result, now)

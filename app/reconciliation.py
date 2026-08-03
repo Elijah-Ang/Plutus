@@ -3,9 +3,9 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
-from .execution import DurableExecutionStore
+from .execution import DurableExecutionStore, _broker_evidence_safe
 from .accounting import separate_accounting_components
 from .fixed_point_accounting import (
     EXACT_DECIMAL_PROVENANCE,
@@ -198,7 +198,15 @@ class BrokerReconciler:
             return outcome
 
         remote_status = _status(_value(remote, "status"))
-        filled_qty = float(_value(remote, "filled_qty", 0) or 0)
+        raw_filled_qty = _value(remote, "filled_qty", None)
+        raw_fill_price = _value(remote, "filled_avg_price", None)
+        try:
+            filled_qty_decimal = decimal_value(raw_filled_qty, "broker reconciliation filled quantity", minimum=ZERO, allow_none=True)
+            fill_price_decimal = decimal_value(raw_fill_price, "broker reconciliation average fill price", minimum=ZERO, allow_none=True)
+        except ValueError:
+            filled_qty_decimal = None
+            fill_price_decimal = None
+        filled_qty = float(filled_qty_decimal or ZERO)
         target = broker_status_to_state(remote_status, filled_qty)
         broker_order_id = str(_value(remote, "id", "") or intent.get("broker_order_id") or "") or None
         self.storage.execute(
@@ -212,24 +220,64 @@ class BrokerReconciler:
             outcome["manual_review_required"] = 1
             return outcome
 
-        fill_price = _value(remote, "filled_avg_price")
-        if filled_qty > 0 and fill_price is not None:
-            event_key = str(_value(remote, "execution_id", "") or f"{broker_order_id or intent['client_order_id']}:{filled_qty:.12g}:{float(fill_price):.12g}")
-            before = float(intent.get("filled_quantity") or 0)
+        if target in {OrderState.PARTIALLY_FILLED, OrderState.FILLED} and (
+            filled_qty_decimal is None
+            or fill_price_decimal is None
+            or filled_qty_decimal <= ZERO
+            or fill_price_decimal <= ZERO
+        ):
+            current = OrderState(intent["state"])
+            if current != OrderState.FILLED and current != OrderState.RECONCILIATION_REQUIRED:
+                self.intent_store.transition(
+                    intent["id"],
+                    OrderState.RECONCILIATION_REQUIRED,
+                    event_type="broker_fill_evidence_missing",
+                    broker_order_id=broker_order_id,
+                    safe_summary="broker reported a fill state without verified cumulative quantity and average price",
+                )
+            self._record_attempt(
+                intent["id"], lookup_type, "fill_evidence_missing", remote_status,
+                {"quantity_present": filled_qty_decimal is not None, "price_present": fill_price_decimal is not None},
+            )
+            outcome["divergence"] = 1
+            outcome["manual_review_required"] = 1
+            return outcome
+        if filled_qty_decimal is not None and filled_qty_decimal > ZERO and fill_price_decimal is not None and fill_price_decimal > ZERO:
+            event_key = str(
+                _value(remote, "execution_id", "")
+                or f"{broker_order_id or intent['client_order_id']}:{decimal_text(filled_qty_decimal)}:{decimal_text(fill_price_decimal)}"
+            )
+            before = decimal_value(intent.get("filled_quantity_decimal") or intent.get("filled_quantity") or 0, "prior filled quantity", minimum=ZERO)
+            assert before is not None
             updated = self.intent_store.record_fill(
                 intent["id"],
-                cumulative_quantity=filled_qty,
-                fill_price=float(fill_price),
+                cumulative_quantity=filled_qty_decimal,
+                fill_price=fill_price_decimal,
                 broker_event_key=event_key,
                 broker_order_id=broker_order_id,
                 occurred_at=str(_value(remote, "filled_at", iso_now())),
                 price_is_cumulative_average=True,
+                broker_evidence={
+                    "source": "broker_reconciliation_response",
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": intent["client_order_id"],
+                    "symbol": intent["symbol"],
+                    "side": intent["side"],
+                    "status": remote_status,
+                    "execution_id": _value(remote, "execution_id", None),
+                    "filled_qty": filled_qty_decimal,
+                    "filled_avg_price": fill_price_decimal,
+                    "filled_at": _value(remote, "filled_at", None),
+                    "payload": _broker_evidence_safe(remote if isinstance(remote, Mapping) else vars(remote) if hasattr(remote, "__dict__") else {}),
+                },
             )
-            if float(updated.get("filled_quantity") or 0) > before:
+            updated_quantity = decimal_value(updated.get("filled_quantity_decimal") or updated.get("filled_quantity") or 0, "updated filled quantity", minimum=ZERO)
+            assert updated_quantity is not None
+            if updated_quantity > before:
                 outcome["fills_upserted"] = 1
             self.storage.link_executed_order_records(intent["id"])
             self.storage.upsert_actual_trade_outcome_for_order(intent["id"])
-            self._maybe_notify_fill(intent, updated["state"], float(updated["filled_quantity"]), float(updated.get("average_fill_price") or fill_price))
+            self._maybe_notify_fill(intent, updated["state"], float(updated_quantity), float(updated.get("average_fill_price_decimal") or updated.get("average_fill_price") or fill_price_decimal))
             target = OrderState(updated["state"])
         elif OrderState(intent["state"]) != target:
             # Broker REST snapshots and stream events may arrive out of order. A
@@ -272,22 +320,17 @@ class BrokerReconciler:
         filled_qty = _value(remote, "filled_qty")
         filled_price = _value(remote, "filled_avg_price")
         if remote_status in {"filled", "partially_filled"} and filled_qty is not None and float(filled_qty) > 0 and filled_price is not None:
-            existing = self.storage.fetch_all("SELECT * FROM fills WHERE order_id=?", (local["id"],))
-            prior_qty = float(existing[0].get("qty") or 0) if existing else 0
-            new_qty = max(prior_qty, float(filled_qty))
+            # Legacy orders have no durable intent and therefore no immutable
+            # client-order authority or broker-fill evidence table binding. A
+            # remote status alone is not enough to create a fill, lot, or P&L
+            # record. Preserve the remote observation for manual migration and
+            # keep the legacy row out of actual-performance reporting.
             self.storage.execute(
-                """INSERT INTO fills(run_id,order_id,qty,price,filled_at,payload,fill_notification_status)
-                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET
-                   run_id=excluded.run_id,qty=MAX(fills.qty,excluded.qty),price=CASE WHEN excluded.qty>=fills.qty THEN excluded.price ELSE fills.price END,
-                   filled_at=CASE WHEN excluded.qty>=fills.qty THEN excluded.filled_at ELSE fills.filled_at END,payload=excluded.payload""",
-                (self.run_id, local["id"], new_qty, float(filled_price), str(_value(remote, "filled_at", iso_now())), json_dumps({"source": "legacy_broker_reconciliation", "aggregate": True}), "pending"),
+                "UPDATE orders SET status='reconciliation_required',payload=?,updated_at=? WHERE id=?",
+                (json_dumps({"source": "legacy_broker_reconciliation", "status": remote_status, "fill_evidence": "unbound_legacy_order"}), iso_now(), local["id"]),
             )
-            if new_qty > prior_qty:
-                outcome["fills_upserted"] = 1
-            self.storage.link_executed_order_records(local["id"])
-            self.storage.upsert_actual_trade_outcome_for_order(local["id"])
-            self._maybe_notify_fill(local, remote_status, new_qty, float(filled_price))
-            self._update_proposal_projection(local, OrderState.FILLED if remote_status == "filled" else OrderState.PARTIALLY_FILLED)
+            outcome["divergence"] = 1
+            outcome["manual_review_required"] = 1
         outcome["found"] = 1
         outcome["updated"] = 1
         return outcome

@@ -10,6 +10,8 @@ from openpyxl import load_workbook
 import app.run_lock as run_lock
 import app.service as service_module
 from app.broker_alpaca import AlpacaBroker
+from app.execution import DurableExecutionStore
+from app.order_state import OrderState
 from app.reconciliation import BrokerReconciler
 from app.reports import export_excel
 from app.risk_engine import RiskEngine
@@ -133,7 +135,24 @@ def insert_local_order(storage):
     )
 
 
-def test_reconciliation_updates_order_and_inserts_fill_once(tmp_path):
+def insert_linked_submitted_intent(storage, proposal_id="notification-proposal"):
+    intent_store = DurableExecutionStore(storage)
+    intent = intent_store.create_or_get_intent(
+        {
+            "id": proposal_id, "proposal_id": proposal_id, "source_id": proposal_id,
+            "symbol": "SPY", "side": "buy", "action": "entry", "qty": 2,
+            "latest_price": 10, "limit_price": 10, "status": "approved",
+            "strategy_version": "rule_based_v2", "trading_mode": "paper",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        },
+        run_id="run", source_type="proposal",
+    )
+    intent_store.transition(intent["id"], OrderState.SUBMITTING, event_type="test")
+    intent_store.transition(intent["id"], OrderState.SUBMITTED, event_type="test")
+    return intent
+
+
+def test_reconciliation_quarantines_unbound_legacy_order_without_creating_fill(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
     insert_local_order(storage)
@@ -141,8 +160,8 @@ def test_reconciliation_updates_order_and_inserts_fill_once(tmp_path):
     reconciler = BrokerReconciler(broker, storage, "run")
     reconciler.reconcile()
     reconciler.reconcile()
-    assert storage.fetch_all("SELECT status FROM orders WHERE id='local-1'")[0]["status"] == "filled"
-    assert storage.fetch_all("SELECT count(*) n FROM fills")[0]["n"] == 1
+    assert storage.fetch_all("SELECT status FROM orders WHERE id='local-1'")[0]["status"] == "reconciliation_required"
+    assert storage.fetch_all("SELECT count(*) n FROM fills")[0]["n"] == 0
     assert broker.submit_calls == 0
 
 
@@ -186,10 +205,19 @@ def test_filled_batch_order_creates_actual_performance_outcome_and_links_rows(tm
         "INSERT INTO shadow_trades(id,run_id,symbol,side,would_have_entry_price,would_have_entry_time,would_have_notional,reason_not_executed,selected_actual_trade_this_cycle) VALUES(?,?,?,?,?,?,?,?,?)",
         ("shadow-1", "scan-run", "IWM", "buy", 299.08, now, 15, "suppressed", 0),
     )
-    storage.execute(
-        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        ("order-1", "approval-run", "proposal-1", "broker-1", "client-1", "IWM", "buy", 15, "submitted", now, now),
+    intent_store = DurableExecutionStore(storage)
+    intent = intent_store.create_or_get_intent(
+        {
+            "id": "proposal-1", "proposal_id": "proposal-1", "source_id": "proposal-1",
+            "symbol": "IWM", "side": "buy", "action": "entry", "qty": 2,
+            "latest_price": 10, "limit_price": 10, "status": "approved",
+            "strategy_version": "rule_based_v2", "trading_mode": "paper",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        },
+        run_id="approval-run", source_type="proposal",
     )
+    intent_store.transition(intent["id"], OrderState.SUBMITTING, event_type="test")
+    intent_store.transition(intent["id"], OrderState.SUBMITTED, event_type="test")
 
     broker = ReconcileBroker()
     BrokerReconciler(broker, storage, "reconcile-run").reconcile()
@@ -197,11 +225,11 @@ def test_filled_batch_order_creates_actual_performance_outcome_and_links_rows(tm
     actual = storage.fetch_all("SELECT * FROM trade_outcomes WHERE actual_or_shadow='actual'")
     assert len(actual) == 1
     row = actual[0]
-    assert row["trade_id"] == "order-1"
+    assert row["trade_id"] == intent["id"]
     assert row["batch_id"] == "batch-1"
     assert row["candidate_id"] == "candidate-1"
     assert row["proposal_id"] == "proposal-1"
-    assert row["order_id"] == "order-1"
+    assert row["order_id"] == intent["id"]
     assert row["broker_order_id"] == "broker-1"
     assert row["risk_budget_decision_id"] == "risk-1"
     assert row["position_sizing_decision_id"] == "size-1"
@@ -214,7 +242,7 @@ def test_filled_batch_order_creates_actual_performance_outcome_and_links_rows(tm
         "selected_actual_trade_this_cycle": 1,
         "reason_not_executed": "executed_as_actual",
     }
-    assert storage.fetch_all("SELECT order_id, broker_order_id, fill_id FROM candidate_risk_budget_decisions WHERE id='risk-1'")[0]["order_id"] == "order-1"
+    assert storage.fetch_all("SELECT order_id, broker_order_id, fill_id FROM candidate_risk_budget_decisions WHERE id='risk-1'")[0]["order_id"] == intent["id"]
     assert storage.fetch_all("SELECT candidate_status FROM proposal_batch_candidates WHERE id='candidate-1'")[0]["candidate_status"] == "filled"
     assert broker.submit_calls == 0
 
@@ -277,7 +305,7 @@ class FillTelegram:
 def test_fill_notification_is_one_shot_and_idempotent(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
-    insert_local_order(storage)
+    intent = insert_linked_submitted_intent(storage)
     telegram = FillTelegram()
     broker = ReconcileBroker()
 
@@ -287,7 +315,7 @@ def test_fill_notification_is_one_shot_and_idempotent(tmp_path):
 
     assert len(telegram.messages) == 1
     assert "Paper order filled" in telegram.messages[0]
-    fill_row = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    fill_row = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id=?", (intent["id"],))[0]
     assert fill_row["fill_notification_status"] == "sent"
     assert fill_row["fill_notified_at"] is not None
 
@@ -295,11 +323,11 @@ def test_fill_notification_is_one_shot_and_idempotent(tmp_path):
 def test_fill_notification_retries_after_telegram_failure_without_duplicates(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
-    insert_local_order(storage)
+    intent = insert_linked_submitted_intent(storage, "retry-notification-proposal")
     broker = ReconcileBroker()
 
     BrokerReconciler(broker, storage, "run", FillTelegram(fail=True)).reconcile()
-    pending = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    pending = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id=?", (intent["id"],))[0]
     assert pending["fill_notification_status"] == "pending"
     assert pending["fill_notified_at"] is None
 
@@ -308,7 +336,7 @@ def test_fill_notification_retries_after_telegram_failure_without_duplicates(tmp
     BrokerReconciler(broker, storage, "run", telegram).reconcile()
 
     assert len(telegram.messages) == 1
-    sent = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id='local-1'")[0]
+    sent = storage.fetch_all("SELECT fill_notification_status, fill_notified_at FROM fills WHERE order_id=?", (intent["id"],))[0]
     assert sent["fill_notification_status"] == "sent"
     assert sent["fill_notified_at"] is not None
 

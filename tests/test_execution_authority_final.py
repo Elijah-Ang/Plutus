@@ -101,8 +101,10 @@ def test_durable_sell_intent_contributes_its_pending_quantity(tmp_path):
 
 def test_caller_holdings_kill_switch_and_loss_hints_are_not_authority(tmp_path):
     storage = Storage(tmp_path / "controls.sqlite3"); storage.initialize()
-    row = capture(storage, Broker(positions=[{"symbol": "ABBV", "qty": 1}]),
-                  context={"current_holdings_quantity": 100, "kill_switch": False, "daily_loss_pct": 0})
+    row = capture(
+        storage,
+        Broker(positions=[{"symbol": "ABBV", "qty": 1, "market_value": 100, "current_price": 100}]),
+        context={"current_holdings_quantity": 100, "kill_switch": False, "daily_loss_pct": 0})
     assert snapshot_body_from_row(row)["risk_context"]["sellable_quantity"] == 1
     with pytest.raises(RuntimeError, match="kill switch"):
         capture(storage, Broker(), trusted_providers={"kill_switch": lambda: True})

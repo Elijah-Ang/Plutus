@@ -556,6 +556,15 @@ crypto:
     send_telegram: false
     manual_approval_enabled: false
     execution_enabled: false
+  profitability_policy:
+    # No crypto candidate is executable without this many completed,
+    # cost-adjusted observations for the selected strategy family.
+    minimum_samples: 50
+    severe_loss_threshold: -0.02
+    minimum_mean_net_return: 0.0
+    require_verified_correlation: true
+    correlation_snapshot_max_age_seconds: 300
+    outcome_horizon_hours: 72
   # Explicitly separate from the non-executable research-preview policy above.
   # Every risk-increasing order requires an exact Telegram approval.
   supervised_paper_lane:

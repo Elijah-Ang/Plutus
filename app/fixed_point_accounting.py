@@ -45,8 +45,49 @@ TABLE_DECIMAL_COLUMNS: dict[str, dict[str, str]] = {
         "decimal_accounting_version": "TEXT",
     },
     "order_intents": {
+        "approved_quantity_ceiling_decimal": "TEXT",
+        "approved_notional_ceiling_decimal": "TEXT",
+        "requested_quantity_decimal": "TEXT",
+        "requested_notional_decimal": "TEXT",
         "filled_quantity_decimal": "TEXT",
         "average_fill_price_decimal": "TEXT",
+        "reference_price_decimal": "TEXT",
+        "intended_stop_price_decimal": "TEXT",
+        "reserved_notional_decimal": "TEXT",
+        "reserved_stop_risk_decimal": "TEXT",
+        "canonical_quantity_decimal": "TEXT",
+        "canonical_notional_decimal": "TEXT",
+        "canonical_stop_risk_decimal": "TEXT",
+        "initial_risk_dollars_decimal": "TEXT",
+        "incremental_risk_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "orders": {
+        "notional_decimal": "TEXT",
+        "qty_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "risk_reservations": {
+        "initial_notional_decimal": "TEXT",
+        "active_notional_decimal": "TEXT",
+        "initial_stop_risk_decimal": "TEXT",
+        "active_stop_risk_decimal": "TEXT",
+        "incremental_risk_decimal": "TEXT",
+        "risk_value_decimal": "TEXT",
+        "conversion_equity_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "add_risk_decisions": {
+        "incremental_risk_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "order_events": {
+        "filled_quantity_decimal": "TEXT",
+        "fill_price_decimal": "TEXT",
         "decimal_provenance": "TEXT",
         "decimal_accounting_version": "TEXT",
     },
@@ -123,8 +164,41 @@ BACKFILL_FIELDS: dict[str, dict[str, str]] = {
         "drawdown_pct_decimal": "drawdown_pct",
     },
     "order_intents": {
+        "approved_quantity_ceiling_decimal": "approved_quantity_ceiling",
+        "approved_notional_ceiling_decimal": "approved_notional_ceiling",
+        "requested_quantity_decimal": "requested_quantity",
+        "requested_notional_decimal": "requested_notional",
         "filled_quantity_decimal": "filled_quantity",
         "average_fill_price_decimal": "average_fill_price",
+        "reference_price_decimal": "reference_price",
+        "intended_stop_price_decimal": "intended_stop_price",
+        "reserved_notional_decimal": "reserved_notional",
+        "reserved_stop_risk_decimal": "reserved_stop_risk",
+        "canonical_quantity_decimal": "canonical_quantity",
+        "canonical_notional_decimal": "canonical_notional",
+        "canonical_stop_risk_decimal": "canonical_stop_risk",
+        "initial_risk_dollars_decimal": "initial_risk_dollars",
+        "incremental_risk_decimal": "incremental_risk",
+    },
+    "orders": {
+        "notional_decimal": "notional",
+        "qty_decimal": "qty",
+    },
+    "risk_reservations": {
+        "initial_notional_decimal": "initial_notional",
+        "active_notional_decimal": "active_notional",
+        "initial_stop_risk_decimal": "initial_stop_risk",
+        "active_stop_risk_decimal": "active_stop_risk",
+        "incremental_risk_decimal": "incremental_risk",
+        "risk_value_decimal": "risk_value",
+        "conversion_equity_decimal": "conversion_equity",
+    },
+    "add_risk_decisions": {
+        "incremental_risk_decimal": "incremental_risk",
+    },
+    "order_events": {
+        "filled_quantity_decimal": "filled_quantity",
+        "fill_price_decimal": "fill_price",
     },
     "broker_fill_events": {
         "cumulative_filled_quantity_decimal": "cumulative_filled_quantity",
@@ -176,7 +250,38 @@ NONNEGATIVE_FIELDS: dict[str, frozenset[str]] = {
     "account_equity_watermarks": frozenset(
         {"peak_equity_decimal", "latest_equity_decimal", "drawdown_pct_decimal"}
     ),
-    "order_intents": frozenset({"filled_quantity_decimal", "average_fill_price_decimal"}),
+    "order_intents": frozenset(
+        {
+            "approved_quantity_ceiling_decimal",
+            "approved_notional_ceiling_decimal",
+            "requested_quantity_decimal",
+            "requested_notional_decimal",
+            "filled_quantity_decimal",
+            "average_fill_price_decimal",
+            "reference_price_decimal",
+            "intended_stop_price_decimal",
+            "reserved_notional_decimal",
+            "reserved_stop_risk_decimal",
+            "canonical_quantity_decimal",
+            "canonical_notional_decimal",
+            "canonical_stop_risk_decimal",
+            "initial_risk_dollars_decimal",
+            "incremental_risk_decimal",
+        }
+    ),
+    "orders": frozenset({"notional_decimal", "qty_decimal"}),
+    "risk_reservations": frozenset(
+        {
+            "initial_notional_decimal",
+            "active_notional_decimal",
+            "initial_stop_risk_decimal",
+            "active_stop_risk_decimal",
+            "incremental_risk_decimal",
+            "risk_value_decimal",
+            "conversion_equity_decimal",
+        }
+    ),
+    "order_events": frozenset({"filled_quantity_decimal", "fill_price_decimal"}),
     "broker_fill_events": frozenset(
         {
             "cumulative_filled_quantity_decimal",
@@ -348,8 +453,12 @@ def apply_fixed_point_accounting_schema(
 
 
 def _projection_matches(canonical: Decimal, legacy: Any) -> bool:
+    # Some exact fields are intentionally newer than their nullable REAL
+    # compatibility projection (for example an order notional on a legacy
+    # order row).  Absence of that projection is not evidence of corruption;
+    # the canonical text remains authoritative.
     if legacy is None:
-        return False
+        return True
     try:
         legacy_decimal = decimal_value(legacy, "legacy projection")
     except ValueError:
@@ -378,7 +487,15 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
             continue
         all_rows[table] = rows
         for row in rows:
-            if (
+            has_decimal_evidence = any(
+                row.get(canonical) not in (None, "")
+                or (
+                    legacy not in {"__zero__", "__unavailable__"}
+                    and row.get(legacy) not in (None, "")
+                )
+                for canonical, legacy in mapping.items()
+            )
+            if has_decimal_evidence and (
                 row.get("decimal_provenance")
                 not in {EXACT_DECIMAL_PROVENANCE, RECONSTRUCTED_REAL_PROVENANCE}
                 or row.get("decimal_accounting_version")
@@ -450,13 +567,58 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
                         "allocated_sell_fees_decimal",
                         "allocated_adjustments_decimal",
                     },
-                    "order_intents": {"filled_quantity_decimal"},
+                    "order_intents": {
+                        "approved_quantity_ceiling_decimal",
+                        "requested_quantity_decimal",
+                        "filled_quantity_decimal",
+                        "reference_price_decimal",
+                        "reserved_notional_decimal",
+                        "reserved_stop_risk_decimal",
+                        "canonical_quantity_decimal",
+                        "canonical_notional_decimal",
+                        "canonical_stop_risk_decimal",
+                        "incremental_risk_decimal",
+                    },
+                    "orders": {"qty_decimal"},
+                    "risk_reservations": {
+                        "initial_notional_decimal",
+                        "active_notional_decimal",
+                        "initial_stop_risk_decimal",
+                        "active_stop_risk_decimal",
+                        "incremental_risk_decimal",
+                        "risk_value_decimal",
+                    },
+                    "order_events": set(),
                     "cash_snapshots": {
                         "equity_decimal",
                         "cash_decimal",
                         "settled_cash_decimal",
                     },
                 }.get(table, set())
+                # Optional exact fields are required when their legacy source
+                # (or an already-written canonical value) exists.  A quantity-
+                # basis intent, for example, legitimately has no requested
+                # notional, and an entry/sell may legitimately have no stop or
+                # conversion-equity field.  Treating those nullable fields as
+                # universally mandatory would turn valid exact rows into false
+                # integrity failures.
+                optional_exact = {
+                    "order_intents": {
+                        "approved_notional_ceiling_decimal",
+                        "requested_notional_decimal",
+                        "average_fill_price_decimal",
+                        "intended_stop_price_decimal",
+                        "initial_risk_dollars_decimal",
+                    },
+                    "orders": {"notional_decimal"},
+                    "risk_reservations": {"conversion_equity_decimal"},
+                    "order_events": {"filled_quantity_decimal", "fill_price_decimal"},
+                    "position_lifecycles": {"average_entry_price_decimal"},
+                    "realized_pnl_events": {"cost_basis_decimal", "remaining_position_quantity_decimal"},
+                }.get(table, set())
+                for field in optional_exact:
+                    if row.get(field) not in (None, "") or field.removesuffix("_decimal") in row and row.get(field.removesuffix("_decimal")) is not None:
+                        exact_required.add(field)
                 if table == "order_intents":
                     filled = parsed.get("filled_quantity_decimal", ZERO)
                     if filled > ZERO:

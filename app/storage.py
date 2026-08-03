@@ -47,6 +47,11 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "order_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, event_key TEXT NOT NULL UNIQUE, from_state TEXT, to_state TEXT NOT NULL, event_type TEXT NOT NULL, broker_event_id TEXT, filled_quantity REAL, fill_price REAL, safe_detail TEXT, created_at TEXT NOT NULL, transition_counter INTEGER NOT NULL",
     "risk_reservations": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL, cluster_name TEXT, initial_notional REAL NOT NULL CHECK(initial_notional>=0), active_notional REAL NOT NULL CHECK(active_notional>=0), initial_stop_risk REAL NOT NULL CHECK(initial_stop_risk>=0), active_stop_risk REAL NOT NULL CHECK(active_stop_risk>=0), state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, released_at TEXT, release_reason TEXT, version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0)",
     "broker_fill_events": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, broker_event_key TEXT NOT NULL UNIQUE, broker_order_id TEXT, cumulative_filled_quantity REAL NOT NULL CHECK(cumulative_filled_quantity>=0), delta_quantity REAL NOT NULL CHECK(delta_quantity>=0), fill_price REAL NOT NULL CHECK(fill_price>=0), occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, payload TEXT",
+    # The broker response envelope is append-only evidence.  It is deliberately
+    # separate from the compatibility aggregate in broker_fill_events so an
+    # aggregate update can never rewrite the original response that justified a
+    # fill or make a duplicate key appear consistent after tampering.
+    "broker_fill_evidence": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, broker_event_key TEXT NOT NULL UNIQUE, broker_order_id TEXT NOT NULL, client_order_id TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, remote_status TEXT NOT NULL, payload TEXT NOT NULL, payload_fingerprint TEXT NOT NULL UNIQUE, evidence_source TEXT NOT NULL, account_id_hash TEXT, captured_at TEXT NOT NULL",
     "reconciliation_attempts": "id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, lookup_type TEXT NOT NULL, lookup_value_redacted TEXT NOT NULL, outcome TEXT NOT NULL, broker_status TEXT, safe_detail TEXT, created_at TEXT NOT NULL, UNIQUE(intent_id, lookup_type, outcome, broker_status, created_at)",
     "telegram_updates": "update_id INTEGER PRIMARY KEY, message_id INTEGER, message_timestamp INTEGER, received_at TEXT NOT NULL, processing_state TEXT NOT NULL, processed_at TEXT, approval_id TEXT, safe_message_type TEXT, normalized_action TEXT, target_hint TEXT, sender_authorized INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT",
     "approval_workflows": "id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE, proposal_id TEXT NOT NULL, telegram_update_id INTEGER UNIQUE, logical_workflow_key TEXT UNIQUE, state TEXT NOT NULL, intent_id TEXT, validation_status TEXT, safe_detail TEXT, claim_owner TEXT, claim_until TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, last_error_category TEXT, update_processed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT, manual_review_reason TEXT, version INTEGER NOT NULL DEFAULT 0",
@@ -255,6 +260,19 @@ def apply_p1_execution_schema(conn: sqlite3.Connection, *, record_migration: boo
         for name, column_type in columns.items():
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_broker_fill_evidence_immutable_update
+           BEFORE UPDATE ON broker_fill_evidence
+           BEGIN SELECT RAISE(ABORT,'broker fill evidence is immutable'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_broker_fill_evidence_immutable_delete
+           BEFORE DELETE ON broker_fill_evidence
+           BEGIN SELECT RAISE(ABORT,'broker fill evidence is immutable'); END"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_broker_fill_evidence_intent ON broker_fill_evidence(intent_id,captured_at)"
+    )
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -367,6 +385,8 @@ class Storage:
             from .cross_asset_allocation import apply_cross_asset_allocation_schema
             from .performance_lab import apply_performance_lab_classification_schema
             from .fixed_point_accounting import apply_fixed_point_accounting_schema
+            from .crypto_outcomes import apply_crypto_outcomes_schema
+            from .crypto_profitability import apply_crypto_profitability_schema
             apply_p1_execution_schema(conn)
             apply_final_hardening_schema(conn)
 
@@ -400,6 +420,8 @@ class Storage:
             apply_cross_asset_allocation_schema(conn)
             apply_performance_lab_classification_schema(conn)
             apply_fixed_point_accounting_schema(conn)
+            apply_crypto_outcomes_schema(conn)
+            apply_crypto_profitability_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             now = iso_now()
             conn.execute(
@@ -491,6 +513,10 @@ class Storage:
                 apply_performance_lab_classification_schema(conn, record_migration=False)
                 from .fixed_point_accounting import apply_fixed_point_accounting_schema
                 apply_fixed_point_accounting_schema(conn, record_migration=False)
+                from .crypto_outcomes import apply_crypto_outcomes_schema
+                apply_crypto_outcomes_schema(conn, record_migration=False)
+                from .crypto_profitability import apply_crypto_profitability_schema
+                apply_crypto_profitability_schema(conn, record_migration=False)
                 _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
             # Establish a prospective accounting boundary once.  Coverage before
             # this instant remains unavailable; repeated startup never advances it.

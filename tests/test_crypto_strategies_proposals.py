@@ -97,6 +97,7 @@ class Broker:
             "reference_equity": "100000", "daily_loss_confidence": "verified",
             "weekly_loss_confidence": "verified", "provenance": "isolated_current_broker",
             "metrics_version": "loss_controls_v2",
+            "captured_at": NOW.isoformat(),
         }
 
     def get_crypto_historical_bars(self, symbol, timeframe="1Hour", limit=169):
@@ -110,6 +111,18 @@ class Broker:
     def submit_order(self, *args, **kwargs):
         self.submit_calls += 1
         raise AssertionError("crypto strategy/proposal research must never submit")
+
+    def get_order(self, order_id):
+        return None
+
+    def get_order_by_client_order_id(self, client_order_id):
+        return None
+
+    def crypto_submission_available(self):
+        return True
+
+    def crypto_cancellation_available(self):
+        return True
 
 
 def _bars(*, count=168, future=False, volatile=False):
@@ -294,8 +307,11 @@ def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp
         now=NOW,
     )
     assert plan.execution_authorized is False
-    assert plan.summary["candidate_count"] == 1
-    assert plan.decisions[0]["decision"] == "REJECT"
+    assert plan.summary["candidate_count"] == 0
+    assert plan.decisions == ()
+    assert storage.fetch_all(
+        "SELECT event_type FROM audit_events WHERE event_type='crypto_profitability_candidate_excluded'"
+    )
     assert storage.fetch_all("SELECT COUNT(*) n FROM cross_asset_allocation_plans")[0]["n"] == 1
 
     assert engine.create_deferred_supervised_entry_proposals(
@@ -304,7 +320,7 @@ def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_proposals")[0]["n"] == 0
 
 
-def test_positive_cross_asset_advisory_materializes_only_a_manual_crypto_proposal(tmp_path, monkeypatch):
+def test_crypto_profitability_gate_blocks_unvalidated_research(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
     config = _config()
     # The synthetic rising series needs a wider target to make the
@@ -342,24 +358,64 @@ def test_positive_cross_asset_advisory_materializes_only_a_manual_crypto_proposa
         now=NOW,
     )
     assert plan.execution_authorized is False
-    assert plan.summary["allocated_candidate_count"] == 1
-    assert plan.decisions[0]["decision"].startswith(
-        "ALLOCATE_SUPERVISED_PAPER_ADVISORY"
-    )
-    assert plan.decisions[0]["action"] == "entry"
-    assert plan.decisions[0]["order_authority"] is False
+    assert plan.summary["allocated_candidate_count"] == 0
+    assert plan.decisions == ()
 
     proposal_ids = engine.create_deferred_supervised_entry_proposals(
         results, plan.decisions, now=NOW
     )
-    assert len(proposal_ids) == 1
-    proposal = storage.fetch_all(
-        "SELECT id,action,status FROM crypto_paper_proposals WHERE id=?",
-        (proposal_ids[0],),
-    )[0]
-    assert proposal["action"] == "entry"
-    assert proposal["status"] == "pending"
+    assert proposal_ids == []
+    assert storage.fetch_all("SELECT id FROM crypto_paper_proposals") == []
     assert broker.submit_calls == 0
+
+
+def test_cross_asset_runtime_accepts_alpaca_account_status_enum(tmp_path, monkeypatch):
+    """The SDK returns AccountStatus.ACTIVE, not the plain string ``active``."""
+
+    from enum import Enum
+
+    storage = _storage(tmp_path)
+    config = _config()
+    monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
+    monkeypatch.setattr(
+        "app.cross_asset_runtime.get_power_status",
+        lambda: SimpleNamespace(connected=True),
+    )
+
+    class AccountStatus(Enum):
+        ACTIVE = "ACTIVE"
+
+    class EnumStatusBroker(Broker):
+        def get_account(self):
+            account = super().get_account()
+            account.status = AccountStatus.ACTIVE
+            return account
+
+        def get_crypto_historical_bars(self, symbol, timeframe="1Hour", limit=500):
+            rows = _bars(count=max(168, limit))
+            for row in rows:
+                row["symbol"] = symbol
+                row["volume"] = "1000"
+            return rows
+
+    broker = EnumStatusBroker()
+    engine = CryptoResearchEngine(config, storage, broker=broker, run_id="run-enum-status")
+    results = engine.run_research(
+        symbols=["BTC/USD"],
+        now=NOW,
+        defer_entry_proposals=True,
+    )
+    plan = CrossAssetRuntimeCoordinator(
+        storage, config, broker, run_id="run-enum-status"
+    ).create_plan(
+        crypto_results=results,
+        positions=broker.get_positions(),
+        orders=broker.get_open_orders(),
+        account=broker.get_account(),
+        now=NOW,
+    )
+
+    assert plan.summary["candidate_count"] == 0
 
 
 def test_hourly_research_preserves_wide_market_strategy_as_blocked_evidence(tmp_path):

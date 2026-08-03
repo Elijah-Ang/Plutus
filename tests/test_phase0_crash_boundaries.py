@@ -323,7 +323,10 @@ def test_crash_08_partial_fill_precedes_submitted_status(tmp_path):
     store = DurableExecutionStore(storage)
     intent = store.create_or_get_intent(_proposal(), run_id="run", source_type="proposal")
     store.transition(intent["id"], OrderState.SUBMITTING, event_type="test")
-    store.record_fill(intent["id"], cumulative_quantity=4, fill_price=10, broker_event_key="exec-1")
+    store.record_fill(
+        intent["id"], cumulative_quantity=4, fill_price=10,
+        broker_event_key="exec-1", broker_order_id="paper-1",
+    )
     broker.orders[intent["client_order_id"]] = SimpleNamespace(id="paper-1", status="submitted", filled_qty="0", filled_avg_price=None)
     BrokerReconciler(broker, storage, "run").reconcile()
     assert store.get_intent(intent["id"])["state"] == "partially_filled"
@@ -349,7 +352,8 @@ def test_crash_10_final_fill_after_partial_notification(tmp_path):
     store.transition(intent["id"], OrderState.SUBMITTING, event_type="test")
     store.record_fill(intent["id"], cumulative_quantity=4, fill_price=10, broker_event_key="exec-1")
     storage.execute("UPDATE fills SET fill_notification_status='sent',fill_notified_at=?", (datetime.now(UTC).isoformat(),))
-    store.record_fill(intent["id"], cumulative_quantity=10, fill_price=11, broker_event_key="exec-2")
+    requested_quantity = store.get_intent(intent["id"])["requested_quantity_decimal"]
+    store.record_fill(intent["id"], cumulative_quantity=requested_quantity, fill_price=11, broker_event_key="exec-2")
     assert store.get_intent(intent["id"])["state"] == "filled"
     assert storage.fetch_all("SELECT fill_notification_status,fill_notified_at FROM fills")[0] == {
         "fill_notification_status": "pending", "fill_notified_at": None

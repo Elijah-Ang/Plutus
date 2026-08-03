@@ -16,6 +16,11 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    decimal_text,
+)
 from .position_risk import PositionRiskDecision, PositionRiskEngine, PositionRiskInput
 from .trend_management import PositionManagementMode, TrendManagementDecision
 from .utils import iso_now, json_dumps
@@ -871,8 +876,9 @@ class WinnerExpansionStore:
               realized_profit_credit_requested,realized_profit_credit_applied,
               projected_portfolio_heat_dollars,projected_symbol_exposure_dollars,
               projected_cluster_exposure_dollars,projected_portfolio_gross_exposure_dollars,
-              caps_json,raw_inputs_json,formula_version,config_hash,decision_fingerprint,created_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              caps_json,raw_inputs_json,formula_version,config_hash,decision_fingerprint,
+              incremental_risk_decimal,decimal_provenance,decimal_accounting_version,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 identifier, run_id, proposal_id, approval_id, decision.decision_stage, decision.symbol,
                 decision.position_lifecycle_id, milestone_id, decision.milestone_key,
@@ -886,7 +892,9 @@ class WinnerExpansionStore:
                 risk.projected_portfolio_heat_dollars, risk.projected_symbol_exposure_dollars,
                 risk.projected_cluster_exposure_dollars, risk.projected_portfolio_gross_exposure_dollars,
                 json_dumps(risk.caps), json_dumps({"winner": decision.raw_inputs, "risk": risk.raw_inputs}),
-                risk.formula_version, config_hash, persistence_fingerprint, iso_now(),
+                risk.formula_version, config_hash, persistence_fingerprint,
+                decimal_text(risk.incremental_risk), EXACT_DECIMAL_PROVENANCE,
+                FIXED_POINT_ACCOUNTING_VERSION, iso_now(),
             ),
         )
         rows = self.storage.fetch_all(

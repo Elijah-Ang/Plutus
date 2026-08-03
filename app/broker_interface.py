@@ -47,6 +47,11 @@ class BrokerInterface(ABC):
     @abstractmethod
     def submit_order(self, symbol: str, side: str, notional_or_qty: dict[str, float], order_type: str, limit_price: float | None = None, client_order_id: str | None = None) -> Any: ...
 
+    def submission_available(self) -> bool:
+        """Prove the adapter can accept an invocation before it is marked."""
+
+        return callable(getattr(self, "submit_order", None))
+
     def submit_crypto_order(
         self,
         symbol: str,
@@ -63,6 +68,16 @@ class BrokerInterface(ABC):
 
     def crypto_submission_available(self) -> bool:
         """Return an explicit pre-invocation proof for the crypto adapter."""
+
+        return False
+
+    def cancel_crypto_order(self, order_id: str) -> Any:
+        """Separate paper-crypto cancellation adapter."""
+
+        raise BrokerSubmissionNotAttempted("separate crypto paper cancellation adapter is unavailable")
+
+    def crypto_cancellation_available(self) -> bool:
+        """Return an explicit proof for the crypto cancellation adapter."""
 
         return False
 

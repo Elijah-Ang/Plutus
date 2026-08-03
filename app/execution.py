@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import json
-import math
+import hashlib
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 
 from .order_state import (
@@ -19,6 +20,7 @@ from .order_state import (
     validate_transition,
 )
 from .risk_engine import RiskEngine
+from .broker_interface import BrokerSubmissionNotAttempted
 from .capabilities import require_autonomous_entry_support, require_autonomous_exit_support, require_protective_paper_exit_support
 from .utils import iso_now, json_dumps
 from .formula_versions import ACCOUNTING_VERSION, EVIDENCE_VERSION
@@ -45,24 +47,79 @@ def _value(obj: Any, name: str, default: Any = None) -> Any:
     return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
 
 
+def _broker_evidence_safe(value: Any) -> Any:
+    """Normalize a broker response without retaining SDK objects or secrets."""
+
+    if isinstance(value, Decimal):
+        return decimal_text(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and not callable(enum_value):
+        return _broker_evidence_safe(enum_value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _broker_evidence_safe(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            if "secret" not in str(key).lower()
+            and "token" not in str(key).lower()
+            and "key" not in str(key).lower()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_broker_evidence_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
+def _broker_evidence_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    raw = dict(evidence)
+    payload = _broker_evidence_safe(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("broker evidence payload must be a mapping")
+    return payload
+
+
+def _broker_evidence_fingerprint(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _winner_add_reservation_risk(
-    proposal: dict[str, Any], quantity: float, reference: float, stop_price: float | None
-) -> tuple[float, float]:
+    proposal: dict[str, Any], quantity: Decimal, reference: Decimal, stop_price: Decimal | None
+) -> tuple[Decimal, Decimal]:
+    quantity_decimal = decimal_value(quantity, "winner ADD quantity", minimum=ZERO)
+    reference_decimal = decimal_value(reference, "winner ADD reference price", minimum=ZERO)
+    stop_decimal = (
+        decimal_value(stop_price, "winner ADD stop price", minimum=ZERO)
+        if stop_price is not None
+        else None
+    )
+    if quantity_decimal is None or reference_decimal is None:
+        raise ValueError("winner ADD canonical quantity or reference is unavailable")
     incremental_risk = proposal.get("incremental_risk")
     if incremental_risk is None:
         raise ValueError("winner ADD requires canonical incremental-risk provenance")
-    incremental_risk = float(incremental_risk)
-    if not math.isfinite(incremental_risk):
-        raise ValueError("winner ADD incremental risk must be finite")
-    canonical_add_leg_risk = quantity * max(reference - float(stop_price or reference), 0.0)
+    incremental_risk_decimal = decimal_value(
+        incremental_risk, "winner ADD incremental risk"
+    )
+    assert incremental_risk_decimal is not None
+    canonical_add_leg_risk = quantity_decimal * max(
+        reference_decimal - (stop_decimal or reference_decimal), ZERO
+    )
     stated_add_leg_risk = proposal.get("pending_add_stop_risk")
     if stated_add_leg_risk is not None:
-        stated_add_leg_risk = float(stated_add_leg_risk)
-        if not math.isfinite(stated_add_leg_risk) or stated_add_leg_risk < 0:
-            raise ValueError("winner ADD pending leg risk must be finite and nonnegative")
-        if abs(stated_add_leg_risk - canonical_add_leg_risk) > 1e-6:
+        stated_add_leg_risk_decimal = decimal_value(
+            stated_add_leg_risk, "winner ADD pending leg risk", minimum=ZERO
+        )
+        assert stated_add_leg_risk_decimal is not None
+        if stated_add_leg_risk_decimal != canonical_add_leg_risk:
             raise ValueError("winner ADD pending leg risk does not match final quantity, price, and stop")
-    return incremental_risk, canonical_add_leg_risk
+    # The second return value is a long-standing private helper compatibility
+    # projection used by callers/tests that compare it as a native number.
+    # Durable execution immediately reparses it into Decimal below.
+    return incremental_risk_decimal, legacy_float(canonical_add_leg_risk)
 
 
 @dataclass(frozen=True)
@@ -339,16 +396,54 @@ class DurableExecutionStore:
             client_order_id = stable_client_order_id(action_key)
             if candidate_evidence.get("client_order_id") not in (None, client_order_id):
                 raise RuntimeError("risk snapshot logical action key does not match the final candidate")
-            reserved_notional = sizing.notional if side == "buy" else 0.0
-            reserved_stop_risk = sizing.stop_risk if side == "buy" else 0.0
+            reserved_notional = sizing.notional if side == "buy" else ZERO
+            reserved_stop_risk = sizing.stop_risk if side == "buy" else ZERO
             if side == "buy" and proposal.get("winner_expansion_decision_id"):
-                incremental_risk, reserved_stop_risk = _winner_add_reservation_risk(
+                incremental_risk, reserved_stop_risk_projection = _winner_add_reservation_risk(
                     proposal, quantity, reference, stop_price
                 )
+                reserved_stop_risk_decimal = decimal_value(
+                    reserved_stop_risk_projection,
+                    "winner ADD reserved stop risk",
+                    minimum=ZERO,
+                )
+                if reserved_stop_risk_decimal is None:
+                    raise ValueError("winner ADD reserved stop risk is unavailable")
+                reserved_stop_risk = reserved_stop_risk_decimal
                 if not proposal.get("pyramiding_milestone_id") or not proposal.get("pyramiding_milestone_key"):
                     raise ValueError("winner ADD requires a durable pyramiding milestone")
             else:
                 incremental_risk = reserved_stop_risk
+            approved_quantity_decimal = decimal_value(
+                proposal.get("approved_quantity_ceiling", quantity),
+                "approved quantity ceiling",
+                minimum=ZERO,
+            )
+            approved_notional_decimal = decimal_value(
+                proposal.get("approved_notional_ceiling", proposal.get("approved_notional", requested_notional)),
+                "approved notional ceiling",
+                minimum=ZERO,
+                allow_none=True,
+            )
+            initial_risk_decimal = decimal_value(
+                proposal.get("initial_risk_dollars"),
+                "initial risk dollars",
+                minimum=ZERO,
+                allow_none=True,
+            )
+            # SQLite REAL fields are retained only as compatibility
+            # projections.  Convert exact Decimal sizing at the persistence
+            # boundary; all identity and risk arithmetic above remains exact.
+            legacy_quantity = legacy_float(quantity)
+            legacy_requested_notional = legacy_float(requested_notional) if requested_notional is not None else None
+            legacy_reference = legacy_float(reference)
+            legacy_stop_price = legacy_float(stop_price) if stop_price is not None else None
+            legacy_reserved_notional = legacy_float(reserved_notional)
+            legacy_reserved_stop_risk = legacy_float(reserved_stop_risk)
+            legacy_incremental_risk = legacy_float(
+                incremental_risk if hasattr(incremental_risk, "as_tuple")
+                else decimal_value(incremental_risk, "incremental risk")
+            )
             existing = conn.execute("SELECT * FROM order_intents WHERE logical_action_key=?", (action_key,)).fetchone()
             if existing:
                 if str(existing["approval_id"] or "") != str(approval_id or ""):
@@ -408,19 +503,34 @@ class DurableExecutionStore:
             if conflict:
                 raise RuntimeError(f"conflicting active order intent exists: {conflict['state']}")
             if side == "buy" and proposal.get("winner_expansion_decision_id"):
-                winner_authority = conn.execute(
-                    """SELECT 1 FROM add_risk_decisions
+                winner_rows = conn.execute(
+                    """SELECT * FROM add_risk_decisions
                        WHERE id=? AND proposal_id=? AND decision_stage='final_revalidation'
-                         AND eligible=1 AND milestone_id=? AND milestone_key=?
-                         AND ABS(incremental_risk-?)<=0.000000001 LIMIT 1""",
+                         AND eligible=1 AND milestone_id=? AND milestone_key=?""",
                     (
                         proposal["winner_expansion_decision_id"],
                         proposal.get("proposal_id") or proposal.get("id"),
                         proposal["pyramiding_milestone_id"],
                         proposal["pyramiding_milestone_key"],
-                        incremental_risk,
                     ),
-                ).fetchone()
+                ).fetchall()
+                winner_authority = None
+                for winner_row in winner_rows:
+                    # A winner decision is authoritative only when its exact
+                    # Decimal risk column is present and equal.  Legacy REAL
+                    # rows are deliberately not revived by an epsilon match.
+                    raw_incremental = winner_row["incremental_risk_decimal"]
+                    if raw_incremental in (None, ""):
+                        continue
+                    try:
+                        exact_incremental = decimal_value(
+                            raw_incremental, "winner authority incremental risk"
+                        )
+                    except ValueError:
+                        continue
+                    if exact_incremental == incremental_risk:
+                        winner_authority = winner_row
+                        break
                 milestone_authority = conn.execute(
                     """SELECT 1 FROM pyramiding_milestones
                        WHERE id=? AND milestone_key=? AND active_proposal_id=?
@@ -435,62 +545,80 @@ class DurableExecutionStore:
                     raise RuntimeError("winner ADD lacks final canonical risk and milestone authority")
             limits = proposal.get("_reservation_limits") or {}
             if side == "buy" and limits:
-                totals = conn.execute(
-                    """SELECT COALESCE(SUM(active_notional),0) total,
-                              COALESCE(SUM(active_stop_risk),0) stop_risk
-                       FROM risk_reservations WHERE state='active'"""
-                ).fetchone()
-                symbol_total = conn.execute(
-                    "SELECT COALESCE(SUM(active_notional),0) n FROM risk_reservations WHERE state='active' AND symbol=?",
-                    (symbol,),
-                ).fetchone()["n"]
-                cluster_total = 0.0
-                if proposal.get("cluster_name"):
-                    cluster_total = conn.execute(
-                        "SELECT COALESCE(SUM(active_notional),0) n FROM risk_reservations WHERE state='active' AND cluster_name=?",
-                        (proposal["cluster_name"],),
-                    ).fetchone()["n"]
+                # SQLite REAL aggregation is not authority at this boundary:
+                # summing binary projections can cross a displayed ceiling by
+                # one cent or one ULP.  Read the canonical Decimal text for
+                # every active reservation and aggregate in Python.
+                active_rows = conn.execute(
+                    "SELECT * FROM risk_reservations WHERE state='active' ORDER BY created_at,id"
+                ).fetchall()
 
-                def enforce(name: str, projected: float, ceiling_key: str) -> None:
+                def exact_reservation(row: Mapping[str, Any], field: str) -> Decimal:
+                    raw = row[f"{field}_decimal"] if f"{field}_decimal" in row.keys() else None
+                    if raw in (None, ""):
+                        raw = row[field]
+                    value = decimal_value(raw, f"active reservation {field}", minimum=ZERO)
+                    if value is None:
+                        raise RuntimeError(f"active reservation {field} is unavailable")
+                    return value
+
+                total_notional = ZERO
+                total_stop_risk = ZERO
+                symbol_total = ZERO
+                cluster_total = ZERO
+                for active_row in active_rows:
+                    row_notional = exact_reservation(active_row, "active_notional")
+                    row_stop_risk = exact_reservation(active_row, "active_stop_risk")
+                    total_notional += row_notional
+                    total_stop_risk += row_stop_risk
+                    if str(active_row["symbol"] or "").upper() == symbol:
+                        symbol_total += row_notional
+                    if proposal.get("cluster_name") and str(active_row["cluster_name"] or "") == str(proposal["cluster_name"]):
+                        cluster_total += row_notional
+
+                def exact_limit(value: Any, label: str) -> Decimal:
+                    parsed = decimal_value(value if value not in (None, "") else ZERO, label, minimum=ZERO)
+                    if parsed is None:
+                        raise RuntimeError(f"atomic reservation {label} is unavailable")
+                    return parsed
+
+                def enforce(name: str, projected: Decimal, ceiling_key: str) -> None:
                     ceiling = limits.get(ceiling_key)
                     if ceiling in (None, ""):
                         return
-                    try:
-                        ceiling_value = float(ceiling)
-                        projected_value = float(projected)
-                    except (TypeError, ValueError) as exc:
-                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid") from exc
-                    if (
-                        not math.isfinite(ceiling_value)
-                        or ceiling_value < 0
-                        or not math.isfinite(projected_value)
-                        or projected_value < 0
-                    ):
-                        raise RuntimeError(f"atomic reservation {ceiling_key} is invalid")
-                    if projected_value > ceiling_value + 1e-9:
+                    ceiling_value = exact_limit(ceiling, f"atomic reservation {ceiling_key}")
+                    if projected > ceiling_value:
                         raise RuntimeError(f"atomic reservation blocked by {name}")
 
                 enforce(
                     "total exposure ceiling",
-                    float(limits.get("base_total_notional") or 0) + float(totals["total"]) + reserved_notional,
+                    exact_limit(limits.get("base_total_notional"), "base total notional")
+                    + total_notional + reserved_notional,
                     "total_notional_ceiling",
                 )
                 enforce(
                     "symbol exposure ceiling",
-                    float(limits.get("base_symbol_notional") or 0) + float(symbol_total) + reserved_notional,
+                    exact_limit(limits.get("base_symbol_notional"), "base symbol notional")
+                    + symbol_total + reserved_notional,
                     "symbol_notional_ceiling",
                 )
                 enforce(
                     "cluster exposure ceiling",
-                    float(limits.get("base_cluster_notional") or 0) + float(cluster_total) + reserved_notional,
+                    exact_limit(limits.get("base_cluster_notional"), "base cluster notional")
+                    + cluster_total + reserved_notional,
                     "cluster_notional_ceiling",
                 )
                 enforce(
                     "open risk ceiling",
-                    float(limits.get("base_open_risk") or 0) + float(totals["stop_risk"]) + reserved_stop_risk,
+                    exact_limit(limits.get("base_open_risk"), "base open risk")
+                    + total_stop_risk + reserved_stop_risk,
                     "open_risk_ceiling",
                 )
-                enforce("paper buying power", float(totals["total"]) + reserved_notional, "buying_power_ceiling")
+                enforce(
+                    "paper buying power",
+                    total_notional + reserved_notional,
+                    "buying_power_ceiling",
+                )
                 if proposal.get("phase4_mode") == "probe":
                     probe_slots = conn.execute(
                         """SELECT COUNT(DISTINCT proposal_id) n FROM (
@@ -501,29 +629,66 @@ class DurableExecutionStore:
                                UNION ALL
                                SELECT pl.entry_proposal_id proposal_id
                                FROM position_lots pl JOIN trade_proposals p ON p.id=pl.entry_proposal_id
-                               WHERE pl.remaining_quantity>0 AND p.strategy_state='PROBE'
+                               WHERE COALESCE(pl.remaining_quantity_decimal,'0')<>'0' AND p.strategy_state='PROBE'
                            )"""
                     ).fetchone()["n"]
                     maximum = int(limits.get("probe_max_active_count", 1))
                     if int(probe_slots or 0) >= maximum:
                         raise RuntimeError("atomic reservation blocked by PROBE active-count ceiling")
-                    probe_totals = conn.execute(
-                        """SELECT
-                               COALESCE((SELECT SUM(rr.active_notional) FROM risk_reservations rr
-                                 JOIN order_intents i ON i.id=rr.intent_id JOIN trade_proposals p ON p.id=i.proposal_id
-                                 WHERE rr.state='active' AND p.strategy_state='PROBE'),0)
-                               + COALESCE((SELECT SUM(pl.remaining_quantity*pl.unit_cost) FROM position_lots pl
-                                 JOIN trade_proposals p ON p.id=pl.entry_proposal_id
-                                 WHERE pl.remaining_quantity>0 AND p.strategy_state='PROBE'),0) gross,
-                               COALESCE((SELECT SUM(rr.active_stop_risk) FROM risk_reservations rr
-                                 JOIN order_intents i ON i.id=rr.intent_id JOIN trade_proposals p ON p.id=i.proposal_id
-                                 WHERE rr.state='active' AND p.strategy_state='PROBE'),0)
-                               + COALESCE((SELECT SUM(pl.initial_risk_dollars*pl.remaining_quantity/pl.original_quantity) FROM position_lots pl
-                                 JOIN trade_proposals p ON p.id=pl.entry_proposal_id
-                                 WHERE pl.remaining_quantity>0 AND pl.initial_risk_dollars IS NOT NULL AND p.strategy_state='PROBE'),0) heat"""
-                    ).fetchone()
-                    enforce("PROBE gross-exposure ceiling", float(probe_totals["gross"] or 0) + reserved_notional, "probe_gross_notional_ceiling")
-                    enforce("PROBE portfolio-heat ceiling", float(probe_totals["heat"] or 0) + reserved_stop_risk, "probe_stop_risk_ceiling")
+                    probe_gross = ZERO
+                    probe_heat = ZERO
+                    probe_reservations = conn.execute(
+                        """SELECT rr.* FROM risk_reservations rr
+                           JOIN order_intents i ON i.id=rr.intent_id
+                           JOIN trade_proposals p ON p.id=i.proposal_id
+                           WHERE rr.state='active' AND p.strategy_state='PROBE'"""
+                    ).fetchall()
+                    for probe_row in probe_reservations:
+                        probe_gross += exact_reservation(probe_row, "active_notional")
+                        probe_heat += exact_reservation(probe_row, "active_stop_risk")
+                    probe_lots = conn.execute(
+                        """SELECT pl.* FROM position_lots pl
+                           JOIN trade_proposals p ON p.id=pl.entry_proposal_id
+                           WHERE COALESCE(pl.remaining_quantity_decimal,'0')<>'0'
+                             AND p.strategy_state='PROBE'"""
+                    ).fetchall()
+                    for probe_lot in probe_lots:
+                        remaining = decimal_value(
+                            probe_lot["remaining_quantity_decimal"],
+                            "PROBE lot remaining quantity",
+                            minimum=ZERO,
+                        )
+                        unit_cost = decimal_value(
+                            probe_lot["unit_cost_decimal"],
+                            "PROBE lot unit cost",
+                            minimum=ZERO,
+                        )
+                        initial_risk = decimal_value(
+                            probe_lot["initial_risk_dollars_decimal"],
+                            "PROBE lot initial risk",
+                            minimum=ZERO,
+                        )
+                        if remaining is None or unit_cost is None or initial_risk is None:
+                            raise RuntimeError("PROBE lot exact accounting evidence is unavailable")
+                        probe_gross += remaining * unit_cost
+                        original = decimal_value(
+                            probe_lot["original_quantity_decimal"],
+                            "PROBE lot original quantity",
+                            minimum=ZERO,
+                        )
+                        if original is None or original <= ZERO:
+                            raise RuntimeError("PROBE lot original quantity is invalid")
+                        probe_heat += initial_risk * remaining / original
+                    enforce(
+                        "PROBE gross-exposure ceiling",
+                        probe_gross + reserved_notional,
+                        "probe_gross_notional_ceiling",
+                    )
+                    enforce(
+                        "PROBE portfolio-heat ceiling",
+                        probe_heat + reserved_stop_risk,
+                        "probe_stop_risk_ceiling",
+                    )
             sleeve_fields_present = any(
                 proposal.get(name) is not None
                 for name in (
@@ -601,25 +766,44 @@ class DurableExecutionStore:
                 if allocation_payload.get("registry_snapshot_id") != proposal["strategy_registry_snapshot_id"]:
                     raise RuntimeError("canonical allocation is not bound to the supplied registry snapshot")
                 risk_unit = str(canonical_sleeve.get("risk_unit") or "")
-                canonical_risk = float(canonical_sleeve.get("remaining_risk"))
+                canonical_risk = decimal_value(
+                    canonical_sleeve.get("remaining_risk"),
+                    "canonical remaining strategy risk",
+                    minimum=ZERO,
+                )
+                if canonical_risk is None:
+                    raise RuntimeError("canonical strategy risk capacity is unavailable")
                 if risk_unit == "pct_equity":
                     replay = allocation_payload.get("raw_replay_inputs") or {}
                     portfolio_snapshot = replay.get("portfolio_snapshot") or {}
-                    equity = float(portfolio_snapshot.get("portfolio_equity") or 0.0)
-                    if not math.isfinite(equity) or equity <= 0:
+                    equity = decimal_value(
+                        portfolio_snapshot.get("portfolio_equity"),
+                        "canonical sleeve equity",
+                        minimum=ZERO,
+                    )
+                    if equity is None or equity <= ZERO:
                         raise RuntimeError("canonical sleeve equity conversion is unavailable")
-                    canonical_risk = equity * canonical_risk / 100.0
+                    canonical_risk = equity * canonical_risk / Decimal("100")
                 elif risk_unit != "stop_risk_dollars":
                     raise RuntimeError("canonical sleeve risk unit is unsupported")
-                canonical_notional = float(canonical_sleeve.get("remaining_notional"))
-                supplied_notional = float(proposal["sleeve_notional_ceiling"])
-                supplied_risk = float(proposal["sleeve_stop_risk_ceiling"])
-                if any(
-                    not math.isfinite(value) or value < 0
-                    for value in (canonical_risk, canonical_notional, supplied_notional, supplied_risk)
-                ):
-                    raise RuntimeError("canonical strategy sleeve ceilings must be finite and nonnegative")
-                if supplied_notional > canonical_notional + 1e-9 or supplied_risk > canonical_risk + 1e-9:
+                canonical_notional = decimal_value(
+                    canonical_sleeve.get("remaining_notional"),
+                    "canonical remaining strategy notional",
+                    minimum=ZERO,
+                )
+                supplied_notional = decimal_value(
+                    proposal["sleeve_notional_ceiling"],
+                    "proposal strategy sleeve notional ceiling",
+                    minimum=ZERO,
+                )
+                supplied_risk = decimal_value(
+                    proposal["sleeve_stop_risk_ceiling"],
+                    "proposal strategy sleeve stop-risk ceiling",
+                    minimum=ZERO,
+                )
+                if canonical_notional is None or supplied_notional is None or supplied_risk is None:
+                    raise RuntimeError("canonical strategy sleeve ceilings are unavailable")
+                if supplied_notional > canonical_notional or supplied_risk > canonical_risk:
                     raise RuntimeError("proposal-carried sleeve ceiling exceeds canonical persisted allocation")
                 effective_notional_ceiling = min(canonical_notional, supplied_notional)
                 effective_risk_ceiling = min(canonical_risk, supplied_risk)
@@ -642,52 +826,74 @@ class DurableExecutionStore:
                     included_ids = [str(identifier) for identifier in included_ids]
                     if any(not identifier for identifier in included_ids) or len(included_ids) != len(set(included_ids)):
                         raise ValueError("reservation snapshot IDs must be unique and nonempty")
-                    pending_claim_map: dict[str, tuple[float, float]] = {}
+                    pending_claim_map: dict[str, tuple[Decimal, Decimal]] = {}
                     for claim in pending_claims:
                         if not isinstance(claim, dict):
                             raise TypeError("pending claim snapshot rows must be mappings")
                         proposal_id = str(claim.get("proposal_id") or "")
-                        claim_notional = float(claim.get("notional"))
-                        claim_risk = float(claim.get("stop_risk"))
+                        claim_notional = decimal_value(
+                            claim.get("notional"),
+                            "pending strategy sleeve claim notional",
+                            minimum=ZERO,
+                        )
+                        claim_risk = decimal_value(
+                            claim.get("stop_risk"),
+                            "pending strategy sleeve claim stop risk",
+                            minimum=ZERO,
+                        )
                         if (
                             not proposal_id or proposal_id in pending_claim_map
-                            or not math.isfinite(claim_notional) or claim_notional < 0
-                            or not math.isfinite(claim_risk) or claim_risk < 0
+                            or claim_notional is None or claim_risk is None
                         ):
                             raise ValueError("pending claim snapshot identity or amount is invalid")
                         pending_claim_map[proposal_id] = (claim_notional, claim_risk)
                 except (KeyError, TypeError, ValueError, OverflowError) as exc:
                     raise RuntimeError("canonical strategy sleeve reservation snapshot is unavailable") from exc
                 current_rows = conn.execute(
-                    """SELECT rr.id,rr.active_notional,rr.active_stop_risk,i.proposal_id
+                    """SELECT rr.id,rr.active_notional,rr.active_stop_risk,
+                              rr.active_notional_decimal,rr.active_stop_risk_decimal,i.proposal_id
                        FROM risk_reservations rr
                        LEFT JOIN order_intents i ON i.id=rr.intent_id
                        WHERE rr.state='active' AND rr.strategy_version=?""",
                     (proposal["strategy_version"],),
                 ).fetchall()
-                incremental_notional = 0.0
-                incremental_risk = 0.0
+                incremental_notional = ZERO
+                incremental_risk = ZERO
                 included_id_set = set(included_ids)
                 for current_row in current_rows:
                     if str(current_row["id"]) in included_id_set:
                         continue
                     pending_notional, pending_risk = pending_claim_map.get(
-                        str(current_row["proposal_id"] or ""), (0.0, 0.0)
+                        str(current_row["proposal_id"] or ""), (ZERO, ZERO)
                     )
-                    incremental_notional += max(
-                        0.0, float(current_row["active_notional"] or 0.0) - pending_notional
+                    active_notional_raw = current_row["active_notional_decimal"]
+                    if active_notional_raw in (None, ""):
+                        active_notional_raw = current_row["active_notional"]
+                    active_risk_raw = current_row["active_stop_risk_decimal"]
+                    if active_risk_raw in (None, ""):
+                        active_risk_raw = current_row["active_stop_risk"]
+                    active_notional = decimal_value(
+                        active_notional_raw,
+                        "active strategy sleeve reservation notional",
+                        minimum=ZERO,
                     )
-                    incremental_risk += max(
-                        0.0, float(current_row["active_stop_risk"] or 0.0) - pending_risk
+                    active_risk = decimal_value(
+                        active_risk_raw,
+                        "active strategy sleeve reservation stop risk",
+                        minimum=ZERO,
                     )
+                    if active_notional is None or active_risk is None:
+                        raise RuntimeError("active strategy sleeve reservation exact amount is unavailable")
+                    incremental_notional += max(ZERO, active_notional - pending_notional)
+                    incremental_risk += max(ZERO, active_risk - pending_risk)
                 candidate_pending_notional, candidate_pending_risk = pending_claim_map.get(
-                    str(proposal.get("proposal_id") or proposal.get("id") or ""), (0.0, 0.0)
+                    str(proposal.get("proposal_id") or proposal.get("id") or ""), (ZERO, ZERO)
                 )
-                candidate_incremental_notional = max(0.0, reserved_notional - candidate_pending_notional)
-                candidate_incremental_risk = max(0.0, reserved_stop_risk - candidate_pending_risk)
-                if incremental_notional + candidate_incremental_notional > effective_notional_ceiling + 1e-9:
+                candidate_incremental_notional = max(ZERO, reserved_notional - candidate_pending_notional)
+                candidate_incremental_risk = max(ZERO, reserved_stop_risk - candidate_pending_risk)
+                if incremental_notional + candidate_incremental_notional > effective_notional_ceiling:
                     raise RuntimeError("atomic reservation blocked by strategy sleeve notional ceiling")
-                if incremental_risk + candidate_incremental_risk > effective_risk_ceiling + 1e-9:
+                if incremental_risk + candidate_incremental_risk > effective_risk_ceiling:
                     raise RuntimeError("atomic reservation blocked by strategy sleeve stop-risk ceiling")
             conn.execute(
                 f"""INSERT INTO order_intents(
@@ -717,15 +923,15 @@ class DurableExecutionStore:
                     side,
                     action,
                     request_basis,
-                    proposal.get("approved_quantity_ceiling", quantity),
-                    proposal.get("approved_notional_ceiling", proposal.get("approved_notional", requested_notional)),
-                    quantity,
-                    requested_notional,
+                    legacy_float(decimal_value(proposal.get("approved_quantity_ceiling", quantity), "approved quantity ceiling")),
+                    legacy_float(decimal_value(proposal.get("approved_notional_ceiling", proposal.get("approved_notional", requested_notional)), "approved notional ceiling")) if proposal.get("approved_notional_ceiling", proposal.get("approved_notional", requested_notional)) is not None else None,
+                    legacy_quantity,
+                    legacy_requested_notional,
                     0.0,
-                    reference,
-                    stop_price,
-                    reserved_notional,
-                    reserved_stop_risk,
+                    legacy_reference,
+                    legacy_stop_price,
+                    legacy_reserved_notional,
+                    legacy_reserved_stop_risk,
                     proposal.get("quote_bid"),
                     proposal.get("quote_ask"),
                     proposal.get("quote_timestamp"),
@@ -746,22 +952,22 @@ class DurableExecutionStore:
                     proposal.get("strategy_version"),
                     proposal.get("entry_regime", proposal.get("volatility_regime")),
                     proposal.get("entry_score", proposal.get("score")),
-                    proposal.get("initial_risk_dollars"),
+                    legacy_float(decimal_value(proposal.get("initial_risk_dollars"), "initial risk dollars")) if proposal.get("initial_risk_dollars") is not None else None,
                     proposal.get("config_hash"),
                     proposal.get("evidence_version", EVIDENCE_VERSION),
                     proposal.get("formula_version", ACCOUNTING_VERSION),
                     proposal.get("strategy_registry_snapshot_id"),
                     proposal.get("strategy_sleeve"),
                     proposal.get("sleeve_allocation_id"),
-                    proposal.get("sleeve_notional_ceiling"),
-                    proposal.get("sleeve_stop_risk_ceiling"),
+                    legacy_float(decimal_value(proposal.get("sleeve_notional_ceiling"), "sleeve notional ceiling")) if proposal.get("sleeve_notional_ceiling") is not None else None,
+                    legacy_float(decimal_value(proposal.get("sleeve_stop_risk_ceiling"), "sleeve stop risk ceiling")) if proposal.get("sleeve_stop_risk_ceiling") is not None else None,
                     proposal.get("winner_expansion_decision_id"),
                     proposal.get("pyramiding_milestone_id"),
                     proposal.get("pyramiding_milestone_key"),
                     proposal.get("management_mode"),
-                    proposal.get("pre_add_open_risk"),
-                    proposal.get("post_add_open_risk"),
-                    incremental_risk,
+                    legacy_float(decimal_value(proposal.get("pre_add_open_risk"), "pre-add open risk")) if proposal.get("pre_add_open_risk") is not None else None,
+                    legacy_float(decimal_value(proposal.get("post_add_open_risk"), "post-add open risk")) if proposal.get("post_add_open_risk") is not None else None,
+                    legacy_incremental_risk,
                     proposal.get("rotation_step_id"),
                     proposal.get("approval_authority_fingerprint"),
                 ),
@@ -769,15 +975,34 @@ class DurableExecutionStore:
             conn.execute(
                 """UPDATE order_intents SET displayed_fingerprint=?,execution_path=?,risk_snapshot_id=?,
                        canonical_quantity=?,canonical_notional=?,canonical_stop_risk=?,
+                       approved_quantity_ceiling_decimal=?,approved_notional_ceiling_decimal=?,
+                       requested_quantity_decimal=?,requested_notional_decimal=?,
+                       reference_price_decimal=?,intended_stop_price_decimal=?,
+                       reserved_notional_decimal=?,reserved_stop_risk_decimal=?,
+                       canonical_quantity_decimal=?,canonical_notional_decimal=?,canonical_stop_risk_decimal=?,
+                       initial_risk_dollars_decimal=?,incremental_risk_decimal=?,
                        filled_quantity_decimal='0',decimal_provenance=?,decimal_accounting_version=?
                        WHERE id=?""",
                 (
                     proposal.get("displayed_fingerprint") or proposal.get("approval_authority_fingerprint"),
                     proposal.get("execution_path"),
                     proposal.get("risk_snapshot_id"),
-                    sizing.quantity,
-                    sizing.notional,
-                    sizing.stop_risk,
+                    legacy_float(sizing.quantity),
+                    legacy_float(sizing.notional),
+                    legacy_float(sizing.stop_risk),
+                    decimal_text(approved_quantity_decimal),
+                    decimal_text(approved_notional_decimal) if approved_notional_decimal is not None else None,
+                    decimal_text(quantity),
+                    decimal_text(requested_notional) if requested_notional is not None else None,
+                    decimal_text(reference),
+                    decimal_text(stop_price) if stop_price is not None else None,
+                    decimal_text(reserved_notional),
+                    decimal_text(reserved_stop_risk),
+                    decimal_text(sizing.quantity),
+                    decimal_text(sizing.notional),
+                    decimal_text(sizing.stop_risk),
+                    decimal_text(initial_risk_decimal) if initial_risk_decimal is not None else None,
+                    decimal_text(incremental_risk),
                     EXACT_DECIMAL_PROVENANCE,
                     FIXED_POINT_ACCOUNTING_VERSION,
                     intent_id,
@@ -795,30 +1020,52 @@ class DurableExecutionStore:
                     intent_id,
                     symbol,
                     proposal.get("cluster_name"),
-                    reserved_notional,
-                    reserved_notional,
-                    reserved_stop_risk,
-                    reserved_stop_risk,
+                    legacy_reserved_notional,
+                    legacy_reserved_notional,
+                    legacy_reserved_stop_risk,
+                    legacy_reserved_stop_risk,
                     "active",
                     now,
                     now,
                     proposal.get("strategy_version"),
                     proposal.get("strategy_sleeve"),
                     proposal.get("sleeve_allocation_id"),
-                    proposal.get("sleeve_notional_ceiling"),
-                    proposal.get("sleeve_stop_risk_ceiling"),
-                    incremental_risk,
-                    reserved_stop_risk,
+                    legacy_float(decimal_value(proposal.get("sleeve_notional_ceiling"), "sleeve notional ceiling")) if proposal.get("sleeve_notional_ceiling") is not None else None,
+                    legacy_float(decimal_value(proposal.get("sleeve_stop_risk_ceiling"), "sleeve stop risk ceiling")) if proposal.get("sleeve_stop_risk_ceiling") is not None else None,
+                    legacy_incremental_risk,
+                    legacy_reserved_stop_risk,
                     "stop_risk_dollars",
                     proposal.get("conversion_equity"),
                     proposal.get("conversion_equity_as_of") or now,
                     proposal.get("risk_formula_version") or "risk_unit_to_stop_risk_dollars_v1",
                 ),
             )
+            conversion_equity_decimal = decimal_value(
+                proposal.get("conversion_equity"),
+                "conversion equity",
+                minimum=ZERO,
+                allow_none=True,
+            )
+            conn.execute(
+                """UPDATE risk_reservations SET
+                   initial_notional_decimal=?,active_notional_decimal=?,
+                   initial_stop_risk_decimal=?,active_stop_risk_decimal=?,
+                   incremental_risk_decimal=?,risk_value_decimal=?,conversion_equity_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=?
+                   WHERE intent_id=?""",
+                (
+                    decimal_text(reserved_notional), decimal_text(reserved_notional),
+                    decimal_text(reserved_stop_risk), decimal_text(reserved_stop_risk),
+                    decimal_text(incremental_risk), decimal_text(reserved_stop_risk),
+                    decimal_text(conversion_equity_decimal) if conversion_equity_decimal is not None else None,
+                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, intent_id,
+                ),
+            )
             conn.execute(
                 """INSERT INTO order_events(
-                       id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                       id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,
+                       transition_counter,decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     event_id,
                     intent_id,
@@ -829,6 +1076,8 @@ class DurableExecutionStore:
                     json_dumps({"source_type": source_type, "reservation_committed_before_broker": True}),
                     now,
                     0,
+                    EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                 ),
             )
             conn.execute(
@@ -843,8 +1092,8 @@ class DurableExecutionStore:
                     client_order_id,
                     symbol,
                     side,
-                    reserved_notional if side == "buy" else proposal.get("notional"),
-                    quantity,
+                    legacy_reserved_notional if side == "buy" else legacy_float(decimal_value(proposal.get("notional"), "order notional")) if proposal.get("notional") is not None else None,
+                    legacy_quantity,
                     OrderState.RESERVED.value,
                     json_dumps({"intent_id": intent_id, "source_type": source_type,
                                 "quote_bid": proposal.get("quote_bid"), "quote_ask": proposal.get("quote_ask"),
@@ -854,6 +1103,20 @@ class DurableExecutionStore:
                     proposal.get("quote_spread_bps"), proposal.get("limit_price"), proposal.get("implementation_shortfall_bps"),
                     now,
                     now,
+                ),
+            )
+            order_notional_decimal = requested_notional
+            if side != "buy" and proposal.get("notional") is not None:
+                order_notional_decimal = decimal_value(
+                    proposal.get("notional"), "order notional", minimum=ZERO, allow_none=True,
+                )
+            conn.execute(
+                """UPDATE orders SET notional_decimal=?,qty_decimal=?,decimal_provenance=?,
+                   decimal_accounting_version=? WHERE id=?""",
+                (
+                    decimal_text(order_notional_decimal) if order_notional_decimal is not None else None,
+                    decimal_text(quantity), EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION, intent_id,
                 ),
             )
             from .profit_milestones import bind_take_profit_intent_in_transaction
@@ -931,8 +1194,10 @@ class DurableExecutionStore:
                 ),
             )
             conn.execute(
-                """INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO order_events(
+                       id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,
+                       transition_counter,decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(uuid.uuid4()),
                     intent_id,
@@ -943,6 +1208,8 @@ class DurableExecutionStore:
                     json_dumps({"error_category": error_category, "summary": safe_summary}),
                     now,
                     counter,
+                    EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                 ),
             )
             conn.execute(
@@ -951,7 +1218,8 @@ class DurableExecutionStore:
             )
             if destination in TERMINAL_STATES:
                 conn.execute(
-                    """UPDATE risk_reservations SET active_notional=0,active_stop_risk=0,state='released',
+                    """UPDATE risk_reservations SET active_notional=0,active_stop_risk=0,
+                       active_notional_decimal='0',active_stop_risk_decimal='0',state='released',
                        released_at=COALESCE(released_at,?),release_reason=COALESCE(release_reason,?),updated_at=?,version=version+1
                        WHERE intent_id=? AND state='active'""",
                     (now, destination.value, now, intent_id),
@@ -979,6 +1247,8 @@ class DurableExecutionStore:
         adjustments: Any = 0,
         source: str = "broker_fill",
         price_is_cumulative_average: bool = False,
+        broker_evidence: Mapping[str, Any] | None = None,
+        account_id_hash: str | None = None,
     ) -> dict[str, Any]:
         cumulative_decimal = decimal_value(
             cumulative_quantity, "cumulative_quantity", minimum=ZERO
@@ -996,18 +1266,136 @@ class DurableExecutionStore:
             raise ValueError("cumulative_quantity must be positive for a fill event")
         if price_decimal == ZERO:
             raise ValueError("fill_price must be positive for a fill event")
-        quantity_tolerance = decimal_value("0.000000001", "quantity_tolerance")
-        assert quantity_tolerance is not None
         now = iso_now()
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             intent = conn.execute("SELECT * FROM order_intents WHERE id=?", (intent_id,)).fetchone()
             if not intent:
                 raise LookupError(f"order intent not found: {intent_id}")
-            prior = conn.execute("SELECT 1 FROM broker_fill_events WHERE broker_event_key=?", (broker_event_key,)).fetchone()
-            if prior:
-                return dict(intent)
-            requested = decimal_value(intent["requested_quantity"], "requested_quantity", minimum=ZERO)
+            requested_raw = (
+                intent["requested_quantity_decimal"]
+                if "requested_quantity_decimal" in intent.keys()
+                and intent["requested_quantity_decimal"] not in (None, "")
+                else intent["requested_quantity"]
+            )
+            requested_authority = decimal_value(
+                requested_raw, "requested_quantity", minimum=ZERO
+            )
+            assert requested_authority is not None
+            if not str(broker_event_key or "").strip():
+                raise ValueError("broker_event_key is required")
+            if broker_evidence is None:
+                # Existing unit fixtures use direct scalar calls.  Keep that
+                # path explicitly test-only; production callers must provide
+                # the raw broker response envelope so a fill cannot be
+                # fabricated by supplying plausible quantity and price.
+                if os.getenv("TRADING_AGENT_TESTING") != "1":
+                    raise ValueError("verified broker evidence is required before recording a fill")
+                broker_evidence = {
+                    "source": "test_fixture_broker_evidence",
+                    "broker_order_id": broker_order_id or f"test-broker-order:{intent_id}",
+                    "client_order_id": intent["client_order_id"],
+                    "symbol": intent["symbol"],
+                    "side": intent["side"],
+                    "status": "filled" if cumulative_decimal >= requested_authority else "partially_filled",
+                    "execution_id": broker_event_key,
+                    "filled_qty": decimal_text(cumulative_decimal),
+                    "filled_avg_price": decimal_text(price_decimal),
+                    "fees": decimal_text(fees_decimal),
+                    "adjustments": decimal_text(adjustments_decimal),
+                }
+            evidence_payload = _broker_evidence_payload(broker_evidence)
+            evidence_order_id = str(
+                evidence_payload.get("broker_order_id") or broker_order_id or intent["broker_order_id"] or ""
+            )
+            evidence_client_id = str(
+                evidence_payload.get("client_order_id") or intent["client_order_id"] or ""
+            )
+            evidence_symbol = str(evidence_payload.get("symbol") or intent["symbol"] or "").upper()
+            evidence_side = str(evidence_payload.get("side") or intent["side"] or "").lower()
+            evidence_status = str(
+                evidence_payload.get("status")
+                or ("filled" if cumulative_decimal >= requested_authority else "partially_filled")
+            ).lower()
+            if not evidence_order_id or not evidence_client_id:
+                raise ValueError("broker evidence must contain broker and client order identities")
+            if evidence_client_id != str(intent["client_order_id"]):
+                raise ValueError("broker evidence client-order identity does not match intent")
+            if intent["broker_order_id"] not in (None, "") and evidence_order_id != str(intent["broker_order_id"]):
+                raise ValueError("broker evidence broker-order identity does not match intent")
+            if evidence_symbol != str(intent["symbol"]).upper() or evidence_side != str(intent["side"]).lower():
+                raise ValueError("broker evidence symbol/side does not match intent")
+            if evidence_status not in {"partially_filled", "partial_fill", "filled", "late_fill_after_cancelled"}:
+                raise ValueError("broker evidence status is not a fill status")
+            reported_quantity = evidence_payload.get("filled_qty", evidence_payload.get("cumulative_quantity"))
+            reported_price = evidence_payload.get("filled_avg_price", evidence_payload.get("fill_price"))
+            if reported_quantity not in (None, "") and decimal_value(reported_quantity, "broker evidence filled quantity", minimum=ZERO) != cumulative_decimal:
+                raise ValueError("broker evidence quantity does not match the fill event")
+            if reported_price not in (None, "") and decimal_value(reported_price, "broker evidence fill price", minimum=ZERO) != price_decimal:
+                raise ValueError("broker evidence price does not match the fill event")
+            evidence_payload.update(
+                {
+                    "intent_id": str(intent["id"]),
+                    "broker_event_key": str(broker_event_key),
+                    "broker_order_id": evidence_order_id,
+                    "client_order_id": evidence_client_id,
+                    "symbol": evidence_symbol,
+                    "side": evidence_side,
+                    "status": evidence_status,
+                    "filled_qty": decimal_text(cumulative_decimal),
+                    "filled_avg_price": decimal_text(price_decimal),
+                    "fees": decimal_text(fees_decimal),
+                    "adjustments": decimal_text(adjustments_decimal),
+                }
+            )
+            evidence_fingerprint = _broker_evidence_fingerprint(evidence_payload)
+            evidence_id = evidence_fingerprint[:32]
+            prior_evidence = conn.execute(
+                "SELECT * FROM broker_fill_evidence WHERE broker_event_key=?",
+                (broker_event_key,),
+            ).fetchone()
+            if prior_evidence is not None:
+                if (
+                    str(prior_evidence["intent_id"]) != str(intent["id"])
+                    or str(prior_evidence["payload_fingerprint"]) != evidence_fingerprint
+                    or str(prior_evidence["broker_order_id"]) != evidence_order_id
+                    or str(prior_evidence["client_order_id"]) != evidence_client_id
+                ):
+                    raise ValueError("duplicate broker fill event payload conflicts with immutable evidence")
+                prior = conn.execute(
+                    "SELECT * FROM broker_fill_events WHERE broker_event_key=?",
+                    (broker_event_key,),
+                ).fetchone()
+                if prior is not None:
+                    return dict(intent)
+            else:
+                conn.execute(
+                    """INSERT INTO broker_fill_evidence(
+                       id,intent_id,broker_event_key,broker_order_id,client_order_id,symbol,side,
+                       remote_status,payload,payload_fingerprint,evidence_source,account_id_hash,captured_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        evidence_id,
+                        intent["id"],
+                        broker_event_key,
+                        evidence_order_id,
+                        evidence_client_id,
+                        evidence_symbol,
+                        evidence_side,
+                        evidence_status,
+                        json.dumps(evidence_payload, sort_keys=True, separators=(",", ":"), default=str),
+                        evidence_fingerprint,
+                        str(evidence_payload.get("source") or source),
+                        account_id_hash,
+                        occurred_at or now,
+                    ),
+                )
+            if intent["broker_order_id"] in (None, ""):
+                conn.execute(
+                    "UPDATE order_intents SET broker_order_id=?,updated_at=? WHERE id=?",
+                    (evidence_order_id, now, intent_id),
+                )
+            requested = requested_authority
             previous = decimal_value(
                 intent["filled_quantity_decimal"]
                 if "filled_quantity_decimal" in intent.keys()
@@ -1019,7 +1407,7 @@ class DurableExecutionStore:
             assert requested is not None and previous is not None
             if requested == ZERO:
                 raise ValueError("requested_quantity must be positive")
-            if cumulative_decimal + quantity_tolerance < previous:
+            if cumulative_decimal < previous:
                 # Retain/dedupe the stale broker event but never reduce quantity.
                 counter = int(intent["transition_counter"] or 0) + 1
                 conn.execute(
@@ -1034,6 +1422,8 @@ class DurableExecutionStore:
                                 "out_of_order": True,
                                 "retained_cumulative": decimal_text(previous),
                                 "canonical_decimal_evidence": True,
+                                "broker_evidence_id": evidence_id,
+                                "broker_evidence_fingerprint": evidence_fingerprint,
                             }
                         ),
                     ),
@@ -1058,12 +1448,26 @@ class DurableExecutionStore:
                     (occurred_at or now, now),
                 )
                 conn.execute(
-                    "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), intent_id, f"{intent_id}:out_of_order_fill:{broker_event_key}", intent["state"], intent["state"], "out_of_order_fill_ignored", json_dumps({"reported": decimal_text(cumulative_decimal), "retained": decimal_text(previous)}), now, counter),
+                    """INSERT INTO order_events(
+                           id,intent_id,event_key,from_state,to_state,event_type,filled_quantity,fill_price,
+                           safe_detail,created_at,transition_counter,filled_quantity_decimal,fill_price_decimal,
+                           decimal_provenance,decimal_accounting_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(uuid.uuid4()), intent_id,
+                        f"{intent_id}:out_of_order_fill:{broker_event_key}",
+                        intent["state"], intent["state"], "out_of_order_fill_ignored",
+                        legacy_float(cumulative_decimal), legacy_float(price_decimal),
+                        json_dumps({"reported": decimal_text(cumulative_decimal), "retained": decimal_text(previous)}),
+                        now, counter, decimal_text(cumulative_decimal), decimal_text(price_decimal),
+                        EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                    ),
                 )
                 conn.execute("UPDATE order_intents SET transition_counter=?,updated_at=? WHERE id=?", (counter, now, intent_id))
                 return dict(intent)
-            cumulative = min(cumulative_decimal, requested)
+            if cumulative_decimal > requested:
+                raise ValueError("broker fill cumulative quantity exceeds the requested quantity")
+            cumulative = cumulative_decimal
             delta = max(ZERO, cumulative - previous)
             if delta == ZERO and (
                 fees_decimal != ZERO or adjustments_decimal != ZERO
@@ -1105,7 +1509,7 @@ class DurableExecutionStore:
             late_after_cancel = current == OrderState.CANCELLED and cumulative > previous
             target = current if late_after_cancel else (
                 OrderState.FILLED
-                if cumulative >= requested - quantity_tolerance
+                if cumulative >= requested
                 else OrderState.PARTIALLY_FILLED
             )
             if current != target:
@@ -1119,16 +1523,18 @@ class DurableExecutionStore:
                     fill_event_id, intent_id, broker_event_key, broker_order_id,
                     legacy_float(cumulative), legacy_float(delta), legacy_float(delta_fill_price),
                     occurred_at or now, now,
-                    json_dumps(
-                        {
-                            "aggregate": True,
-                            "reported_price": decimal_text(price_decimal),
-                            "price_semantics": "cumulative_average"
-                            if price_is_cumulative_average
-                            else "delta_execution",
-                            "canonical_decimal_evidence": True,
-                        }
-                    ),
+                        json_dumps(
+                            {
+                                "aggregate": True,
+                                "reported_price": decimal_text(price_decimal),
+                                "price_semantics": "cumulative_average"
+                                if price_is_cumulative_average
+                                else "delta_execution",
+                                "canonical_decimal_evidence": True,
+                                "broker_evidence_id": evidence_id,
+                                "broker_evidence_fingerprint": evidence_fingerprint,
+                            }
+                        ),
                 ),
             )
             conn.execute(
@@ -1185,20 +1591,64 @@ class DurableExecutionStore:
                     now, now if target == OrderState.FILLED else None, counter, intent_id,
                 ),
             )
-            remaining_ratio = float(max(ZERO, requested - cumulative) / requested)
+            remaining_ratio_decimal = max(ZERO, requested - cumulative) / requested
             reservation_state = "released" if target == OrderState.FILLED or late_after_cancel else "active"
             if late_after_cancel:
-                remaining_ratio = 0.0
+                remaining_ratio_decimal = ZERO
+            reservation = conn.execute(
+                "SELECT * FROM risk_reservations WHERE intent_id=? AND state IN ('active','released')",
+                (intent_id,),
+            ).fetchone()
+            if reservation is None:
+                raise ValueError("risk reservation is missing while recording a fill")
+            initial_notional = decimal_value(
+                reservation["initial_notional_decimal"]
+                if "initial_notional_decimal" in reservation.keys()
+                and reservation["initial_notional_decimal"] not in (None, "")
+                else reservation["initial_notional"],
+                "initial reservation notional",
+                minimum=ZERO,
+            )
+            initial_stop_risk = decimal_value(
+                reservation["initial_stop_risk_decimal"]
+                if "initial_stop_risk_decimal" in reservation.keys()
+                and reservation["initial_stop_risk_decimal"] not in (None, "")
+                else reservation["initial_stop_risk"],
+                "initial reservation stop risk",
+                minimum=ZERO,
+            )
+            assert initial_notional is not None and initial_stop_risk is not None
+            active_notional_decimal = initial_notional * remaining_ratio_decimal
+            active_stop_risk_decimal = initial_stop_risk * remaining_ratio_decimal
             conn.execute(
-                """UPDATE risk_reservations SET active_notional=initial_notional*?,active_stop_risk=initial_stop_risk*?,
+                """UPDATE risk_reservations SET active_notional=?,active_stop_risk=?,
+                       active_notional_decimal=?,active_stop_risk_decimal=?,
                        state=?,released_at=CASE WHEN ?='released' THEN COALESCE(released_at,?) ELSE released_at END,
                        release_reason=CASE WHEN ?='released' THEN COALESCE(release_reason,'filled') ELSE release_reason END,
                        updated_at=?,version=version+1 WHERE intent_id=?""",
-                (remaining_ratio, remaining_ratio, reservation_state, reservation_state, now, reservation_state, now, intent_id),
+                (
+                    legacy_float(active_notional_decimal), legacy_float(active_stop_risk_decimal),
+                    decimal_text(active_notional_decimal), decimal_text(active_stop_risk_decimal),
+                    reservation_state, reservation_state, now, reservation_state, now, intent_id,
+                ),
             )
             conn.execute(
-                "INSERT INTO order_events(id,intent_id,event_key,from_state,to_state,event_type,broker_event_id,filled_quantity,fill_price,safe_detail,created_at,transition_counter) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}", current.value, target.value, "late_fill_after_cancelled" if late_after_cancel else ("final_fill" if target == OrderState.FILLED else "partial_fill"), broker_event_key, legacy_float(cumulative), legacy_float(delta_fill_price), json_dumps({"delta_quantity": decimal_text(delta)}), now, counter),
+                """INSERT INTO order_events(
+                       id,intent_id,event_key,from_state,to_state,event_type,broker_event_id,
+                       filled_quantity,fill_price,safe_detail,created_at,transition_counter,
+                       filled_quantity_decimal,fill_price_decimal,decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()), intent_id, f"{intent_id}:fill:{broker_event_key}",
+                    current.value, target.value,
+                    "late_fill_after_cancelled" if late_after_cancel else (
+                        "final_fill" if target == OrderState.FILLED else "partial_fill"
+                    ),
+                    broker_event_key, legacy_float(cumulative), legacy_float(delta_fill_price),
+                    json_dumps({"delta_quantity": decimal_text(delta)}), now, counter,
+                    decimal_text(cumulative), decimal_text(delta_fill_price),
+                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                ),
             )
             conn.execute(
                 "UPDATE orders SET broker_order_id=COALESCE(?,broker_order_id),status=?,implementation_shortfall_bps=?,updated_at=? WHERE id=?",
@@ -1242,17 +1692,40 @@ class DurableExecutionStore:
 
     def active_reservations(self) -> dict[str, Any]:
         rows = self.storage.fetch_all(
-            "SELECT symbol,cluster_name,active_notional,active_stop_risk FROM risk_reservations WHERE state='active'"
+            "SELECT * FROM risk_reservations WHERE state='active'"
         )
+        total_notional_decimal = ZERO
+        total_stop_risk_decimal = ZERO
         by_symbol: dict[str, float] = {}
         by_cluster: dict[str, float] = {}
         for row in rows:
-            by_symbol[row["symbol"]] = by_symbol.get(row["symbol"], 0.0) + float(row["active_notional"] or 0)
+            notional = decimal_value(
+                row["active_notional_decimal"]
+                if row.get("active_notional_decimal") not in (None, "")
+                else row["active_notional"],
+                "active reservation notional",
+                minimum=ZERO,
+            )
+            stop_risk = decimal_value(
+                row["active_stop_risk_decimal"]
+                if row.get("active_stop_risk_decimal") not in (None, "")
+                else row["active_stop_risk"],
+                "active reservation stop risk",
+                minimum=ZERO,
+            )
+            assert notional is not None and stop_risk is not None
+            total_notional_decimal += notional
+            total_stop_risk_decimal += stop_risk
+            by_symbol[row["symbol"]] = by_symbol.get(row["symbol"], 0.0) + float(notional)
             if row.get("cluster_name"):
-                by_cluster[row["cluster_name"]] = by_cluster.get(row["cluster_name"], 0.0) + float(row["active_notional"] or 0)
+                by_cluster[row["cluster_name"]] = by_cluster.get(row["cluster_name"], 0.0) + float(notional)
         return {
-            "active_reserved_notional": sum(float(row["active_notional"] or 0) for row in rows),
-            "active_reserved_stop_risk": sum(float(row["active_stop_risk"] or 0) for row in rows),
+            # Decimal text is the authoritative aggregate. Legacy numeric
+            # fields remain as compatibility projections for older callers.
+            "active_reserved_notional_decimal": decimal_text(total_notional_decimal),
+            "active_reserved_stop_risk_decimal": decimal_text(total_stop_risk_decimal),
+            "active_reserved_notional": float(total_notional_decimal),
+            "active_reserved_stop_risk": float(total_stop_risk_decimal),
             "symbol_reserved_notional": by_symbol,
             "cluster_reserved_notional": by_cluster,
             "count": len(rows),
@@ -1304,6 +1777,26 @@ class DurableExecutionStore:
             "fill_ledger_mismatch": """SELECT COUNT(*) n FROM order_intents i
                 WHERE ABS(COALESCE((SELECT MAX(f.cumulative_filled_quantity) FROM broker_fill_events f
                                     WHERE f.intent_id=i.id),0)-COALESCE(i.filled_quantity,0))>0.000000001""",
+            "broker_fill_evidence_orphaned": """SELECT COUNT(*) n FROM broker_fill_evidence e
+                LEFT JOIN order_intents i ON i.id=e.intent_id
+                LEFT JOIN broker_fill_events f ON f.broker_event_key=e.broker_event_key
+                WHERE i.id IS NULL OR f.id IS NULL""",
+            "broker_fill_evidence_identity_mismatch": """SELECT COUNT(*) n FROM broker_fill_evidence e
+                JOIN order_intents i ON i.id=e.intent_id
+                WHERE e.client_order_id<>i.client_order_id
+                   OR COALESCE(i.broker_order_id,'')<>e.broker_order_id
+                   OR upper(e.symbol)<>upper(i.symbol)
+                   OR lower(e.side)<>lower(i.side)""",
+            "broker_fill_events_missing_immutable_evidence": """SELECT COUNT(*) n FROM broker_fill_events f
+                WHERE (json_valid(f.payload)<>1
+                   OR COALESCE(json_extract(f.payload,'$.broker_evidence_id'),'')=''
+                   OR NOT EXISTS(
+                       SELECT 1 FROM broker_fill_evidence e
+                       WHERE e.id=json_extract(f.payload,'$.broker_evidence_id')
+                         AND e.broker_event_key=f.broker_event_key
+                         AND e.intent_id=f.intent_id
+                   ))
+                  AND f.occurred_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
             "broker_relevant_missing_identity": """SELECT COUNT(*) n FROM order_intents
                 WHERE state IN ('submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required')
                   AND COALESCE(client_order_id,'')='' AND COALESCE(broker_order_id,'')=''""",
@@ -1598,6 +2091,26 @@ class DurableExecutionStore:
                   + (SELECT COUNT(*) FROM crypto_risk_decisions WHERE execution_authorized<>0)
                   + (SELECT COUNT(*) FROM crypto_strategy_decisions WHERE proposal_authorized<>0 OR execution_authorized<>0)
                   + (SELECT COUNT(*) FROM crypto_proposal_previews WHERE manual_approval_eligible<>0 OR execution_authorized<>0) n""",
+            "orphaned_crypto_profitability_validation": """SELECT COUNT(*) n
+                FROM crypto_profitability_decisions p
+                LEFT JOIN profitability_validation_families f
+                  ON f.id=p.validation_family_id
+                LEFT JOIN profitability_validation_decisions d
+                  ON d.id=p.validation_decision_id
+                WHERE f.id IS NULL OR d.id IS NULL
+                   OR p.validation_family_id<>d.family_id
+                   OR p.config_hash<>f.config_hash
+                   OR p.validation_decision_fingerprint<>d.decision_fingerprint
+                   OR p.walk_forward_status<>d.status
+                   OR p.validation_sample_count<>d.sample_count
+                   OR p.validation_fold_count<>d.fold_count
+                   OR p.validation_reason<>d.reason""",
+            "invalid_crypto_profitability_authority": """SELECT COUNT(*) n
+                FROM crypto_profitability_decisions p
+                WHERE p.validation_status='validated'
+                  AND (p.walk_forward_status<>'validated'
+                       OR json_valid(p.rejection_reasons_json)<>1
+                       OR json_array_length(p.rejection_reasons_json)<>0)""",
             "invalid_cross_asset_allocation_plan": """SELECT COUNT(*) n
                 FROM cross_asset_allocation_plans p
                 WHERE p.execution_authorized<>0
@@ -1667,6 +2180,107 @@ class DurableExecutionStore:
             name: int(self.storage.fetch_all(sql)[0]["n"])
             for name, sql in checks.items()
         }
+        # Recompute the safety-critical accounting counters from canonical
+        # Decimal text for post-hardening intents.  The SQL expressions above
+        # remain compatibility diagnostics for historical REAL rows, but they
+        # must not decide whether current execution state is internally sound.
+        hardening_boundary = self.storage.fetch_all(
+            "SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'"
+        )
+        boundary = str(hardening_boundary[0]["value"]) if hardening_boundary else "9999"
+
+        def exact_row_value(row: Mapping[str, Any], field: str) -> Decimal | None:
+            raw = row.get(f"{field}_decimal")
+            if raw in (None, ""):
+                return None
+            try:
+                return decimal_value(raw, field, minimum=ZERO)
+            except ValueError:
+                return None
+
+        intent_rows = self.storage.fetch_all(
+            """SELECT id,created_at,requested_quantity_decimal,filled_quantity_decimal,
+                      canonical_quantity_decimal,canonical_notional_decimal,
+                      canonical_stop_risk_decimal,reference_price_decimal
+               FROM order_intents WHERE created_at>=?""",
+            (boundary,),
+        )
+        exact_overfills = 0
+        exact_sizing_mismatches = 0
+        for row in intent_rows:
+            requested = exact_row_value(row, "requested_quantity")
+            filled = exact_row_value(row, "filled_quantity")
+            if requested is None or filled is None or filled > requested:
+                exact_overfills += 1
+            canonical_quantity = exact_row_value(row, "canonical_quantity")
+            canonical_notional = exact_row_value(row, "canonical_notional")
+            canonical_stop_risk = exact_row_value(row, "canonical_stop_risk")
+            reference = exact_row_value(row, "reference_price")
+            if (
+                canonical_quantity is None
+                or canonical_notional is None
+                or canonical_stop_risk is None
+                or reference is None
+                or canonical_quantity != requested
+                or canonical_notional != canonical_quantity * reference
+                or canonical_stop_risk < ZERO
+            ):
+                exact_sizing_mismatches += 1
+        report["fills_exceeding_quantity"] = exact_overfills
+        report["intent_canonical_sizing_mismatch"] = exact_sizing_mismatches
+
+        exact_ledger_mismatches = 0
+        for row in intent_rows:
+            event_rows = self.storage.fetch_all(
+                """SELECT cumulative_filled_quantity_decimal
+                   FROM broker_fill_events WHERE intent_id=?""",
+                (row["id"],),
+            )
+            cumulative_values: list[Decimal] = []
+            invalid_event = False
+            for event in event_rows:
+                value = event.get("cumulative_filled_quantity_decimal")
+                if value in (None, ""):
+                    invalid_event = True
+                    break
+                try:
+                    parsed = decimal_value(value, "cumulative filled quantity", minimum=ZERO)
+                except ValueError:
+                    invalid_event = True
+                    break
+                if parsed is not None:
+                    cumulative_values.append(parsed)
+            filled = exact_row_value(row, "filled_quantity")
+            expected = max(cumulative_values, default=ZERO)
+            if invalid_event or filled is None or expected != filled:
+                exact_ledger_mismatches += 1
+        report["fill_ledger_mismatch"] = exact_ledger_mismatches
+        report["broker_fill_evidence_payload_invalid"] = 0
+        report["broker_fill_evidence_payload_fingerprint_mismatch"] = 0
+        report["broker_fill_event_evidence_fingerprint_mismatch"] = 0
+        evidence_by_id: dict[str, dict[str, Any]] = {}
+        for evidence in self.storage.fetch_all("SELECT * FROM broker_fill_evidence"):
+            evidence_by_id[str(evidence["id"])] = evidence
+            try:
+                payload = json.loads(str(evidence["payload"]))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("broker evidence payload is not an object")
+                if _broker_evidence_fingerprint(payload) != str(evidence["payload_fingerprint"]):
+                    report["broker_fill_evidence_payload_fingerprint_mismatch"] += 1
+            except (TypeError, ValueError, json.JSONDecodeError):
+                report["broker_fill_evidence_payload_invalid"] += 1
+        for event in self.storage.fetch_all(
+            """SELECT broker_event_key,payload FROM broker_fill_events
+               WHERE occurred_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')"""
+        ):
+            try:
+                payload = json.loads(str(event["payload"]))
+                evidence_id = str(payload.get("broker_evidence_id") or "")
+                evidence = evidence_by_id.get(evidence_id)
+                if evidence is None or str(payload.get("broker_evidence_fingerprint") or "") != str(evidence["payload_fingerprint"]):
+                    report["broker_fill_event_evidence_fingerprint_mismatch"] += 1
+            except (TypeError, ValueError, json.JSONDecodeError):
+                report["broker_fill_event_evidence_fingerprint_mismatch"] += 1
         from .fixed_point_accounting import fixed_point_integrity_report
         from .allocation_authority import allocation_authority_integrity_report
         from .strategy_execution_registry import strategy_registry_integrity_report
@@ -1703,6 +2317,22 @@ class Executor:
     def _fault(self, boundary: str, **detail: Any) -> None:
         if self.fault_hook is not None:
             self.fault_hook(boundary, detail)
+
+    def _verify_submission_adapter_available(self) -> None:
+        """Fail closed before durable authority records possible broker I/O."""
+
+        if self.broker is None or not callable(getattr(self.broker, "submit_order", None)):
+            raise BrokerSubmissionNotAttempted("broker submission adapter is unavailable")
+        checker = getattr(self.broker, "submission_available", None)
+        if callable(checker):
+            try:
+                available = checker()
+            except Exception as exc:
+                raise BrokerSubmissionNotAttempted(
+                    "broker submission adapter availability could not be verified"
+                ) from exc
+            if available is not True:
+                raise BrokerSubmissionNotAttempted("broker submission adapter is unavailable")
 
     def _load_approval_authority(
         self,
@@ -1822,12 +2452,12 @@ class Executor:
             if caller_envelope.get(field) != stored_envelope.get(field):
                 return workflow_store, existing_intent, f"approved {field} does not match the stored proposal"
 
-        def number(value: Any) -> float | None:
+        def number(value: Any) -> Decimal | None:
             try:
-                result = float(value)
-            except (TypeError, ValueError):
+                result = decimal_value(value, "approved ceiling")
+            except ValueError:
                 return None
-            return result if math.isfinite(result) else None
+            return result
 
         try:
             sizing = canonical_sizing(proposal)
@@ -1845,8 +2475,13 @@ class Executor:
         )
         if not isolated_display_fixture:
             for label, actual, maximum in candidate_limits:
-                if maximum is not None and actual > float(maximum) + 1e-9:
-                    return workflow_store, existing_intent, f"approved {label} may only stay equal or decrease"
+                if maximum is not None:
+                    try:
+                        maximum_decimal = decimal_value(maximum, f"displayed maximum {label}")
+                    except ValueError:
+                        return workflow_store, existing_intent, f"displayed maximum {label} is invalid"
+                    if maximum_decimal is None or actual > maximum_decimal:
+                        return workflow_store, existing_intent, f"approved {label} may only stay equal or decrease"
         ceiling_fields = (
             ("approved quantity", "approved_quantity_ceiling", "max_quantity"),
             ("approved notional", "approved_notional_ceiling", "max_notional"),
@@ -1859,8 +2494,13 @@ class Executor:
                 not isolated_display_fixture or candidate_key in proposal
             ):
                 return workflow_store, existing_intent, f"{label} ceiling is required"
-            if candidate_ceiling is not None and maximum is not None and candidate_ceiling > float(maximum) + 1e-9:
-                return workflow_store, existing_intent, f"approved {label} may not increase"
+            if candidate_ceiling is not None and maximum is not None:
+                try:
+                    maximum_decimal = decimal_value(maximum, f"displayed maximum {label}")
+                except ValueError:
+                    return workflow_store, existing_intent, f"displayed maximum {label} is invalid"
+                if maximum_decimal is None or candidate_ceiling > maximum_decimal:
+                    return workflow_store, existing_intent, f"approved {label} may not increase"
         proposal["approval_authority_fingerprint"] = approved_fingerprint
         proposal["displayed_fingerprint"] = approved_fingerprint
         proposal["execution_path"] = stored_envelope.get("execution_path")
@@ -2241,6 +2881,8 @@ class Executor:
             refreshed_decision = self.risk_engine.evaluate(candidate, refreshed_context, final=True)
             if not refreshed_decision.passed:
                 raise RuntimeError("final pre-broker risk controls failed: " + "; ".join(refreshed_decision.reasons))
+            self._verify_submission_adapter_available()
+            self._fault("after_final_authority_before_invocation_marker", intent_id=intent_id)
             from .approval_display import validate_consumed_display_authority
 
             invocation_time = iso_now()
@@ -2283,6 +2925,10 @@ class Executor:
                 ).rowcount
                 if updated != 1:
                     raise RuntimeError("broker invocation authority was concurrently consumed")
+            # The marker transaction is committed before adapter I/O.  A crash
+            # after this boundary is therefore always reconciled as possibly
+            # submitted and is never eligible for automatic resubmission.
+            self._fault("after_invocation_marker_before_adapter", intent_id=intent_id)
         except Exception as exc:
             store.transition(
                 intent_id,
@@ -2327,9 +2973,21 @@ class Executor:
             elif remote_status == "partially_filled":
                 target = OrderState.PARTIALLY_FILLED
             if target in {OrderState.PARTIALLY_FILLED, OrderState.FILLED}:
-                filled_quantity = float(_value(response, "filled_qty", intent["requested_quantity"] if target == OrderState.FILLED else 0) or 0)
-                fill_price = float(_value(response, "filled_avg_price", candidate.get("latest_price")) or 0)
-                if filled_quantity <= 0 or fill_price <= 0:
+                raw_filled_quantity = _value(response, "filled_qty", None)
+                raw_fill_price = _value(response, "filled_avg_price", None)
+                try:
+                    filled_quantity_decimal = decimal_value(
+                        raw_filled_quantity, "broker filled quantity", minimum=ZERO
+                    )
+                    fill_price_decimal = decimal_value(
+                        raw_fill_price, "broker average fill price", minimum=ZERO
+                    )
+                    if filled_quantity_decimal == ZERO or fill_price_decimal == ZERO:
+                        raise ValueError("broker fill quantity and price must be positive")
+                except ValueError:
+                    filled_quantity_decimal = None
+                    fill_price_decimal = None
+                if filled_quantity_decimal is None or fill_price_decimal is None:
                     store.transition(
                         intent_id,
                         OrderState.UNKNOWN,
@@ -2339,15 +2997,31 @@ class Executor:
                     )
                     target = OrderState.UNKNOWN
                 else:
-                    event_key = str(_value(response, "execution_id", "") or f"{broker_order_id or intent['client_order_id']}:{filled_quantity:.12g}:{fill_price:.12g}")
+                    event_key = str(
+                        _value(response, "execution_id", "")
+                        or f"{broker_order_id or intent['client_order_id']}:{decimal_text(filled_quantity_decimal)}:{decimal_text(fill_price_decimal)}"
+                    )
                     store.record_fill(
                         intent_id,
-                        cumulative_quantity=filled_quantity,
-                        fill_price=fill_price,
+                        cumulative_quantity=filled_quantity_decimal,
+                        fill_price=fill_price_decimal,
                         broker_event_key=event_key,
                         broker_order_id=broker_order_id,
                         occurred_at=str(_value(response, "filled_at", iso_now())),
                         price_is_cumulative_average=True,
+                        broker_evidence={
+                            "source": "broker_submission_response",
+                            "broker_order_id": broker_order_id,
+                            "client_order_id": intent["client_order_id"],
+                            "symbol": intent["symbol"],
+                            "side": intent["side"],
+                            "status": remote_status,
+                            "execution_id": _value(response, "execution_id", None),
+                            "filled_qty": filled_quantity_decimal,
+                            "filled_avg_price": fill_price_decimal,
+                            "filled_at": _value(response, "filled_at", None),
+                            "payload": _broker_evidence_safe(response if isinstance(response, Mapping) else vars(response) if hasattr(response, "__dict__") else {}),
+                        },
                     )
             else:
                 store.transition(intent_id, target, event_type="broker_submission_acknowledged", broker_order_id=broker_order_id)

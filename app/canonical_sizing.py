@@ -1,30 +1,67 @@
-"""One canonical quantity/notional/risk calculation for approval and execution."""
+"""One canonical quantity/notional/risk calculation for approval and execution.
+
+The public execution boundary intentionally returns :class:`Decimal` values.
+SQLite ``REAL`` columns and broker request projections are compatibility
+surfaces only; the sizing identity itself must never be evaluated in binary
+floating point.
+"""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+import math
 from typing import Any, Mapping
+
+
+ZERO = Decimal("0")
 
 
 @dataclass(frozen=True)
 class CanonicalSizing:
     request_basis: str
-    quantity: float
-    notional: float
-    stop_risk: float
-    reference_price: float
-    stop_price: float | None
+    quantity: Decimal
+    notional: Decimal
+    stop_risk: Decimal
+    reference_price: Decimal
+    stop_price: Decimal | None
 
 
-def _positive(value: Any, label: str) -> float:
+def _decimal(value: Any, label: str, *, positive: bool = False) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{label} must be numeric")
     try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be numeric") from exc
-    if not math.isfinite(number) or number <= 0:
-        raise ValueError(f"{label} must be finite and positive")
+    if not number.is_finite() or (positive and number <= ZERO) or (not positive and number < ZERO):
+        raise ValueError(f"{label} must be finite and {'positive' if positive else 'nonnegative'}")
     return number
+
+
+def _positive(value: Any, label: str) -> Decimal:
+    return _decimal(value, label, positive=True)
+
+
+def _text(value: Decimal) -> str:
+    return "0" if value == ZERO else format(value.normalize(), "f")
+
+
+def _matches_legacy_float(expected: Decimal, supplied: Decimal, raw: Any) -> bool:
+    """Accept only a representational ULP error from an old float caller.
+
+    Production authority is persisted and replayed as Decimal text.  A few
+    historical internal callers still pass a float notional or stop-risk
+    projection computed from other floats, so the projection can differ from
+    the exact identity by one binary ULP.  Permit that boundary artifact only
+    for an actual ``float`` input; Decimal and string inputs remain exact.
+    """
+
+    if expected == supplied or not isinstance(raw, float) or not math.isfinite(raw):
+        return expected == supplied
+    magnitude = max(abs(raw), 1.0)
+    ulp = Decimal(str(math.ulp(magnitude)))
+    return abs(expected - supplied) <= ulp * Decimal("2")
 
 
 def canonical_sizing(terms: Mapping[str, Any]) -> CanonicalSizing:
@@ -46,8 +83,7 @@ def canonical_sizing(terms: Mapping[str, Any]) -> CanonicalSizing:
         basis = "quantity"
         if raw_notional not in (None, ""):
             supplied = _positive(raw_notional, "notional")
-            tolerance = max(1e-6, notional * 1e-6)
-            if abs(supplied - notional) > tolerance:
+            if not _matches_legacy_float(notional, supplied, raw_notional):
                 raise ValueError("quantity and notional are mathematically inconsistent")
     else:
         notional = _positive(raw_notional, "notional")
@@ -55,19 +91,15 @@ def canonical_sizing(terms: Mapping[str, Any]) -> CanonicalSizing:
         basis = "notional"
         if raw_qty not in (None, ""):
             supplied = _positive(raw_qty, "quantity")
-            tolerance = max(1e-9, quantity * 1e-6)
-            if abs(supplied - quantity) > tolerance:
+            if not _matches_legacy_float(quantity, supplied, raw_qty):
                 raise ValueError("quantity and notional are mathematically inconsistent")
     raw_stop = terms.get("stop_price", terms.get("intended_stop_price"))
     stop = _positive(raw_stop, "stop price") if raw_stop not in (None, "") else None
-    stop_risk = quantity * max(reference - float(stop or reference), 0.0)
+    stop_risk = quantity * max(reference - (stop or reference), ZERO)
     supplied_risk = terms.get("stop_risk_dollars")
     if supplied_risk not in (None, ""):
-        try:
-            supplied = float(supplied_risk)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("stop risk must be numeric") from exc
-        if not math.isfinite(supplied) or supplied < 0 or abs(supplied - stop_risk) > max(1e-6, stop_risk * 1e-6):
+        supplied = _decimal(supplied_risk, "stop risk")
+        if not _matches_legacy_float(stop_risk, supplied, supplied_risk):
             raise ValueError("stop risk does not match canonical quantity, price, and stop")
     return CanonicalSizing(basis, quantity, notional, stop_risk, reference, stop)
 
@@ -83,11 +115,9 @@ def enforce_ceilings(sizing: CanonicalSizing, terms: Mapping[str, Any], *, requi
             if required:
                 raise ValueError(f"approved {label} ceiling is required")
             continue
-        try:
-            ceiling = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"approved {label} ceiling must be numeric") from exc
-        if not math.isfinite(ceiling) or ceiling < 0:
-            raise ValueError(f"approved {label} ceiling must be finite and nonnegative")
-        if actual > ceiling + 1e-9:
+        ceiling = _decimal(raw, f"approved {label} ceiling")
+        if actual > ceiling and not _matches_legacy_float(actual, ceiling, raw):
             raise RuntimeError(f"canonical {label} exceeds approved ceiling")
+
+
+__all__ = ["CanonicalSizing", "canonical_sizing", "enforce_ceilings"]

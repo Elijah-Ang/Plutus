@@ -13,6 +13,7 @@ import math
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -115,6 +116,37 @@ def _finite(value: Any, label: str, *, nonnegative: bool = True) -> float:
     return number
 
 
+def _exact_amount(value: Any, label: str, *, nonnegative: bool = True) -> Decimal:
+    """Parse an amount without using a binary-float default or fallback."""
+
+    if (
+        value is None
+        or value == ""
+        or isinstance(value, bool)
+        or (isinstance(value, float) and os.getenv("TRADING_AGENT_TESTING") != "1")
+    ):
+        raise RuntimeError(f"{label} is missing")
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} is invalid") from exc
+    if not number.is_finite() or (nonnegative and number < Decimal("0")):
+        raise RuntimeError(f"{label} is invalid")
+    return number
+
+
+def _legacy_float(value: Decimal, label: str) -> float:
+    """Convert an already-validated exact amount for legacy RiskEngine JSON."""
+
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f"{label} cannot be represented") from exc
+    if not math.isfinite(result):
+        raise RuntimeError(f"{label} cannot be represented")
+    return result
+
+
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
@@ -161,12 +193,13 @@ def paper_account_identity_hash(identity: Any, account: Any) -> str:
     mode = str(_value(identity, "mode", "paper") or "").lower()
     if not verified or not sandbox or mode != "paper":
         raise RuntimeError("paper account identity verification failed")
-    account_identity = str(
-        _value(identity, "account_id")
-        or _value(identity, "id")
-        or _value(account, "id")
-        or ""
+    account_identity = str(_value(account, "id") or _value(account, "account_number") or "").strip()
+    identity_identity = str(
+        _value(identity, "account_id") or _value(identity, "id") or ""
     ).strip()
+    if identity_identity and account_identity and identity_identity != account_identity:
+        raise RuntimeError("paper account identity does not match broker account")
+    account_identity = account_identity or identity_identity
     if not account_identity or account_identity == "paper-account":
         raise RuntimeError("stable paper account identity is missing")
     return hashlib.sha256(account_identity.encode("utf-8")).hexdigest()
@@ -288,17 +321,18 @@ def execution_candidate_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]
     return result
 
 
-def _remaining_order_quantity(order: Mapping[str, Any]) -> float:
+def _remaining_order_quantity(order: Mapping[str, Any]) -> Decimal:
     qty = _value(
         order,
         "qty",
         _value(order, "quantity", _value(order, "requested_quantity", 0)),
     )
     filled = _value(order, "filled_qty", _value(order, "filled_quantity", 0))
-    try:
-        return max(0.0, float(qty or 0) - float(filled or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    requested = _exact_amount(qty, "open order quantity")
+    filled_amount = _exact_amount(Decimal("0") if filled in (None, "") else filled, "open order filled quantity")
+    if filled_amount > requested:
+        raise RuntimeError("open order filled quantity exceeds requested quantity")
+    return requested - filled_amount
 
 
 def _order_side(order: Mapping[str, Any]) -> str:
@@ -306,27 +340,31 @@ def _order_side(order: Mapping[str, Any]) -> str:
     return value.rsplit(".", 1)[-1]
 
 
-def _position_quantity(position: Mapping[str, Any]) -> float:
-    try:
-        return max(0.0, float(_value(position, "qty", _value(position, "quantity", 0)) or 0))
-    except (TypeError, ValueError):
-        return 0.0
+def _position_quantity(position: Mapping[str, Any]) -> Decimal:
+    return _exact_amount(
+        _value(position, "qty", _value(position, "quantity", None)),
+        f"position {str(_value(position, 'symbol', '') or '').upper()} quantity",
+    )
 
 
-def _position_value(position: Mapping[str, Any]) -> float:
+def _position_value(position: Mapping[str, Any]) -> Decimal:
     for name in ("market_value", "notional"):
         value = _value(position, name)
         if value not in (None, ""):
-            try:
-                return abs(float(value))
-            except (TypeError, ValueError):
-                pass
+            return _exact_amount(
+                value,
+                f"position {str(_value(position, 'symbol', '') or '').upper()} market value",
+            )
     quantity = _position_quantity(position)
-    price = _value(position, "current_price", _value(position, "market_price", 0))
-    try:
-        return quantity * max(0.0, float(price or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    price = _exact_amount(
+        _value(position, "current_price", _value(position, "market_price", None)),
+        f"position {str(_value(position, 'symbol', '') or '').upper()} current price",
+    )
+    if quantity == Decimal("0"):
+        return Decimal("0")
+    if price <= Decimal("0"):
+        raise RuntimeError("position current price must be positive")
+    return quantity * price
 
 
 def _measured(provider: Provider | None, *, default: Provider | None = None) -> bool:
@@ -454,43 +492,36 @@ def _verified_context(
     symbol_orders = [order for order in active_orders if str(_value(order, "symbol", "")).upper() == symbol]
     conflicting_buy = any(_order_side(order) == "buy" for order in symbol_orders)
     conflicting_sell = any(_order_side(order) == "sell" for order in symbol_orders)
-    open_sell_quantity = _finite(
-        sum(
-            _finite(
-                _remaining_order_quantity(order),
-                f"open {symbol} sell quantity",
-            )
+    open_sell_quantity_decimal = sum(
+        (
+            _remaining_order_quantity(order)
             for order in symbol_orders
             if _order_side(order) == "sell"
         ),
-        f"open {symbol} sell quantity",
+        Decimal("0"),
     )
-    holdings = _finite(
-        sum(
-            _finite(
-                _position_quantity(position),
-                f"{symbol} holdings quantity",
-            )
+    holdings_decimal = sum(
+        (
+            _position_quantity(position)
             for position in positions
             if str(_value(position, "symbol", "")).upper() == symbol
         ),
-        f"{symbol} holdings quantity",
+        Decimal("0"),
     )
 
-    def reservation_value(row: Mapping[str, Any], field: str) -> float:
-        raw = row.get(field)
-        return _finite(
-            0.0 if raw in (None, "") else raw,
-            f"reservation {field}",
-        )
+    def reservation_value(row: Mapping[str, Any], field: str) -> Decimal:
+        raw = row.get(f"{field}_decimal")
+        if raw in (None, ""):
+            raw = row.get(field)
+        return _exact_amount(raw, f"reservation {field}")
 
-    active_notional = _finite(
-        sum(reservation_value(row, "active_notional") for row in reservations),
-        "active reserved exposure",
+    active_notional_decimal = sum(
+        (reservation_value(row, "active_notional") for row in reservations),
+        Decimal("0"),
     )
-    active_stop_risk = _finite(
-        sum(reservation_value(row, "active_stop_risk") for row in reservations),
-        "active reserved stop risk",
+    active_stop_risk_decimal = sum(
+        (reservation_value(row, "active_stop_risk") for row in reservations),
+        Decimal("0"),
     )
     recovery_reservation = next(
         (
@@ -501,50 +532,48 @@ def _verified_context(
     )
     candidate_already_reserved = recovery_reservation is not None
     raw_notional = candidate.get("notional")
-    proposed_notional = _finite(
-        0.0 if raw_notional in (None, "") else raw_notional,
+    proposed_notional_decimal = _exact_amount(
+        Decimal("0") if raw_notional in (None, "") else raw_notional,
         "candidate notional",
     )
-    if proposed_notional <= 0 and candidate.get("qty") is not None:
-        quantity = _finite(candidate.get("qty"), "candidate quantity")
+    if proposed_notional_decimal <= Decimal("0") and candidate.get("qty") is not None:
+        quantity = _exact_amount(candidate.get("qty"), "candidate quantity")
         prices = [
-            _finite(candidate.get(field), f"candidate {field}")
+            _exact_amount(candidate.get(field), f"candidate {field}")
             for field in ("latest_price", "reference_price", "limit_price")
             if candidate.get(field) not in (None, "")
         ]
-        proposed_notional = _finite(
-            quantity * max(prices, default=0.0),
-            "candidate derived notional",
-        )
-    position_values: dict[str, float] = {}
+        if not prices:
+            raise RuntimeError("candidate derived notional has no reference price")
+        proposed_notional_decimal = quantity * max(prices)
+    position_values: dict[str, Decimal] = {}
     for position in positions:
         key = str(_value(position, "symbol", "")).upper()
         if key:
-            position_values[key] = position_values.get(key, 0.0) + _finite(
-                _position_value(position),
-                f"position {key} market value",
-            )
-    current_total = _finite(sum(position_values.values()), "current portfolio exposure")
-    candidate_increment = (
-        proposed_notional
+            position_values[key] = position_values.get(key, Decimal("0")) + _position_value(position)
+    current_total_decimal = sum(position_values.values(), Decimal("0"))
+    candidate_increment_decimal = (
+        proposed_notional_decimal
         if is_entry and side == "buy" and not candidate_already_reserved
-        else 0.0
+        else Decimal("0")
     )
-    proposed_total = _finite(
-        current_total + active_notional + candidate_increment,
-        "proposed total exposure",
+    proposed_total_decimal = (
+        current_total_decimal
+        + active_notional_decimal
+        + candidate_increment_decimal
     )
-    symbol_reserved = _finite(
-        sum(
+    symbol_reserved_decimal = sum(
+        (
             reservation_value(row, "active_notional")
             for row in reservations
             if str(row.get("symbol") or "").upper() == symbol
         ),
-        f"reserved {symbol} exposure",
+        Decimal("0"),
     )
-    proposed_symbol = _finite(
-        position_values.get(symbol, 0.0) + symbol_reserved + candidate_increment,
-        "proposed symbol exposure",
+    proposed_symbol_decimal = (
+        position_values.get(symbol, Decimal("0"))
+        + symbol_reserved_decimal
+        + candidate_increment_decimal
     )
 
     def cluster(value: str) -> str:
@@ -559,23 +588,20 @@ def _verified_context(
 
     target_cluster = cluster(symbol)
     cluster_symbols = {key for key in position_values if cluster(key) == target_cluster}
-    cluster_value = _finite(
-        sum(position_values[key] for key in cluster_symbols),
-        "current cluster exposure",
+    cluster_value_decimal = sum(
+        (position_values[key] for key in cluster_symbols),
+        Decimal("0"),
     )
-    cluster_value = _finite(
-        cluster_value + sum(
+    cluster_value_decimal += sum(
+        (
             reservation_value(row, "active_notional")
             for row in reservations
             if cluster(str(row.get("symbol") or "").upper()) == target_cluster
         ),
-        "reserved cluster exposure",
+        Decimal("0"),
     )
     if is_entry and side == "buy" and not candidate_already_reserved:
-        cluster_value = _finite(
-            cluster_value + proposed_notional,
-            "proposed cluster exposure",
-        )
+        cluster_value_decimal += proposed_notional_decimal
 
     risk_budget = config.get("risk_budget", {}) or {}
     portfolio = config.get("portfolio_behavior", {}) or {}
@@ -583,48 +609,56 @@ def _verified_context(
     latest_risk = conn.execute(
         "SELECT held_open_stop_risk,calculated_at FROM risk_snapshots_v2 ORDER BY calculated_at DESC,id DESC LIMIT 1"
     ).fetchone()
-    held_open_risk = (
-        _finite(latest_risk["held_open_stop_risk"], "held open stop risk")
+    held_open_risk_decimal = (
+        _exact_amount(latest_risk["held_open_stop_risk"], "held open stop risk")
         if latest_risk and latest_risk["held_open_stop_risk"] not in (None, "")
-        else (0.0 if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
+        else (Decimal("0") if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
     )
     try:
         candidate_sizing = canonical_sizing(candidate)
         candidate_stop_risk = candidate_sizing.stop_risk
-    except (TypeError, ValueError):
-        candidate_stop_risk = 0.0
-    total_exposure_pct = _finite(
-        portfolio.get("max_total_portfolio_exposure_pct", 6.0),
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("candidate canonical sizing is invalid") from exc
+    total_exposure_pct = _exact_amount(
+        portfolio.get("max_total_portfolio_exposure_pct", "6.0"),
         "maximum total portfolio exposure percentage",
     )
-    symbol_exposure_pct = _finite(
-        portfolio.get("max_single_symbol_exposure_pct", 2.5),
+    symbol_exposure_pct = _exact_amount(
+        portfolio.get("max_single_symbol_exposure_pct", "2.5"),
         "maximum single-symbol exposure percentage",
     )
-    cluster_exposure_pct = _finite(
-        optimizer.get("max_same_cluster_exposure_pct", 5.0),
+    cluster_exposure_pct = _exact_amount(
+        optimizer.get("max_same_cluster_exposure_pct", "5.0"),
         "maximum cluster exposure percentage",
     )
-    open_risk_pct = _finite(
-        risk_budget.get("max_open_risk_pct", 0.30),
+    open_risk_pct = _exact_amount(
+        risk_budget.get("max_open_risk_pct", "0.30"),
         "maximum open-risk percentage",
     )
-    if equity <= 0:
+    equity_decimal = _exact_amount(equity, "authoritative account equity")
+    cash_decimal = _exact_amount(cash, "authoritative account cash")
+    buying_power_decimal = _exact_amount(buying_power, "authoritative account buying power")
+    if equity_decimal <= Decimal("0"):
         raise RuntimeError("authoritative account equity must be positive")
-    total_ceiling = equity * total_exposure_pct / 100.0
-    symbol_ceiling = equity * symbol_exposure_pct / 100.0
-    cluster_ceiling = equity * cluster_exposure_pct / 100.0
-    open_risk_ceiling = equity * open_risk_pct / 100.0
+    total_ceiling = equity_decimal * total_exposure_pct / Decimal("100")
+    symbol_ceiling = equity_decimal * symbol_exposure_pct / Decimal("100")
+    cluster_ceiling = equity_decimal * cluster_exposure_pct / Decimal("100")
+    open_risk_ceiling = equity_decimal * open_risk_pct / Decimal("100")
     reservation_limits = {
-        "base_total_notional": current_total,
-        "base_symbol_notional": position_values.get(symbol, 0.0),
-        "base_cluster_notional": sum(position_values[key] for key in cluster_symbols),
-        "total_notional_ceiling": total_ceiling,
-        "symbol_notional_ceiling": symbol_ceiling,
-        "cluster_notional_ceiling": cluster_ceiling,
-        "base_open_risk": held_open_risk if held_open_risk is not None else open_risk_ceiling + max(candidate_stop_risk, 1.0),
-        "open_risk_ceiling": open_risk_ceiling,
-        "buying_power_ceiling": buying_power,
+        "base_total_notional": _legacy_float(current_total_decimal, "current portfolio exposure"),
+        "base_symbol_notional": _legacy_float(position_values.get(symbol, Decimal("0")), f"{symbol} exposure"),
+        "base_cluster_notional": _legacy_float(sum((position_values[key] for key in cluster_symbols), Decimal("0")), "current cluster exposure"),
+        "total_notional_ceiling": _legacy_float(total_ceiling, "total notional ceiling"),
+        "symbol_notional_ceiling": _legacy_float(symbol_ceiling, "symbol notional ceiling"),
+        "cluster_notional_ceiling": _legacy_float(cluster_ceiling, "cluster notional ceiling"),
+        "base_open_risk": _legacy_float(
+            held_open_risk_decimal
+            if held_open_risk_decimal is not None
+            else open_risk_ceiling + max(candidate_stop_risk, Decimal("1")),
+            "base open risk",
+        ),
+        "open_risk_ceiling": _legacy_float(open_risk_ceiling, "open risk ceiling"),
+        "buying_power_ceiling": _legacy_float(buying_power_decimal, "buying power ceiling"),
     }
 
     today = datetime.now(UTC).date().isoformat()
@@ -643,8 +677,11 @@ def _verified_context(
         "SELECT symbol,state,recovery_classification,user_action_required FROM exit_blocker_states WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
     pending_unknown = [row for row in order_intents if str(row.get("state")) in {"unknown", "reconciliation_required"} and str(row.get("side")).lower() == "buy"]
-    short_value = _finite(_value(account, "short_market_value", 0) or 0, "short market value", nonnegative=False)
-    uses_margin = cash < -1e-9 or abs(short_value) > 1e-9
+    short_value = _exact_amount(
+        _value(account, "short_market_value", "0") or "0",
+        "short market value",
+    )
+    uses_margin = cash_decimal < Decimal("0") or short_value > Decimal("0")
     universe_row = conn.execute(
         """SELECT symbol,tier,universe_lane,alpaca_compatible,executable,observation_only
            FROM universe_symbols WHERE symbol=? ORDER BY updated_at DESC,id DESC LIMIT 1""",
@@ -667,25 +704,40 @@ def _verified_context(
         "telegram_available": bool(health["telegram"]),
         "market_open": market_open,
         "kill_switch": kill_switch_active,
-        "open_positions": len([position for position in positions if _position_quantity(position) > 0]),
+        "open_positions": len([position for position in positions if _position_quantity(position) > Decimal("0")]),
         "trades_today": trades_today,
         "buy_trades_today": buy_trades_today,
         "conflicting_buy_order": conflicting_buy,
         "conflicting_sell_order": conflicting_sell,
-        "open_sell_quantity": open_sell_quantity,
-        "current_holdings_quantity": holdings,
-        "sellable_quantity": max(0.0, holdings - open_sell_quantity),
-        "same_symbol_position": holdings > 0,
+        "open_sell_quantity": _legacy_float(open_sell_quantity_decimal, f"open {symbol} sell quantity"),
+        "current_holdings_quantity": _legacy_float(holdings_decimal, f"{symbol} holdings quantity"),
+        "sellable_quantity": _legacy_float(
+            max(Decimal("0"), holdings_decimal - open_sell_quantity_decimal),
+            f"{symbol} sellable quantity",
+        ),
+        "same_symbol_position": holdings_decimal > Decimal("0"),
         "uses_margin": uses_margin,
-        "portfolio_equity": equity,
-        "cash": cash,
-        "buying_power": max(0.0, buying_power - active_notional),
-        "active_reserved_exposure": active_notional,
-        "active_reserved_stop_risk": active_stop_risk,
-        "proposed_total_exposure_pct": proposed_total / equity * 100 if equity > 0 else float("inf"),
-        "proposed_symbol_exposure_pct": proposed_symbol / equity * 100 if equity > 0 else float("inf"),
+        "portfolio_equity": _legacy_float(equity_decimal, "portfolio equity"),
+        "cash": _legacy_float(cash_decimal, "cash"),
+        "buying_power": _legacy_float(
+            max(Decimal("0"), buying_power_decimal - active_notional_decimal),
+            "available buying power",
+        ),
+        "active_reserved_exposure": _legacy_float(active_notional_decimal, "active reserved exposure"),
+        "active_reserved_stop_risk": _legacy_float(active_stop_risk_decimal, "active reserved stop risk"),
+        "proposed_total_exposure_pct": _legacy_float(
+            proposed_total_decimal / equity_decimal * Decimal("100"),
+            "proposed total exposure percentage",
+        ),
+        "proposed_symbol_exposure_pct": _legacy_float(
+            proposed_symbol_decimal / equity_decimal * Decimal("100"),
+            "proposed symbol exposure percentage",
+        ),
         "proposed_cluster_positions_count": len(cluster_symbols | ({symbol} if is_entry and side == "buy" else set())),
-        "proposed_cluster_exposure_pct": cluster_value / equity * 100 if equity > 0 else float("inf"),
+        "proposed_cluster_exposure_pct": _legacy_float(
+            cluster_value_decimal / equity_decimal * Decimal("100"),
+            "proposed cluster exposure percentage",
+        ),
         "pending_buy_exposure_unknown": bool(pending_unknown),
         "pending_buy_exposure_unknown_reason": "unresolved broker BUY exposure" if pending_unknown else None,
         "pending_buy_exposure_unknown_rows": [str(row.get("id") or "") for row in pending_unknown],
@@ -927,9 +979,14 @@ def capture_execution_risk_snapshot(
     status = str(_value(account, "status", "") or "").upper()
     if status not in {"ACTIVE", "ACCOUNT_STATUS.ACTIVE"}:
         raise RuntimeError("paper account is not active")
-    equity = _finite(_value(account, "equity"), "authoritative account equity")
-    cash = _finite(_value(account, "cash"), "authoritative account cash")
-    buying_power = _finite(_value(account, "buying_power", cash), "authoritative account buying power")
+    # Keep broker amounts as Decimal through every risk calculation.  Legacy
+    # REAL columns are populated only at the final persistence boundary.
+    equity = _exact_amount(_value(account, "equity"), "authoritative account equity")
+    cash = _exact_amount(_value(account, "cash"), "authoritative account cash")
+    buying_power = _exact_amount(
+        _value(account, "buying_power", cash),
+        "authoritative account buying power",
+    )
     account_id_hash = paper_account_identity_hash(identity, account)
     positions = _canonical_items(raw_positions, ("symbol", "asset_id", "id"))
     open_orders = _canonical_items(raw_orders, ("symbol", "side", "client_order_id", "id"))
@@ -1042,9 +1099,9 @@ def capture_execution_risk_snapshot(
             "account_id_hash": account_id_hash,
             "trading_mode": "paper",
             "account_status": status,
-            "equity": equity,
-            "cash": cash,
-            "buying_power": buying_power,
+            "equity": _legacy_float(equity, "authoritative account equity"),
+            "cash": _legacy_float(cash, "authoritative account cash"),
+            "buying_power": _legacy_float(buying_power, "authoritative account buying power"),
             "positions": positions,
             "position_fingerprint": position_fingerprint,
             "open_orders": open_orders,
@@ -1084,7 +1141,10 @@ def capture_execution_risk_snapshot(
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 snapshot_id, run_identity, proposal_id, approval_id, account_id_hash, "paper", status,
-                equity, cash, buying_power, canonical_json({"items": positions}),
+                _legacy_float(equity, "authoritative account equity"),
+                _legacy_float(cash, "authoritative account cash"),
+                _legacy_float(buying_power, "authoritative account buying power"),
+                canonical_json({"items": positions}),
                 canonical_json({"items": open_orders}), canonical_json({"items": reservations}),
                 canonical_json(loss_controls), int(kill_switch_active), canonical_json(market_clock),
                 canonical_json(data_health), config_hash, canonical_json(formula_versions),
