@@ -285,7 +285,7 @@ def test_research_incomplete_does_not_emit_completed_notification(monkeypatch):
     assert not any(e[0] == "research_completed_trading_blocked_market_closed" for e in FakeStorage.last_instance.audit_events)
 
 
-def test_market_closed_without_research_due_exits_blocked_without_trading(monkeypatch):
+def test_market_closed_without_research_due_is_a_healthy_noop(monkeypatch):
     from app import main
 
     FakeService.instances = []
@@ -298,13 +298,14 @@ def test_market_closed_without_research_due_exits_blocked_without_trading(monkey
     monkeypatch.setattr(main, "run_trading_preflight", _closed_trading)
     monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
 
-    assert main.run_once() == 2
+    assert main.run_once() == 0
 
     service = FakeService.instances[0]
     assert service.run_cycle_called is False
     assert service.crypto_calls == 1
     assert service.notify_called is False
-    assert FakeStorage.last_instance.finished == ("blocked", "market_open")
+    assert FakeStorage.last_instance.finished == ("market_closed_research_not_due", "market_open")
+    assert any(e[0] == "market_closed_research_not_due" for e in FakeStorage.last_instance.audit_events)
 
 
 def test_market_open_runs_trading_without_duplicate_dynamic_universe(monkeypatch):

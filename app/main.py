@@ -199,6 +199,26 @@ def run_once(config_path: str | Path | None = None) -> int:
         storage.audit(run_id, "preflight_split_evaluated", split_detail)
         if not trading_result.passed:
             reasons = "; ".join(failed_trading)
+            research_not_due = not research_results or all(
+                str(result.get("status") or "").lower() == "not_due"
+                or str(result.get("reason") or "").lower() == "not_due"
+                for result in research_results
+            )
+            if market_open_failed and set(failed_trading) == {"market_open"} and research_not_due:
+                # A closed equity session with no scheduled research is a
+                # normal 24/7 runtime no-op, not a blocked or failed scanner
+                # run. Crypto due-checking has already happened above, and a
+                # future due interval will create its own immutable evidence.
+                detail = {
+                    **split_detail,
+                    "research_completed": False,
+                    "research_skipped_reason": "not_due",
+                    "research_status_notification_evaluated": False,
+                }
+                storage.audit(run_id, "market_closed_research_not_due", detail)
+                storage.finish_run(run_id, "market_closed_research_not_due", reasons)
+                logger.info("market_closed_research_not_due")
+                return 0
             if research_ran:
                 market_open_only = market_open_failed and set(failed_trading) == {"market_open"}
                 event_type = "research_completed_trading_blocked_market_closed"

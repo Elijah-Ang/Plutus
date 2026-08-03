@@ -1171,7 +1171,11 @@ class Storage:
         rows = self.fetch_all("SELECT mode FROM runs WHERE id=?", (run_id,))
         if rows and rows[0]["mode"] == "paper":
             now = iso_now()
-            state = "healthy" if status in {"completed", "research_completed_trading_blocked_market_closed"} else ("blocked" if status == "blocked" else "failed")
+            state = "healthy" if status in {
+                "completed",
+                "research_completed_trading_blocked_market_closed",
+                "market_closed_research_not_due",
+            } else ("blocked" if status == "blocked" else "failed")
             self.execute(
                 """INSERT INTO health_heartbeats(
                        component,state,completed_at,successful_at,blocked_reason,
