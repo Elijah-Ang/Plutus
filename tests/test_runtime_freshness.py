@@ -431,7 +431,7 @@ def test_scanner_storage_heartbeat_persists_exact_boot_commit(
     assert started["commit_sha"] == COMMIT
     assert json.loads(started["detail"])["run_id"] == run_id
 
-    storage.finish_run(run_id, "completed")
+    storage.finish_run(run_id, "market_closed_research_not_due", "market_open")
     finished = storage.fetch_all(
         "SELECT state,detail,commit_sha FROM health_heartbeats WHERE component='scanner'"
     )[0]
