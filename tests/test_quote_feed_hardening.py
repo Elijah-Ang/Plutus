@@ -218,7 +218,13 @@ def test_final_abbv_revalidation_blocks_with_evidence_and_zero_broker_calls(tmp_
 
     result, refreshed, refreshed_at, refreshed_iso, age, movement = (
         service._execute_final_revalidation(
-            row, proposal, "ABBV", "sell", False, "abbv-approval"
+            row,
+            proposal,
+            "ABBV",
+            "sell",
+            False,
+            "abbv-approval",
+            now=broker.quote_timestamp,
         )
     )
 
