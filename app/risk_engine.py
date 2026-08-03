@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from .formula_versions import EVIDENCE_VERSION, RISK_DECISION_VERSION, STRATEGY_POLICY_VERSION
@@ -34,6 +35,16 @@ def _dt(value: Any) -> datetime | None:
     else:
         result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
+
+
+def _loss_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 class RiskEngine:
@@ -364,11 +375,19 @@ class RiskEngine:
         daily_confidence = context.get("daily_loss_confidence")
         weekly_confidence = context.get("weekly_loss_confidence")
         metrics_version = context.get("loss_metrics_version")
+        daily_loss_pct_decimal = _loss_decimal(daily_loss_pct)
+        weekly_loss_pct_decimal = _loss_decimal(weekly_loss_pct)
+        daily_loss_dollars_decimal = _loss_decimal(daily_loss_dollars)
+        weekly_loss_dollars_decimal = _loss_decimal(weekly_loss_dollars)
         daily_known = (
-            isinstance(daily_loss_pct, (int, float)) and daily_confidence in {"verified", "reconstructed"}
+            daily_loss_pct_decimal is not None
+            and daily_loss_pct_decimal >= 0
+            and daily_confidence in {"verified", "reconstructed"}
         )
         weekly_known = (
-            isinstance(weekly_loss_pct, (int, float)) and weekly_confidence in {"verified", "reconstructed"}
+            weekly_loss_pct_decimal is not None
+            and weekly_loss_pct_decimal >= 0
+            and weekly_confidence in {"verified", "reconstructed"}
         )
         loss_information_safe = metrics_version == LOSS_METRICS_VERSION and daily_known and weekly_known
         check(
@@ -383,12 +402,16 @@ class RiskEngine:
         weekly_pct_limit = self.risk.get("stop_if_weekly_loss_pct_exceeds", 1.50)
         daily_dollar_limit = self.risk.get("stop_if_daily_loss_dollars_exceeds")
         weekly_dollar_limit = self.risk.get("stop_if_weekly_loss_dollars_exceeds")
-        check("daily_loss", not is_entry or (daily_known and daily_pct_limit is not None and float(daily_loss_pct) < float(daily_pct_limit)), "daily percentage loss limit")
-        check("weekly_loss", not is_entry or (weekly_known and weekly_pct_limit is not None and float(weekly_loss_pct) < float(weekly_pct_limit)), "weekly percentage loss limit")
+        daily_pct_limit_decimal = _loss_decimal(daily_pct_limit)
+        weekly_pct_limit_decimal = _loss_decimal(weekly_pct_limit)
+        check("daily_loss", not is_entry or (daily_known and daily_pct_limit_decimal is not None and daily_loss_pct_decimal < daily_pct_limit_decimal), "daily percentage loss limit")
+        check("weekly_loss", not is_entry or (weekly_known and weekly_pct_limit_decimal is not None and weekly_loss_pct_decimal < weekly_pct_limit_decimal), "weekly percentage loss limit")
         if daily_dollar_limit is not None:
-            check("daily_loss_dollars", not is_entry or (isinstance(daily_loss_dollars, (int, float)) and float(daily_loss_dollars) < float(daily_dollar_limit)), "daily dollar loss limit")
+            daily_limit_decimal = _loss_decimal(daily_dollar_limit)
+            check("daily_loss_dollars", not is_entry or (daily_loss_dollars_decimal is not None and daily_loss_dollars_decimal >= 0 and daily_limit_decimal is not None and daily_loss_dollars_decimal < daily_limit_decimal), "daily dollar loss limit")
         if weekly_dollar_limit is not None:
-            check("weekly_loss_dollars", not is_entry or (isinstance(weekly_loss_dollars, (int, float)) and float(weekly_loss_dollars) < float(weekly_dollar_limit)), "weekly dollar loss limit")
+            weekly_limit_decimal = _loss_decimal(weekly_dollar_limit)
+            check("weekly_loss_dollars", not is_entry or (weekly_loss_dollars_decimal is not None and weekly_loss_dollars_decimal >= 0 and weekly_limit_decimal is not None and weekly_loss_dollars_decimal < weekly_limit_decimal), "weekly dollar loss limit")
 
         created = _dt(proposal.get("created_at"))
         expires = _dt(proposal.get("expires_at"))

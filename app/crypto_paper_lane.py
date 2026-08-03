@@ -31,6 +31,7 @@ from .crypto_market_data import CryptoMarketDataStore
 from .crypto_risk import CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest, load_verified_crypto_sizing
 from .crypto_strategies import CryptoStrategyStore
+from .fixed_point_accounting import legacy_float
 from .formula_versions import (
     CRYPTO_CAPABILITY_FORMULA_VERSION,
     CRYPTO_MARKET_DATA_FORMULA_VERSION,
@@ -487,6 +488,20 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS crypto_paper_telegram_outbox(
+          id TEXT PRIMARY KEY,proposal_id TEXT NOT NULL UNIQUE,
+          chat_id TEXT NOT NULL,rendered_text TEXT NOT NULL,
+          display_fingerprint TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed')),
+          attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+          telegram_message_id TEXT,telegram_chat_id TEXT,error TEXT,
+          created_at TEXT NOT NULL,updated_at TEXT NOT NULL,sent_at TEXT,
+          FOREIGN KEY(proposal_id) REFERENCES crypto_paper_proposals(id)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS crypto_paper_position_management(
           id TEXT PRIMARY KEY,symbol TEXT NOT NULL UNIQUE,quantity TEXT NOT NULL,
           average_entry_price TEXT NOT NULL,peak_price TEXT NOT NULL,stop_price TEXT,
@@ -531,6 +546,7 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_paper_evidence_intent ON crypto_paper_order_evidence(intent_id,captured_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_paper_reconciliation_intent ON crypto_paper_reconciliation_events(intent_id,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_paper_position_symbol ON crypto_paper_position_management(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_paper_telegram_outbox_status ON crypto_paper_telegram_outbox(status,updated_at)")
     # Evidence and fills are append-only.  Updates/deletes would destroy the
     # broker payload that justified a downstream accounting decision.
     conn.execute(
@@ -587,6 +603,26 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
         CREATE TRIGGER IF NOT EXISTS trg_crypto_performance_links_immutable_delete
         BEFORE DELETE ON crypto_performance_links
         BEGIN SELECT RAISE(ABORT,'crypto performance links are immutable'); END
+        """
+    )
+    # The rendered Telegram envelope is immutable.  Only delivery state and
+    # returned Telegram identity may change after the durable send claim.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_crypto_paper_telegram_outbox_authority_immutable_update
+        BEFORE UPDATE ON crypto_paper_telegram_outbox
+        WHEN OLD.proposal_id<>NEW.proposal_id
+          OR OLD.chat_id<>NEW.chat_id
+          OR OLD.rendered_text<>NEW.rendered_text
+          OR OLD.display_fingerprint<>NEW.display_fingerprint
+        BEGIN SELECT RAISE(ABORT,'crypto Telegram outbox authority is immutable'); END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_crypto_paper_telegram_outbox_immutable_delete
+        BEFORE DELETE ON crypto_paper_telegram_outbox
+        BEGIN SELECT RAISE(ABORT,'crypto Telegram outbox is immutable'); END
         """
     )
     if record_migration:
@@ -1001,6 +1037,8 @@ class CryptoPaperLaneStore:
     ) -> CryptoPaperProposal:
         if not str(message_id or "").strip():
             raise CryptoPaperLaneError("Telegram message identity is required")
+        if chat_id in (None, ""):
+            raise CryptoPaperLaneError("Telegram chat identity is required")
         proposal = self.load_proposal(proposal_id, config, now=now)
         rendered = str(rendered_text if rendered_text is not None else format_crypto_paper_proposal(proposal))
         if not rendered.strip():
@@ -1021,7 +1059,27 @@ class CryptoPaperLaneStore:
                 raise CryptoPaperLaneError("crypto paper proposal Telegram display text changed")
             if row["telegram_chat_id"] not in (None, "") and str(chat_id) != str(row["telegram_chat_id"]):
                 raise CryptoPaperLaneError("crypto paper proposal Telegram chat identity changed")
-            bound_chat_id = row["telegram_chat_id"] if row["telegram_chat_id"] not in (None, "") else (None if chat_id is None else str(chat_id))
+            bound_chat_id = row["telegram_chat_id"] if row["telegram_chat_id"] not in (None, "") else str(chat_id)
+            outbox_row = conn.execute(
+                "SELECT * FROM crypto_paper_telegram_outbox WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+            if outbox_row is not None:
+                if (
+                    str(outbox_row["chat_id"]) != str(bound_chat_id)
+                    or str(outbox_row["rendered_text"]) != rendered
+                    or str(outbox_row["display_fingerprint"]) != rendered_fingerprint
+                ):
+                    raise CryptoPaperLaneError("crypto Telegram outbox authority changed")
+                if str(outbox_row["status"]) != "sent":
+                    raise CryptoPaperLaneError(
+                        "crypto Telegram proposal cannot bind before the durable outbox send is sent"
+                    )
+                if (
+                    str(outbox_row["telegram_message_id"] or "") != str(message_id)
+                    or str(outbox_row["telegram_chat_id"] or "") != str(bound_chat_id)
+                ):
+                    raise CryptoPaperLaneError("crypto Telegram outbox message identity changed")
             conn.execute(
                 """UPDATE crypto_paper_proposals
                    SET telegram_message_id=?,telegram_chat_id=?,telegram_display_text=?,
@@ -1031,7 +1089,198 @@ class CryptoPaperLaneStore:
                     rendered_fingerprint, (now or datetime.now(UTC)).astimezone(UTC).isoformat(), proposal_id,
                 ),
             )
+            # Keep the direct binding API backwards-compatible for old callers
+            # and fixtures while preserving the same durable identity in the
+            # outbox.  New production sends already queued and marked the row
+            # sent before they reach this method; legacy direct callers create
+            # a sent row atomically with the binding.
+            conn.execute(
+                """INSERT OR IGNORE INTO crypto_paper_telegram_outbox(
+                   id,proposal_id,chat_id,rendered_text,display_fingerprint,status,attempts,
+                   telegram_message_id,telegram_chat_id,error,created_at,updated_at,sent_at
+                ) VALUES(?,?,?,?,?,'sent',1,?,?,NULL,?,?,?)""",
+                (
+                    str(uuid.uuid4()), proposal_id, bound_chat_id, rendered,
+                    rendered_fingerprint, str(message_id), bound_chat_id,
+                    (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
+                    (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
+                    (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
+                ),
+            )
         return self.load_proposal(proposal_id, config, now=now)
+
+    def queue_telegram_display(
+        self,
+        proposal_id: str,
+        config: Mapping[str, Any],
+        *,
+        chat_id: str,
+        rendered_text: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist the exact outbound display before touching Telegram."""
+
+        if str(chat_id or "").strip() == "":
+            raise CryptoPaperLaneError("Telegram outbox chat identity is required")
+        proposal = self.load_proposal(proposal_id, config, now=now)
+        rendered = str(rendered_text if rendered_text is not None else format_crypto_paper_proposal(proposal))
+        if not rendered.strip():
+            raise CryptoPaperLaneError("Telegram outbox display text is required")
+        display_fingerprint = _sha256(rendered)
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM crypto_paper_telegram_outbox WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["chat_id"]) != str(chat_id)
+                    or str(existing["rendered_text"]) != rendered
+                    or str(existing["display_fingerprint"]) != display_fingerprint
+                ):
+                    raise CryptoPaperLaneError("crypto Telegram outbox authority changed")
+                return dict(existing)
+            outbox_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO crypto_paper_telegram_outbox(
+                   id,proposal_id,chat_id,rendered_text,display_fingerprint,status,attempts,
+                   telegram_message_id,telegram_chat_id,error,created_at,updated_at,sent_at
+                ) VALUES(?,?,?,?,?,'queued',0,NULL,NULL,NULL,?,?,NULL)""",
+                (outbox_id, proposal_id, str(chat_id), rendered, display_fingerprint, current, current),
+            )
+            row = conn.execute(
+                "SELECT * FROM crypto_paper_telegram_outbox WHERE id=?", (outbox_id,)
+            ).fetchone()
+            return dict(row)
+
+    def claim_telegram_display(self, proposal_id: str, *, now: datetime | None = None) -> bool:
+        """Claim a queued send once; ``sending`` is intentionally not retried."""
+
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM crypto_paper_telegram_outbox WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise CryptoPaperLaneError("crypto Telegram outbox row is missing")
+            if str(row["status"]) != "queued":
+                return False
+            conn.execute(
+                "UPDATE crypto_paper_telegram_outbox SET status='sending',attempts=attempts+1,updated_at=? WHERE proposal_id=? AND status='queued'",
+                (current, proposal_id),
+            )
+            return conn.total_changes == 1
+
+    def mark_telegram_sent(
+        self,
+        proposal_id: str,
+        *,
+        message_id: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not str(message_id or "").strip() or not str(chat_id or "").strip():
+            raise CryptoPaperLaneError("Telegram send did not return message and chat identity")
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM crypto_paper_telegram_outbox WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise CryptoPaperLaneError("crypto Telegram outbox row is missing")
+            if str(row["chat_id"]) != str(chat_id):
+                raise CryptoPaperLaneError("Telegram outbox chat identity changed")
+            if str(row["status"]) == "sent":
+                if str(row["telegram_message_id"]) != str(message_id):
+                    raise CryptoPaperLaneError("Telegram outbox message identity changed")
+            elif str(row["status"]) != "sending":
+                raise CryptoPaperLaneError("crypto Telegram outbox is not in sending state")
+            else:
+                conn.execute(
+                    "UPDATE crypto_paper_telegram_outbox SET status='sent',telegram_message_id=?,telegram_chat_id=?,sent_at=?,updated_at=?,error=NULL WHERE proposal_id=?",
+                    (str(message_id), str(chat_id), current, current, proposal_id),
+                )
+            refreshed = conn.execute(
+                "SELECT * FROM crypto_paper_telegram_outbox WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            return dict(refreshed)
+
+    def mark_telegram_failed(
+        self,
+        proposal_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> None:
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE crypto_paper_telegram_outbox SET status='failed',error=?,updated_at=? WHERE proposal_id=? AND status IN ('queued','sending')",
+                (str(reason or "Telegram send failed")[:500], current, proposal_id),
+            )
+
+    def recover_telegram_outbox(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Quarantine ambiguous sends; never resend a row marked ``sending``."""
+
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        recovered: list[dict[str, Any]] = []
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT proposal_id,status FROM crypto_paper_telegram_outbox WHERE status='sending' ORDER BY updated_at,proposal_id"
+            ).fetchall()
+            for row in rows:
+                proposal_id = str(row["proposal_id"])
+                conn.execute(
+                    "UPDATE crypto_paper_telegram_outbox SET status='failed',error=?,updated_at=? WHERE proposal_id=? AND status='sending'",
+                    ("ambiguous Telegram send after restart; no resend", current, proposal_id),
+                )
+                conn.execute(
+                    "UPDATE crypto_paper_proposals SET status='manual_review' WHERE id=? AND status='pending'",
+                    (proposal_id,),
+                )
+                recovered.append({"proposal_id": proposal_id, "status": "manual_review"})
+        return recovered
+
+    def mark_unbound_manual_review(
+        self,
+        proposal_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Make a proposal with no immutable Telegram identity unapprovable.
+
+        A send failure must never leave a pending row that can later be
+        approved without proving which Telegram message and chat displayed the
+        exact authority envelope.
+        """
+
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        safe_reason = str(reason or "telegram identity unavailable")[:500]
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT run_id,status FROM crypto_paper_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise CryptoPaperLaneError("crypto paper proposal is missing")
+            if str(row["status"]) == "pending":
+                conn.execute(
+                    "UPDATE crypto_paper_proposals SET status='manual_review' WHERE id=?",
+                    (proposal_id,),
+                )
+        self.storage.audit(
+            str(row["run_id"] or "") or None,
+            "crypto_paper_proposal_manual_review",
+            {"proposal_id": proposal_id, "reason": safe_reason, "at": current.isoformat()},
+        )
 
     def approve_proposal(
         self,
@@ -1043,6 +1292,7 @@ class CryptoPaperLaneStore:
         raw_message: str | None = None,
         reply_to_message_id: str | None = None,
         chat_id: str | None = None,
+        direct_command: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -1060,7 +1310,9 @@ class CryptoPaperLaneStore:
         stored_text = str(stored_row.get("telegram_display_text") or "")
         stored_display_fingerprint = str(stored_row.get("telegram_display_fingerprint") or "")
         stored_chat_id = stored_row.get("telegram_chat_id")
-        if stored_chat_id not in (None, "") and str(chat_id) != str(stored_chat_id):
+        if stored_chat_id in (None, "") or chat_id in (None, ""):
+            raise CryptoPaperLaneError("crypto paper approval Telegram chat identity is missing")
+        if str(chat_id) != str(stored_chat_id):
             raise CryptoPaperLaneError("crypto paper approval chat identity does not match displayed proposal")
         expected_display_text = format_crypto_paper_proposal(proposal)
         if (
@@ -1069,15 +1321,25 @@ class CryptoPaperLaneStore:
             or _sha256(stored_text) != stored_display_fingerprint
         ):
             raise CryptoPaperLaneError("crypto paper Telegram display binding is missing or changed")
-        if stored_message is not None and str(reply_to_message_id) != str(stored_message):
+        if direct_command and reply_to_message_id in (None, ""):
+            bound_reply_target = str(stored_message)
+        else:
+            bound_reply_target = None if reply_to_message_id in (None, "") else str(reply_to_message_id)
+        if bound_reply_target != str(stored_message):
             raise CryptoPaperLaneError("crypto paper approval reply target does not match displayed Telegram message")
         if not _matches_crypto_command(raw_message, action="approve", proposal_id=proposal.id):
             raise CryptoPaperLaneError("crypto paper approval command is not an allowed direct reply")
+        if direct_command and _normalized_command(raw_message) != f"YES CRYPTO {proposal.id}".upper():
+            raise CryptoPaperLaneError("explicit crypto approval requires YES CRYPTO <proposal-id>")
         approval_id = str(uuid.uuid4())
         body = {
             "id": approval_id, "proposal_id": proposal.id, "sender_id": str(sender_id),
             "raw_message": str(raw_message),
-            "reply_to_message_id": reply_to_message_id, "parsed_action": "approve",
+            # For a standalone explicit-ID command, bind the approval to the
+            # immutable displayed message even though Telegram supplied no
+            # reply object.  The targeting method is therefore auditable from
+            # raw_message plus this exact display identity.
+            "reply_to_message_id": bound_reply_target, "parsed_action": "approve",
             "telegram_chat_id": None if chat_id is None else str(chat_id),
             "display_fingerprint": proposal.display_fingerprint,
             "telegram_message_fingerprint": stored_display_fingerprint,
@@ -1101,7 +1363,7 @@ class CryptoPaperLaneStore:
                    approved_at,display_fingerprint,telegram_chat_id,telegram_message_fingerprint,approval_fingerprint
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    approval_id, proposal.id, str(sender_id), body["raw_message"], reply_to_message_id,
+                    approval_id, proposal.id, str(sender_id), body["raw_message"], bound_reply_target,
                     "approve", "active", current.isoformat(), proposal.display_fingerprint,
                     None if chat_id is None else str(chat_id), stored_display_fingerprint, fingerprint,
                 ),
@@ -1119,6 +1381,7 @@ class CryptoPaperLaneStore:
         raw_message: str | None = None,
         reply_to_message_id: str | None = None,
         chat_id: str | None = None,
+        direct_command: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Persist an exact, sender- and display-bound crypto rejection."""
@@ -1134,18 +1397,26 @@ class CryptoPaperLaneStore:
         display_text = str(row.get("telegram_display_text") or "")
         display_fingerprint = str(row.get("telegram_display_fingerprint") or "")
         stored_chat_id = row.get("telegram_chat_id")
-        if stored_chat_id not in (None, "") and str(chat_id) != str(stored_chat_id):
+        if stored_chat_id in (None, "") or chat_id in (None, ""):
+            raise CryptoPaperLaneError("crypto paper rejection Telegram chat identity is missing")
+        if str(chat_id) != str(stored_chat_id):
             raise CryptoPaperLaneError("crypto paper rejection chat identity does not match displayed proposal")
         if not message_id or not display_text or _sha256(display_text) != display_fingerprint:
             raise CryptoPaperLaneError("crypto paper Telegram display binding is missing or changed")
-        if str(reply_to_message_id) != message_id:
+        if direct_command and reply_to_message_id in (None, ""):
+            bound_reply_target = message_id
+        else:
+            bound_reply_target = None if reply_to_message_id in (None, "") else str(reply_to_message_id)
+        if bound_reply_target != message_id:
             raise CryptoPaperLaneError("crypto paper rejection reply target does not match displayed Telegram message")
         if not _matches_crypto_command(raw_message, action="reject", proposal_id=proposal.id):
             raise CryptoPaperLaneError("crypto paper rejection command is not an allowed direct reply")
+        if direct_command and _normalized_command(raw_message) != f"NO CRYPTO {proposal.id}".upper():
+            raise CryptoPaperLaneError("explicit crypto rejection requires NO CRYPTO <proposal-id>")
         rejection_id = str(uuid.uuid4())
         body = {
             "id": rejection_id, "proposal_id": proposal.id, "sender_id": str(sender_id),
-            "raw_message": str(raw_message), "reply_to_message_id": str(reply_to_message_id),
+            "raw_message": str(raw_message), "reply_to_message_id": bound_reply_target,
             "telegram_chat_id": None if chat_id is None else str(chat_id),
             "telegram_message_fingerprint": display_fingerprint, "rejected_at": current.isoformat(),
         }
@@ -1165,7 +1436,7 @@ class CryptoPaperLaneStore:
                 ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
                     rejection_id, proposal.id, str(sender_id), None if chat_id is None else str(chat_id),
-                    str(raw_message), str(reply_to_message_id),
+                    str(raw_message), bound_reply_target,
                     display_fingerprint, fingerprint, current.isoformat(),
                 ),
             )
@@ -1332,6 +1603,11 @@ class CryptoPaperLaneStore:
             "rejected": "rejected", "canceled": "cancelled", "cancelled": "cancelled", "expired": "expired",
         }.get(value, "submitted")
 
+    @staticmethod
+    def _mapped_proposal_state(intent_state: str) -> str:
+        """Map durable intent terminal states onto the proposal CHECK domain."""
+        return {"cancelled": "rejected"}.get(intent_state, intent_state)
+
     def _record_reconciliation_event_locked(
         self,
         conn: Any,
@@ -1340,18 +1616,30 @@ class CryptoPaperLaneStore:
         event_type: str,
         evidence: Mapping[str, Any],
         now: datetime,
-    ) -> None:
+    ) -> str:
         payload = self._evidence_payload(evidence)
         fingerprint = _hash(payload)
+        event_id = str(uuid.uuid4())
         conn.execute(
             """INSERT OR IGNORE INTO crypto_paper_reconciliation_events(
                id,intent_id,event_type,broker_order_id,client_order_id,payload,payload_fingerprint,created_at
             ) VALUES(?,?,?,?,?,?,?,?)""",
             (
-                str(uuid.uuid4()), intent["id"], event_type, evidence.get("broker_order_id"),
+                event_id, intent["id"], event_type, evidence.get("broker_order_id"),
                 evidence.get("client_order_id"), json_dumps(payload), fingerprint, now.isoformat(),
             ),
         )
+        # The payload fingerprint is the immutable event identity. Returning
+        # the existing row on an idempotent insert keeps callers able to bind a
+        # fill to the durable event even when the same broker snapshot is
+        # observed twice.
+        row = conn.execute(
+            "SELECT id FROM crypto_paper_reconciliation_events WHERE intent_id=? AND event_type=? AND payload_fingerprint=?",
+            (intent["id"], event_type, fingerprint),
+        ).fetchone()
+        if row is None:
+            raise CryptoPaperLaneError("crypto reconciliation event was not persisted")
+        return str(row["id"])
 
     @staticmethod
     def _mark_reconciliation_required_locked(
@@ -1372,6 +1660,244 @@ class CryptoPaperLaneStore:
             "UPDATE crypto_paper_proposals SET status='manual_review' WHERE id=? AND status NOT IN ('rejected','expired')",
             (proposal_id,),
         )
+
+    def expire_pending(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Terminalise local crypto authority that expired before broker I/O.
+
+        Broker-invoked orders are deliberately excluded: an expired local
+        approval is not evidence that the remote order is cancelled. Those
+        orders are reconciled, and (when still open) cancellation is requested
+        through :meth:`cancel_intent` by the recovery sweep.
+        """
+
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        expired: list[dict[str, Any]] = []
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal_rows = conn.execute(
+                """SELECT * FROM crypto_paper_proposals
+                   WHERE status IN ('pending','approved') AND expires_at<=?
+                   ORDER BY expires_at,id""",
+                (current.isoformat(),),
+            ).fetchall()
+            for row in proposal_rows:
+                proposal_id = str(row["id"])
+                conn.execute(
+                    "UPDATE crypto_paper_proposals SET status='expired' WHERE id=? AND status IN ('pending','approved')",
+                    (proposal_id,),
+                )
+                conn.execute(
+                    "UPDATE crypto_paper_approvals SET status='expired' WHERE proposal_id=? AND status IN ('active','consumed')",
+                    (proposal_id,),
+                )
+                expired.append({"proposal_id": proposal_id, "state": "expired", "reason": "proposal_expired_before_intent"})
+            intent_rows = conn.execute(
+                """SELECT i.* FROM crypto_paper_intents i
+                   JOIN crypto_paper_proposals p ON p.id=i.proposal_id
+                   WHERE i.broker_invocation_occurred=0
+                     AND i.state IN ('reserved','submitting','retryable_pre_submission')
+                     AND p.expires_at<=?
+                   ORDER BY i.created_at,i.id""",
+                (current.isoformat(),),
+            ).fetchall()
+            for row in intent_rows:
+                expired.append(
+                    self._expire_intent_locked(
+                        conn, dict(row), now=current,
+                        reason="crypto_paper_proposal_expired_before_broker",
+                    )
+                )
+        return expired
+
+    @staticmethod
+    def _cancel_unsubmitted_locked(
+        conn: Any,
+        row: Mapping[str, Any],
+        *,
+        now: datetime,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Cancel a locally reserved intent before any broker invocation."""
+
+        intent_id = str(row["id"])
+        proposal_id = str(row["proposal_id"])
+        timestamp = now.isoformat()
+        conn.execute(
+            """UPDATE crypto_paper_intents
+               SET state='cancelled',last_error=?,updated_at=?,terminal_at=?
+               WHERE id=? AND broker_invocation_occurred=0""",
+            (str(reason)[:500], timestamp, timestamp, intent_id),
+        )
+        conn.execute(
+            "UPDATE crypto_paper_proposals SET status='rejected' WHERE id=? AND status NOT IN ('filled','expired')",
+            (proposal_id,),
+        )
+        conn.execute(
+            "UPDATE crypto_paper_approvals SET status='expired' WHERE id=? AND status IN ('active','consumed')",
+            (row["approval_id"],),
+        )
+        conn.execute(
+            """UPDATE crypto_paper_reservations
+               SET active_notional='0',active_stop_risk='0',state='released',
+                   released_at=?,release_reason='cancelled',updated_at=?
+               WHERE intent_id=? AND state='active'""",
+            (timestamp, timestamp, intent_id),
+        )
+        CryptoPaperLaneStore._refresh_reservation_fingerprint_locked(conn, intent_id)
+        conn.execute(
+            """INSERT OR IGNORE INTO crypto_paper_order_events(
+                 id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at
+             ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                str(uuid.uuid4()), intent_id, f"{intent_id}:cancelled",
+                row["state"], "cancelled", "cancelled_before_broker",
+                str(reason)[:500], timestamp,
+            ),
+        )
+        refreshed = conn.execute(
+            "SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)
+        ).fetchone()
+        return {
+            **dict(refreshed), "state": "cancelled", "broker_call": False,
+            "broker_invocation_occurred": 0, "last_error": str(reason)[:500],
+        }
+
+    def cancel_intent(
+        self,
+        intent_id: str,
+        config: Mapping[str, Any],
+        broker: Any,
+        *,
+        reason: str = "operator_requested",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Request cancellation through the dedicated crypto paper adapter.
+
+        The durable ``cancel_pending`` transition is committed before the
+        adapter call.  A successful cancel response is not treated as terminal
+        evidence; the next client-order reconciliation must prove the broker's
+        final state and account for any late fill.
+        """
+
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        _policy(config)
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            raw = conn.execute(
+                "SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)
+            ).fetchone()
+            if raw is None:
+                raise CryptoPaperLaneError("crypto paper intent is missing")
+            row = dict(raw)
+            state = str(row["state"] or "")
+            if state in TERMINAL_INTENT_STATES:
+                return row
+            if int(row.get("broker_invocation_occurred") or 0) == 0:
+                return self._cancel_unsubmitted_locked(
+                    conn, row, now=current, reason=reason,
+                )
+            if state in AMBIGUOUS_INTENT_STATES:
+                self._record_reconciliation_event_locked(
+                    conn, intent=row, event_type="cancel_blocked_ambiguous",
+                    evidence={"client_order_id": row["client_order_id"], "reason": str(reason)[:500]},
+                    now=current,
+                )
+                return {**row, "state": state, "broker_call": False, "cancellation_requested": False}
+            if state == "cancel_pending":
+                return {**row, "broker_call": False, "cancellation_requested": True}
+            broker_order_id = str(row.get("broker_order_id") or "").strip()
+            if not broker_order_id:
+                self._record_reconciliation_event_locked(
+                    conn, intent=row, event_type="cancel_blocked_order_identity_missing",
+                    evidence={"client_order_id": row["client_order_id"], "reason": str(reason)[:500]},
+                    now=current,
+                )
+                self._mark_reconciliation_required_locked(
+                    conn, intent_id=intent_id, proposal_id=str(row["proposal_id"]),
+                    error="crypto cancellation requires a broker order identity", now=current,
+                )
+                return {**row, "state": "reconciliation_required", "broker_call": False}
+            conn.execute(
+                "UPDATE crypto_paper_intents SET state='cancel_pending',last_error=?,updated_at=? WHERE id=?",
+                (str(reason)[:500], current.isoformat(), intent_id),
+            )
+            conn.execute(
+                """INSERT INTO crypto_paper_order_events(
+                   id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()), intent_id, f"{intent_id}:cancel_request:{current.isoformat()}",
+                    state, "cancel_pending", "cancel_invocation_marked",
+                    str(reason)[:500], current.isoformat(),
+                ),
+            )
+            pending = dict(conn.execute("SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)).fetchone())
+
+        cancel = getattr(broker, "cancel_crypto_order", None)
+        available = getattr(broker, "crypto_cancellation_available", None)
+        cancellation_available = callable(cancel) and callable(available)
+        if cancellation_available:
+            try:
+                cancellation_available = available() is True
+            except Exception:
+                cancellation_available = False
+        if not cancellation_available:
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._record_reconciliation_event_locked(
+                    conn, intent=pending, event_type="cancel_unavailable",
+                    evidence={"broker_order_id": pending["broker_order_id"], "client_order_id": pending["client_order_id"]},
+                    now=current,
+                )
+                self._mark_reconciliation_required_locked(
+                    conn, intent_id=intent_id, proposal_id=str(pending["proposal_id"]),
+                    error="crypto cancellation adapter unavailable", now=current,
+                )
+            return {**pending, "state": "reconciliation_required", "broker_call": False, "cancellation_requested": False}
+        try:
+            response = cancel(str(pending["broker_order_id"]))
+        except BrokerSubmissionNotAttempted as exc:
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE crypto_paper_intents SET state=?,last_error=?,updated_at=? WHERE id=? AND state='cancel_pending'",
+                    (state, str(exc)[:500], current.isoformat(), intent_id),
+                )
+                self._record_reconciliation_event_locked(
+                    conn, intent=pending, event_type="cancel_not_attempted",
+                    evidence={"broker_order_id": pending["broker_order_id"], "client_order_id": pending["client_order_id"], "error_type": type(exc).__name__},
+                    now=current,
+                )
+            return {**pending, "state": state, "broker_call": False, "cancellation_requested": False, "last_error": str(exc)[:500]}
+        except Exception as exc:
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._record_reconciliation_event_locked(
+                    conn, intent=pending, event_type="cancel_call_ambiguous",
+                    evidence={"broker_order_id": pending["broker_order_id"], "client_order_id": pending["client_order_id"], "error_type": type(exc).__name__},
+                    now=current,
+                )
+                conn.execute(
+                    "UPDATE crypto_paper_intents SET last_error=?,updated_at=? WHERE id=? AND state='cancel_pending'",
+                    (type(exc).__name__, current.isoformat(), intent_id),
+                )
+            return {**pending, "state": "cancel_pending", "broker_call": True, "cancellation_requested": True, "last_error": type(exc).__name__}
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._record_reconciliation_event_locked(
+                conn, intent=pending, event_type="cancel_requested",
+                evidence={
+                    "broker_order_id": pending["broker_order_id"],
+                    "client_order_id": pending["client_order_id"],
+                    "response": str(response),
+                },
+                now=current,
+            )
+            refreshed = dict(conn.execute("SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)).fetchone())
+        return {
+            **refreshed, "state": "cancel_pending", "broker_call": True,
+            "cancellation_requested": True, "response": response,
+        }
 
     def reconcile_intent(self, intent_id: str, config: Mapping[str, Any], broker: Any, *, now: datetime | None = None) -> dict[str, Any]:
         """Resolve a post-invocation intent by broker client-order identity.
@@ -1471,6 +1997,56 @@ class CryptoPaperLaneStore:
                     error=";".join(verification_errors), now=current,
                 )
             return {**intent, "state": "reconciliation_required", "reconciliation": "identity_conflict", "last_error": ";".join(verification_errors)}
+        mapped = self._mapped_order_state(evidence["status"])
+        try:
+            cumulative = _decimal(
+                evidence["cumulative_filled_quantity"],
+                "reconciled cumulative quantity",
+            )
+            requested = _decimal(intent["requested_quantity"], "requested crypto quantity", positive=True)
+        except CryptoPaperLaneError as exc:
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._record_order_evidence_locked(conn, intent=intent, evidence=evidence, captured_at=current)
+                self._record_reconciliation_event_locked(
+                    conn, intent=intent, event_type="fill_quantity_invalid",
+                    evidence={**evidence, "accounting_error": str(exc)}, now=current,
+                )
+                self._mark_reconciliation_required_locked(
+                    conn, intent_id=intent_id, proposal_id=str(intent["proposal_id"]),
+                    error=str(exc), now=current,
+                )
+            return {**intent, "state": "reconciliation_required", "reconciliation": "fill_quantity_invalid", "last_error": str(exc)}
+        terminal_with_fill = mapped in {"cancelled", "expired", "rejected"} and cumulative > ZERO
+        fill_status = evidence["status"] in {"partially_filled", "partial_fill", "filled"}
+        if cumulative == ZERO and mapped in {"filled", "partially_filled"}:
+            invalid_reason = "terminal broker status has no verified cumulative fill" if mapped == "filled" else "partial broker status has no verified cumulative fill"
+        elif cumulative > requested:
+            invalid_reason = "broker cumulative fill exceeds requested quantity"
+        elif mapped == "filled" and cumulative != requested:
+            invalid_reason = "filled broker status does not equal requested cumulative quantity"
+        elif mapped == "partially_filled" and cumulative >= requested:
+            invalid_reason = "partial broker status is inconsistent with requested cumulative quantity"
+        elif cumulative > ZERO and not fill_status and not terminal_with_fill:
+            invalid_reason = "broker status is not compatible with a verified fill"
+        else:
+            invalid_reason = None
+        if invalid_reason:
+            with self.storage.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                evidence_id, evidence_fingerprint = self._record_order_evidence_locked(
+                    conn, intent=intent, evidence=evidence, captured_at=current,
+                )
+                self._record_reconciliation_event_locked(
+                    conn, intent=intent, event_type="fill_state_invalid",
+                    evidence={**evidence, "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint, "accounting_error": invalid_reason},
+                    now=current,
+                )
+                self._mark_reconciliation_required_locked(
+                    conn, intent_id=intent_id, proposal_id=str(intent["proposal_id"]),
+                    error=invalid_reason, now=current,
+                )
+            return {**intent, "state": "reconciliation_required", "reconciliation": "fill_state_invalid", "last_error": invalid_reason}
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             refreshed = conn.execute("SELECT * FROM crypto_paper_intents WHERE id=?", (intent_id,)).fetchone()
@@ -1478,20 +2054,27 @@ class CryptoPaperLaneStore:
                 raise CryptoPaperLaneError("crypto paper intent disappeared during reconciliation")
             intent = dict(refreshed)
             evidence_id, evidence_fingerprint = self._record_order_evidence_locked(conn, intent=intent, evidence=evidence, captured_at=current)
-            mapped = self._mapped_order_state(evidence["status"])
             conn.execute(
                 "UPDATE crypto_paper_intents SET state=?,broker_order_id=?,last_error=NULL,updated_at=?,terminal_at=CASE WHEN ? IN ('rejected','cancelled','expired') THEN ? ELSE terminal_at END WHERE id=?",
                 (mapped, evidence["broker_order_id"], current.isoformat(), mapped, current.isoformat(), intent_id),
             )
-            conn.execute("UPDATE crypto_paper_proposals SET status=? WHERE id=?", (mapped, intent["proposal_id"]))
+            conn.execute(
+                "UPDATE crypto_paper_proposals SET status=? WHERE id=?",
+                (self._mapped_proposal_state(mapped), intent["proposal_id"]),
+            )
             if mapped in {"rejected", "cancelled", "expired"} and _decimal(evidence["cumulative_filled_quantity"], "reconciled cumulative quantity") == ZERO:
                 conn.execute(
                     "UPDATE crypto_paper_reservations SET active_notional='0',active_stop_risk='0',state='released',released_at=?,release_reason=?,updated_at=? WHERE intent_id=? AND state='active'",
                     (current.isoformat(), mapped, current.isoformat(), intent_id),
                 )
                 self._refresh_reservation_fingerprint_locked(conn, intent_id)
-            self._record_reconciliation_event_locked(conn, intent=intent, event_type="order_verified", evidence={**evidence, "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint}, now=current)
-        cumulative = _decimal(evidence["cumulative_filled_quantity"], "reconciled cumulative quantity")
+            reconciliation_event_id = self._record_reconciliation_event_locked(
+                conn,
+                intent=intent,
+                event_type="order_verified",
+                evidence={**evidence, "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint},
+                now=current,
+            )
         with self.storage.connect() as conn:
             fill_totals = conn.execute(
                 "SELECT quantity,price,fees FROM crypto_paper_fills WHERE intent_id=? ORDER BY occurred_at,id",
@@ -1565,7 +2148,9 @@ class CryptoPaperLaneStore:
             try:
                 fill = self.record_verified_fill(
                     intent_id, event_key, delta, delta_price, fee_delta, config,
-                    broker_evidence=evidence, occurred_at=current,
+                    broker_evidence=evidence,
+                    reconciliation_event_id=reconciliation_event_id,
+                    occurred_at=current,
                 )
             except CryptoPaperLaneError as exc:
                 with self.storage.connect() as conn:
@@ -1599,15 +2184,41 @@ class CryptoPaperLaneStore:
         return result
 
     def recover_pending(self, config: Mapping[str, Any], broker: Any, *, now: datetime | None = None) -> list[dict[str, Any]]:
-        """Reconcile all crypto intents that could have reached the broker."""
+        """Expire local authority, cancel stale open orders, then reconcile."""
 
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        results = self.expire_pending(now=current)
         rows = self.storage.fetch_all(
             """SELECT id FROM crypto_paper_intents
                WHERE broker_invocation_occurred=1
                  AND state IN ('submitting','submitted','partially_filled','unknown','reconciliation_required','cancel_pending')
                ORDER BY created_at,id"""
         )
-        return [self.reconcile_intent(str(row["id"]), config, broker, now=now) for row in rows]
+        for raw in rows:
+            intent_id = str(raw["id"])
+            intent_rows = self.storage.fetch_all(
+                """SELECT i.*,p.expires_at FROM crypto_paper_intents i
+                   JOIN crypto_paper_proposals p ON p.id=i.proposal_id WHERE i.id=?""",
+                (intent_id,),
+            )
+            if not intent_rows:
+                continue
+            intent = intent_rows[0]
+            state = str(intent.get("state") or "")
+            if (
+                state in {"submitting", "submitted", "partially_filled"}
+                and _utc(intent["expires_at"], "crypto paper proposal expiry") <= current
+            ):
+                results.append(
+                    self.cancel_intent(
+                        intent_id, config, broker,
+                        reason="crypto_paper_proposal_expired_after_broker_submission",
+                        now=current,
+                    )
+                )
+                continue
+            results.append(self.reconcile_intent(intent_id, config, broker, now=current))
+        return results
 
     @staticmethod
     def _intent(row: Mapping[str, Any]) -> CryptoPaperIntent:
@@ -2171,7 +2782,10 @@ class CryptoPaperLaneStore:
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE crypto_paper_intents SET state=?,broker_order_id=?,updated_at=?,terminal_at=CASE WHEN ? IN ('filled','rejected','cancelled','expired') THEN ? ELSE terminal_at END WHERE id=?", (mapped_state, broker_order_id or None, current.isoformat(), mapped_state, current.isoformat(), intent_id))
-            conn.execute("UPDATE crypto_paper_proposals SET status=? WHERE id=?", (mapped_state, row["proposal_id"]))
+            conn.execute(
+                "UPDATE crypto_paper_proposals SET status=? WHERE id=?",
+                (self._mapped_proposal_state(mapped_state), row["proposal_id"]),
+            )
             if mapped_state in TERMINAL_INTENT_STATES:
                 conn.execute("UPDATE crypto_paper_reservations SET active_notional='0',active_stop_risk='0',state='released',released_at=?,release_reason=?,updated_at=? WHERE intent_id=?", (current.isoformat(), mapped_state, current.isoformat(), intent_id))
                 self._refresh_reservation_fingerprint_locked(conn, intent_id)
@@ -2326,7 +2940,7 @@ class CryptoPaperLaneStore:
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         lifecycle_id, symbol, None, "long", "active", opened_at,
-                        float(original), float(remaining), float(average), "crypto_paper_recovered",
+                        legacy_float(original), legacy_float(remaining), legacy_float(average), "crypto_paper_recovered",
                         occurred_at.isoformat(), occurred_at.isoformat(),
                         _text(original), _text(remaining), _text(average),
                         "exact_source_decimal", "fixed_point_fifo_accounting_v1",
@@ -2361,7 +2975,7 @@ class CryptoPaperLaneStore:
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     lifecycle_id, symbol, None, "long", "active", occurred_at.isoformat(),
-                    float(quantity), float(quantity), float(price), "crypto_paper_lane",
+                    legacy_float(quantity), legacy_float(quantity), legacy_float(price), "crypto_paper_lane",
                     occurred_at.isoformat(), occurred_at.isoformat(),
                     _text(quantity), _text(quantity), _text(price),
                     "exact_source_decimal", "fixed_point_fifo_accounting_v1",
@@ -2407,7 +3021,7 @@ class CryptoPaperLaneStore:
                    decimal_provenance=?,decimal_accounting_version=?
                WHERE id=?""",
             (
-                state, closed_at, float(original), float(remaining), float(average), occurred_at.isoformat(),
+                state, closed_at, legacy_float(original), legacy_float(remaining), legacy_float(average), occurred_at.isoformat(),
                 _text(original), _text(remaining), _text(average),
                 "exact_source_decimal", "fixed_point_fifo_accounting_v1", lifecycle_id,
             ),
@@ -2445,12 +3059,32 @@ class CryptoPaperLaneStore:
         payload = self._evidence_payload(evidence)
         fingerprint = _hash(payload)
         existing = conn.execute(
-            "SELECT id,intent_id,broker_order_id,client_order_id FROM crypto_paper_order_evidence WHERE payload_fingerprint=?",
+            "SELECT * FROM crypto_paper_order_evidence WHERE payload_fingerprint=?",
             (fingerprint,),
         ).fetchone()
         if existing is not None:
             if str(existing["intent_id"]) != str(intent["id"]):
                 raise CryptoPaperLaneError("crypto broker evidence payload is reused across intents")
+            try:
+                existing_payload = json.loads(existing["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CryptoPaperLaneError("persisted crypto broker evidence payload is invalid") from exc
+            if not isinstance(existing_payload, Mapping) or _hash(existing_payload) != str(existing["payload_fingerprint"] or ""):
+                raise CryptoPaperLaneError("persisted crypto broker evidence payload fingerprint is invalid")
+            for column, key in (
+                ("broker_order_id", "broker_order_id"),
+                ("client_order_id", "client_order_id"),
+                ("symbol", "symbol"),
+                ("side", "side"),
+                ("status", "status"),
+                ("requested_quantity", "requested_quantity"),
+                ("requested_notional", "requested_notional"),
+                ("filled_quantity", "cumulative_filled_quantity"),
+                ("filled_average_price", "filled_average_price"),
+                ("fees", "fees"),
+            ):
+                if str(existing[column] or "") != str(evidence.get(key) or ""):
+                    raise CryptoPaperLaneError(f"persisted crypto broker evidence {column} changed")
             return str(existing["id"]), fingerprint
         evidence_id = str(uuid.uuid4())
         conn.execute(
@@ -2503,7 +3137,7 @@ class CryptoPaperLaneStore:
             ).fetchall()
         }
         if not {"performance_setups", "performance_outcomes"}.issubset(tables):
-            return
+            raise CryptoPaperLaneError("crypto Performance Lab schema is incomplete")
         proposal = conn.execute(
             "SELECT run_id,strategy_decision_id,symbol,side,action,display_json FROM crypto_paper_proposals WHERE id=?",
             (intent["proposal_id"],),
@@ -2697,6 +3331,7 @@ class CryptoPaperLaneStore:
         fees: Any,
         evidence: Mapping[str, Any],
         config: Mapping[str, Any],
+        reconciliation_event_id: str,
         occurred_at: datetime,
     ) -> dict[str, Any]:
         intent = dict(intent)
@@ -2709,8 +3344,6 @@ class CryptoPaperLaneStore:
         symbol = str(evidence.get("symbol") or "").upper().replace("-", "/")
         side = str(evidence.get("side") or "").lower()
         evidence_status = _enum(evidence.get("status"))
-        if evidence_status not in {"partially_filled", "partial_fill", "filled"}:
-            raise CryptoPaperLaneError("crypto fill evidence is not a broker fill event")
         if not broker_order_id or not client_order_id:
             raise CryptoPaperLaneError("crypto fill broker order identity is missing")
         if client_order_id != str(intent["client_order_id"]):
@@ -2724,6 +3357,13 @@ class CryptoPaperLaneStore:
         fees_d = _decimal(fees, "crypto fill fees")
         requested = _decimal(intent["requested_quantity"], "requested crypto quantity", positive=True)
         cumulative = _decimal(evidence.get("cumulative_filled_quantity"), "crypto cumulative fill quantity", positive=True)
+        terminal_with_fill = evidence_status in {"cancelled", "canceled", "expired", "rejected"} and cumulative > ZERO
+        if evidence_status not in {"partially_filled", "partial_fill", "filled"} and not terminal_with_fill:
+            raise CryptoPaperLaneError("crypto fill evidence is not a broker fill event")
+        if evidence_status == "filled" and cumulative != requested:
+            raise CryptoPaperLaneError("filled broker status does not equal the requested cumulative quantity")
+        if evidence_status in {"partially_filled", "partial_fill"} and cumulative >= requested:
+            raise CryptoPaperLaneError("partial broker status is inconsistent with the requested cumulative quantity")
         proposal_row = conn.execute(
             "SELECT display_json,config_hash FROM crypto_paper_proposals WHERE id=?",
             (intent["proposal_id"],),
@@ -2747,22 +3387,50 @@ class CryptoPaperLaneStore:
         evidence_id, evidence_fingerprint = self._record_order_evidence_locked(
             conn, intent=intent, evidence=evidence, captured_at=occurred_at,
         )
+        event_id = str(reconciliation_event_id or "").strip()
+        if not event_id:
+            raise CryptoPaperLaneError("crypto fill requires a persisted reconciliation event")
+        event_row = conn.execute(
+            """SELECT id,intent_id,event_type,payload,payload_fingerprint
+               FROM crypto_paper_reconciliation_events
+               WHERE id=? AND intent_id=? AND event_type='order_verified'""",
+            (event_id, intent["id"]),
+        ).fetchone()
+        if event_row is None:
+            raise CryptoPaperLaneError("crypto fill reconciliation event is missing or not an order verification")
+        try:
+            event_payload = json.loads(event_row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CryptoPaperLaneError("crypto fill reconciliation event payload is invalid") from exc
+        if (
+            not isinstance(event_payload, Mapping)
+            or _hash(event_payload) != str(event_row["payload_fingerprint"] or "")
+            or str(event_payload.get("evidence_id") or "") != evidence_id
+            or str(event_payload.get("evidence_fingerprint") or "") != evidence_fingerprint
+            or str(event_payload.get("broker_order_id") or "") != broker_order_id
+            or str(event_payload.get("client_order_id") or "") != client_order_id
+        ):
+            raise CryptoPaperLaneError("crypto fill reconciliation event is not bound to broker evidence")
         payload = {
             "broker_event_key": str(broker_event_key),
+            "intent_id": str(intent["id"]),
             "broker_order_id": broker_order_id, "client_order_id": client_order_id,
             "symbol": symbol, "side": side, "quantity": _text(quantity_d),
             "price": _text(price_d), "fees": _text(fees_d),
             "cumulative_filled_quantity": _text(cumulative),
             "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint,
+            "reconciliation_event_id": event_id,
             "broker_payload": self._evidence_payload(evidence),
         }
         payload_fingerprint = _hash(payload)
         existing = conn.execute(
-            "SELECT id,payload_fingerprint,quantity,price,fees,evidence_fingerprint FROM crypto_paper_fills WHERE broker_event_key=?",
+            "SELECT id,intent_id,payload_fingerprint,quantity,price,fees,evidence_fingerprint FROM crypto_paper_fills WHERE broker_event_key=?",
             (broker_event_key,),
         ).fetchone()
         if existing is not None:
             if (
+                str(existing["intent_id"]) != str(intent["id"])
+                or
                 existing["payload_fingerprint"] != payload_fingerprint
                 or existing["quantity"] != _text(quantity_d)
                 or existing["price"] != _text(price_d)
@@ -2974,6 +3642,569 @@ class CryptoPaperLaneStore:
             "position_lifecycle_id": lifecycle_id,
         }
 
+    def _persist_closed_crypto_outcome(
+        self,
+        lifecycle_id: str,
+        closing_fill_id: str,
+        config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one closed crypto lifecycle as verified actual outcome evidence.
+
+        This projection is intentionally read-only over the execution ledger.
+        It can only use the immutable strategy decision, broker evidence,
+        Performance Lab link, exact FIFO lots/consumptions, and the closed
+        lifecycle.  If any part of that lineage is incomplete, the caller
+        records a deferred audit event instead of manufacturing an outcome.
+        """
+
+        from .crypto_outcomes import CryptoCostModel, build_actual_observation, persist_observation
+
+        def row_decimal(
+            row: Mapping[str, Any],
+            key: str,
+            label: str,
+            *,
+            positive: bool = False,
+            allow_negative: bool = False,
+        ) -> Decimal:
+            value = row.get(key)
+            if value in (None, ""):
+                raise CryptoPaperLaneError(f"actual crypto outcome evidence is missing:{label}")
+            minimum = Decimal("-Infinity") if allow_negative else ZERO
+            return _decimal(value, label, minimum=minimum, positive=positive)
+
+        def parse_timestamp(value: Any, label: str) -> datetime:
+            try:
+                parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError) as exc:
+                raise CryptoPaperLaneError(f"actual crypto outcome timestamp is invalid:{label}") from exc
+            if parsed.tzinfo is None:
+                raise CryptoPaperLaneError(f"actual crypto outcome timestamp is naive:{label}")
+            return parsed.astimezone(UTC)
+
+        def elapsed_hours(start: datetime, end: datetime) -> Decimal:
+            delta = end - start
+            micros = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+            if micros < 0:
+                raise CryptoPaperLaneError("actual crypto outcome timestamps are out of order")
+            return Decimal(micros) / Decimal(3_600_000_000)
+
+        lifecycle_rows = self.storage.fetch_all(
+            "SELECT * FROM position_lifecycles WHERE id=? AND state='closed'",
+            (lifecycle_id,),
+        )
+        if len(lifecycle_rows) != 1:
+            raise CryptoPaperLaneError("actual crypto outcome requires one closed lifecycle")
+        lifecycle = lifecycle_rows[0]
+        symbol = str(lifecycle.get("symbol") or "").upper().replace("-", "/")
+        if not symbol or not str(lifecycle.get("source") or "").startswith("crypto_paper"):
+            raise CryptoPaperLaneError("actual crypto outcome lifecycle is not a crypto paper lifecycle")
+        if str(lifecycle.get("current_quantity_decimal") or "") != "0":
+            raise CryptoPaperLaneError("closed crypto lifecycle still has nonzero exact quantity")
+
+        fill_query = """
+            SELECT
+              l.id AS link_id,l.link_fingerprint,l.evidence_fingerprint AS link_evidence_fingerprint,
+              l.setup_id,l.outcome_id,l.broker_order_id,l.realized_pl,l.side AS link_side,
+              l.action AS link_action,l.quantity AS link_quantity,l.price AS link_price,
+              l.fees AS link_fees,l.fill_type,l.position_lifecycle_id AS link_lifecycle_id,
+              l.order_status,
+              f.id AS fill_id,f.broker_event_key,f.quantity AS fill_quantity,
+              f.price AS fill_price,f.fees AS fill_fees,f.occurred_at AS fill_occurred_at,
+              f.payload AS fill_payload,f.payload_fingerprint AS fill_payload_fingerprint,
+              f.broker_order_id AS fill_broker_order_id,f.client_order_id AS fill_client_order_id,
+              f.evidence_id,f.evidence_fingerprint AS fill_evidence_fingerprint,
+              e.payload AS evidence_payload,e.payload_fingerprint AS evidence_payload_fingerprint,
+              e.verified AS evidence_verified,e.broker_order_id AS evidence_broker_order_id,
+              e.client_order_id AS evidence_client_order_id,
+              i.id AS intent_id,i.proposal_id,i.side AS intent_side,
+              p.strategy_decision_id,p.strategy_decision_fingerprint,p.symbol AS proposal_symbol,
+              p.config_hash AS proposal_config_hash
+            FROM crypto_performance_links l
+            JOIN crypto_paper_fills f ON f.id=l.fill_id
+            JOIN crypto_paper_order_evidence e ON e.id=f.evidence_id
+            JOIN crypto_paper_intents i ON i.id=l.intent_id
+            JOIN crypto_paper_proposals p ON p.id=i.proposal_id
+            WHERE l.position_lifecycle_id=?
+            ORDER BY f.occurred_at,f.id
+        """
+        all_fill_rows = self.storage.fetch_all(fill_query, (lifecycle_id,))
+        if not all_fill_rows:
+            raise CryptoPaperLaneError("actual crypto outcome has no Performance Lab fill lineage")
+
+        def verify_fill_lineage(row: Mapping[str, Any]) -> None:
+            if str(row.get("link_lifecycle_id") or "") != str(lifecycle_id):
+                raise CryptoPaperLaneError("actual crypto outcome Performance Lab lifecycle mismatch")
+            if int(row.get("evidence_verified") or 0) != 1:
+                raise CryptoPaperLaneError("actual crypto outcome fill evidence is not verified")
+            if str(row.get("fill_evidence_fingerprint") or "") != str(row.get("link_evidence_fingerprint") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome fill/link evidence mismatch")
+            if str(row.get("fill_evidence_fingerprint") or "") != str(row.get("evidence_payload_fingerprint") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome fill/evidence payload mismatch")
+            if str(row.get("fill_broker_order_id") or "") != str(row.get("evidence_broker_order_id") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome broker order evidence mismatch")
+            if str(row.get("fill_client_order_id") or "") != str(row.get("evidence_client_order_id") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome client order evidence mismatch")
+            try:
+                fill_payload = json.loads(row.get("fill_payload") or "{}")
+                evidence_payload = json.loads(row.get("evidence_payload") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CryptoPaperLaneError("actual crypto outcome fill evidence JSON is invalid") from exc
+            if not isinstance(fill_payload, Mapping) or _hash(fill_payload) != str(row.get("fill_payload_fingerprint") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome fill payload fingerprint mismatch")
+            if not isinstance(evidence_payload, Mapping) or _hash(evidence_payload) != str(row.get("evidence_payload_fingerprint") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome broker evidence fingerprint mismatch")
+            event_id = str(fill_payload.get("reconciliation_event_id") or "")
+            if not event_id:
+                raise CryptoPaperLaneError("actual crypto outcome fill reconciliation identity is missing")
+            events = self.storage.fetch_all(
+                "SELECT * FROM crypto_paper_reconciliation_events WHERE id=? AND intent_id=? AND event_type='order_verified'",
+                (event_id, row["intent_id"]),
+            )
+            if len(events) != 1:
+                raise CryptoPaperLaneError("actual crypto outcome fill has no order verification event")
+            event = events[0]
+            try:
+                event_payload = json.loads(event.get("payload") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CryptoPaperLaneError("actual crypto outcome order verification JSON is invalid") from exc
+            if (
+                not isinstance(event_payload, Mapping)
+                or _hash(event_payload) != str(event.get("payload_fingerprint") or "")
+                or str(event_payload.get("evidence_id") or "") != str(row.get("evidence_id") or "")
+                or str(event_payload.get("evidence_fingerprint") or "") != str(row.get("fill_evidence_fingerprint") or "")
+                or str(event_payload.get("broker_order_id") or "") != str(row.get("fill_broker_order_id") or "")
+                or str(event_payload.get("client_order_id") or "") != str(row.get("fill_client_order_id") or "")
+            ):
+                raise CryptoPaperLaneError("actual crypto outcome order verification is not bound to the fill")
+            expected_link = _hash({
+                "fill_id": str(row.get("fill_id") or ""),
+                "intent_id": str(row.get("intent_id") or ""),
+                "setup_id": str(row.get("setup_id") or ""),
+                "outcome_id": str(row.get("outcome_id") or ""),
+                "broker_order_id": str(row.get("broker_order_id") or ""),
+                "evidence_fingerprint": str(row.get("link_evidence_fingerprint") or ""),
+                "side": str(row.get("link_side") or ""),
+                "action": str(row.get("link_action") or ""),
+                "quantity": str(row.get("link_quantity") or ""),
+                "price": str(row.get("link_price") or ""),
+                "fees": str(row.get("link_fees") or ""),
+                "fill_type": str(row.get("fill_type") or ""),
+                "position_lifecycle_id": str(row.get("link_lifecycle_id") or ""),
+                "realized_pl": row.get("realized_pl"),
+                "order_status": str(row.get("order_status") or ""),
+            })
+            if expected_link != str(row.get("link_fingerprint") or ""):
+                raise CryptoPaperLaneError("actual crypto outcome Performance Lab link fingerprint mismatch")
+
+        for row in all_fill_rows:
+            verify_fill_lineage(row)
+        entry_rows = [row for row in all_fill_rows if str(row.get("fill_type") or "") == "entry"]
+        exit_rows = [row for row in all_fill_rows if str(row.get("fill_type") or "") == "exit"]
+        if not entry_rows or not exit_rows:
+            raise CryptoPaperLaneError("actual crypto outcome requires verified entry and exit fills")
+        closing_rows = [row for row in exit_rows if str(row.get("fill_id") or "") == str(closing_fill_id)]
+        closing = closing_rows[0] if closing_rows else exit_rows[-1]
+
+        strategy_ids = {str(row.get("strategy_decision_id") or "") for row in entry_rows}
+        strategy_fingerprints = {str(row.get("strategy_decision_fingerprint") or "") for row in entry_rows}
+        if len(strategy_ids) != 1 or "" in strategy_ids or len(strategy_fingerprints) != 1 or "" in strategy_fingerprints:
+            raise CryptoPaperLaneError("actual crypto outcome entry strategy lineage is ambiguous")
+        strategy_id = next(iter(strategy_ids))
+        strategy_fingerprint = next(iter(strategy_fingerprints))
+        strategy_rows = self.storage.fetch_all("SELECT * FROM crypto_strategy_decisions WHERE id=?", (strategy_id,))
+        if len(strategy_rows) != 1:
+            raise CryptoPaperLaneError("actual crypto outcome strategy decision is missing")
+        strategy_row = strategy_rows[0]
+        try:
+            strategy_payload = json.loads(strategy_row.get("decision_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CryptoPaperLaneError("actual crypto outcome strategy decision JSON is invalid") from exc
+        if not isinstance(strategy_payload, Mapping) or _hash(strategy_payload) != str(strategy_row.get("decision_fingerprint") or ""):
+            raise CryptoPaperLaneError("actual crypto outcome strategy decision fingerprint mismatch")
+        if str(strategy_row.get("decision_fingerprint") or "") != strategy_fingerprint:
+            raise CryptoPaperLaneError("actual crypto outcome strategy decision does not match entry proposal")
+        if (
+            str(strategy_row.get("symbol") or "").upper().replace("-", "/") != symbol
+            or not bool(strategy_row.get("signal_eligible"))
+            or not str(strategy_row.get("selected_strategy") or "").strip()
+            or not strategy_row.get("stop_price")
+            or not strategy_row.get("target_price")
+        ):
+            raise CryptoPaperLaneError("actual crypto outcome strategy decision is not an eligible setup")
+        metrics = strategy_payload.get("metrics")
+        if not isinstance(metrics, Mapping) or metrics.get("close") in (None, ""):
+            raise CryptoPaperLaneError("actual crypto outcome strategy entry metric is missing")
+
+        lot_rows = self.storage.fetch_all(
+            "SELECT * FROM position_lots WHERE position_lifecycle_id=? ORDER BY opened_at,id",
+            (lifecycle_id,),
+        )
+        if not lot_rows:
+            raise CryptoPaperLaneError("actual crypto outcome FIFO lots are missing")
+        opening_quantity = ZERO
+        entry_notional = ZERO
+        buy_fees = ZERO
+        stop_risk = ZERO
+        lot_evidence: list[dict[str, Any]] = []
+        entry_timestamp: datetime | None = None
+        for lot in lot_rows:
+            original = row_decimal(lot, "original_quantity_decimal", "lot original quantity", positive=True)
+            remaining = row_decimal(lot, "remaining_quantity_decimal", "lot remaining quantity")
+            unit_cost = row_decimal(lot, "unit_cost_decimal", "lot unit cost", positive=True)
+            lot_fee = row_decimal(lot, "fees_allocated_decimal", "lot allocated fees")
+            lot_risk = row_decimal(lot, "initial_risk_dollars_decimal", "lot initial risk")
+            if remaining != ZERO or str(lot.get("decimal_provenance") or "") != "exact_source_decimal":
+                raise CryptoPaperLaneError("actual crypto outcome FIFO lot is not fully exact and closed")
+            opened = parse_timestamp(lot.get("opened_at"), "lot.opened_at")
+            entry_timestamp = opened if entry_timestamp is None or opened < entry_timestamp else entry_timestamp
+            opening_quantity += original
+            entry_notional += original * unit_cost
+            buy_fees += lot_fee
+            stop_risk += lot_risk
+            lot_evidence.append({
+                "id": str(lot.get("id") or ""),
+                "source_fill_event_key": str(lot.get("source_fill_event_key") or ""),
+                "opened_at": opened.isoformat(),
+                "original_quantity": _text(original),
+                "remaining_quantity": _text(remaining),
+                "unit_cost": _text(unit_cost),
+                "fees_allocated": _text(lot_fee),
+                "initial_risk_dollars": _text(lot_risk),
+                "position_lifecycle_id": str(lot.get("position_lifecycle_id") or ""),
+            })
+        lifecycle_opening = row_decimal(lifecycle, "opening_quantity_decimal", "lifecycle opening quantity", positive=True)
+        if opening_quantity != lifecycle_opening or entry_timestamp is None:
+            raise CryptoPaperLaneError("actual crypto outcome lifecycle and FIFO opening quantities differ")
+
+        consumption_rows = self.storage.fetch_all(
+            "SELECT * FROM lot_consumptions WHERE position_lifecycle_id=? ORDER BY occurred_at,id",
+            (lifecycle_id,),
+        )
+        if not consumption_rows:
+            raise CryptoPaperLaneError("actual crypto outcome FIFO consumption evidence is missing")
+        exit_quantity = ZERO
+        gross_proceeds = ZERO
+        raw_cost_basis = ZERO
+        consumed_buy_fees = ZERO
+        sell_fees = ZERO
+        adjustments = ZERO
+        net_pnl = ZERO
+        consumption_evidence: list[dict[str, Any]] = []
+        for consumption in consumption_rows:
+            quantity = row_decimal(consumption, "quantity_decimal", "consumption quantity", positive=True)
+            proceeds = row_decimal(consumption, "allocated_proceeds_decimal", "consumption proceeds")
+            cost_basis = row_decimal(consumption, "allocated_cost_basis_decimal", "consumption cost basis")
+            allocated_buy_fees = row_decimal(consumption, "allocated_buy_fees_decimal", "consumption buy fees")
+            allocated_sell_fees = row_decimal(consumption, "allocated_sell_fees_decimal", "consumption sell fees")
+            allocated_adjustments = row_decimal(
+                consumption, "allocated_adjustments_decimal", "consumption adjustments", allow_negative=True
+            )
+            realized = row_decimal(
+                consumption, "realized_pnl_decimal", "consumption realized P&L", allow_negative=True
+            )
+            exit_quantity += quantity
+            gross_proceeds += proceeds
+            raw_cost_basis += cost_basis
+            consumed_buy_fees += allocated_buy_fees
+            sell_fees += allocated_sell_fees
+            adjustments += allocated_adjustments
+            net_pnl += realized
+            consumption_evidence.append({
+                "id": str(consumption.get("id") or ""),
+                "broker_event_key": str(consumption.get("broker_event_key") or ""),
+                "lot_id": str(consumption.get("lot_id") or ""),
+                "quantity": _text(quantity),
+                "allocated_proceeds": _text(proceeds),
+                "allocated_cost_basis": _text(cost_basis),
+                "allocated_buy_fees": _text(allocated_buy_fees),
+                "allocated_sell_fees": _text(allocated_sell_fees),
+                "allocated_adjustments": _text(allocated_adjustments),
+                "realized_pnl": _text(realized),
+                "occurred_at": str(consumption.get("occurred_at") or ""),
+            })
+        if exit_quantity != opening_quantity:
+            raise CryptoPaperLaneError("actual crypto outcome exit quantity does not close FIFO quantity")
+
+        pnl_rows = self.storage.fetch_all(
+            "SELECT * FROM crypto_paper_realized_pnl WHERE position_lifecycle_id=? ORDER BY occurred_at,id",
+            (lifecycle_id,),
+        )
+        if not pnl_rows:
+            raise CryptoPaperLaneError("actual crypto outcome realized P&L evidence is missing")
+        pnl_quantity = ZERO
+        pnl_proceeds = ZERO
+        pnl_cost_basis = ZERO
+        pnl_sell_fees = ZERO
+        pnl_net = ZERO
+        pnl_evidence: list[dict[str, Any]] = []
+        for pnl in pnl_rows:
+            pnl_quantity += row_decimal(pnl, "quantity", "realized P&L quantity", positive=True)
+            pnl_proceeds += row_decimal(pnl, "gross_proceeds", "realized P&L proceeds")
+            pnl_cost_basis += row_decimal(pnl, "cost_basis", "realized P&L cost basis")
+            pnl_sell_fees += row_decimal(pnl, "fees", "realized P&L fees")
+            pnl_net += row_decimal(pnl, "realized_pl", "realized P&L", allow_negative=True)
+            pnl_evidence.append({
+                "id": str(pnl.get("id") or ""),
+                "broker_event_key": str(pnl.get("broker_event_key") or ""),
+                "quantity": str(pnl.get("quantity") or ""),
+                "gross_proceeds": str(pnl.get("gross_proceeds") or ""),
+                "cost_basis": str(pnl.get("cost_basis") or ""),
+                "fees": str(pnl.get("fees") or ""),
+                "realized_pl": str(pnl.get("realized_pl") or ""),
+                "evidence_fingerprint": str(pnl.get("evidence_fingerprint") or ""),
+                "confidence": str(pnl.get("confidence") or ""),
+                "occurred_at": str(pnl.get("occurred_at") or ""),
+            })
+        if (
+            pnl_quantity != exit_quantity
+            or pnl_proceeds != gross_proceeds
+            or pnl_cost_basis != raw_cost_basis + consumed_buy_fees
+            or pnl_sell_fees != sell_fees
+            or pnl_net != net_pnl
+        ):
+            raise CryptoPaperLaneError("actual crypto outcome realized P&L does not reconcile to FIFO consumption")
+        expected_net = gross_proceeds - raw_cost_basis - consumed_buy_fees - sell_fees + adjustments
+        if expected_net != net_pnl:
+            raise CryptoPaperLaneError("actual crypto outcome net P&L formula does not reconcile")
+        if entry_notional <= ZERO or gross_proceeds <= ZERO:
+            raise CryptoPaperLaneError("actual crypto outcome turnover is not positive")
+
+        exit_timestamp = parse_timestamp(lifecycle.get("closed_at"), "lifecycle.closed_at")
+        closing_timestamp = parse_timestamp(closing.get("fill_occurred_at"), "closing fill")
+        if exit_timestamp != closing_timestamp:
+            raise CryptoPaperLaneError("actual crypto outcome closing lifecycle timestamp differs from fill")
+        holding_hours = elapsed_hours(entry_timestamp, exit_timestamp)
+        actual_entry_price = entry_notional / opening_quantity
+        exit_price = gross_proceeds / exit_quantity
+        gross_pnl = gross_proceeds - raw_cost_basis + adjustments
+        gross_return = gross_pnl / raw_cost_basis
+        net_return = net_pnl / raw_cost_basis
+        turnover = entry_notional + gross_proceeds
+        total_fees = consumed_buy_fees + sell_fees
+        fee_bps = total_fees / turnover * Decimal("10000")
+        cost_model = CryptoCostModel(
+            version="crypto_actual_fill_cost_v1",
+            fee_bps=fee_bps,
+            spread_bps=ZERO,
+            slippage_bps=ZERO,
+        )
+
+        profitability_policy = (config.get("crypto") or {}).get("profitability_policy") or {}
+        raw_horizon = profitability_policy.get("outcome_horizon_hours")
+        if isinstance(raw_horizon, bool):
+            raise CryptoPaperLaneError("actual crypto outcome horizon policy is invalid")
+        if isinstance(raw_horizon, int):
+            horizon_hours = raw_horizon
+        elif isinstance(raw_horizon, str) and raw_horizon.strip().isdigit():
+            horizon_hours = int(raw_horizon.strip())
+        else:
+            raise CryptoPaperLaneError("actual crypto outcome horizon policy is missing")
+        if horizon_hours <= 0:
+            raise CryptoPaperLaneError("actual crypto outcome horizon policy is invalid")
+
+        setup_payload = {
+            "symbol": symbol,
+            "strategy_decision_id": strategy_id,
+            "strategy_decision_fingerprint": strategy_fingerprint,
+            "research_timestamp": str(strategy_row.get("as_of") or strategy_payload.get("as_of") or ""),
+            # The setup entry is the immutable strategy signal.  The exact
+            # filled entry price is retained separately in input evidence.
+            "entry_price": str(metrics.get("close") or ""),
+            "stop_price": str(strategy_row.get("stop_price") or ""),
+            "target_price": str(strategy_row.get("target_price") or ""),
+            "horizon_hours": horizon_hours,
+            "side": "long",
+            "quantity": _text(opening_quantity),
+            "cost_model": cost_model.to_payload(),
+        }
+        lineage = {
+            "fill": {
+                "id": str(closing.get("fill_id") or ""),
+                "verified": True,
+                "intent_id": str(closing.get("intent_id") or ""),
+                "broker_event_key": str(closing.get("broker_event_key") or ""),
+                "evidence_id": str(closing.get("evidence_id") or ""),
+                "evidence_fingerprint": str(closing.get("fill_evidence_fingerprint") or ""),
+            },
+            "performance_link": {
+                "id": str(closing.get("link_id") or ""),
+                "verified": True,
+                "link_fingerprint": str(closing.get("link_fingerprint") or ""),
+                "evidence_fingerprint": str(closing.get("link_evidence_fingerprint") or ""),
+            },
+            "lifecycle": {
+                "id": str(lifecycle_id),
+                "state": "closed",
+                "symbol": symbol,
+                "closed_at": exit_timestamp.isoformat(),
+            },
+        }
+        input_evidence = {
+            "authority_version": "crypto_actual_outcome_lineage_v1",
+            "lifecycle": {
+                "id": str(lifecycle_id),
+                "symbol": symbol,
+                "source": str(lifecycle.get("source") or ""),
+                "opened_at": str(lifecycle.get("opened_at") or ""),
+                "closed_at": exit_timestamp.isoformat(),
+                "opening_quantity": _text(opening_quantity),
+                "current_quantity": "0",
+            },
+            "strategy_decision": {
+                "id": strategy_id,
+                "fingerprint": strategy_fingerprint,
+                "selected_strategy": str(strategy_row.get("selected_strategy") or ""),
+                "as_of": str(strategy_row.get("as_of") or ""),
+                "input_fingerprint": str(strategy_row.get("input_fingerprint") or ""),
+                "decision_fingerprint": str(strategy_row.get("decision_fingerprint") or ""),
+            },
+            "entry_fills": [
+                {
+                    "fill_id": str(row.get("fill_id") or ""),
+                    "link_id": str(row.get("link_id") or ""),
+                    "broker_event_key": str(row.get("broker_event_key") or ""),
+                    "quantity": str(row.get("fill_quantity") or ""),
+                    "price": str(row.get("fill_price") or ""),
+                    "fees": str(row.get("fill_fees") or ""),
+                    "evidence_id": str(row.get("evidence_id") or ""),
+                    "evidence_fingerprint": str(row.get("fill_evidence_fingerprint") or ""),
+                }
+                for row in entry_rows
+            ],
+            "exit_fills": [
+                {
+                    "fill_id": str(row.get("fill_id") or ""),
+                    "link_id": str(row.get("link_id") or ""),
+                    "broker_event_key": str(row.get("broker_event_key") or ""),
+                    "quantity": str(row.get("fill_quantity") or ""),
+                    "price": str(row.get("fill_price") or ""),
+                    "fees": str(row.get("fill_fees") or ""),
+                    "evidence_id": str(row.get("evidence_id") or ""),
+                    "evidence_fingerprint": str(row.get("fill_evidence_fingerprint") or ""),
+                }
+                for row in exit_rows
+            ],
+            "fifo_lots": lot_evidence,
+            "fifo_consumptions": consumption_evidence,
+            "realized_pnl_events": pnl_evidence,
+            "derived": {
+                "actual_entry_price": _text(actual_entry_price),
+                "actual_exit_price": _text(exit_price),
+                "entry_notional": _text(entry_notional),
+                "gross_proceeds": _text(gross_proceeds),
+                "raw_cost_basis": _text(raw_cost_basis),
+                "gross_pnl": _text(gross_pnl),
+                "net_pnl": _text(net_pnl),
+                "buy_fees": _text(consumed_buy_fees),
+                "sell_fees": _text(sell_fees),
+                "total_fees": _text(total_fees),
+                "risk_amount": _text(stop_risk),
+                "holding_hours": _text(holding_hours),
+                "gross_return": _text(gross_return),
+                "net_return": _text(net_return),
+                "fee_bps": _text(fee_bps),
+            },
+            "lineage": lineage,
+        }
+        outcome_class = "actual_profit" if net_pnl > ZERO else "actual_loss" if net_pnl < ZERO else "actual_flat"
+        gross_r = None if stop_risk <= ZERO else gross_pnl / stop_risk
+        net_r = None if stop_risk <= ZERO else net_pnl / stop_risk
+        observation = build_actual_observation(
+            {
+                "observation_id": f"actual:crypto:{lifecycle_id}",
+                "setup": setup_payload,
+                "status": "completed",
+                "outcome_class": outcome_class,
+                "reason": "verified_closed_crypto_paper_lifecycle",
+                "exit_price": exit_price,
+                "exit_timestamp": exit_timestamp,
+                "holding_hours": holding_hours,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+                "risk_amount": stop_risk,
+                "gross_r_multiple": gross_r,
+                "net_r_multiple": net_r,
+                "input_evidence": input_evidence,
+            },
+            lineage=lineage,
+        )
+        persisted = persist_observation(self.storage, observation)
+        return {
+            "status": "recorded" if persisted.inserted else "duplicate",
+            "lifecycle_id": lifecycle_id,
+            "observation_id": persisted.observation_id,
+            "input_fingerprint": persisted.input_fingerprint,
+        }
+
+    def refresh_closed_crypto_outcomes(
+        self,
+        config: Mapping[str, Any],
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retry only closed, evidenced crypto lifecycles lacking an outcome.
+
+        This is a recovery projection, not an execution path.  It never
+        creates fills or lifecycle state and keeps incomplete historical rows
+        explicitly deferred for later evidence repair.
+        """
+
+        rows = self.storage.fetch_all(
+            """
+            SELECT l.id
+            FROM position_lifecycles l
+            WHERE l.state='closed' AND l.source LIKE 'crypto_paper%'
+              AND EXISTS (
+                SELECT 1 FROM crypto_paper_realized_pnl p
+                WHERE p.position_lifecycle_id=l.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM crypto_profitability_observations o
+                WHERE o.evidence_type='actual'
+                  AND json_extract(o.actual_lineage_json,'$.lifecycle.id')=l.id
+              )
+            ORDER BY l.closed_at,l.id
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            lifecycle_id = str(row.get("id") or "")
+            closing_rows = self.storage.fetch_all(
+                """
+                SELECT f.id
+                FROM crypto_performance_links l
+                JOIN crypto_paper_fills f ON f.id=l.fill_id
+                WHERE l.position_lifecycle_id=? AND l.fill_type='exit'
+                ORDER BY f.occurred_at DESC,f.id DESC
+                LIMIT 1
+                """,
+                (lifecycle_id,),
+            )
+            if not closing_rows:
+                continue
+            closing_fill_id = str(closing_rows[0].get("id") or "")
+            try:
+                result = self._persist_closed_crypto_outcome(lifecycle_id, closing_fill_id, config)
+                results.append(result)
+            except Exception as exc:
+                self.storage.audit(
+                    None,
+                    "crypto_actual_outcome_deferred",
+                    {
+                        "lifecycle_id": lifecycle_id,
+                        "closing_fill_id": closing_fill_id,
+                        "error_type": type(exc).__name__,
+                        "reason": str(exc)[:500],
+                    },
+                    actor="crypto_paper_outcome_recovery",
+                )
+        return results
+
     def record_verified_fill(
         self,
         intent_id: str,
@@ -2984,6 +4215,7 @@ class CryptoPaperLaneStore:
         config: Mapping[str, Any],
         *,
         broker_evidence: Mapping[str, Any],
+        reconciliation_event_id: str,
         occurred_at: datetime | None = None,
     ) -> dict[str, Any]:
         current = (occurred_at or datetime.now(UTC)).astimezone(UTC)
@@ -2995,7 +4227,8 @@ class CryptoPaperLaneStore:
                 raise CryptoPaperLaneError("crypto paper intent is missing")
             result = self._record_verified_fill_locked(
                 conn, intent=intent, broker_event_key=str(broker_event_key), quantity=quantity,
-                price=price, fees=fees, evidence=broker_evidence, config=config, occurred_at=current,
+                price=price, fees=fees, evidence=broker_evidence, config=config,
+                reconciliation_event_id=reconciliation_event_id, occurred_at=current,
             )
         # Attribution is a post-commit projection over the now-authoritative
         # lifecycle and FIFO rows.  A fill remains durable if a report writer
@@ -3020,6 +4253,39 @@ class CryptoPaperLaneStore:
                         json_dumps({"lifecycle_id": lifecycle_id, "error_type": type(exc).__name__}), iso_now(),
                     ),
                 )
+            lifecycle_state = self.storage.fetch_all(
+                "SELECT state FROM position_lifecycles WHERE id=?",
+                (lifecycle_id,),
+            )
+            if lifecycle_state and str(lifecycle_state[0].get("state") or "") == "closed":
+                try:
+                    outcome_result = self._persist_closed_crypto_outcome(
+                        lifecycle_id,
+                        str(result.get("fill_id") or ""),
+                        config,
+                    )
+                    self.storage.audit(
+                        None,
+                        "crypto_actual_outcome_persisted",
+                        outcome_result,
+                        actor="crypto_paper_lane",
+                    )
+                except Exception as exc:
+                    # The fill, FIFO, and lifecycle remain the authority.  A
+                    # sidecar projection may be retried after a transient or
+                    # incomplete historical lineage, but it must never be
+                    # replaced with guessed outcome data.
+                    self.storage.audit(
+                        None,
+                        "crypto_actual_outcome_deferred",
+                        {
+                            "lifecycle_id": lifecycle_id,
+                            "closing_fill_id": str(result.get("fill_id") or ""),
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc)[:500],
+                        },
+                        actor="crypto_paper_lane",
+                    )
         return result
 
     def record_fill(
@@ -3032,6 +4298,7 @@ class CryptoPaperLaneStore:
         config: Mapping[str, Any],
         *,
         broker_evidence: Mapping[str, Any] | None = None,
+        reconciliation_event_id: str | None = None,
         occurred_at: datetime | None = None,
     ) -> dict[str, Any]:
         """Compatibility wrapper that refuses caller-synthesized fills."""
@@ -3040,7 +4307,9 @@ class CryptoPaperLaneStore:
             raise CryptoPaperLaneError("verified broker evidence is required for a crypto fill")
         return self.record_verified_fill(
             intent_id, broker_event_key, quantity, price, fees, config,
-            broker_evidence=broker_evidence, occurred_at=occurred_at,
+            broker_evidence=broker_evidence,
+            reconciliation_event_id=reconciliation_event_id or "",
+            occurred_at=occurred_at,
         )
 
     def portfolio_metrics(self, broker: Any, config: Mapping[str, Any] | None = None, *, now: datetime | None = None) -> dict[str, Any]:
@@ -3170,11 +4439,51 @@ class CryptoPaperLaneStore:
             "crypto_paper_closed_lifecycle_with_open_fifo_lots": "SELECT COUNT(*) n FROM position_lifecycles l JOIN position_lots p ON p.position_lifecycle_id=l.id WHERE l.source LIKE 'crypto_paper%' AND l.state='closed' AND COALESCE(p.remaining_quantity_decimal,'0')<>'0'",
             "crypto_paper_active_lifecycle_without_open_fifo_lots": "SELECT COUNT(*) n FROM position_lifecycles l WHERE l.source LIKE 'crypto_paper%' AND l.state='active' AND NOT EXISTS (SELECT 1 FROM position_lots p WHERE p.position_lifecycle_id=l.id AND COALESCE(p.remaining_quantity_decimal,'0')<>'0')",
             "crypto_paper_closed_lifecycle_without_attribution": "SELECT COUNT(*) n FROM position_lifecycles l LEFT JOIN profit_attribution_records a ON a.position_lifecycle_id=l.id WHERE l.source LIKE 'crypto_paper%' AND l.state='closed' AND a.id IS NULL",
+            "crypto_paper_closed_lifecycle_without_actual_outcome": """SELECT COUNT(*) n
+                FROM position_lifecycles l
+                WHERE l.source LIKE 'crypto_paper%' AND l.state='closed'
+                  AND EXISTS (
+                    SELECT 1 FROM crypto_paper_realized_pnl p
+                    WHERE p.position_lifecycle_id=l.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM crypto_profitability_observations o
+                    WHERE o.evidence_type='actual'
+                      AND json_extract(o.actual_lineage_json,'$.lifecycle.id')=l.id
+                  )""",
             "crypto_paper_performance_link_lifecycle_mismatch": "SELECT COUNT(*) n FROM crypto_performance_links l JOIN crypto_paper_intents i ON i.id=l.intent_id WHERE COALESCE(l.position_lifecycle_id,'')<>COALESCE(i.position_lifecycle_id,'')",
             "crypto_paper_reservation_without_intent": "SELECT COUNT(*) n FROM crypto_paper_reservations r LEFT JOIN crypto_paper_intents i ON i.id=r.intent_id WHERE i.id IS NULL",
             "crypto_paper_active_reservation_symbol_mismatch": "SELECT COUNT(*) n FROM crypto_paper_reservations r JOIN crypto_paper_intents i ON i.id=r.intent_id WHERE r.symbol<>i.symbol",
-            "crypto_paper_approval_display_mismatch": "SELECT COUNT(*) n FROM crypto_paper_approvals a JOIN crypto_paper_proposals p ON p.id=a.proposal_id WHERE a.raw_message<>('YES CRYPTO '||p.id) OR a.display_fingerprint<>p.display_fingerprint OR a.telegram_message_fingerprint<>p.telegram_display_fingerprint OR a.reply_to_message_id<>p.telegram_message_id",
-            "crypto_paper_pending_telegram_binding_missing": "SELECT COUNT(*) n FROM crypto_paper_proposals WHERE status='pending' AND (telegram_message_id IS NULL OR telegram_display_text IS NULL OR telegram_display_fingerprint IS NULL)",
+            "crypto_paper_approval_display_mismatch": "SELECT COUNT(*) n FROM crypto_paper_approvals a JOIN crypto_paper_proposals p ON p.id=a.proposal_id WHERE a.display_fingerprint<>p.display_fingerprint OR a.telegram_message_fingerprint<>p.telegram_display_fingerprint OR a.reply_to_message_id<>p.telegram_message_id OR a.telegram_chat_id IS NULL OR p.telegram_chat_id IS NULL OR a.telegram_chat_id<>p.telegram_chat_id",
+            "crypto_paper_pending_telegram_binding_missing": "SELECT COUNT(*) n FROM crypto_paper_proposals WHERE status='pending' AND (telegram_message_id IS NULL OR telegram_chat_id IS NULL OR telegram_display_text IS NULL OR telegram_display_fingerprint IS NULL)",
+            "crypto_paper_order_evidence_payload_mismatch": "SELECT COUNT(*) n FROM crypto_paper_order_evidence WHERE payload IS NULL OR payload_fingerprint IS NULL",
+            "crypto_paper_fill_payload_binding_mismatch": "SELECT COUNT(*) n FROM crypto_paper_fills WHERE payload IS NULL OR payload_fingerprint IS NULL OR evidence_id IS NULL OR evidence_fingerprint IS NULL",
+            "crypto_paper_fills_without_order_verified_event": """SELECT COUNT(*) n FROM crypto_paper_fills f
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM crypto_paper_reconciliation_events r
+                  WHERE r.id=json_extract(f.payload,'$.reconciliation_event_id')
+                    AND r.intent_id=f.intent_id AND r.event_type='order_verified'
+                )""",
+            "crypto_paper_telegram_outbox_orphan": """SELECT COUNT(*) n
+                FROM crypto_paper_telegram_outbox o
+                LEFT JOIN crypto_paper_proposals p ON p.id=o.proposal_id
+                WHERE p.id IS NULL""",
+            "crypto_paper_telegram_outbox_ambiguous_sending": """SELECT COUNT(*) n
+                FROM crypto_paper_telegram_outbox WHERE status='sending'""",
+            "crypto_paper_telegram_outbox_sent_identity_missing": """SELECT COUNT(*) n
+                FROM crypto_paper_telegram_outbox
+                WHERE status='sent' AND (telegram_message_id IS NULL OR telegram_chat_id IS NULL)""",
+            "crypto_paper_telegram_outbox_proposal_binding_mismatch": """SELECT COUNT(*) n
+                FROM crypto_paper_telegram_outbox o
+                JOIN crypto_paper_proposals p ON p.id=o.proposal_id
+                WHERE o.status='sent' AND (
+                  p.telegram_message_id IS NULL OR p.telegram_chat_id IS NULL
+                  OR p.telegram_display_text IS NULL OR p.telegram_display_fingerprint IS NULL
+                  OR p.telegram_message_id<>o.telegram_message_id
+                  OR p.telegram_chat_id<>o.telegram_chat_id
+                  OR p.telegram_display_text<>o.rendered_text
+                  OR p.telegram_display_fingerprint<>o.display_fingerprint
+                )""",
         }
         result: dict[str, int] = {}
         with self.storage.connect() as conn:
@@ -3212,6 +4521,83 @@ class CryptoPaperLaneStore:
                         result["crypto_paper_fill_payload_fingerprint_mismatch"] = result.get("crypto_paper_fill_payload_fingerprint_mismatch", 0) + 1
                 except (TypeError, ValueError, json.JSONDecodeError):
                     result["crypto_paper_fill_payload_invalid"] = result.get("crypto_paper_fill_payload_invalid", 0) + 1
+                    payload = {}
+                if isinstance(payload, Mapping):
+                    if not str(payload.get("reconciliation_event_id") or ""):
+                        result["crypto_paper_fill_payload_binding_mismatch"] = result.get("crypto_paper_fill_payload_binding_mismatch", 0) + 1
+                    for key, expected in (
+                        ("intent_id", str(fill["intent_id"])),
+                        ("broker_event_key", str(fill["broker_event_key"])),
+                        ("broker_order_id", str(fill["broker_order_id"] or "")),
+                        ("client_order_id", str(fill["client_order_id"] or "")),
+                        ("quantity", str(fill["quantity"] or "")),
+                        ("price", str(fill["price"] or "")),
+                        ("fees", str(fill["fees"] or "")),
+                        ("evidence_id", str(fill["evidence_id"] or "")),
+                        ("evidence_fingerprint", str(fill["evidence_fingerprint"] or "")),
+                    ):
+                        if str(payload.get(key) or "") != expected:
+                            result["crypto_paper_fill_payload_binding_mismatch"] = result.get("crypto_paper_fill_payload_binding_mismatch", 0) + 1
+                            break
+                    if not isinstance(payload.get("broker_payload"), Mapping):
+                        result["crypto_paper_fill_payload_binding_mismatch"] = result.get("crypto_paper_fill_payload_binding_mismatch", 0) + 1
+                    event_id = str(payload.get("reconciliation_event_id") or "")
+                    event = conn.execute(
+                        "SELECT intent_id,event_type,payload,payload_fingerprint FROM crypto_paper_reconciliation_events WHERE id=?",
+                        (event_id,),
+                    ).fetchone()
+                    if event is None or str(event["intent_id"]) != str(fill["intent_id"]) or event["event_type"] != "order_verified":
+                        result["crypto_paper_fills_without_order_verified_event"] = result.get("crypto_paper_fills_without_order_verified_event", 0) + 1
+                    else:
+                        try:
+                            event_payload = json.loads(event["payload"] or "{}")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            event_payload = {}
+                        if (
+                            not isinstance(event_payload, Mapping)
+                            or _hash(event_payload) != str(event["payload_fingerprint"] or "")
+                            or str(event_payload.get("evidence_id") or "") != str(fill["evidence_id"] or "")
+                            or str(event_payload.get("evidence_fingerprint") or "") != str(fill["evidence_fingerprint"] or "")
+                        ):
+                            result["crypto_paper_reconciliation_event_binding_mismatch"] = result.get("crypto_paper_reconciliation_event_binding_mismatch", 0) + 1
+            evidence_rows = conn.execute(
+                "SELECT * FROM crypto_paper_order_evidence ORDER BY captured_at,id"
+            ).fetchall()
+            for evidence in evidence_rows:
+                try:
+                    evidence_payload = json.loads(evidence["payload"] or "{}")
+                    if not isinstance(evidence_payload, Mapping) or _hash(evidence_payload) != str(evidence["payload_fingerprint"] or ""):
+                        raise ValueError("evidence payload fingerprint mismatch")
+                    for key, expected in (
+                        ("broker_order_id", str(evidence["broker_order_id"] or "")),
+                        ("client_order_id", str(evidence["client_order_id"] or "")),
+                        ("symbol", str(evidence["symbol"] or "")),
+                        ("side", str(evidence["side"] or "")),
+                        ("status", str(evidence["status"] or "")),
+                        ("requested_quantity", str(evidence["requested_quantity"] or "")),
+                        ("requested_notional", str(evidence["requested_notional"] or "")),
+                        ("cumulative_filled_quantity", str(evidence["filled_quantity"] or "")),
+                        ("filled_average_price", str(evidence["filled_average_price"] or "")),
+                        ("fees", str(evidence["fees"] or "")),
+                    ):
+                        if str(evidence_payload.get(key) or "") != expected:
+                            raise ValueError(f"evidence field mismatch:{key}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result["crypto_paper_order_evidence_payload_mismatch"] = result.get("crypto_paper_order_evidence_payload_mismatch", 0) + 1
+            intent_rows = conn.execute(
+                "SELECT id,state,requested_quantity FROM crypto_paper_intents ORDER BY id"
+            ).fetchall()
+            for intent_row in intent_rows:
+                try:
+                    requested = _decimal(intent_row["requested_quantity"], "crypto integrity requested quantity", positive=True)
+                    total = fills_by_intent.get(str(intent_row["id"]), ZERO)
+                    state = str(intent_row["state"] or "")
+                    if state == "filled" and total != requested:
+                        result["crypto_paper_filled_quantity_state_mismatch"] = result.get("crypto_paper_filled_quantity_state_mismatch", 0) + 1
+                    if state == "partially_filled" and not (ZERO < total < requested):
+                        result["crypto_paper_partial_quantity_state_mismatch"] = result.get("crypto_paper_partial_quantity_state_mismatch", 0) + 1
+                except CryptoPaperLaneError:
+                    result["crypto_paper_malformed_intent_quantity"] = result.get("crypto_paper_malformed_intent_quantity", 0) + 1
             link_rows = conn.execute(
                 """SELECT l.*,f.evidence_fingerprint AS fill_evidence_fingerprint,
                           i.client_order_id AS intent_client_order_id,
@@ -3262,12 +4648,18 @@ class CryptoPaperLaneStore:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     result["crypto_paper_proposal_payload_invalid"] = result.get("crypto_paper_proposal_payload_invalid", 0) + 1
             pending_rows = conn.execute(
-                "SELECT id,telegram_message_id,telegram_chat_id,telegram_display_text,telegram_display_fingerprint FROM crypto_paper_proposals WHERE telegram_message_id IS NOT NULL OR telegram_display_text IS NOT NULL OR telegram_display_fingerprint IS NOT NULL"
+                "SELECT id,telegram_message_id,telegram_chat_id,telegram_display_text,telegram_display_fingerprint FROM crypto_paper_proposals WHERE telegram_message_id IS NOT NULL OR telegram_chat_id IS NOT NULL OR telegram_display_text IS NOT NULL OR telegram_display_fingerprint IS NOT NULL"
             ).fetchall()
             for proposal in pending_rows:
                 text_value = str(proposal["telegram_display_text"] or "")
                 stored_fingerprint = str(proposal["telegram_display_fingerprint"] or "")
-                if not text_value or not stored_fingerprint or _sha256(text_value) != stored_fingerprint:
+                if (
+                    not proposal["telegram_message_id"]
+                    or not proposal["telegram_chat_id"]
+                    or not text_value
+                    or not stored_fingerprint
+                    or _sha256(text_value) != stored_fingerprint
+                ):
                     result["crypto_paper_telegram_binding_mismatch"] = result.get("crypto_paper_telegram_binding_mismatch", 0) + 1
             reservation_rows = conn.execute(
                 "SELECT * FROM crypto_paper_reservations ORDER BY id"
@@ -3308,11 +4700,29 @@ class CryptoPaperLaneStore:
                 except CryptoPaperLaneError:
                     result["crypto_paper_malformed_lot_decimal"] = result.get("crypto_paper_malformed_lot_decimal", 0) + 1
             pnl_rows = conn.execute(
-                "SELECT * FROM crypto_paper_realized_pnl"
+                """SELECT p.*,e.symbol AS ledger_symbol,e.quantity_decimal AS ledger_quantity,
+                          e.gross_proceeds_decimal AS ledger_gross_proceeds,
+                          e.cost_basis_decimal AS ledger_cost_basis,e.fees_decimal AS ledger_fees,
+                          e.realized_pl_decimal AS ledger_realized_pl,e.occurred_at AS ledger_occurred_at
+                   FROM crypto_paper_realized_pnl p
+                   LEFT JOIN realized_pnl_events e ON e.broker_event_key=p.broker_event_key
+                      AND e.source='crypto_paper_fill'"""
             ).fetchall()
             for pnl in pnl_rows:
                 if str(pnl["pnl_fingerprint"] or "") != _crypto_pnl_fingerprint(dict(pnl)):
                     result["crypto_paper_realized_pnl_fingerprint_mismatch"] = result.get("crypto_paper_realized_pnl_fingerprint_mismatch", 0) + 1
+                for field, ledger_field in (
+                    ("symbol", "ledger_symbol"),
+                    ("quantity", "ledger_quantity"),
+                    ("gross_proceeds", "ledger_gross_proceeds"),
+                    ("cost_basis", "ledger_cost_basis"),
+                    ("fees", "ledger_fees"),
+                    ("realized_pl", "ledger_realized_pl"),
+                    ("occurred_at", "ledger_occurred_at"),
+                ):
+                    if pnl[ledger_field] is None or str(pnl[field] or "") != str(pnl[ledger_field] or ""):
+                        result["crypto_paper_realized_pnl_ledger_mismatch"] = result.get("crypto_paper_realized_pnl_ledger_mismatch", 0) + 1
+                        break
             approval_rows = conn.execute(
                 "SELECT * FROM crypto_paper_approvals ORDER BY id"
             ).fetchall()
@@ -3331,6 +4741,19 @@ class CryptoPaperLaneStore:
                 })
                 if str(approval["approval_fingerprint"] or "") != expected_approval:
                     result["crypto_paper_approval_fingerprint_mismatch"] = result.get("crypto_paper_approval_fingerprint_mismatch", 0) + 1
+                proposal = conn.execute(
+                    "SELECT id,telegram_chat_id FROM crypto_paper_proposals WHERE id=?",
+                    (approval["proposal_id"],),
+                ).fetchone()
+                if (
+                    proposal is None
+                    or not _matches_crypto_command(
+                        approval["raw_message"], action="approve", proposal_id=str(proposal["id"])
+                    )
+                    or not approval["telegram_chat_id"]
+                    or str(approval["telegram_chat_id"]) != str(proposal["telegram_chat_id"] or "")
+                ):
+                    result["crypto_paper_approval_display_mismatch"] = result.get("crypto_paper_approval_display_mismatch", 0) + 1
         return result
 
 

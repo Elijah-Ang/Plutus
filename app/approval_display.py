@@ -18,6 +18,12 @@ from .utils import iso_now
 DISPLAY_SCHEMA_VERSION = "telegram_approval_display_v2_equity_quote_feed"
 
 
+def _decimal_text(value: Any) -> str:
+    """Render exact sizing values as stable strings inside JSON authority."""
+
+    return format(value.normalize(), "f") if value else "0"
+
+
 def display_envelope(
     proposal: Mapping[str, Any],
     *,
@@ -78,10 +84,10 @@ def display_envelope(
                 sizing = None
     if sizing is None:
         raise RuntimeError("display authority requires canonical sizing and applicable ceilings")
-    base["max_quantity"] = sizing.quantity
-    base["max_notional"] = sizing.notional
+    base["max_quantity"] = _decimal_text(sizing.quantity)
+    base["max_notional"] = _decimal_text(sizing.notional)
     if str(base.get("action") or "") in {"entry", "add"}:
-        base["max_stop_risk"] = sizing.stop_risk
+        base["max_stop_risk"] = _decimal_text(sizing.stop_risk)
     applicable = [base["max_quantity"] if request_basis == "quantity" else base["max_notional"]]
     if str(base.get("action") or "") in {"entry", "add"}:
         applicable.append(base.get("max_stop_risk"))

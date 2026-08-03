@@ -35,9 +35,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ASSET_CLASSES = frozenset({"equity", "etf", "crypto"})
 EXECUTION_LANES = frozenset({"operational_paper", "research_only", "supervised_paper"})
 ACTIONS = frozenset({"entry", "add", "rotation_entry"})
-SOURCE_TYPES = frozenset(
-    {"candidate_profitability_decision", "crypto_profitability_research"}
-)
+SOURCE_TYPES = frozenset({"candidate_profitability_decision"})
 
 
 class CrossAssetAllocationError(ValueError):
@@ -259,6 +257,10 @@ class CrossAssetCandidate:
         source_type = _required_text(self.source_type, "source_type")
         if source_type not in SOURCE_TYPES:
             raise CrossAssetAllocationError("source_type is unsupported")
+        if asset_class == "crypto" and source_type != "candidate_profitability_decision":
+            raise CrossAssetAllocationError(
+                "crypto candidates require a persisted profitability decision"
+            )
         canonical = {
             "candidate_id": _required_text(self.candidate_id, "candidate_id"),
             "source_type": source_type,
@@ -1390,6 +1392,26 @@ class CrossAssetAllocationStore:
         self.storage = storage
         self.config = config
 
+    def _verify_candidate_sources(self, candidates: Sequence[CrossAssetCandidate]) -> None:
+        """Reload every source authority before persisting an allocation plan."""
+
+        from .crypto_profitability import CryptoProfitabilityStore
+        crypto_store = CryptoProfitabilityStore(self.storage)
+        current_hash = _hash(self.config.get("effective_config_hash"), "effective_config_hash")
+        for candidate in candidates:
+            if candidate.source_type != "candidate_profitability_decision":
+                raise CrossAssetAllocationError("candidate source type is not a persisted profitability decision")
+            if candidate.asset_class == "crypto":
+                decision = crypto_store.load_verified(candidate.source_id)
+                if (
+                    not decision.eligible
+                    or decision.symbol != _required_text(candidate.symbol, "candidate.symbol").upper()
+                    or decision.config_hash != current_hash
+                    or candidate.source_fingerprint != decision.decision_fingerprint
+                    or candidate.source_authoritative is not True
+                ):
+                    raise CrossAssetAllocationError("crypto candidate profitability authority is not current")
+
     @staticmethod
     def _payload(
         plan: CrossAssetAllocationPlan,
@@ -1450,6 +1472,7 @@ class CrossAssetAllocationStore:
         portfolio: CrossAssetPortfolioSnapshot,
         as_of: str,
     ) -> CrossAssetAllocationPlan:
+        self._verify_candidate_sources(candidates)
         plan = optimize_cross_asset_allocation(
             run_id=run_id,
             candidates=candidates,
@@ -1560,6 +1583,7 @@ class CrossAssetAllocationStore:
             raise CrossAssetAllocationError("cross-asset portfolio payload is missing")
         candidate_objects = [CrossAssetCandidate.from_mapping(item) for item in candidates_data]
         portfolio_object = CrossAssetPortfolioSnapshot.from_mapping(portfolio_data)
+        self._verify_candidate_sources(candidate_objects)
         recomputed = optimize_cross_asset_allocation(
             run_id=row["run_id"],
             candidates=candidate_objects,

@@ -4,6 +4,7 @@ import hashlib
 import socket
 import ssl
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .broker_interface import BrokerInterface
@@ -101,6 +102,15 @@ class AlpacaBroker(BrokerInterface):
 
     def get_account(self) -> Any:
         return self._call("get_account", "read", self.trading.get_account)
+
+    def submission_available(self) -> bool:
+        """Return a local adapter proof without sending an order."""
+
+        return bool(
+            self.mode == "paper"
+            and "paper" in self.configured_trading_endpoint.lower()
+            and callable(getattr(self.trading, "submit_order", None))
+        )
 
     def paper_account_identity(self) -> dict[str, Any]:
         account = self.get_account()
@@ -386,6 +396,31 @@ class AlpacaBroker(BrokerInterface):
             and callable(getattr(self.trading, "submit_order", None))
         )
 
+    def cancel_crypto_order(self, order_id: str) -> Any:
+        """Cancel a paper crypto order through the explicit crypto path."""
+
+        if self.mode != "paper" or not self.paper_requested:
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto cancellation is paper-only")
+        if not str(order_id or "").strip():
+            from .broker_interface import BrokerSubmissionNotAttempted
+
+            raise BrokerSubmissionNotAttempted("crypto broker order identity is required")
+        return self._call(
+            "cancel_crypto_order",
+            "order_submission",
+            lambda: self.trading.cancel_order_by_id(str(order_id)),
+        )
+
+    def crypto_cancellation_available(self) -> bool:
+        return bool(
+            self.mode == "paper"
+            and self.paper_requested
+            and callable(getattr(self, "cancel_crypto_order", None))
+            and callable(getattr(self.trading, "cancel_order_by_id", None))
+        )
+
     def cancel_order(self, order_id: str) -> Any:
         return self._call("cancel_order", "order_submission", lambda: self.trading.cancel_order_by_id(order_id))
 
@@ -399,13 +434,34 @@ class AlpacaBroker(BrokerInterface):
         return self._call("get_clock", "read", self.trading.get_clock)
 
     def get_loss_metrics(self) -> dict[str, float | str | None]:
-        """Return explicit, versioned dollar loss metrics from Alpaca."""
-        account = self.get_account()
-        equity = float(account.equity)
-        last_equity = float(account.last_equity)
-        daily_loss = max(0.0, last_equity - equity)
+        """Return explicit, versioned dollar loss metrics from Alpaca.
 
-        weekly_loss: float | None = None
+        The adapter boundary never performs account arithmetic in binary
+        floating point.  Decimal strings remain auditable JSON values; callers
+        that need numeric operations parse them into their own exact domain.
+        """
+
+        def amount(value: Any, label: str) -> Decimal:
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError(f"{label} is not a finite decimal") from exc
+            if not parsed.is_finite():
+                raise RuntimeError(f"{label} is not a finite decimal")
+            return parsed
+
+        def text(value: Decimal) -> str:
+            rendered = format(value, "f")
+            if "." in rendered:
+                rendered = rendered.rstrip("0").rstrip(".")
+            return rendered or "0"
+
+        account = self.get_account()
+        equity = amount(account.equity, "account equity")
+        last_equity = amount(account.last_equity, "prior account equity")
+        daily_loss = max(Decimal("0"), last_equity - equity)
+
+        weekly_loss: Decimal | None = None
         try:
             from alpaca.trading.requests import GetPortfolioHistoryRequest
 
@@ -416,15 +472,19 @@ class AlpacaBroker(BrokerInterface):
                     GetPortfolioHistoryRequest(period="1W", timeframe="1D", extended_hours=False)
                 ),
             )
-            equities = [float(value) for value in (getattr(history, "equity", None) or []) if value is not None and float(value) > 0]
+            equities = [
+                amount(value, "portfolio history equity")
+                for value in (getattr(history, "equity", None) or [])
+                if value is not None and amount(value, "portfolio history equity") > 0
+            ]
             if len(equities) >= 2:
-                weekly_loss = max(0.0, equities[0] - equities[-1])
+                weekly_loss = max(Decimal("0"), equities[0] - equities[-1])
         except Exception:
             weekly_loss = None
         return {
-            "daily_loss_dollars": daily_loss,
-            "weekly_loss_dollars": weekly_loss,
-            "reference_equity": last_equity,
+            "daily_loss_dollars": text(daily_loss),
+            "weekly_loss_dollars": None if weekly_loss is None else text(weekly_loss),
+            "reference_equity": text(last_equity),
             "daily_loss_confidence": "verified",
             "weekly_loss_confidence": "verified" if weekly_loss is not None else "unavailable",
             "provenance": "alpaca_account_and_portfolio_history",

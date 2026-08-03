@@ -104,7 +104,7 @@ STRICT_SECTION_KEYS = {
         "approval_max_price_move_bps_base", "approval_max_price_move_bps_hard_cap",
         "default_order_type", "limit_price_source", "fallback_market_orders",
         "allow_new_entries", "allow_add_to_winner", "allow_exits", "eodhd_research_enabled",
-        "data_source", "sizing_policy", "risk_policy", "strategy_policy", "proposal_policy",
+        "data_source", "sizing_policy", "risk_policy", "strategy_policy", "proposal_policy", "profitability_policy",
         "stage_transition_governance", "runtime_evidence_gate", "schedule", "supervised_paper_lane",
     },
     "supervised_paper_lane": {
@@ -261,6 +261,11 @@ STRICT_NESTED_KEYS = {
         "mode", "formula_version", "schema_version", "preview_expiry_minutes",
         "create_trade_proposals", "send_telegram", "manual_approval_enabled",
         "execution_enabled",
+    },
+    "crypto.profitability_policy": {
+        "minimum_samples", "severe_loss_threshold", "minimum_mean_net_return",
+        "require_verified_correlation", "correlation_snapshot_max_age_seconds",
+        "outcome_horizon_hours",
     },
     "cross_asset_allocation.score_weights": {
         "uncertainty_adjusted_net_expectancy", "expected_net_expectancy",
@@ -1109,6 +1114,37 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         and isinstance(crypto_strategy.get("maximum_stop_distance_pct"), (int, float))
         and crypto_strategy["minimum_stop_distance_pct"] <= crypto_strategy["maximum_stop_distance_pct"],
         "crypto strategy stop-distance minimum must not exceed its maximum",
+    )
+
+    crypto_profitability = crypto.get("profitability_policy") or {}
+    _bounded(
+        crypto_profitability.get("minimum_samples"),
+        "crypto.profitability_policy.minimum_samples", errors, 1, 100000,
+    )
+    _bounded(
+        crypto_profitability.get("severe_loss_threshold"),
+        "crypto.profitability_policy.severe_loss_threshold", errors, -1, 0,
+    )
+    _bounded(
+        crypto_profitability.get("minimum_mean_net_return"),
+        "crypto.profitability_policy.minimum_mean_net_return", errors, -1, 1,
+    )
+    _bounded(
+        crypto_profitability.get("correlation_snapshot_max_age_seconds"),
+        "crypto.profitability_policy.correlation_snapshot_max_age_seconds", errors, 1, 86400,
+    )
+    _bounded(
+        crypto_profitability.get("outcome_horizon_hours"),
+        "crypto.profitability_policy.outcome_horizon_hours", errors, 1, 720,
+    )
+    require(
+        isinstance(crypto_profitability.get("minimum_samples"), int)
+        and not isinstance(crypto_profitability.get("minimum_samples"), bool),
+        "crypto.profitability_policy.minimum_samples must be an integer",
+    )
+    require(
+        crypto_profitability.get("require_verified_correlation") is True,
+        "crypto profitability must require verified correlation evidence",
     )
 
     crypto_proposal = crypto.get("proposal_policy") or {}

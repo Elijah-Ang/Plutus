@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from .lot_ledger import KNOWN_CONFIDENCE
@@ -12,11 +13,11 @@ LOSS_METRICS_VERSION = "loss_controls_v2"
 
 @dataclass(frozen=True)
 class LossMetrics:
-    daily_loss_dollars: float | None
-    weekly_loss_dollars: float | None
-    daily_loss_pct: float | None
-    weekly_loss_pct: float | None
-    loss_reference_equity: float | None
+    daily_loss_dollars: Decimal | None
+    weekly_loss_dollars: Decimal | None
+    daily_loss_pct: Decimal | None
+    weekly_loss_pct: Decimal | None
+    loss_reference_equity: Decimal | None
     daily_loss_confidence: str
     weekly_loss_confidence: str
     loss_provenance: str
@@ -36,10 +37,13 @@ class LossMetrics:
         }
 
 
-def _number(value: Any) -> float | None:
+def _number(value: Any) -> Decimal | None:
     try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
+        if value is None or isinstance(value, bool):
+            return None
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+        return result if result.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
         return None
 
 
@@ -58,8 +62,8 @@ def build_loss_metrics(
     account_reference = _number(account_equity)
     reference = broker_reference if broker_reference and broker_reference > 0 else account_reference
 
-    daily_candidates: list[tuple[float, str, str]] = []
-    weekly_candidates: list[tuple[float, str, str]] = []
+    daily_candidates: list[tuple[Decimal, str, str]] = []
+    weekly_candidates: list[tuple[Decimal, str, str]] = []
     daily_broker = _number(broker.get("daily_loss_dollars"))
     weekly_broker = _number(broker.get("weekly_loss_dollars"))
     if daily_broker is not None and daily_broker >= 0 and reference and reference > 0:
@@ -70,17 +74,17 @@ def build_loss_metrics(
     daily_pl = _number(daily_realized_pl)
     weekly_pl = _number(weekly_realized_pl)
     if daily_pl is not None and daily_confidence in KNOWN_CONFIDENCE and reference and reference > 0:
-        daily_candidates.append((max(0.0, -daily_pl), daily_confidence, realized_provenance or "lot_ledger"))
+        daily_candidates.append((max(Decimal("0"), -daily_pl), daily_confidence, realized_provenance or "lot_ledger"))
     if weekly_pl is not None and weekly_confidence in KNOWN_CONFIDENCE and reference and reference > 0:
-        weekly_candidates.append((max(0.0, -weekly_pl), weekly_confidence, realized_provenance or "lot_ledger"))
+        weekly_candidates.append((max(Decimal("0"), -weekly_pl), weekly_confidence, realized_provenance or "lot_ledger"))
 
-    def combine(candidates: list[tuple[float, str, str]]) -> tuple[float | None, float | None, str, list[str]]:
+    def combine(candidates: list[tuple[Decimal, str, str]]) -> tuple[Decimal | None, Decimal | None, str, list[str]]:
         if not candidates or reference is None or reference <= 0:
             return None, None, "unavailable", []
         dollars = max(item[0] for item in candidates)
         confidence = "verified" if any(item[1] == "verified" for item in candidates) else "reconstructed"
         provenance = [item[2] for item in candidates]
-        return dollars, dollars / reference * 100.0, confidence, provenance
+        return dollars, dollars / reference * Decimal("100"), confidence, provenance
 
     daily_dollars, daily_pct, daily_result_confidence, daily_sources = combine(daily_candidates)
     weekly_dollars, weekly_pct, weekly_result_confidence, weekly_sources = combine(weekly_candidates)

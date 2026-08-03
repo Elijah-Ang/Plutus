@@ -270,6 +270,34 @@ class TradingService:
     def _recover_local_workflows(self) -> dict[str, int]:
         """Idempotently surface unfinished local work without submitting orders."""
         recovery = DurableExecutionStore(self.storage).recovery_sweep()
+        try:
+            from .crypto_paper_lane import CryptoPaperLaneStore
+
+            crypto_outbox = CryptoPaperLaneStore(self.storage).recover_telegram_outbox(
+                now=datetime.now(UTC)
+            )
+            if crypto_outbox:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_paper_telegram_outbox_recovered_manual_review",
+                    {"proposals": crypto_outbox},
+                )
+            crypto_outcomes = CryptoPaperLaneStore(self.storage).refresh_closed_crypto_outcomes(
+                self.config,
+                limit=100,
+            )
+            if crypto_outcomes:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_actual_outcome_recovery_persisted",
+                    {"outcomes": crypto_outcomes},
+                )
+        except Exception as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_paper_telegram_outbox_recovery_failed_closed",
+                {"error": type(exc).__name__},
+            )
 
         def load_local_proposal(proposal_id: str) -> dict[str, Any] | None:
             rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
@@ -596,10 +624,13 @@ class TradingService:
                 equity = _value(account, "equity")
                 last_equity = _value(account, "last_equity")
                 if equity is not None and last_equity is not None:
+                    equity_decimal = Decimal(str(equity))
+                    last_equity_decimal = Decimal(str(last_equity))
+                    daily_loss_decimal = max(Decimal("0"), last_equity_decimal - equity_decimal)
                     state["loss_metrics"] = {
-                        "daily_loss_dollars": max(0.0, float(last_equity) - float(equity)),
+                        "daily_loss_dollars": format(daily_loss_decimal, "f"),
                         "weekly_loss_dollars": None,
-                        "reference_equity": float(last_equity),
+                        "reference_equity": format(last_equity_decimal, "f"),
                         "daily_loss_confidence": "verified",
                         "weekly_loss_confidence": "unavailable",
                         "provenance": "alpaca_account_snapshot_fallback",
@@ -1784,7 +1815,8 @@ class TradingService:
             )
             self.telegram.send_message("Crypto paper command rejected: sender is not authorized.", chat)
             return True
-        if reply_to_message_id is None:
+        explicit_id_command = explicit_match is not None
+        if reply_to_message_id is None and not explicit_id_command:
             self.storage.audit(
                 self.run_id,
                 "crypto_paper_telegram_command_rejected",
@@ -1814,8 +1846,9 @@ class TradingService:
                     sender_id=sender,
                     allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
                     raw_message=str(text),
-                    reply_to_message_id=str(reply_to_message_id),
+                    reply_to_message_id=None if explicit_id_command else str(reply_to_message_id),
                     chat_id=chat,
+                    direct_command=explicit_id_command,
                 )
                 self.storage.audit(
                     self.run_id,
@@ -1836,8 +1869,9 @@ class TradingService:
                 sender_id=sender,
                 allowed_sender_id=str(getattr(self.telegram, "allowed_user_id", "") or ""),
                 raw_message=str(text),
-                reply_to_message_id=str(reply_to_message_id),
+                reply_to_message_id=None if explicit_id_command else str(reply_to_message_id),
                 chat_id=chat,
+                direct_command=explicit_id_command,
             )
             intent = lane.create_intent(proposal_id, self.config)
             execution = lane.execute_intent(intent.id, self.config, self.broker)
