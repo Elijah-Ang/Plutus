@@ -503,6 +503,25 @@ def test_atomic_sleeve_rejects_tampering_with_regenerated_local_fingerprints(
     ] == 1
 
 
+def test_allocation_integrity_report_requires_exact_sleeve_for_allocations(
+    tmp_path,
+) -> None:
+    storage = _storage(tmp_path)
+    _registry_id, allocation_id = _persist_registry_and_allocation(storage)
+    payload = json.loads(
+        storage.fetch_all(
+            "SELECT payload FROM phase4_allocation_decisions WHERE id=?",
+            (allocation_id,),
+        )[0]["payload"]
+    )
+    payload["strategy_sleeves"]["rule_based_v2"].pop("remaining_risk_decimal")
+    _persist_allocation_variant(storage, allocation_id, payload)
+
+    assert DurableExecutionStore(storage).integrity_report()[
+        "invalid_phase4_allocation_authority"
+    ] == 1
+
+
 def test_atomic_sleeve_rejects_allocation_bound_to_different_registry_replay(
     tmp_path,
 ) -> None:
