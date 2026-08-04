@@ -16,6 +16,8 @@ from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, forma
 from .crypto_risk import CryptoRiskError, CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest
 from .crypto_outcomes import CryptoCostModel, calculate_shadow_outcome, persist_observation
+from .fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
+from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .storage import Storage
 from .utils import json_dumps
 
@@ -1200,6 +1202,39 @@ class CryptoResearchEngine:
         mode = _crypto_mode(self.config)
         candidate = _build_candidate_metadata(result, self.config, now)
         blockers = self._crypto_blockers(result, candidate, now)
+        # ``performance_outcomes`` keeps REAL compatibility projections for
+        # older reporting consumers, but its Decimal sidecars are still
+        # required whenever those projections are populated.  This research
+        # row is hypothetical evidence reconstructed from provider/config
+        # values, not a broker fill, so the provenance must say so explicitly.
+        shadow_entry_price_decimal = None
+        shadow_entry_notional_decimal = None
+        shadow_entry_quantity_decimal = None
+        try:
+            if result.price is not None:
+                shadow_entry_price_decimal = _crypto_decimal(
+                    result.price, "crypto Performance Lab shadow entry price"
+                )
+            if candidate.get("position_size") is not None:
+                shadow_entry_notional_decimal = _crypto_decimal(
+                    candidate.get("position_size"),
+                    "crypto Performance Lab shadow entry notional",
+                )
+            if (
+                shadow_entry_price_decimal is not None
+                and shadow_entry_price_decimal > Decimal("0")
+                and shadow_entry_notional_decimal is not None
+            ):
+                shadow_entry_quantity_decimal = (
+                    shadow_entry_notional_decimal / shadow_entry_price_decimal
+                )
+        except ValueError:
+            # Preserve the existing descriptive row and let the read-only
+            # integrity report expose malformed source evidence; never invent
+            # a Decimal sidecar for an invalid research value.
+            shadow_entry_price_decimal = None
+            shadow_entry_notional_decimal = None
+            shadow_entry_quantity_decimal = None
         proposed = 0
         action_decision = "paper_watch" if mode == "paper_watch" else ("paper_proposal" if mode == "paper_proposal" else "research_only")
         self.storage.execute(
@@ -1246,13 +1281,29 @@ class CryptoResearchEngine:
         self.storage.execute(
             """
             INSERT INTO performance_outcomes(
-                id,setup_id,run_id,symbol,actual_or_shadow,entry_time,entry_price,entry_notional,status,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                id,setup_id,run_id,symbol,actual_or_shadow,entry_time,entry_price,entry_notional,entry_qty,status,
+                created_at,updated_at,entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                decimal_provenance,decimal_accounting_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), setup_id, self.run_id, result.symbol, "shadow", now.isoformat(), result.price,
-                candidate.get("position_size"), "pending_forward_returns",
-                now.isoformat(), now.isoformat(),
+                candidate.get("position_size"),
+                None
+                if shadow_entry_quantity_decimal is None
+                else float(shadow_entry_quantity_decimal),
+                "pending_forward_returns", now.isoformat(), now.isoformat(),
+                None
+                if shadow_entry_price_decimal is None
+                else _decimal_text(shadow_entry_price_decimal),
+                None
+                if shadow_entry_quantity_decimal is None
+                else _decimal_text(shadow_entry_quantity_decimal),
+                None
+                if shadow_entry_notional_decimal is None
+                else _decimal_text(shadow_entry_notional_decimal),
+                RECONSTRUCTED_REAL_PROVENANCE,
+                FIXED_POINT_ACCOUNTING_VERSION,
             ),
         )
         for horizon in (1, 5, 20):

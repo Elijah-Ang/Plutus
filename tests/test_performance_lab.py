@@ -118,6 +118,16 @@ def test_performance_lab_records_qualified_suppressed_and_placeholders(tmp_path)
     assert storage.fetch_all("SELECT * FROM performance_counterfactuals")
     assert storage.fetch_all("SELECT * FROM trade_proposals") == []
     assert storage.fetch_all("SELECT * FROM orders") == []
+    outcome = storage.fetch_all(
+        """SELECT entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                  decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
+    )[0]
+    assert outcome["entry_price_decimal"] == "100"
+    assert outcome["entry_qty_decimal"] == "0.05"
+    assert outcome["entry_notional_decimal"] == "5"
+    assert outcome["decimal_provenance"] == "reconstructed_from_sqlite_real"
+    assert outcome["decimal_accounting_version"] == "fixed_point_fifo_accounting_v1"
     assert broker.submitted_orders == []
 
 

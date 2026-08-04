@@ -39,6 +39,7 @@ from .exit_blocker import ExitBlockerStore
 from .fixed_point_accounting import (
     EXACT_DECIMAL_PROVENANCE,
     FIXED_POINT_ACCOUNTING_VERSION,
+    RECONSTRUCTED_REAL_PROVENANCE,
     ZERO,
     decimal_text,
     require_exact_decimal,
@@ -14412,17 +14413,65 @@ class TradingService:
                             "pending", 0, 0, None, None, now.isoformat(),
                         ),
                     )
+            # These rows are research/proposal evidence rather than broker
+            # fills, so derive their Decimal sidecars from the compatibility
+            # values and label them as reconstructed. Leaving the sidecars
+            # empty makes every new shadow outcome an unexplained fixed-point
+            # integrity finding even though its source values are present.
+            performance_entry_price_decimal = None
+            performance_entry_qty_decimal = None
+            performance_entry_notional_decimal = None
+            try:
+                if res.get("price") is not None:
+                    performance_entry_price_decimal = decimal_text(
+                        _service_decimal(res.get("price"), "Performance Lab shadow entry price")
+                    )
+                if hypothetical_notional is not None:
+                    performance_entry_notional_decimal = decimal_text(
+                        _service_decimal(
+                            hypothetical_notional,
+                            "Performance Lab shadow entry notional",
+                        )
+                    )
+                if res.get("suggested_shares") is not None:
+                    performance_entry_qty_decimal = decimal_text(
+                        _service_decimal(
+                            res.get("suggested_shares"),
+                            "Performance Lab shadow entry quantity",
+                        )
+                    )
+                elif performance_entry_price_decimal and performance_entry_notional_decimal:
+                    entry_price_exact = _service_decimal(
+                        performance_entry_price_decimal,
+                        "Performance Lab shadow entry price",
+                    )
+                    if entry_price_exact > ZERO:
+                        performance_entry_qty_decimal = decimal_text(
+                            _service_decimal(
+                                performance_entry_notional_decimal,
+                                "Performance Lab shadow entry notional",
+                            )
+                            / entry_price_exact
+                        )
+            except (TypeError, ValueError, ArithmeticError):
+                performance_entry_price_decimal = None
+                performance_entry_qty_decimal = None
+                performance_entry_notional_decimal = None
             self.storage.execute(
                 """
                 INSERT INTO performance_outcomes(
                     id,setup_id,run_id,symbol,proposal_id,batch_id,actual_or_shadow,entry_time,entry_price,
-                    entry_notional,entry_qty,status,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    entry_notional,entry_qty,status,created_at,updated_at,entry_price_decimal,entry_qty_decimal,
+                    entry_notional_decimal,decimal_provenance,decimal_accounting_version
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     str(uuid.uuid4()), setup_id, self.run_id, symbol, proposal_id, batch_id, actual_or_shadow,
                     now.isoformat(), res.get("price"), hypothetical_notional, res.get("suggested_shares"),
                     "pending_forward_returns", now.isoformat(), now.isoformat(),
+                    performance_entry_price_decimal, performance_entry_qty_decimal,
+                    performance_entry_notional_decimal, RECONSTRUCTED_REAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                 ),
             )
             for horizon in (1, 5, 20):
