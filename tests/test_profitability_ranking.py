@@ -899,9 +899,15 @@ def test_service_canonicalizes_quantity_without_exceeding_notional_authority() -
         "side": "buy",
         "action": "entry",
         "proposal_price": 123.45,
+        "proposal_price_decimal": "123.45",
         "qty": 8.10044552,
+        "qty_decimal": "8.10044552",
         "notional": 1000.0,
+        "notional_decimal": "1000",
         "stop_distance_dollars": 5.25,
+        "stop_distance_dollars_decimal": "5.25",
+        "stop_price": 118.20,
+        "stop_price_decimal": "118.20",
         "approved_quantity_ceiling": 8.10044552,
         "approved_stop_risk_ceiling": 100.0,
         "displayed_adaptive_ceiling": 1000.0,
@@ -916,6 +922,17 @@ def test_service_canonicalizes_quantity_without_exceeding_notional_authority() -
     assert D(str(proposal["stop_risk_dollars"])) == quantity * D("5.25")
     assert D(str(proposal["approved_quantity_ceiling"])) == quantity
     assert D(str(proposal["displayed_adaptive_ceiling"])) == notional
+
+
+def test_service_rejects_float_only_profitability_display_terms() -> None:
+    proposal = {
+        "side": "buy", "action": "entry", "proposal_price": 123.45,
+        "qty": 8.0, "notional": 987.60,
+    }
+    with pytest.raises(ValueError, match="exact decimal sidecars"):
+        TradingService._canonicalize_profitability_display_terms(
+            proposal, require_exact=True,
+        )
 
 
 def test_profitability_components_are_visible_in_single_and_batch_displays(

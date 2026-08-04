@@ -92,6 +92,8 @@ class RiskSnapshotBuilder:
         net_decimal = ZERO
         symbol_exposure: dict[str, float] = {}
         cluster_exposure: dict[str, float] = {}
+        symbol_values_decimal: dict[str, Decimal] = {}
+        cluster_values_decimal: dict[str, Decimal] = {}
         exposures_known = True
         for position in positions:
             symbol = str(_value(position, "symbol", "")).upper()
@@ -120,9 +122,11 @@ class RiskSnapshotBuilder:
             gross_decimal += abs(market_value_decimal)
             net_decimal += market_value_decimal
             symbol_exposure[symbol] = symbol_exposure.get(symbol, 0.0) + market_value
+            symbol_values_decimal[symbol] = symbol_values_decimal.get(symbol, ZERO) + market_value_decimal
             cluster = self.cluster_resolver(symbol)
             if cluster:
                 cluster_exposure[cluster] = cluster_exposure.get(cluster, 0.0) + market_value
+                cluster_values_decimal[cluster] = cluster_values_decimal.get(cluster, ZERO) + market_value_decimal
         if not exposures_known:
             unavailable.extend(["filled_gross_exposure", "filled_net_exposure"])
 
@@ -210,6 +214,22 @@ class RiskSnapshotBuilder:
                 "unresolved_unknown_exposure_decimal": decimal_text(unknown_decimal),
                 "buying_power_decimal": None if buying_power is None else decimal_text(_decimal(_value(account, "buying_power"), "buying power")),
                 "cash_decimal": None if cash is None else decimal_text(_decimal(_value(account, "cash"), "cash")),
+                "symbol_exposure_decimal": (
+                    {
+                        symbol: decimal_text(value / equity_decimal * Decimal("100"))
+                        for symbol, value in symbol_values_decimal.items()
+                    }
+                    if equity_decimal is not None and equity_decimal > ZERO
+                    else None
+                ),
+                "cluster_exposure_decimal": (
+                    {
+                        cluster: decimal_text(value / equity_decimal * Decimal("100"))
+                        for cluster, value in cluster_values_decimal.items()
+                    }
+                    if equity_decimal is not None and equity_decimal > ZERO
+                    else None
+                ),
             },
         )
 

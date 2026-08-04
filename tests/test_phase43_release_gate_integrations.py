@@ -312,7 +312,9 @@ def _persist_registry_and_allocation(
                 "strategy_version": "rule_based_v2",
                 "risk_unit": "pct_equity",
                 "remaining_risk": 0.01,
+                "remaining_risk_decimal": "0.01",
                 "remaining_notional": 10.0,
+                "remaining_notional_decimal": "10",
             }
         },
     }
@@ -550,7 +552,10 @@ def test_atomic_sleeve_coordinates_overlapping_allocation_ids(tmp_path) -> None:
     payload = json.loads(storage.fetch_all(
         "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
-    payload["strategy_sleeves"]["rule_based_v2"]["remaining_notional"] = 200.0
+    payload["strategy_sleeves"]["rule_based_v2"].update({
+        "remaining_notional": 200.0,
+        "remaining_notional_decimal": "200",
+    })
     allocation_id = _persist_allocation_variant(
         storage, allocation_id, payload, replace_source=True
     )
@@ -583,7 +588,8 @@ def test_atomic_sleeve_snapshot_ids_close_read_to_persist_race_without_double_co
         "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
     payload["strategy_sleeves"]["rule_based_v2"].update({
-        "remaining_notional": 200.0, "remaining_risk": 1.0,
+        "remaining_notional": 200.0, "remaining_notional_decimal": "200",
+        "remaining_risk": 1.0, "remaining_risk_decimal": "1",
     })
     allocation_id = _persist_allocation_variant(
         storage, allocation_id, payload, replace_source=True
@@ -615,7 +621,8 @@ def test_atomic_sleeve_snapshot_ids_close_read_to_persist_race_without_double_co
 
     accounted_payload = json.loads(json.dumps(stale_payload))
     accounted_payload["strategy_sleeves"]["rule_based_v2"].update({
-        "remaining_notional": 140.0, "remaining_risk": 0.4,
+        "remaining_notional": 140.0, "remaining_notional_decimal": "140",
+        "remaining_risk": 0.4, "remaining_risk_decimal": "0.4",
     })
     first_reservation_id = storage.fetch_all(
         "SELECT id FROM risk_reservations WHERE intent_id=?", (first["id"],)
@@ -645,7 +652,8 @@ def test_pending_claim_identity_survives_conversion_to_reservation(tmp_path) -> 
         "SELECT payload FROM phase4_allocation_decisions WHERE id=?", (allocation_id,)
     )[0]["payload"])
     payload["strategy_sleeves"]["rule_based_v2"].update({
-        "remaining_notional": 200.0, "remaining_risk": 0.01,
+        "remaining_notional": 200.0, "remaining_notional_decimal": "200",
+        "remaining_risk": 0.01, "remaining_risk_decimal": "0.01",
     })
     allocation_id = _persist_allocation_variant(
         storage, allocation_id, payload, replace_source=True
@@ -662,7 +670,8 @@ def test_pending_claim_identity_survives_conversion_to_reservation(tmp_path) -> 
 
     next_payload = json.loads(json.dumps(payload))
     next_payload["strategy_sleeves"]["rule_based_v2"].update({
-        "remaining_notional": 40.0, "remaining_risk": 0.004,
+        "remaining_notional": 40.0, "remaining_notional_decimal": "40",
+        "remaining_risk": 0.004, "remaining_risk_decimal": "0.004",
     })
     next_payload["raw_replay_inputs"]["portfolio_snapshot"].update({
         "active_reservation_ids_by_strategy": {},

@@ -3087,6 +3087,96 @@ class TradingService:
             label="unknown active reservation notional",
             minimum=ZERO,
         )
+        canonical_exact = canonical_risk.exact_values
+        portfolio_equity_decimal = canonical_exact.get("portfolio_equity_decimal")
+        projected_gross_decimal = canonical_exact.get("projected_gross_exposure_decimal")
+        held_stop_risk_decimal = canonical_exact.get("held_open_stop_risk_decimal")
+        pending_notional_decimal = pending_execution.get("total_notional_decimal")
+        pending_stop_risk_decimal = pending_execution.get("total_stop_risk_decimal")
+        proposed_total_exposure_decimal = None
+        current_heat_decimal = None
+        current_symbol_exposure_decimal = None
+        proposed_symbol_exposure_decimal = None
+        current_cluster_exposure_decimal = None
+        proposed_cluster_exposure_decimal = None
+        if portfolio_equity_decimal and projected_gross_decimal:
+            try:
+                equity_exact = _service_decimal(portfolio_equity_decimal, "portfolio equity")
+                if equity_exact > ZERO:
+                    proposed_total_exposure_decimal = decimal_text(
+                        (
+                            _service_decimal(projected_gross_decimal, "projected gross exposure")
+                            + proposal_notional_decimal
+                        )
+                        / equity_exact
+                        * Decimal("100")
+                    )
+                    if held_stop_risk_decimal is not None:
+                        current_heat_decimal = decimal_text(
+                            (
+                                _service_decimal(held_stop_risk_decimal, "held open stop risk")
+                                + active_reserved_stop_risk_decimal
+                                + _service_decimal(pending_stop_risk_decimal or "0", "pending stop risk")
+                            )
+                            / equity_exact
+                            * Decimal("100")
+                        )
+            except ValueError:
+                proposed_total_exposure_decimal = None
+                current_heat_decimal = None
+        try:
+            equity_exact = _service_decimal(
+                portfolio_equity_decimal,
+                "portfolio equity",
+            )
+            if equity_exact > ZERO:
+                exact_symbol_exposure = canonical_exact.get("symbol_exposure_decimal") or {}
+                exact_cluster_exposure = canonical_exact.get("cluster_exposure_decimal") or {}
+                symbol_base_exact = _service_decimal(
+                    exact_symbol_exposure.get(symbol_upper, "0"),
+                    "current symbol exposure",
+                )
+                current_symbol_exposure_decimal = decimal_text(
+                    symbol_base_exact
+                    + _service_decimal(
+                        (reservation_snapshot["symbol_reserved_notional_decimal"] or {}).get(symbol_upper, "0"),
+                        "symbol reserved notional",
+                    ) / equity_exact * Decimal("100")
+                )
+                proposed_symbol_exposure_decimal = decimal_text(
+                    _service_decimal(
+                        current_symbol_exposure_decimal,
+                        "current symbol exposure",
+                    )
+                    + proposal_notional_decimal / equity_exact * Decimal("100")
+                )
+                if c_name:
+                    cluster_base_exact = _service_decimal(
+                        exact_cluster_exposure.get(c_name, "0"),
+                        "current cluster exposure",
+                    )
+                    current_cluster_exposure_decimal = decimal_text(
+                        cluster_base_exact
+                        + _service_decimal(
+                            (reservation_snapshot["cluster_reserved_notional_decimal"] or {}).get(c_name, "0"),
+                            "cluster reserved notional",
+                        ) / equity_exact * Decimal("100")
+                    )
+                    proposed_cluster_exposure_decimal = decimal_text(
+                        _service_decimal(
+                            current_cluster_exposure_decimal,
+                            "current cluster exposure",
+                        )
+                        + proposal_notional_decimal / equity_exact * Decimal("100")
+                    )
+                else:
+                    current_cluster_exposure_decimal = "0"
+                    proposed_cluster_exposure_decimal = "0"
+        except (TypeError, ValueError):
+            current_symbol_exposure_decimal = None
+            proposed_symbol_exposure_decimal = None
+            current_cluster_exposure_decimal = None
+            proposed_cluster_exposure_decimal = None
         return {
             "power_connected": get_power_status().connected is True,
             "internet_available": state["internet_available"],
@@ -3129,8 +3219,12 @@ class TradingService:
 
             # Exposure context fields
             "proposed_total_exposure_pct": proposed_total_exposure_pct,
+            "current_symbol_exposure_pct_decimal": current_symbol_exposure_decimal,
+            "proposed_symbol_exposure_pct_decimal": proposed_symbol_exposure_decimal,
             "proposed_symbol_exposure_pct": proposed_symbol_exposure_pct,
             "proposed_cluster_positions_count": proposed_cluster_positions_count,
+            "current_cluster_exposure_pct_decimal": current_cluster_exposure_decimal,
+            "proposed_cluster_exposure_pct_decimal": proposed_cluster_exposure_decimal,
             "proposed_cluster_exposure_pct": proposed_cluster_exposure_pct,
             "exit_pending": exit_pending,
             "exit_pending_symbol": exit_blocker.get("symbol"),
@@ -3141,19 +3235,39 @@ class TradingService:
             "universe_symbol_info": universe_symbol_info,
             "active_dynamic_paper_tradable_symbols": active_dynamic,
             "portfolio_equity": equity,
+            "portfolio_equity_decimal": portfolio_equity_decimal,
             "cash": snapshot["cash"],
+            "cash_decimal": canonical_exact.get("cash_decimal"),
+            "buying_power_decimal": (
+                decimal_text(
+                    max(
+                        ZERO,
+                        _service_decimal(canonical_exact["buying_power_decimal"], "buying power")
+                        - active_reserved_notional_decimal,
+                    )
+                )
+                if canonical_exact.get("buying_power_decimal") is not None
+                else None
+            ),
             "active_reserved_exposure": active_reserved_notional,
+            "active_reserved_exposure_decimal": decimal_text(active_reserved_notional_decimal),
             "active_reserved_stop_risk": active_reserved_stop_risk,
+            "active_reserved_stop_risk_decimal": decimal_text(active_reserved_stop_risk_decimal),
             "pending_buy_exposure_unknown": bool(pending_execution.get("unknown")),
             "pending_buy_exposure_unknown_reason": pending_execution.get("unknown_reason"),
             "pending_buy_exposure_unknown_rows": pending_execution.get("unknown_rows", []),
             "pending_buy_notional": float(pending_execution.get("total_notional") or 0.0),
+            "pending_buy_notional_decimal": pending_notional_decimal,
             "pending_buy_stop_risk": float(pending_execution.get("total_stop_risk") or 0.0),
+            "pending_buy_stop_risk_decimal": pending_stop_risk_decimal,
             "probe_active_count": int(probe_commitments["active_count"]),
             "probe_projected_count": int(probe_commitments["active_count"]) + (1 if proposal.get("phase4_mode") == "probe" and proposal.get("action", "entry") == "entry" else 0),
             "probe_projected_gross_notional": float(probe_commitments["gross_notional"]) + (proposal_notional if proposal.get("phase4_mode") == "probe" else 0.0),
             "probe_projected_stop_risk": float(probe_commitments["stop_risk"]) + (proposal_stop_risk if proposal.get("phase4_mode") == "probe" else 0.0),
             "held_open_stop_risk": canonical_risk.held_open_stop_risk,
+            "held_open_stop_risk_decimal": held_stop_risk_decimal,
+            "current_portfolio_heat_pct_decimal": current_heat_decimal,
+            "proposed_total_exposure_pct_decimal": proposed_total_exposure_decimal,
             "unresolved_unknown_order_exposure": float(unknown_reserved_exposure),
         }
 
@@ -3359,6 +3473,13 @@ class TradingService:
         """Gather authoritative inputs; all sizing formulae remain in the engine."""
         if proposal.get("action") not in {"entry", "add"} or str(proposal.get("side") or "").lower() != "buy":
             return None
+
+        def sidecar(source: dict[str, Any], key: str, fallback: Any, label: str) -> str | None:
+            raw = source.get(f"{key}_decimal")
+            if raw not in (None, ""):
+                return str(raw)
+            return None
+
         equity = float(portfolio.get("portfolio_equity") or 0.0)
         operational_notional = float(sizing.get("final_notional") or proposal.get("notional") or 0.0)
         proposal_notional = float(proposal.get("notional") or operational_notional)
@@ -3373,6 +3494,28 @@ class TradingService:
                 + float(portfolio.get("active_reserved_stop_risk") or 0.0)
                 + float(portfolio.get("pending_buy_stop_risk") or 0.0)
             ) / equity * 100.0
+        equity_decimal = sidecar(portfolio, "portfolio_equity", equity, "portfolio equity")
+        proposal_notional_decimal = sidecar(proposal, "notional", proposal_notional, "proposal notional")
+        proposal_pct_decimal = None
+        if equity_decimal and proposal_notional_decimal:
+            proposal_pct_decimal = decimal_text(
+                _service_decimal(proposal_notional_decimal, "proposal notional")
+                / _service_decimal(equity_decimal, "portfolio equity")
+                * Decimal("100")
+            )
+        current_gross_decimal = portfolio.get("current_gross_exposure_pct_decimal")
+        if current_gross_decimal in (None, "") and portfolio.get("proposed_total_exposure_pct_decimal") not in (None, "") and proposal_pct_decimal is not None:
+            current_gross_decimal = decimal_text(
+                _service_decimal(portfolio["proposed_total_exposure_pct_decimal"], "proposed total exposure")
+                - _service_decimal(proposal_pct_decimal, "proposal exposure percentage")
+            )
+        if current_gross_decimal in (None, ""):
+            current_gross_decimal = sidecar(portfolio, "proposed_total_exposure_pct", current_gross, "current gross exposure")
+        current_heat_decimal = portfolio.get("current_portfolio_heat_pct_decimal") or sidecar(
+            portfolio, "current_portfolio_heat_pct", current_heat, "current portfolio heat"
+        )
+        current_symbol_decimal = sidecar(portfolio, "current_symbol_exposure_pct", current_symbol, "current symbol exposure")
+        current_cluster_decimal = sidecar(portfolio, "current_cluster_exposure_pct", current_cluster, "current cluster exposure")
         phase3_profile = (self.config.get("phase3", {}) or {}).get("risk_profile", {}) or {}
         engine = AdaptiveSizingEngine(self.config)
         decision = engine.evaluate({
@@ -3383,8 +3526,13 @@ class TradingService:
             "approval_id": approval_id, "strategy_version": proposal.get("strategy_version"),
             "policy_id": proposal.get("policy_decision_id"), "action": proposal.get("action"), "side": proposal.get("side"),
             "adaptive_conviction": adaptive_conviction, "operational_sizing": sizing,
-            "authoritative_equity": equity, "authoritative_cash": portfolio.get("cash"),
+            "authoritative_equity": equity, "authoritative_equity_decimal": equity_decimal,
+            "authoritative_cash": portfolio.get("cash"),
+            "authoritative_cash_decimal": sidecar(portfolio, "cash", portfolio.get("cash"), "cash"),
             "authoritative_buying_power": portfolio.get("buying_power"),
+            "authoritative_buying_power_decimal": sidecar(
+                portfolio, "buying_power", portfolio.get("buying_power"), "buying power"
+            ),
             "canonical_risk_snapshot": {
                 "held_open_stop_risk": portfolio.get("held_open_stop_risk"),
                 "pending_buy_stop_risk": portfolio.get("pending_buy_stop_risk"),
@@ -3393,14 +3541,28 @@ class TradingService:
             "active_reservations": {
                 "notional": portfolio.get("active_reserved_exposure"),
                 "stop_risk": portfolio.get("active_reserved_stop_risk"),
+                "notional_decimal": portfolio.get("active_reserved_exposure_decimal") or sidecar(
+                    portfolio, "active_reserved_exposure", portfolio.get("active_reserved_exposure"), "active reserved notional"
+                ),
+                "stop_risk_decimal": portfolio.get("active_reserved_stop_risk_decimal") or sidecar(
+                    portfolio, "active_reserved_stop_risk", portfolio.get("active_reserved_stop_risk"), "active reserved stop risk"
+                ),
             },
             "entry_price": proposal.get("latest_price") or proposal.get("proposal_price"),
+            "entry_price_decimal": proposal.get("latest_price_decimal") or proposal.get("proposal_price_decimal") or sidecar(
+                proposal, "latest_price", proposal.get("latest_price") or proposal.get("proposal_price"), "entry price"
+            ),
             "stop_price": proposal.get("stop_price") or sizing.get("stop_price"),
             "stop_distance_dollars": proposal.get("stop_distance_dollars") or sizing.get("stop_distance_dollars"),
+            "stop_distance_dollars_decimal": proposal.get("stop_distance_dollars_decimal") or sizing.get("stop_distance_dollars_decimal") or sidecar(
+                proposal, "stop_distance_dollars", proposal.get("stop_distance_dollars") or sizing.get("stop_distance_dollars"), "stop distance"
+            ),
             "strategy_policy_state": sizing.get("strategy_state") or proposal.get("strategy_state"),
             "strategy_policy_version": sizing.get("strategy_policy_version") or proposal.get("strategy_policy_version"),
-            "current_portfolio_heat_pct": current_heat, "current_gross_exposure_pct": current_gross,
-            "current_symbol_exposure_pct": current_symbol, "current_cluster_exposure_pct": current_cluster,
+            "current_portfolio_heat_pct": current_heat, "current_portfolio_heat_pct_decimal": current_heat_decimal,
+            "current_gross_exposure_pct": current_gross, "current_gross_exposure_pct_decimal": current_gross_decimal,
+            "current_symbol_exposure_pct": current_symbol, "current_symbol_exposure_pct_decimal": current_symbol_decimal,
+            "current_cluster_exposure_pct": current_cluster, "current_cluster_exposure_pct_decimal": current_cluster_decimal,
             "hard_limits_pct": {
                 "portfolio_heat": phase3_profile.get("max_portfolio_heat_pct"),
                 "gross_exposure": phase3_profile.get("hard_gross_exposure_pct"),
@@ -3408,11 +3570,25 @@ class TradingService:
                 "cluster_exposure": phase3_profile.get("max_cluster_exposure_pct"),
             },
             "displayed_adaptive_ceiling": displayed_adaptive_ceiling,
+            "displayed_adaptive_ceiling_decimal": (
+                (proposal.get("adaptive_sizing") or {}).get("exact_values", {}).get(
+                    "displayed_adaptive_ceiling_decimal"
+                )
+                if stage == "final_revalidation" else None
+            ),
             "displayed_quantity_ceiling": (
                 proposal.get("approved_quantity_ceiling") or proposal.get("qty")
             ) if stage == "final_revalidation" else None,
+            "displayed_quantity_ceiling_decimal": (
+                proposal.get("approved_quantity_ceiling_decimal")
+                or proposal.get("qty_decimal")
+            ) if stage == "final_revalidation" else None,
             "displayed_stop_risk_dollars": (
                 proposal.get("approved_stop_risk_ceiling") or proposal.get("stop_risk_dollars")
+            ) if stage == "final_revalidation" else None,
+            "displayed_stop_risk_dollars_decimal": (
+                proposal.get("approved_stop_risk_ceiling_decimal")
+                or proposal.get("stop_risk_dollars_decimal")
             ) if stage == "final_revalidation" else None,
             "proposal_adaptive_notional": proposal_adaptive_notional,
             "final_revalidation_blocked": final_revalidation_blocked,
@@ -5290,6 +5466,19 @@ class TradingService:
         else:
             now_dt = now_dt.astimezone(UTC)
 
+        def required_exact(key: str, label: str) -> Decimal:
+            field = f"{key}_decimal"
+            for source in (proposal, row):
+                raw = source.get(field)
+                if raw not in (None, ""):
+                    return _service_decimal(raw, label)
+            raise ValueError(f"{label} exact sidecar is missing")
+
+        strict_exact_sizing = bool(
+            self._operational_adaptive_enabled()
+            or self._profitability_operational_enforced()
+        )
+
         # General safety pre-flights
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             block_reason = "this build supports paper mode only"
@@ -5612,6 +5801,9 @@ class TradingService:
                 if execution_reference_price <= 0:
                     raise ValueError("nonpositive execution reference")
                 proposal["execution_reference_price"] = execution_reference_price
+                proposal["execution_reference_price_decimal"] = decimal_text(
+                    _service_decimal(execution_reference_price, "execution reference price")
+                )
             except (TypeError, ValueError):
                 block_reason = "conservative BUY execution reference is unavailable"
 
@@ -5620,11 +5812,38 @@ class TradingService:
         # risk check so stale proposal geometry cannot be misclassified.
         if block_reason is None and row.get("emergency_exit_triggered") != 1 and execution_reference_price is not None:
             try:
-                persisted_stop = float(proposal.get("stop_price"))
-                if prop_side == "buy" and persisted_stop > 0 and execution_reference_price > persisted_stop:
-                    proposal["stop_distance_dollars"] = execution_reference_price - persisted_stop
-            except (TypeError, ValueError):
-                pass
+                if strict_exact_sizing:
+                    persisted_stop_exact = required_exact("stop_price", "protective stop")
+                    execution_reference_exact = required_exact(
+                        "execution_reference_price", "execution reference price"
+                    )
+                else:
+                    persisted_stop_raw = (
+                        proposal.get("stop_price")
+                        if proposal.get("stop_price") not in (None, "")
+                        else row.get("stop_price")
+                    )
+                    persisted_stop_exact = (
+                        _service_decimal(persisted_stop_raw, "protective stop")
+                        if persisted_stop_raw not in (None, "") else None
+                    )
+                    execution_reference_exact = _service_decimal(
+                        execution_reference_price,
+                        "execution reference price",
+                    )
+                if (
+                    prop_side == "buy"
+                    and persisted_stop_exact is not None
+                    and persisted_stop_exact > ZERO
+                    and execution_reference_exact > persisted_stop_exact
+                ):
+                    stop_distance_exact = execution_reference_exact - persisted_stop_exact
+                    proposal["stop_distance_dollars"] = float(stop_distance_exact)
+                    proposal["stop_distance_dollars_decimal"] = decimal_text(stop_distance_exact)
+            except (TypeError, ValueError) as exc:
+                if prop_side == "buy" and proposal.get("action") in {"entry", "add"}:
+                    if strict_exact_sizing:
+                        block_reason = "exact proposal protective-stop authority is unavailable"
 
         if block_reason is None:
             block_reason = self._final_revalidate_position_management(proposal, refreshed_price_val)
@@ -5688,6 +5907,19 @@ class TradingService:
         approved_notional = float(row.get("notional") or 0.0)
         proposal["approved_notional"] = approved_notional
         proposal["approved_notional_ceiling"] = approved_notional
+        if strict_exact_sizing:
+            try:
+                approved_notional_exact = required_exact(
+                    "notional", "approved notional ceiling"
+                )
+                proposal["approved_notional_ceiling_decimal"] = decimal_text(
+                    approved_notional_exact
+                )
+            except (TypeError, ValueError) as exc:
+                block_reason = block_reason or (
+                    "exact approved notional ceiling is unavailable: "
+                    f"{redact_exception(exc)[:1000]}"
+                )
         proposal["cluster_name"] = self._get_symbol_cluster(prop_symbol)
         size_dict: dict[str, Any] | None = None
 
@@ -5784,34 +6016,79 @@ class TradingService:
                 block_reason = "final operational adaptive sizing could not be recomputed"
 
             final_adaptive = proposal.get("adaptive_sizing_final") or {}
-            final_notional = min(
-                max(0.0, approved_notional),
-                max(0.0, float(final_adaptive.get("operational_notional") or 0.0)),
-            )
-            if final_notional <= 0:
-                block_reason = block_reason or "final operational adaptive sizing found no safe executable size"
+            final_adaptive_exact = final_adaptive.get("exact_values") or {}
+            try:
+                approved_notional_exact = required_exact(
+                    "approved_notional_ceiling", "approved notional ceiling"
+                )
+                adaptive_notional_exact = _service_decimal(
+                    final_adaptive_exact.get("final_operational_notional_decimal"),
+                    "final adaptive notional",
+                )
+                displayed_quantity_exact = required_exact(
+                    "approved_quantity_ceiling", "displayed quantity ceiling"
+                )
+                displayed_stop_risk_exact = required_exact(
+                    "approved_stop_risk_ceiling", "displayed stop-risk ceiling"
+                )
+                execution_reference_exact = required_exact(
+                    "execution_reference_price", "execution reference price"
+                )
+                stop_distance_exact = required_exact("stop_distance_dollars", "stop distance")
+            except (TypeError, ValueError) as exc:
+                block_reason = block_reason or (
+                    "final exact sizing authority is unavailable: "
+                    f"{redact_exception(exc)[:1000]}"
+                )
             else:
-                displayed_quantity = float(row.get("qty") or proposal.get("approved_quantity_ceiling") or proposal.get("qty") or 0.0)
-                displayed_stop_risk = float(proposal.get("approved_stop_risk_ceiling") or proposal.get("stop_risk_dollars") or 0.0)
-                recomputed_quantity = final_notional / execution_reference_price if execution_reference_price and execution_reference_price > 0 else 0.0
-                stop_distance = float(proposal.get("stop_distance_dollars") or 0.0)
-                risk_quantity_ceiling = displayed_stop_risk / stop_distance if displayed_stop_risk > 0 and stop_distance > 0 else recomputed_quantity
-                final_quantity = min(recomputed_quantity, displayed_quantity, risk_quantity_ceiling)
-                final_notional = min(final_notional, final_quantity * float(execution_reference_price or 0.0))
-                proposal["notional_reduced_by_cap"] = final_notional < approved_notional - 1e-9
-                proposal["notional"] = final_notional
-                proposal["qty"] = final_quantity
-                proposal["stop_risk_dollars"] = float(proposal["qty"]) * float(proposal.get("stop_distance_dollars") or 0.0)
-                proposal["approved_quantity_ceiling"] = displayed_quantity
-                proposal["approved_notional_ceiling"] = approved_notional
-                proposal["sizing_caps"] = dict(final_adaptive.get("sizing_caps") or {})
-                proposal["binding_caps"] = [final_adaptive.get("binding_adaptive_cap")]
-                proposal["deployment_mode"] = final_conviction.get("deployment_mode") if final_conviction else proposal.get("deployment_mode")
-                proposal["opportunity_class"] = final_conviction.get("opportunity_class") if final_conviction else proposal.get("opportunity_class")
-                proposal["permitted_stop_risk_pct"] = final_conviction.get("recommended_stop_risk_pct") if final_conviction else proposal.get("permitted_stop_risk_pct")
-                context = self._portfolio_context(proposal, approval_valid=True)
-                if final_notional <= 0 or final_quantity <= 0:
-                    block_reason = "displayed quantity or stop-risk ceiling leaves no executable final size"
+                final_notional_exact = min(
+                    max(ZERO, approved_notional_exact),
+                    max(ZERO, adaptive_notional_exact),
+                )
+                final_notional = float(final_notional_exact)
+                if final_notional_exact <= ZERO:
+                    block_reason = block_reason or "final operational adaptive sizing found no safe executable size"
+                else:
+                    recomputed_quantity_exact = (
+                        final_notional_exact / execution_reference_exact
+                        if execution_reference_exact > ZERO else ZERO
+                    )
+                    risk_quantity_ceiling_exact = (
+                        displayed_stop_risk_exact / stop_distance_exact
+                        if displayed_stop_risk_exact > ZERO and stop_distance_exact > ZERO
+                        else recomputed_quantity_exact
+                    )
+                    final_quantity_exact = min(
+                        recomputed_quantity_exact,
+                        displayed_quantity_exact,
+                        risk_quantity_ceiling_exact,
+                    )
+                    final_notional_exact = min(
+                        final_notional_exact,
+                        final_quantity_exact * execution_reference_exact,
+                    )
+                    final_notional = float(final_notional_exact)
+                    final_quantity = float(final_quantity_exact)
+                    proposal["notional_reduced_by_cap"] = final_notional < approved_notional - 1e-9
+                    proposal["notional"] = final_notional
+                    proposal["notional_decimal"] = decimal_text(final_notional_exact)
+                    proposal["qty"] = final_quantity
+                    proposal["qty_decimal"] = decimal_text(final_quantity_exact)
+                    exact_final_stop_risk = final_quantity_exact * stop_distance_exact
+                    proposal["stop_risk_dollars"] = float(exact_final_stop_risk)
+                    proposal["stop_risk_dollars_decimal"] = decimal_text(exact_final_stop_risk)
+                    proposal["approved_quantity_ceiling"] = float(displayed_quantity_exact)
+                    proposal["approved_quantity_ceiling_decimal"] = decimal_text(displayed_quantity_exact)
+                    proposal["approved_notional_ceiling"] = float(approved_notional_exact)
+                    proposal["approved_notional_ceiling_decimal"] = decimal_text(approved_notional_exact)
+                    proposal["sizing_caps"] = dict(final_adaptive.get("sizing_caps") or {})
+                    proposal["binding_caps"] = [final_adaptive.get("binding_adaptive_cap")]
+                    proposal["deployment_mode"] = final_conviction.get("deployment_mode") if final_conviction else proposal.get("deployment_mode")
+                    proposal["opportunity_class"] = final_conviction.get("opportunity_class") if final_conviction else proposal.get("opportunity_class")
+                    proposal["permitted_stop_risk_pct"] = final_conviction.get("recommended_stop_risk_pct") if final_conviction else proposal.get("permitted_stop_risk_pct")
+                    context = self._portfolio_context(proposal, approval_valid=True)
+                    if final_notional <= 0 or final_quantity <= 0:
+                        block_reason = "displayed quantity or stop-risk ceiling leaves no executable final size"
 
         if (
             block_reason is None and prop_side == "buy" and proposal.get("action") == "add"
@@ -8228,11 +8505,15 @@ class TradingService:
                                 "action": proposal_action,
                                 "is_add": 1 if proposal_is_add else 0,
                                 "notional": notional,
+                                "notional_decimal": res.get("final_notional_decimal"),
                                 "qty": qty_val,
+                                "qty_decimal": res.get("suggested_shares_decimal"),
                                 "notional_adjustment_note": notional_adjustment_note,
                                 "latest_price": proposal_price_value,
+                                "latest_price_decimal": decimal_text(_service_decimal(proposal_quote["ask"] if signal.side == "buy" else proposal_quote["bid"], "proposal price")),
                                 "price_at": proposal_price_timestamp,
                                 "proposal_price": proposal_price_value,
+                                "proposal_price_decimal": decimal_text(_service_decimal(proposal_quote["ask"] if signal.side == "buy" else proposal_quote["bid"], "proposal price")),
                                 "proposal_price_timestamp": proposal_price_timestamp,
                                 "proposal_price_source": "alpaca_quote",
                                 "proposal_price_age_seconds_at_send": proposal_price_age,
@@ -8310,8 +8591,10 @@ class TradingService:
                                 "exit_priority_applied": exit_priority_applied,
                                 # Sizing & risk details
                                 "stop_price": stop_price,
+                                "stop_price_decimal": res.get("stop_price_decimal"),
                                 "stop_distance_pct": stop_distance_pct,
                                 "stop_distance_dollars": stop_distance_dollars,
+                                "stop_distance_dollars_decimal": res.get("stop_distance_dollars_decimal"),
                                 "stop_model_used": stop_model_used,
                                 "stop_validation_status": res.get("stop_validation_status"),
                                 "stop_policy_version": res.get("stop_policy_version", STOP_POLICY_VERSION),
@@ -8320,12 +8603,14 @@ class TradingService:
                                 "initial_risk_per_share": (proposal_price_value - float(stop_price)) if stop_price is not None and float(stop_price) < proposal_price_value else None,
                                 "initial_risk_pct": stop_distance_pct if stop_price is not None and float(stop_price) < proposal_price_value else None,
                                 "initial_risk_dollars": ((proposal_price_value - float(stop_price)) * float(qty_val)) if stop_price is not None and qty_val is not None and float(stop_price) < proposal_price_value else None,
+                                "stop_risk_dollars_decimal": res.get("stop_risk_dollars_decimal"),
                                 "stop_model": stop_model_used,
                                 "stop_source": stop_model_used,
                                 "entry_price_for_r": proposal_price_value,
                                 "risk_model_version": SIZING_POLICY_VERSION,
                                 "sizing_policy_version": res.get("sizing_policy_version", SIZING_POLICY_VERSION),
                                 "sizing_caps": res.get("sizing_caps", {}),
+                                "sizing_caps_decimal": res.get("sizing_caps_decimal", {}),
                                 "binding_caps": res.get("binding_caps", []),
                                 "formula_version": res.get("formula_version", RISK_DECISION_VERSION),
                                 "evidence_version": EVIDENCE_VERSION,
@@ -8376,14 +8661,18 @@ class TradingService:
                                     proposal, res
                                 )
 
-                            if is_buy and proposal_allowed:
+                            if (
+                                is_buy
+                                and proposal_allowed
+                            ):
                                 # The executable ask can differ from the latest
                                 # trade used during signal sizing. Reduce to one
                                 # exact quantity/notional/stop-risk identity
                                 # before any proposal risk decision or display.
                                 try:
                                     self._canonicalize_profitability_display_terms(
-                                        proposal
+                                        proposal,
+                                        require_exact=self._profitability_operational_enforced(),
                                     )
                                 except ValueError as exc:
                                     proposal_allowed = False
@@ -8424,6 +8713,10 @@ class TradingService:
                                 operational_adaptive = proposal.get("adaptive_sizing") or {}
                                 adaptive_notional = float(operational_adaptive.get("operational_notional") or 0.0)
                                 adaptive_quantity = float(operational_adaptive.get("operational_quantity") or 0.0)
+                                adaptive_exact = operational_adaptive.get("exact_values") or {}
+                                adaptive_notional_decimal = adaptive_exact.get("final_operational_notional_decimal")
+                                adaptive_quantity_decimal = adaptive_exact.get("final_operational_quantity_decimal")
+                                adaptive_stop_risk_decimal = adaptive_exact.get("adaptive_constrained_stop_risk_dollars_decimal")
                                 if not baseline_decision.passed or adaptive_notional <= 0 or adaptive_quantity <= 0:
                                     reasons = baseline_decision.reasons if not baseline_decision.passed else ["adaptive operational sizing found no safe executable size"]
                                     no_action_reason = f"blocked by risk checks: {'; '.join(reasons)}"
@@ -8431,11 +8724,17 @@ class TradingService:
                                 else:
                                     proposal["baseline_operational_notional"] = float(proposal.get("notional") or 0.0)
                                     proposal["notional"] = adaptive_notional
+                                    proposal["notional_decimal"] = adaptive_notional_decimal or decimal_text(_service_decimal(adaptive_notional, "adaptive notional"))
                                     proposal["qty"] = adaptive_quantity
+                                    proposal["qty_decimal"] = adaptive_quantity_decimal or decimal_text(_service_decimal(adaptive_quantity, "adaptive quantity"))
                                     proposal["displayed_adaptive_ceiling"] = adaptive_notional
+                                    proposal["displayed_adaptive_ceiling_decimal"] = proposal["notional_decimal"]
                                     proposal["approved_quantity_ceiling"] = adaptive_quantity
+                                    proposal["approved_quantity_ceiling_decimal"] = proposal["qty_decimal"]
                                     proposal["approved_stop_risk_ceiling"] = float(operational_adaptive.get("stop_risk_dollars") or 0.0)
+                                    proposal["approved_stop_risk_ceiling_decimal"] = adaptive_stop_risk_decimal or decimal_text(_service_decimal(proposal["approved_stop_risk_ceiling"], "approved stop risk"))
                                     proposal["stop_risk_dollars"] = adaptive_quantity * float(proposal.get("stop_distance_dollars") or 0.0)
+                                    proposal["stop_risk_dollars_decimal"] = adaptive_stop_risk_decimal or decimal_text(_service_decimal(proposal["stop_risk_dollars"], "stop risk"))
                                     proposal["initial_risk_dollars"] = proposal["stop_risk_dollars"]
                                     proposal["initial_risk_pct"] = (
                                         proposal["stop_risk_dollars"] / float(snapshot["portfolio_equity"]) * 100.0
@@ -8496,7 +8795,8 @@ class TradingService:
                             ):
                                 try:
                                     self._canonicalize_profitability_display_terms(
-                                        proposal
+                                        proposal,
+                                        require_exact=True,
                                     )
                                     notional = float(proposal["notional"])
                                     qty_val = float(proposal["qty"])
@@ -9887,21 +10187,71 @@ class TradingService:
             strategy_consumption = self._phase4_strategy_consumption(
                 list(runtime_state.get("positions") or []), equity
             )
+            phase4_exact = canonical_phase4.exact_values
+            phase4_equity_decimal = phase4_exact.get("portfolio_equity_decimal")
+            phase4_heat_before_decimal = None
+            phase4_gross_before_decimal = None
+            try:
+                equity_exact = _service_decimal(
+                    phase4_equity_decimal or equity, "Phase 4 portfolio equity"
+                )
+                pending_stop_exact = _service_decimal(
+                    pending_phase4.get("total_stop_risk_decimal"),
+                    "Phase 4 pending stop risk",
+                )
+                pending_notional_exact = _service_decimal(
+                    pending_phase4.get("total_notional_decimal"),
+                    "Phase 4 pending notional",
+                )
+                if equity_exact > ZERO:
+                    phase4_heat_before_decimal = decimal_text(
+                        (
+                            _service_decimal(
+                                phase4_exact.get("projected_total_open_risk_decimal"),
+                                "Phase 4 projected open risk",
+                            )
+                            + pending_stop_exact
+                        )
+                        / equity_exact
+                        * Decimal("100")
+                    )
+                    phase4_gross_before_decimal = decimal_text(
+                        (
+                            _service_decimal(
+                                phase4_exact.get("projected_gross_exposure_decimal"),
+                                "Phase 4 projected gross exposure",
+                            )
+                            + pending_notional_exact
+                        )
+                        / equity_exact
+                        * Decimal("100")
+                    )
+            except ValueError as exc:
+                self.storage.audit(self.run_id, "phase4_exact_snapshot_unavailable", {
+                    "error_type": type(exc).__name__, "manual_approval_required": True,
+                    "allocation_authorized": False,
+                })
+                phase4_equity_decimal = None
             phase3_profile = Phase3Controller(self.storage, self.config, self.run_id).profile
             allocation_as_of = iso_now()
             phase4_snapshot = {
                 "portfolio_equity": equity,
+                "portfolio_equity_decimal": phase4_equity_decimal,
                 "as_of": allocation_as_of,
                 "equity_as_of": allocation_as_of,
                 "heat_before_pct": ((float(canonical_phase4.projected_total_open_risk or 0.0) + float(pending_phase4.get("total_stop_risk") or 0.0)) / equity * 100.0) if equity > 0 else None,
                 "gross_exposure_before_pct": ((float(canonical_phase4.projected_gross_exposure or 0.0) + float(pending_phase4.get("total_notional") or 0.0)) / equity * 100.0) if equity > 0 else None,
+                "heat_before_pct_decimal": phase4_heat_before_decimal,
+                "gross_exposure_before_pct_decimal": phase4_gross_before_decimal,
                 "symbol_exposure_before": canonical_phase4.symbol_exposure,
                 "cluster_exposure_before": canonical_phase4.cluster_exposure,
                 "pending_risk": float(pending_phase4.get("total_stop_risk") or 0.0),
                 "reserved_risk": float(reservations_phase4.get("active_reserved_stop_risk") or 0.0),
                 "strategy_risk_by_strategy": strategy_consumption["risk_dollars"] if strategy_consumption["complete"] else {},
+                "strategy_risk_by_strategy_decimal": strategy_consumption["risk_dollars_decimal"] if strategy_consumption["complete"] else {},
                 "strategy_risk_unit": "stop_risk_dollars",
                 "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
+                "strategy_notional_by_strategy_decimal": strategy_consumption["notional_dollars_decimal"] if strategy_consumption["complete"] else {},
                 "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
                 "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
                 "strategy_attribution_complete": strategy_consumption["complete"],
@@ -9909,11 +10259,87 @@ class TradingService:
                 "phase3_gross_exposure_capacity_pct": phase3_profile.hard_gross_exposure_pct,
                 "strategy_registry_snapshot_id": self._ensure_strategy_registry_snapshot(),
             }
-            self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
-                regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot,
-                strategy_policy_map=self._strategy_policy_map or {},
-                as_of=allocation_as_of,
+            phase4_exact_ready = all(
+                value is not None
+                for value in (
+                    phase4_equity_decimal,
+                    phase4_heat_before_decimal,
+                    phase4_gross_before_decimal,
+                )
             )
+            if not phase4_exact_ready:
+                # Phase 4 allocation is executable authority.  A compatible
+                # float snapshot must never be allowed to become an
+                # allocation when any canonical account/risk sidecar is
+                # absent.  Keep the cache shape stable for diagnostics and
+                # make every known strategy explicitly non-operational.
+                blocked_strategies = sorted(
+                    set((self._strategy_policy_map or {}).keys()) | {STRATEGY_VERSION}
+                )
+                blocked_reason = "Phase 4 exact snapshot evidence unavailable"
+                self._phase4_allocation_cache = {
+                    "allocation_id": None,
+                    "decision": "PRESERVE_CASH",
+                    "cash_weight": 1.0,
+                    "allocation_class": "unallocated",
+                    "operational_kelly_used": False,
+                    "binding_caps": {"exact_snapshot": blocked_reason},
+                    "evidence_versions": {},
+                    "estimates": {},
+                    "strategy_policies": {
+                        strategy: {
+                            "strategy_version": strategy,
+                            "mode": "blocked",
+                            "state": "RESEARCH_ONLY",
+                            "reason": blocked_reason,
+                            "operationally_executable": False,
+                            "manual_approval_required": True,
+                            "risk_budget_multiplier": 0.0,
+                            "stop_risk_pct": 0.0,
+                            "max_stop_risk_pct": 0.0,
+                        }
+                        for strategy in blocked_strategies
+                    },
+                    "strategy_sleeves": {
+                        strategy: {
+                            "strategy_version": strategy,
+                            "risk_unit": "stop_risk_dollars",
+                            "remaining_risk": 0.0,
+                            "remaining_risk_decimal": "0",
+                            "remaining_notional": 0.0,
+                            "remaining_notional_decimal": "0",
+                        }
+                        for strategy in blocked_strategies
+                    },
+                    "authorized_strategies": [],
+                    "operational_strategies": [],
+                    "phase3_available_risk": 0.0,
+                    "phase3_available_risk_decimal": "0",
+                    "phase3_available_risk_unit": "stop_risk_dollars",
+                    "risk_value": 0.0,
+                    "risk_value_decimal": "0",
+                    "risk_unit": "stop_risk_dollars",
+                    "weights": {},
+                    "raw_replay_inputs": {},
+                    "unallocated_available_risk": 0.0,
+                    "unallocated_available_risk_decimal": "0",
+                    "risk_reconciliation_residual": 0.0,
+                    "risk_reconciliation_residual_decimal": "0",
+                    "healthy": False,
+                }
+                self.storage.audit(self.run_id, "phase4_allocation_blocked", {
+                    "allocation_id": None,
+                    "decision": "PRESERVE_CASH",
+                    "reason": blocked_reason,
+                    "manual_approval_required": True,
+                    "allocation_authorized": False,
+                })
+            else:
+                self._phase4_allocation_cache = AdaptiveAllocator(self.storage, self.config, self.run_id).run(
+                    regime="runtime_mixed_uncertain", drawdown_pct=drawdown, portfolio_snapshot=phase4_snapshot,
+                    strategy_policy_map=self._strategy_policy_map or {},
+                    as_of=allocation_as_of,
+                )
             self.storage.audit(self.run_id, "phase4_active_adaptive_allocation", {
                 "allocation_id": self._phase4_allocation_cache["allocation_id"],
                 "decision": self._phase4_allocation_cache["decision"],
@@ -10814,22 +11240,32 @@ class TradingService:
                 if not isinstance(payload, dict):
                     raise ValueError("payload is not an object")
                 notional = _service_decimal(
-                    payload.get("notional") if payload.get("notional") is not None else row.get("notional"),
+                    payload.get("notional_decimal")
+                    if payload.get("notional_decimal") is not None
+                    else payload.get("notional") if payload.get("notional") is not None else row.get("notional"),
                     "pending proposal notional",
                     minimum=ZERO,
                 )
                 price = _service_decimal(
-                    payload.get("latest_price") or payload.get("reference_price"),
+                    payload.get("latest_price_decimal")
+                    if payload.get("latest_price_decimal") is not None
+                    else payload.get("reference_price_decimal")
+                    if payload.get("reference_price_decimal") is not None
+                    else payload.get("latest_price") or payload.get("reference_price"),
                     "pending proposal reference price",
                     minimum=ZERO,
                 )
                 stop = _service_decimal(
-                    payload.get("stop_distance_dollars"),
+                    payload.get("stop_distance_dollars_decimal")
+                    if payload.get("stop_distance_dollars_decimal") is not None
+                    else payload.get("stop_distance_dollars"),
                     "pending proposal stop distance",
                     minimum=ZERO,
                 )
                 risk_dollars = _service_decimal(
-                    payload.get("stop_risk_dollars") or "0",
+                    payload.get("stop_risk_dollars_decimal")
+                    if payload.get("stop_risk_dollars_decimal") is not None
+                    else payload.get("stop_risk_dollars") or "0",
                     "pending proposal stop risk",
                     minimum=ZERO,
                 )
@@ -11070,19 +11506,47 @@ class TradingService:
                 continue
             try:
                 quantity = _service_decimal(
-                    payload.get("qty") or "0", "pending strategy quantity"
+                    payload.get("qty_decimal")
+                    if payload.get("qty_decimal") is not None
+                    else payload.get("qty") or "0",
+                    "pending strategy quantity",
                 )
                 reference = max(
-                    _service_decimal(payload.get("latest_price") or "0", "pending latest price"),
-                    _service_decimal(payload.get("limit_price") or "0", "pending limit price"),
+                    _service_decimal(
+                        payload.get("latest_price_decimal")
+                        if payload.get("latest_price_decimal") is not None
+                        else payload.get("latest_price") or "0",
+                        "pending latest price",
+                    ),
+                    _service_decimal(
+                        payload.get("limit_price_decimal")
+                        if payload.get("limit_price_decimal") is not None
+                        else payload.get("limit_price") or "0",
+                        "pending limit price",
+                    ),
                 )
                 notional = max(
-                    _service_decimal(row.get("notional") or payload.get("notional") or "0", "pending proposal notional"),
+                    _service_decimal(
+                        payload.get("notional_decimal")
+                        if payload.get("notional_decimal") is not None
+                        else row.get("notional") or payload.get("notional") or "0",
+                        "pending proposal notional",
+                    ),
                     quantity * reference,
                 )
                 risk = max(
-                    _service_decimal(payload.get("pending_add_stop_risk") or "0", "pending add stop risk"),
-                    _service_decimal(payload.get("stop_risk_dollars") or "0", "pending stop risk"),
+                    _service_decimal(
+                        payload.get("pending_add_stop_risk_decimal")
+                        if payload.get("pending_add_stop_risk_decimal") is not None
+                        else payload.get("pending_add_stop_risk") or "0",
+                        "pending add stop risk",
+                    ),
+                    _service_decimal(
+                        payload.get("stop_risk_dollars_decimal")
+                        if payload.get("stop_risk_dollars_decimal") is not None
+                        else payload.get("stop_risk_dollars") or "0",
+                        "pending stop risk",
+                    ),
                 )
             except (TypeError, ValueError, ArithmeticError):
                 notional = risk = None
@@ -11192,7 +11656,9 @@ class TradingService:
         sleeve_allocation_id = None
         strategy_sleeve = None
         sleeve_risk_remaining_dollars = None
+        sleeve_risk_remaining_dollars_exact: Decimal | None = None
         sleeve_notional_remaining = None
+        sleeve_notional_remaining_exact: Decimal | None = None
         strategy_sleeve_payload = None
         risk_per_trade_pct = finite(sizing_cfg.get("risk_per_trade_pct"))
         if risk_per_trade_pct is None or risk_per_trade_pct < 0:
@@ -11249,9 +11715,49 @@ class TradingService:
                     strategy_consumption = self._phase4_strategy_consumption(
                         list(phase4_state.get("positions") or []), equity
                     )
+                    phase4_exact = phase4_canonical.exact_values
+                    phase4_equity_decimal = phase4_exact.get("portfolio_equity_decimal")
+                    phase4_heat_before_decimal = None
+                    phase4_gross_before_decimal = None
+                    try:
+                        equity_exact = _service_decimal(
+                            phase4_equity_decimal or equity, "Phase 4 portfolio equity"
+                        )
+                        if equity_exact > ZERO:
+                            phase4_heat_before_decimal = decimal_text(
+                                (
+                                    _service_decimal(
+                                        phase4_exact.get("projected_total_open_risk_decimal"),
+                                        "Phase 4 projected open risk",
+                                    )
+                                    + _service_decimal(
+                                        phase4_pending.get("total_stop_risk_decimal"),
+                                        "Phase 4 pending stop risk",
+                                    )
+                                )
+                                / equity_exact
+                                * Decimal("100")
+                            )
+                            phase4_gross_before_decimal = decimal_text(
+                                (
+                                    _service_decimal(
+                                        phase4_exact.get("projected_gross_exposure_decimal"),
+                                        "Phase 4 projected gross exposure",
+                                    )
+                                    + _service_decimal(
+                                        phase4_pending.get("total_notional_decimal"),
+                                        "Phase 4 pending notional",
+                                    )
+                                )
+                                / equity_exact
+                                * Decimal("100")
+                            )
+                    except ValueError:
+                        return empty("Phase 4 exact snapshot evidence unavailable")
                     allocation_as_of = iso_now()
                     phase4_snapshot = {
                         "portfolio_equity": equity,
+                        "portfolio_equity_decimal": phase4_equity_decimal,
                         "as_of": allocation_as_of,
                         "equity_as_of": allocation_as_of,
                         "heat_before_pct": (
@@ -11264,11 +11770,15 @@ class TradingService:
                              + float(_service_decimal(phase4_pending.get("total_notional_decimal"), "phase4 pending notional")))
                             / equity * 100.0
                         ),
+                        "heat_before_pct_decimal": phase4_heat_before_decimal,
+                        "gross_exposure_before_pct_decimal": phase4_gross_before_decimal,
                         "pending_risk": float(_service_decimal(phase4_pending.get("total_stop_risk_decimal"), "phase4 pending stop risk")),
                         "reserved_risk": float(_service_decimal(phase4_reservations.get("active_reserved_stop_risk_decimal"), "phase4 reserved stop risk")),
                         "strategy_risk_by_strategy": strategy_consumption["risk_dollars"] if strategy_consumption["complete"] else {},
+                        "strategy_risk_by_strategy_decimal": strategy_consumption["risk_dollars_decimal"] if strategy_consumption["complete"] else {},
                         "strategy_risk_unit": "stop_risk_dollars",
                         "strategy_notional_by_strategy": strategy_consumption["notional_dollars"] if strategy_consumption["complete"] else {},
+                        "strategy_notional_by_strategy_decimal": strategy_consumption["notional_dollars_decimal"] if strategy_consumption["complete"] else {},
                         "active_reservation_ids_by_strategy": strategy_consumption["active_reservation_ids_by_strategy"] if strategy_consumption["complete"] else {},
                         "pending_proposal_claims_by_strategy": strategy_consumption["pending_proposal_claims_by_strategy"] if strategy_consumption["complete"] else {},
                         "strategy_attribution_complete": strategy_consumption["complete"],
@@ -11285,13 +11795,19 @@ class TradingService:
                 phase4_policy = self._phase4_allocation_cache.get("strategy_policies", {}).get(strategy_version, {})
                 sleeve = self._phase4_allocation_cache.get("strategy_sleeves", {}).get(strategy_version) or {}
                 risk_unit = str(sleeve.get("risk_unit") or self._phase4_allocation_cache.get("phase3_available_risk_unit") or "pct_equity")
-                sleeve_risk_remaining = float(sleeve.get("remaining_risk") or 0.0)
-                sleeve_risk_remaining_dollars = (
-                    equity * sleeve_risk_remaining / 100.0
-                    if risk_unit == "pct_equity"
-                    else sleeve_risk_remaining
-                )
-                sleeve_notional_remaining = float(sleeve.get("remaining_notional") or 0.0)
+                try:
+                    sleeve_risk_remaining_dollars_exact = _service_decimal(
+                        sleeve.get("remaining_risk_decimal"),
+                        "strategy sleeve remaining stop risk",
+                    )
+                    sleeve_notional_remaining_exact = _service_decimal(
+                        sleeve.get("remaining_notional_decimal"),
+                        "strategy sleeve remaining notional",
+                    )
+                except ValueError as exc:
+                    return empty(f"strategy sleeve exact risk/notional evidence unavailable: {exc}")
+                sleeve_risk_remaining_dollars = float(sleeve_risk_remaining_dollars_exact)
+                sleeve_notional_remaining = float(sleeve_notional_remaining_exact)
                 strategy_registry_snapshot_id = self._ensure_strategy_registry_snapshot()
                 sleeve_allocation_id = self._phase4_allocation_cache.get("allocation_id")
                 strategy_sleeve = strategy_version
@@ -11341,7 +11857,9 @@ class TradingService:
                 "sleeve_allocation_id": sleeve_allocation_id,
                 "strategy_sleeve": strategy_sleeve,
                 "sleeve_risk_remaining_dollars": sleeve_risk_remaining_dollars,
+                "sleeve_risk_remaining_dollars_exact": sleeve_risk_remaining_dollars_exact,
                 "sleeve_notional_remaining": sleeve_notional_remaining,
+                "sleeve_notional_remaining_exact": sleeve_notional_remaining_exact,
                 "strategy_sleeve_payload": strategy_sleeve_payload,
             }
         risk_budget = equity * risk_per_trade_pct / 100.0
@@ -11845,14 +12363,10 @@ class TradingService:
             exact_extra_caps["probe_gross_cap"] = probe_gross_remaining_exact
             exact_extra_caps["probe_active_count_cap"] = ZERO if blocked_reason else Decimal("Infinity")
         if self.config.get("phase4", {}).get("active"):
-            exact_sleeve_risk = _service_decimal(
-                phase3_context.get("sleeve_risk_remaining_dollars") or "0",
-                "strategy sleeve stop risk",
-            )
-            exact_sleeve_notional = _service_decimal(
-                phase3_context.get("sleeve_notional_remaining") or "0",
-                "strategy sleeve notional",
-            )
+            exact_sleeve_risk = phase3_context.get("sleeve_risk_remaining_dollars_exact")
+            exact_sleeve_notional = phase3_context.get("sleeve_notional_remaining_exact")
+            if not isinstance(exact_sleeve_risk, Decimal) or not isinstance(exact_sleeve_notional, Decimal):
+                return empty("strategy sleeve exact risk/notional evidence unavailable")
             exact_extra_caps["strategy_sleeve_stop_risk"] = exact_sleeve_risk * entry_exact / stop_distance_exact
             exact_extra_caps["strategy_sleeve_notional"] = exact_sleeve_notional
 
@@ -12034,9 +12548,19 @@ class TradingService:
 
         return {
             "final_notional": final_notional, "suggested_shares": suggested_shares, "stop_price": stop_price,
+            "final_notional_decimal": decimal_text(final_notional_exact),
+            "suggested_shares_decimal": decimal_text(final_notional_exact / entry_exact),
+            "stop_price_decimal": (
+                decimal_text(entry_exact - stop_distance_exact)
+                if entry_exact > stop_distance_exact > ZERO else None
+            ),
             "stop_distance_pct": stop_distance_pct, "stop_distance_dollars": stop_distance_dollars,
+            "stop_distance_dollars_decimal": decimal_text(stop_distance_exact),
             "risk_budget": risk_budget, "risk_budget_dollars": risk_budget,
+            "risk_budget_decimal": decimal_text(risk_budget_exact),
+            "risk_budget_dollars_decimal": decimal_text(risk_budget_exact),
             "stop_risk_dollars": stop_risk_dollars,
+            "stop_risk_dollars_decimal": decimal_text(stop_risk_dollars_exact),
             "phase4_mode": phase3_context.get("phase4_mode", "disabled"),
             "phase4_exploration_heat_cap_pct": phase3_context.get("phase4_exploration_heat_cap_pct"),
             "phase4_exploration_gross_cap_pct": phase3_context.get("phase4_exploration_gross_cap_pct"),
@@ -12049,12 +12573,37 @@ class TradingService:
             "risk_based_shares": risk_based_shares, "score_adjusted_notional": target_notional,
             "vol_adjusted_notional": target_notional, "base_notional": policy.default_notional_usd,
             "raw_risk_based_notional": risk_based_notional, "quality_adjusted_notional": target_notional,
+            "risk_based_shares_decimal": decimal_text(risk_based_shares_exact),
+            "score_adjusted_notional_decimal": decimal_text(target_notional_exact),
+            "vol_adjusted_notional_decimal": decimal_text(target_notional_exact),
+            "base_notional_decimal": decimal_text(_service_decimal(policy.default_notional_usd, "default notional")),
+            "raw_risk_based_notional_decimal": decimal_text(risk_based_notional_exact),
+            "quality_adjusted_notional_decimal": decimal_text(target_notional_exact),
             "cash_cap": cash_cap, "cash_available_cap": cash_available_cap, "cash_usage_cap": cash_usage_cap,
             "buying_power_cap": buying_power_cap, "position_cap": symbol_cap, "portfolio_cap": portfolio_cap,
             "cluster_cap": cluster_cap, "stage_cap": stage_cap, "equity_cap": equity_cap, "absolute_cap": absolute_cap,
             "stop_risk_cap": stop_risk_cap, "allocation_cap": allocation_cap, "exploration_cap": exploration_cap, "probe_cap": probe_cap,
+            "cash_cap_decimal": decimal_text(cash_cap_exact),
+            "cash_available_cap_decimal": decimal_text(cash_available_cap_exact),
+            "cash_usage_cap_decimal": decimal_text(cash_usage_cap_exact),
+            "buying_power_cap_decimal": decimal_text(buying_power_cap_exact),
+            "position_cap_decimal": decimal_text(symbol_cap_exact),
+            "portfolio_cap_decimal": decimal_text(portfolio_cap_exact),
+            "cluster_cap_decimal": decimal_text(cluster_cap_exact) if cluster_cap_exact.is_finite() else None,
+            "stage_cap_decimal": decimal_text(stage_cap_exact) if stage_cap_exact.is_finite() else None,
+            "equity_cap_decimal": decimal_text(equity_cap_exact) if equity_cap_exact.is_finite() else None,
+            "absolute_cap_decimal": decimal_text(absolute_cap_exact) if absolute_cap_exact.is_finite() else None,
+            "stop_risk_cap_decimal": decimal_text(stop_risk_cap_exact),
+            "allocation_cap_decimal": decimal_text(allocation_cap_exact) if allocation_cap_exact.is_finite() else None,
+            "sizing_caps_decimal": {
+                name: decimal_text(value) for name, value in finite_exact_caps.items()
+            },
             "average_dollar_volume": average_dollar_volume if phase3_enabled else None,
-            "minimum_executable_notional": minimum_executable_notional, "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
+            "minimum_executable_notional": minimum_executable_notional,
+            "minimum_executable_notional_decimal": decimal_text(
+                _service_decimal(minimum_executable_notional, "minimum executable notional")
+            ),
+            "caps_applied": ", ".join(caps_applied) if caps_applied else "none",
             "binding_caps": binding_caps, "sizing_caps": sizing_caps, "blocked_reason": blocked_reason,
             "pending_exposure_unknown": False, "sizing_policy_version": SIZING_POLICY_VERSION,
             "formula_version": RISK_DECISION_VERSION,
@@ -12073,6 +12622,16 @@ class TradingService:
             "sleeve_allocation_id": phase3_context.get("sleeve_allocation_id"),
             "sleeve_stop_risk_ceiling": phase3_context.get("sleeve_risk_remaining_dollars"),
             "sleeve_notional_ceiling": phase3_context.get("sleeve_notional_remaining"),
+            "sleeve_stop_risk_ceiling_decimal": (
+                decimal_text(phase3_context["sleeve_risk_remaining_dollars_exact"])
+                if isinstance(phase3_context.get("sleeve_risk_remaining_dollars_exact"), Decimal)
+                else None
+            ),
+            "sleeve_notional_ceiling_decimal": (
+                decimal_text(phase3_context["sleeve_notional_remaining_exact"])
+                if isinstance(phase3_context.get("sleeve_notional_remaining_exact"), Decimal)
+                else None
+            ),
             "strategy_sleeve_payload": phase3_context.get("strategy_sleeve_payload"),
             # Candidate risk is the risk of this candidate's final quantity and
             # stop. Sleeve capacity remains a separate authority ceiling.
@@ -12112,8 +12671,15 @@ class TradingService:
     @staticmethod
     def _canonicalize_profitability_display_terms(
         proposal: dict[str, Any],
+        *,
+        require_exact: bool = False,
     ) -> None:
-        """Reduce BUY display terms to one exact 8-decimal quantity basis."""
+        """Reduce BUY display terms to one exact 8-decimal quantity basis.
+
+        Legacy non-operational callers may still provide compatibility floats;
+        the active profitability/operational-paper gate passes ``require_exact``
+        so missing or malformed decimal sidecars fail closed.
+        """
         if (
             str(proposal.get("side") or "").lower() != "buy"
             or str(proposal.get("action") or "").lower()
@@ -12121,7 +12687,19 @@ class TradingService:
         ):
             return
         try:
-            prices = [
+            exact_prices = [
+                proposal.get("execution_reference_price_decimal"),
+                proposal.get("proposal_price_decimal"),
+                proposal.get("latest_price_decimal"),
+                proposal.get("limit_price_decimal"),
+            ]
+            # The compatibility path must preserve the historical quote and
+            # sizing projections used by non-operational fixtures.  Fresh
+            # operational proposals take the exact-only path below; mixing
+            # their sidecars into a legacy float proposal can pair a newer
+            # exact quantity with an older quote and make display authority
+            # appear internally inconsistent.
+            prices = exact_prices if require_exact else [
                 proposal.get("proposal_price"),
                 proposal.get("latest_price"),
                 proposal.get("limit_price"),
@@ -12131,11 +12709,21 @@ class TradingService:
                 for value in prices
                 if value not in (None, "")
             )
-            quantity = Decimal(str(proposal.get("qty")))
-            notional_ceiling = Decimal(str(proposal.get("notional")))
+            quantity_raw = (
+                proposal.get("qty_decimal")
+                if require_exact
+                else proposal.get("qty_decimal") or proposal.get("qty")
+            )
+            notional_raw = (
+                proposal.get("notional_decimal")
+                if require_exact
+                else proposal.get("notional") or proposal.get("notional_decimal")
+            )
+            quantity = Decimal(str(quantity_raw))
+            notional_ceiling = Decimal(str(notional_raw))
         except Exception as exc:
             raise ValueError(
-                "BUY display terms are not valid decimals"
+                "BUY display terms require valid exact decimal sidecars"
             ) from exc
         if (
             not entry.is_finite()
@@ -12161,6 +12749,8 @@ class TradingService:
         exact_notional = quantity * entry
         proposal["qty"] = float(quantity)
         proposal["notional"] = float(exact_notional)
+        proposal["qty_decimal"] = decimal_text(quantity)
+        proposal["notional_decimal"] = decimal_text(exact_notional)
         if proposal.get("approved_quantity_ceiling") not in (None, ""):
             proposal["approved_quantity_ceiling"] = min(
                 float(proposal["approved_quantity_ceiling"]),
@@ -12174,16 +12764,32 @@ class TradingService:
         proposal["execution_reference_price"] = float(entry)
         proposal["latest_price"] = float(entry)
         proposal["entry_price_for_r"] = float(entry)
-        stop_price = proposal.get("stop_price")
-        stop_distance = proposal.get("stop_distance_dollars")
+        proposal["execution_reference_price_decimal"] = decimal_text(entry)
+        proposal["latest_price_decimal"] = decimal_text(entry)
+        proposal["entry_price_for_r_decimal"] = decimal_text(entry)
+        stop_price = (
+            proposal.get("stop_price_decimal")
+            if require_exact
+            else proposal.get("stop_price") or proposal.get("stop_price_decimal")
+        )
+        stop_distance = (
+            proposal.get("stop_distance_dollars_decimal")
+            if require_exact
+            else proposal.get("stop_distance_dollars") or proposal.get("stop_distance_dollars_decimal")
+        )
+        if require_exact and proposal.get("stop_price") not in (None, "") and stop_price in (None, ""):
+            raise ValueError("BUY stop price exact sidecar is missing")
         if stop_price not in (None, ""):
             stop_value = Decimal(str(stop_price))
             if not stop_value.is_finite() or stop_value <= 0 or stop_value >= entry:
                 raise ValueError("BUY stop price must be below the execution reference")
             stop_distance = entry - stop_value
             proposal["stop_distance_dollars"] = float(stop_distance)
+            proposal["stop_distance_dollars_decimal"] = decimal_text(stop_distance)
             proposal["stop_distance_pct"] = float(stop_distance / entry * Decimal("100"))
             proposal["initial_risk_per_share"] = float(stop_distance)
+        if require_exact and proposal.get("stop_distance_dollars") not in (None, "") and stop_distance in (None, ""):
+            raise ValueError("BUY stop distance exact sidecar is missing")
         if stop_distance not in (None, ""):
             distance = Decimal(str(stop_distance))
             if not distance.is_finite() or distance <= 0:
@@ -12192,6 +12798,7 @@ class TradingService:
                 )
             exact_stop_risk = quantity * distance
             proposal["stop_risk_dollars"] = float(exact_stop_risk)
+            proposal["stop_risk_dollars_decimal"] = decimal_text(exact_stop_risk)
             proposal["initial_risk_dollars"] = float(exact_stop_risk)
             proposal["initial_risk_pct"] = float(
                 exact_stop_risk / entry / quantity * Decimal("100")
@@ -13165,21 +13772,33 @@ class TradingService:
         reasons: dict[str, str] = {}
 
         sleeve_inputs: dict[str, dict[str, Any]] = {}
-        sleeve_notional_remaining: dict[str, float] = {}
-        global_sleeve_remaining = 0.0
+        sleeve_notional_remaining_decimal: dict[str, Decimal] = {}
+        global_sleeve_remaining_decimal = ZERO
+        phase4_sleeve_evidence_error: str | None = None
         if self.config.get("phase4", {}).get("active") and self._phase4_allocation_cache:
             for strategy, sleeve in (self._phase4_allocation_cache.get("strategy_sleeves") or {}).items():
                 row = dict(sleeve)
-                remaining = float(row.get("remaining_risk") or 0.0)
-                if str(row.get("risk_unit") or "pct_equity") == "pct_equity":
-                    remaining = equity * remaining / 100.0
-                row["remaining_risk"] = max(0.0, remaining)
+                try:
+                    remaining = _service_decimal(
+                        row.get("remaining_risk_decimal"),
+                        "Phase 4 sleeve remaining stop risk",
+                    )
+                    remaining_notional = _service_decimal(
+                        row.get("remaining_notional_decimal"),
+                        "Phase 4 sleeve remaining notional",
+                    )
+                except ValueError as exc:
+                    phase4_sleeve_evidence_error = str(exc)
+                    continue
+                row["remaining_risk_decimal"] = decimal_text(remaining)
+                row["remaining_risk"] = float(remaining)
                 row["risk_unit"] = "stop_risk_dollars"
                 sleeve_inputs[str(strategy)] = row
-                sleeve_notional_remaining[str(strategy)] = max(0.0, float(row.get("remaining_notional") or 0.0))
-            global_sleeve_remaining = sum(
-                float(row.get("remaining_risk") or 0.0) for row in sleeve_inputs.values()
-            )
+                row["remaining_notional_decimal"] = decimal_text(remaining_notional)
+                row["remaining_notional"] = float(remaining_notional)
+                sleeve_notional_remaining_decimal[str(strategy)] = remaining_notional
+                global_sleeve_remaining_decimal += remaining
+            global_sleeve_remaining_decimal = max(ZERO, global_sleeve_remaining_decimal)
 
         for candidate in ranked_candidates:
             symbol = str(candidate["symbol"]).upper()
@@ -13203,6 +13822,8 @@ class TradingService:
             cap_reason = None
             reduction_reason = None
             final_notional = max(0.0, raw_notional)
+            if phase4_sleeve_evidence_error and self.config.get("phase4", {}).get("active"):
+                cap_reason = f"not actionable - Phase 4 exact sleeve evidence unavailable: {phase4_sleeve_evidence_error}"
 
             current_symbol_pct = float(single_after.get(symbol, 0.0) or 0.0)
             cluster_name = self._get_symbol_cluster(symbol)
@@ -13279,11 +13900,12 @@ class TradingService:
                     or getattr(signal, "strategy_version", "")
                     or STRATEGY_VERSION
                 )
-                remaining_notional = sleeve_notional_remaining.get(strategy)
-                if remaining_notional is None:
+                remaining_notional_exact = sleeve_notional_remaining_decimal.get(strategy)
+                if remaining_notional_exact is None:
                     cap_reason = "not actionable - Phase 4 strategy sleeve allocation rejected the candidate"
                 else:
-                    if final_notional > remaining_notional:
+                    remaining_notional = float(remaining_notional_exact)
+                    if _service_decimal(final_notional, "candidate notional") > remaining_notional_exact:
                         final_notional = max(0.0, remaining_notional)
                         reduction_reason = "Phase 4 strategy sleeve candidate-set notional budget"
                     if final_notional < cfg["min_notional"]:
@@ -13291,6 +13913,14 @@ class TradingService:
                     requested_risk = (
                         final_notional * float(stop_distance_pct or 0.0) / 100.0
                         if cap_reason is None else 0.0
+                    )
+                    requested_risk_decimal = decimal_text(
+                        _service_decimal(requested_risk, "Phase 4 candidate stop risk")
+                    )
+                    minimum_risk_decimal = decimal_text(
+                        _service_decimal(cfg["min_notional"], "minimum executable notional")
+                        * _service_decimal(stop_distance_pct or 0.0, "Phase 4 candidate stop-risk percentage")
+                        / Decimal("100")
                     )
                     sleeve_plan = allocate_candidates_to_sleeves(
                         [{
@@ -13300,8 +13930,10 @@ class TradingService:
                             "action": "add" if candidate.get("is_add") else "entry",
                             "side": "buy",
                             "risk_value": requested_risk,
+                            "risk_value_decimal": requested_risk_decimal,
                             "risk_unit": "stop_risk_dollars",
                             "minimum_risk_value": cfg["min_notional"] * float(stop_distance_pct or 0.0) / 100.0,
+                            "minimum_risk_value_decimal": minimum_risk_decimal,
                             "minimum_risk_unit": "stop_risk_dollars",
                             "setup_score": candidate.get("score"),
                             "evidence_quality": candidate.get("strategy_quality_score"),
@@ -13310,7 +13942,7 @@ class TradingService:
                             "average_dollar_volume": candidate.get("average_dollar_volume"),
                         }],
                         sleeve_inputs,
-                        global_available_risk=global_sleeve_remaining,
+                        global_available_risk=global_sleeve_remaining_decimal,
                         global_risk_unit="stop_risk_dollars",
                         conversion_equity=equity,
                         conversion_equity_as_of=allocation_as_of,
@@ -13320,18 +13952,35 @@ class TradingService:
                     if sleeve_decision.get("decision") not in {"ALLOCATE", "ALLOCATE_PARTIAL"}:
                         cap_reason = "not actionable - Phase 4 strategy sleeve allocation rejected the candidate"
                     else:
-                        allocated_risk = float(sleeve_decision["allocated_risk"])
-                        risk_factor = float(stop_distance_pct or 0.0) / 100.0
-                        sleeve_notional_cap = allocated_risk / risk_factor if risk_factor > 0 else 0.0
-                        if final_notional > sleeve_notional_cap:
+                        allocated_risk_exact = _service_decimal(
+                            sleeve_decision.get("allocated_risk_decimal"),
+                            "allocated Phase 4 candidate stop risk",
+                        )
+                        allocated_risk = float(allocated_risk_exact)
+                        risk_factor_exact = _service_decimal(
+                            stop_distance_pct or 0.0,
+                            "Phase 4 candidate stop-risk percentage",
+                        ) / Decimal("100")
+                        sleeve_notional_cap_exact = (
+                            allocated_risk_exact / risk_factor_exact
+                            if risk_factor_exact > ZERO else ZERO
+                        )
+                        sleeve_notional_cap = float(sleeve_notional_cap_exact)
+                        if _service_decimal(final_notional, "candidate notional") > sleeve_notional_cap_exact:
                             final_notional = max(0.0, sleeve_notional_cap)
                             reduction_reason = "Phase 4 strategy sleeve candidate-set risk budget"
                         candidate["phase4_candidate_allocation"] = sleeve_decision
                         sleeve_inputs = {
                             str(key): dict(value) for key, value in sleeve_plan["sleeves_after"].items()
                         }
-                        global_sleeve_remaining = float(sleeve_plan["global_remaining_risk"])
-                        sleeve_notional_remaining[strategy] = max(0.0, remaining_notional - final_notional)
+                        global_sleeve_remaining_decimal = _service_decimal(
+                            sleeve_plan.get("global_remaining_risk_decimal"),
+                            "remaining Phase 4 global stop risk",
+                        )
+                        sleeve_notional_remaining_decimal[strategy] = max(
+                            ZERO,
+                            remaining_notional_exact - _service_decimal(final_notional, "candidate notional"),
+                        )
 
             risk_pct = (final_notional * (stop_distance_pct / 100) / equity) * 100 if equity and stop_distance_pct else 0.0
             exposure_pct = (final_notional / equity) * 100 if equity else 0.0

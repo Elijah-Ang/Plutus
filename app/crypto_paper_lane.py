@@ -2783,13 +2783,88 @@ class CryptoPaperLaneStore:
         mapped_state = {
             "rejected": "rejected", "canceled": "cancelled", "cancelled": "cancelled", "expired": "expired",
         }.get(status, "submitted")
+        submit_evidence: dict[str, Any] | None = None
+        if mapped_state in TERMINAL_INTENT_STATES:
+            try:
+                submit_evidence = self._normalize_broker_order(response, intent=row)
+            except CryptoPaperLaneError as exc:
+                submit_evidence = {
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": str(row["client_order_id"]),
+                    "symbol": str(row["symbol"]).upper(),
+                    "side": str(row["side"]).lower(),
+                    "status": status,
+                    "requested_quantity": row.get("requested_quantity"),
+                    "requested_notional": row.get("requested_notional"),
+                    "cumulative_filled_quantity": "0",
+                    "filled_average_price": None,
+                    "fees": "0",
+                    "payload": {"status": status, "normalization_error": type(exc).__name__},
+                }
+            submit_evidence["broker_order_id"] = (
+                submit_evidence.get("broker_order_id")
+                or broker_order_id
+                or ""
+            )
+            submit_evidence["client_order_id"] = (
+                submit_evidence.get("client_order_id") or str(row["client_order_id"])
+            )
+            submit_evidence["symbol"] = submit_evidence.get("symbol") or str(row["symbol"]).upper()
+            submit_evidence["side"] = submit_evidence.get("side") or str(row["side"]).lower()
+            submit_evidence["status"] = status
+            submit_evidence["verified"] = False
+            submit_evidence["verification_error"] = "terminal_submit_response_requires_durable_reconciliation"
+            submit_evidence["payload"] = {
+                "submit_response": submit_evidence.get("payload") or {"status": status},
+                "broker_order_id": broker_order_id or None,
+                "client_order_id": str(row["client_order_id"]),
+            }
+            try:
+                if _decimal(
+                    submit_evidence.get("cumulative_filled_quantity") or "0",
+                    "terminal submit cumulative quantity",
+                    minimum=ZERO,
+                ) > ZERO:
+                    # A terminal submit response with quantity is not a
+                    # verified fill. Keep the reservation until reconciliation.
+                    mapped_state = "submitted"
+                    submit_evidence["verification_error"] = "terminal_submit_response_contains_unverified_fill_quantity"
+            except CryptoPaperLaneError:
+                mapped_state = "submitted"
+                submit_evidence["verification_error"] = "terminal_submit_response_has_invalid_fill_quantity"
+            else:
+                # A terminal status returned by the submit call is not yet a
+                # verified broker/account observation. Keep the reservation
+                # and route the intent through the normal client-order
+                # reconciliation path before releasing capital.
+                mapped_state = "reconciliation_required"
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE crypto_paper_intents SET state=?,broker_order_id=?,updated_at=?,terminal_at=CASE WHEN ? IN ('filled','rejected','cancelled','expired') THEN ? ELSE terminal_at END WHERE id=?", (mapped_state, broker_order_id or None, current.isoformat(), mapped_state, current.isoformat(), intent_id))
             conn.execute(
                 "UPDATE crypto_paper_proposals SET status=? WHERE id=?",
-                (self._mapped_proposal_state(mapped_state), row["proposal_id"]),
+                ("manual_review" if mapped_state == "reconciliation_required" else self._mapped_proposal_state(mapped_state), row["proposal_id"]),
             )
+            evidence_id = None
+            evidence_fingerprint = None
+            if submit_evidence is not None:
+                evidence_id, evidence_fingerprint = self._record_order_evidence_locked(
+                    conn,
+                    intent=row,
+                    evidence=submit_evidence,
+                    captured_at=current,
+                )
+                self._record_reconciliation_event_locked(
+                    conn,
+                    intent=row,
+                    event_type="submit_terminal_response",
+                    evidence={
+                        **submit_evidence,
+                        "evidence_id": evidence_id,
+                        "evidence_fingerprint": evidence_fingerprint,
+                    },
+                    now=current,
+                )
             if mapped_state in TERMINAL_INTENT_STATES:
                 conn.execute("UPDATE crypto_paper_reservations SET active_notional='0',active_stop_risk='0',state='released',released_at=?,release_reason=?,updated_at=? WHERE intent_id=?", (current.isoformat(), mapped_state, current.isoformat(), intent_id))
                 self._refresh_reservation_fingerprint_locked(conn, intent_id)
@@ -2797,6 +2872,7 @@ class CryptoPaperLaneStore:
             **row, "state": mapped_state, "broker_invocation_occurred": 1,
             "broker_order_id": broker_order_id, "broker_call": True,
             "broker_status": status, "response": response,
+            "evidence_id": evidence_id, "evidence_fingerprint": evidence_fingerprint,
         }
 
     @staticmethod

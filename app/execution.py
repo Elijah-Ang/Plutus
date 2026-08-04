@@ -767,11 +767,21 @@ class DurableExecutionStore:
                 if allocation_payload.get("registry_snapshot_id") != proposal["strategy_registry_snapshot_id"]:
                     raise RuntimeError("canonical allocation is not bound to the supplied registry snapshot")
                 risk_unit = str(canonical_sleeve.get("risk_unit") or "")
-                canonical_risk = decimal_value(
-                    canonical_sleeve.get("remaining_risk"),
-                    "canonical remaining strategy risk",
-                    minimum=ZERO,
-                )
+                try:
+                    canonical_risk = require_exact_decimal(
+                        canonical_sleeve,
+                        "remaining_risk_decimal",
+                        minimum=ZERO,
+                    )
+                    canonical_notional = require_exact_decimal(
+                        canonical_sleeve,
+                        "remaining_notional_decimal",
+                        minimum=ZERO,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "canonical strategy sleeve exact capacity is unavailable"
+                    ) from exc
                 if canonical_risk is None:
                     raise RuntimeError("canonical strategy risk capacity is unavailable")
                 if risk_unit == "pct_equity":
@@ -787,11 +797,6 @@ class DurableExecutionStore:
                     canonical_risk = equity * canonical_risk / Decimal("100")
                 elif risk_unit != "stop_risk_dollars":
                     raise RuntimeError("canonical sleeve risk unit is unsupported")
-                canonical_notional = decimal_value(
-                    canonical_sleeve.get("remaining_notional"),
-                    "canonical remaining strategy notional",
-                    minimum=ZERO,
-                )
                 supplied_notional = decimal_value(
                     proposal["sleeve_notional_ceiling"],
                     "proposal strategy sleeve notional ceiling",

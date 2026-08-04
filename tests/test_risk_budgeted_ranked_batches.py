@@ -212,7 +212,9 @@ def test_phase4_ranked_batch_uses_current_authoritative_equity_timestamp(tmp_pat
                 "strategy_version": "rule_based_v1",
                 "risk_unit": "stop_risk_dollars",
                 "remaining_risk": 10.0,
+                "remaining_risk_decimal": "10",
                 "remaining_notional": 100.0,
+                "remaining_notional_decimal": "100",
             }
         }
     }
