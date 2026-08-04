@@ -1,9 +1,11 @@
 """Canonical fixed-point evidence for fills, FIFO lots, and realized P&L.
 
-SQLite ``REAL`` columns remain as compatibility projections for existing report
-and risk code.  The authoritative accounting values are normalized decimal
-strings so broker quantities, prices, fees, basis, and realized P&L never rely
-on binary floating-point arithmetic.
+SQLite ``REAL`` columns remain only as compatibility projections for legacy
+reports and older integrations.  Authoritative trading, risk, reservation,
+fill, and accounting paths must read the canonical decimal-text sidecars and
+perform their aggregation in Python ``Decimal`` arithmetic.  A missing or
+malformed sidecar is an integrity failure, never a reason to fall back to the
+legacy projection in an authoritative calculation.
 """
 
 from __future__ import annotations
@@ -144,6 +146,93 @@ TABLE_DECIMAL_COLUMNS: dict[str, dict[str, str]] = {
         "decimal_provenance": "TEXT",
         "decimal_accounting_version": "TEXT",
     },
+    "risk_snapshots_v2": {
+        "portfolio_equity_decimal": "TEXT",
+        "filled_gross_exposure_decimal": "TEXT",
+        "filled_net_exposure_decimal": "TEXT",
+        "active_reserved_exposure_decimal": "TEXT",
+        "projected_gross_exposure_decimal": "TEXT",
+        "held_open_stop_risk_decimal": "TEXT",
+        "active_reserved_stop_risk_decimal": "TEXT",
+        "projected_total_open_risk_decimal": "TEXT",
+        "daily_realized_pl_decimal": "TEXT",
+        "daily_realized_loss_pct_decimal": "TEXT",
+        "weekly_realized_pl_decimal": "TEXT",
+        "weekly_realized_loss_pct_decimal": "TEXT",
+        "unresolved_unknown_exposure_decimal": "TEXT",
+        "buying_power_decimal": "TEXT",
+        "cash_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "rotation_groups": {
+        "estimated_release_notional_decimal": "TEXT",
+        "actual_released_notional_decimal": "TEXT",
+        "actual_released_risk_decimal": "TEXT",
+        "reconciled_cash_decimal": "TEXT",
+        "reconciled_buying_power_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "rotation_steps": {
+        "requested_quantity_decimal": "TEXT",
+        "filled_quantity_decimal": "TEXT",
+        "filled_notional_decimal": "TEXT",
+        "released_risk_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "rotation_contingent_entries": {
+        "displayed_max_quantity_decimal": "TEXT",
+        "displayed_max_notional_decimal": "TEXT",
+        "displayed_max_stop_risk_decimal": "TEXT",
+        "final_quantity_decimal": "TEXT",
+        "final_notional_decimal": "TEXT",
+        "final_stop_risk_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "take_profit_milestones": {
+        "target_quantity_decimal": "TEXT",
+        "cumulative_filled_quantity_decimal": "TEXT",
+        "completed_fraction_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "take_profit_milestone_actions": {
+        "requested_quantity_decimal": "TEXT",
+        "cumulative_filled_quantity_decimal": "TEXT",
+        "completed_fraction_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "take_profit_milestone_fill_links": {
+        "delta_quantity_decimal": "TEXT",
+        "cumulative_intent_quantity_decimal": "TEXT",
+        "fill_price_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "trade_outcomes": {
+        "entry_price_decimal": "TEXT",
+        "quantity_decimal": "TEXT",
+        "notional_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "performance_setups": {
+        "fill_price_decimal": "TEXT",
+        "fill_qty_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
+    "performance_outcomes": {
+        "entry_price_decimal": "TEXT",
+        "entry_qty_decimal": "TEXT",
+        "entry_notional_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
+    },
 }
 
 
@@ -240,6 +329,73 @@ BACKFILL_FIELDS: dict[str, dict[str, str]] = {
         "allocated_adjustments_decimal": "allocated_adjustments",
         "realized_pnl_decimal": "realized_pnl",
     },
+    "risk_snapshots_v2": {
+        "portfolio_equity_decimal": "portfolio_equity",
+        "filled_gross_exposure_decimal": "filled_gross_exposure",
+        "filled_net_exposure_decimal": "filled_net_exposure",
+        "active_reserved_exposure_decimal": "active_reserved_exposure",
+        "projected_gross_exposure_decimal": "projected_gross_exposure",
+        "held_open_stop_risk_decimal": "held_open_stop_risk",
+        "active_reserved_stop_risk_decimal": "active_reserved_stop_risk",
+        "projected_total_open_risk_decimal": "projected_total_open_risk",
+        "daily_realized_pl_decimal": "daily_realized_pl",
+        "daily_realized_loss_pct_decimal": "daily_realized_loss_pct",
+        "weekly_realized_pl_decimal": "weekly_realized_pl",
+        "weekly_realized_loss_pct_decimal": "weekly_realized_loss_pct",
+        "unresolved_unknown_exposure_decimal": "unresolved_unknown_exposure",
+        "buying_power_decimal": "buying_power",
+        "cash_decimal": "cash",
+    },
+    "rotation_groups": {
+        "estimated_release_notional_decimal": "estimated_release_notional",
+        "actual_released_notional_decimal": "actual_released_notional",
+        "actual_released_risk_decimal": "actual_released_risk",
+        "reconciled_cash_decimal": "reconciled_cash",
+        "reconciled_buying_power_decimal": "reconciled_buying_power",
+    },
+    "rotation_steps": {
+        "requested_quantity_decimal": "requested_quantity",
+        "filled_quantity_decimal": "filled_quantity",
+        "filled_notional_decimal": "filled_notional",
+        "released_risk_decimal": "released_risk",
+    },
+    "rotation_contingent_entries": {
+        "displayed_max_quantity_decimal": "displayed_max_quantity",
+        "displayed_max_notional_decimal": "displayed_max_notional",
+        "displayed_max_stop_risk_decimal": "displayed_max_stop_risk",
+        "final_quantity_decimal": "final_quantity",
+        "final_notional_decimal": "final_notional",
+        "final_stop_risk_decimal": "final_stop_risk",
+    },
+    "take_profit_milestones": {
+        "target_quantity_decimal": "target_quantity",
+        "cumulative_filled_quantity_decimal": "cumulative_filled_quantity",
+        "completed_fraction_decimal": "completed_fraction",
+    },
+    "take_profit_milestone_actions": {
+        "requested_quantity_decimal": "requested_quantity",
+        "cumulative_filled_quantity_decimal": "cumulative_filled_quantity",
+        "completed_fraction_decimal": "completed_fraction",
+    },
+    "take_profit_milestone_fill_links": {
+        "delta_quantity_decimal": "delta_quantity",
+        "cumulative_intent_quantity_decimal": "cumulative_intent_quantity",
+        "fill_price_decimal": "fill_price",
+    },
+    "trade_outcomes": {
+        "entry_price_decimal": "entry_price",
+        "quantity_decimal": "quantity",
+        "notional_decimal": "notional",
+    },
+    "performance_setups": {
+        "fill_price_decimal": "fill_price",
+        "fill_qty_decimal": "fill_qty",
+    },
+    "performance_outcomes": {
+        "entry_price_decimal": "entry_price",
+        "entry_qty_decimal": "entry_qty",
+        "entry_notional_decimal": "entry_notional",
+    },
 }
 
 
@@ -325,6 +481,73 @@ NONNEGATIVE_FIELDS: dict[str, frozenset[str]] = {
             "allocated_sell_fees_decimal",
         }
     ),
+    "risk_snapshots_v2": frozenset(
+        {
+            "portfolio_equity_decimal",
+            "filled_gross_exposure_decimal",
+            "active_reserved_exposure_decimal",
+            "projected_gross_exposure_decimal",
+            "held_open_stop_risk_decimal",
+            "active_reserved_stop_risk_decimal",
+            "projected_total_open_risk_decimal",
+            "daily_realized_loss_pct_decimal",
+            "weekly_realized_loss_pct_decimal",
+            "unresolved_unknown_exposure_decimal",
+            "buying_power_decimal",
+            "cash_decimal",
+        }
+    ),
+    "rotation_groups": frozenset(
+        {
+            "estimated_release_notional_decimal",
+            "actual_released_notional_decimal",
+            "actual_released_risk_decimal",
+            "reconciled_cash_decimal",
+            "reconciled_buying_power_decimal",
+        }
+    ),
+    "rotation_steps": frozenset(
+        {
+            "requested_quantity_decimal",
+            "filled_quantity_decimal",
+            "filled_notional_decimal",
+            "released_risk_decimal",
+        }
+    ),
+    "rotation_contingent_entries": frozenset(
+        {
+            "displayed_max_quantity_decimal",
+            "displayed_max_notional_decimal",
+            "displayed_max_stop_risk_decimal",
+            "final_quantity_decimal",
+            "final_notional_decimal",
+            "final_stop_risk_decimal",
+        }
+    ),
+    "take_profit_milestones": frozenset(
+        {
+            "target_quantity_decimal",
+            "cumulative_filled_quantity_decimal",
+            "completed_fraction_decimal",
+        }
+    ),
+    "take_profit_milestone_actions": frozenset(
+        {
+            "requested_quantity_decimal",
+            "cumulative_filled_quantity_decimal",
+            "completed_fraction_decimal",
+        }
+    ),
+    "take_profit_milestone_fill_links": frozenset(
+        {
+            "delta_quantity_decimal",
+            "cumulative_intent_quantity_decimal",
+            "fill_price_decimal",
+        }
+    ),
+    "trade_outcomes": frozenset({"entry_price_decimal", "quantity_decimal", "notional_decimal"}),
+    "performance_setups": frozenset({"fill_price_decimal", "fill_qty_decimal"}),
+    "performance_outcomes": frozenset({"entry_price_decimal", "entry_qty_decimal", "entry_notional_decimal"}),
 }
 
 
@@ -378,6 +601,60 @@ def row_decimal(
     if canonical not in (None, ""):
         return decimal_value(canonical, canonical_field, allow_none=allow_none)
     return decimal_value(row.get(legacy_field), legacy_field, allow_none=allow_none)
+
+
+def require_exact_decimal(
+    row: Mapping[str, Any],
+    canonical_field: str,
+    *,
+    minimum: Decimal | None = None,
+    allow_none: bool = False,
+) -> Decimal | None:
+    """Read a canonical decimal-text field without a REAL compatibility fallback.
+
+    This helper is for authoritative aggregate/risk paths.  Migrations may
+    retain legacy projections, but runtime calculations must not silently use
+    them when the exact sidecar is absent or malformed.
+    """
+
+    if hasattr(row, "get"):
+        raw = row.get(canonical_field)
+    else:
+        try:
+            raw = row[canonical_field]  # type: ignore[index]
+        except (KeyError, IndexError):
+            raw = None
+    if raw in (None, ""):
+        if allow_none:
+            return None
+        raise ValueError(f"{canonical_field} exact decimal evidence is missing")
+    if not isinstance(raw, str):
+        raise ValueError(f"{canonical_field} exact decimal evidence must be text")
+    value = decimal_value(raw, canonical_field, minimum=minimum, allow_none=allow_none)
+    if value is not None and decimal_text(value) != raw:
+        raise ValueError(f"{canonical_field} exact decimal evidence is not canonical")
+    return value
+
+
+def sum_exact_decimal_rows(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    canonical_field: str,
+    *,
+    label: str | None = None,
+    minimum: Decimal | None = None,
+) -> Decimal:
+    """Sum canonical decimal-text rows without SQLite numeric aggregation."""
+
+    total = ZERO
+    for row in rows:
+        value = require_exact_decimal(
+            row,
+            canonical_field,
+            minimum=minimum,
+        )
+        assert value is not None
+        total += value
+    return total
 
 
 def legacy_float(value: Decimal | None) -> float | None:
@@ -594,6 +871,70 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
                         "cash_decimal",
                         "settled_cash_decimal",
                     },
+                    "risk_snapshots_v2": {
+                        "portfolio_equity_decimal",
+                        "filled_gross_exposure_decimal",
+                        "filled_net_exposure_decimal",
+                        "active_reserved_exposure_decimal",
+                        "projected_gross_exposure_decimal",
+                        "held_open_stop_risk_decimal",
+                        "active_reserved_stop_risk_decimal",
+                        "projected_total_open_risk_decimal",
+                        "unresolved_unknown_exposure_decimal",
+                        "buying_power_decimal",
+                        "cash_decimal",
+                    },
+                    "rotation_groups": {
+                        "estimated_release_notional_decimal",
+                        "actual_released_notional_decimal",
+                        "actual_released_risk_decimal",
+                        "reconciled_cash_decimal",
+                        "reconciled_buying_power_decimal",
+                    },
+                    "rotation_steps": {
+                        "requested_quantity_decimal",
+                        "filled_quantity_decimal",
+                        "filled_notional_decimal",
+                        "released_risk_decimal",
+                    },
+                    "rotation_contingent_entries": {
+                        "displayed_max_quantity_decimal",
+                        "displayed_max_notional_decimal",
+                        "displayed_max_stop_risk_decimal",
+                        "final_quantity_decimal",
+                        "final_notional_decimal",
+                        "final_stop_risk_decimal",
+                    },
+                    "take_profit_milestones": {
+                        "target_quantity_decimal",
+                        "cumulative_filled_quantity_decimal",
+                        "completed_fraction_decimal",
+                    },
+                    "take_profit_milestone_actions": {
+                        "requested_quantity_decimal",
+                        "cumulative_filled_quantity_decimal",
+                        "completed_fraction_decimal",
+                    },
+                    "take_profit_milestone_fill_links": {
+                        "delta_quantity_decimal",
+                        "cumulative_intent_quantity_decimal",
+                        "fill_price_decimal",
+                    },
+                    "trade_outcomes": {
+                        "entry_price_decimal",
+                        "quantity_decimal",
+                        "notional_decimal",
+                    },
+                    # Fill evidence is nullable for a setup that has not
+                    # produced a broker fill.  The optional-field rule below
+                    # requires these sidecars whenever the legacy fill
+                    # projection (or a canonical value) is present.
+                    "performance_setups": set(),
+                    "performance_outcomes": {
+                        "entry_price_decimal",
+                        "entry_qty_decimal",
+                        "entry_notional_decimal",
+                    },
                 }.get(table, set())
                 # Optional exact fields are required when their legacy source
                 # (or an already-written canonical value) exists.  A quantity-
@@ -615,6 +956,21 @@ def fixed_point_integrity_report(storage: Any) -> dict[str, int]:
                     "order_events": {"filled_quantity_decimal", "fill_price_decimal"},
                     "position_lifecycles": {"average_entry_price_decimal"},
                     "realized_pnl_events": {"cost_basis_decimal", "remaining_position_quantity_decimal"},
+                    "rotation_groups": {
+                        "reconciled_cash_decimal",
+                        "reconciled_buying_power_decimal",
+                    },
+                    "rotation_contingent_entries": {
+                        "final_quantity_decimal",
+                        "final_notional_decimal",
+                        "final_stop_risk_decimal",
+                    },
+                    "performance_setups": {"fill_price_decimal", "fill_qty_decimal"},
+                    "performance_outcomes": {
+                        "entry_price_decimal",
+                        "entry_qty_decimal",
+                        "entry_notional_decimal",
+                    },
                 }.get(table, set())
                 for field in optional_exact:
                     if row.get(field) not in (None, "") or field.removesuffix("_decimal") in row and row.get(field.removesuffix("_decimal")) is not None:

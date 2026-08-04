@@ -669,6 +669,7 @@ def test_pending_claim_identity_survives_conversion_to_reservation(tmp_path) -> 
         "pending_proposal_claims_by_strategy": {
             "rule_based_v2": [{
                 "proposal_id": "pending-a", "notional": 60.0, "stop_risk": 0.6,
+                "notional_decimal": "60", "stop_risk_decimal": "0.6",
             }],
         },
     })
@@ -701,10 +702,13 @@ def test_phase4_strategy_notional_uses_current_broker_mark_and_reconciles_lots(t
         """INSERT INTO position_lots(
              id,position_lifecycle_id,symbol,source_fill_event_key,opened_at,original_quantity,remaining_quantity,
              unit_cost,fees_allocated,source,provenance,confidence,entry_proposal_id,entry_intent_id,
-             strategy_version,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             strategy_version,created_at,updated_at,original_quantity_decimal,remaining_quantity_decimal,
+             unit_cost_decimal,fees_allocated_decimal,initial_risk_dollars_decimal,decimal_provenance,
+             decimal_accounting_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         ("lot", "life", "SPY", "fill", now, 2.0, 2.0, 50.0, 0.0, "test", "{}", "high",
-         "proposal", "order", "rule_based_v2", now, now),
+         "proposal", "order", "rule_based_v2", now, now, "2", "2", "50", "0", "0",
+         "exact_decimal_evidence_v1", "fixed_point_accounting_v1"),
     )
     service = TradingService.__new__(TradingService)
     service.storage = storage
@@ -738,6 +742,7 @@ def test_phase4_strategy_consumption_includes_pending_nonrotation_claims(tmp_pat
     assert result["pending_proposal_claims_by_strategy"] == {
         "rule_based_v2": [{
             "proposal_id": "pending", "notional": 100.0, "stop_risk": 2.0,
+            "notional_decimal": "100", "stop_risk_decimal": "2",
         }]
     }
 

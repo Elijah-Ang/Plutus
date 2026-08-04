@@ -31,7 +31,11 @@ from .crypto_market_data import CryptoMarketDataStore
 from .crypto_risk import CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest, load_verified_crypto_sizing
 from .crypto_strategies import CryptoStrategyStore
-from .fixed_point_accounting import legacy_float
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    legacy_float,
+)
 from .formula_versions import (
     CRYPTO_CAPABILITY_FORMULA_VERSION,
     CRYPTO_MARKET_DATA_FORMULA_VERSION,
@@ -3207,15 +3211,18 @@ class CryptoPaperLaneStore:
                    id,timestamp,run_id,symbol,asset_class,tier,setup_type,action_decision,
                    proposed,proposal_id,not_proposed_reason,signal_state,current_price,
                    proposed_notional,created_at,updated_at,broker_order_id,fill_id,
-                   fill_price,fill_qty,order_status
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   fill_price,fill_qty,order_status,fill_price_decimal,fill_qty_decimal,
+                   decimal_provenance,decimal_accounting_version
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     setup_id, occurred_at.isoformat(), run_id, symbol, "crypto",
                     "PAPER_ACTIVE", setup_type, "actual_fill", 1, intent["proposal_id"],
                     None, signal_state, entry_price, entry_notional,
                     occurred_at.isoformat(), occurred_at.isoformat(),
                     str(intent.get("broker_order_id") or "") or None, fill_id,
-                    entry_price, entry_quantity, order_status,
+                    entry_price, entry_quantity, order_status, entry_price,
+                    entry_quantity, EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                 ),
             )
             setup = conn.execute(
@@ -3228,12 +3235,15 @@ class CryptoPaperLaneStore:
                    SET proposed=1,proposal_id=COALESCE(proposal_id,?),
                        broker_order_id=COALESCE(broker_order_id,?),fill_id=COALESCE(fill_id,?),
                        fill_price=?,fill_qty=?,
-                       order_status=?,updated_at=?
+                       order_status=?,updated_at=?,fill_price_decimal=?,fill_qty_decimal=?,
+                       decimal_provenance=?,decimal_accounting_version=?
                    WHERE id=?""",
                 (
                     intent["proposal_id"], str(intent.get("broker_order_id") or "") or None,
                     fill_id, entry_price, entry_quantity, order_status,
-                    occurred_at.isoformat(), setup_id,
+                    occurred_at.isoformat(), entry_price, entry_quantity,
+                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                    setup_id,
                 ),
             )
 
@@ -3246,14 +3256,17 @@ class CryptoPaperLaneStore:
                 """INSERT INTO performance_outcomes(
                    id,setup_id,run_id,symbol,proposal_id,broker_order_id,fill_id,
                    actual_or_shadow,entry_time,entry_price,entry_notional,entry_qty,
-                   status,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   status,created_at,updated_at,entry_price_decimal,entry_qty_decimal,
+                   entry_notional_decimal,decimal_provenance,decimal_accounting_version
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     outcome_id, setup_id, run_id, symbol, intent["proposal_id"],
                     str(intent.get("broker_order_id") or "") or None, fill_id,
                     "actual_fill", occurred_at.isoformat(), entry_price,
                     entry_notional, entry_quantity, "actual_fill",
-                    occurred_at.isoformat(), occurred_at.isoformat(),
+                    occurred_at.isoformat(), occurred_at.isoformat(), entry_price,
+                    entry_quantity, entry_notional, EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION,
                 ),
             )
         else:
@@ -3264,12 +3277,16 @@ class CryptoPaperLaneStore:
                        broker_order_id=COALESCE(broker_order_id,?),fill_id=COALESCE(fill_id,?),
                        entry_time=COALESCE(entry_time,?),entry_price=?,
                        entry_notional=?,entry_qty=?,
-                       status='actual_fill',updated_at=?
+                       status='actual_fill',updated_at=?,entry_price_decimal=?,
+                       entry_qty_decimal=?,entry_notional_decimal=?,decimal_provenance=?,
+                       decimal_accounting_version=?
                    WHERE setup_id=?""",
                 (
                     intent["proposal_id"], str(intent.get("broker_order_id") or "") or None,
                     fill_id, occurred_at.isoformat(), entry_price, entry_notional,
-                    entry_quantity, occurred_at.isoformat(), setup_id,
+                    entry_quantity, occurred_at.isoformat(), entry_price,
+                    entry_quantity, entry_notional, EXACT_DECIMAL_PROVENANCE,
+                    FIXED_POINT_ACCOUNTING_VERSION, setup_id,
                 ),
             )
 

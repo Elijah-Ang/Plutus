@@ -38,6 +38,7 @@ from .formula_versions import (
 )
 from .internet import internet_available
 from .loss_controls import LOSS_METRICS_VERSION, build_loss_metrics
+from .fixed_point_accounting import require_exact_decimal
 from .power import get_power_status
 from .utils import PROJECT_ROOT
 
@@ -510,10 +511,13 @@ def _verified_context(
     )
 
     def reservation_value(row: Mapping[str, Any], field: str) -> Decimal:
-        raw = row.get(f"{field}_decimal")
-        if raw in (None, ""):
-            raw = row.get(field)
-        return _exact_amount(raw, f"reservation {field}")
+        value = require_exact_decimal(
+            row,
+            f"{field}_decimal",
+            minimum=Decimal("0"),
+        )
+        assert value is not None
+        return value
 
     active_notional_decimal = sum(
         (reservation_value(row, "active_notional") for row in reservations),
@@ -607,13 +611,20 @@ def _verified_context(
     portfolio = config.get("portfolio_behavior", {}) or {}
     optimizer = config.get("portfolio_optimizer", {}) or {}
     latest_risk = conn.execute(
-        "SELECT held_open_stop_risk,calculated_at FROM risk_snapshots_v2 ORDER BY calculated_at DESC,id DESC LIMIT 1"
+        "SELECT held_open_stop_risk_decimal,calculated_at FROM risk_snapshots_v2 ORDER BY calculated_at DESC,id DESC LIMIT 1"
     ).fetchone()
-    held_open_risk_decimal = (
-        _exact_amount(latest_risk["held_open_stop_risk"], "held open stop risk")
-        if latest_risk and latest_risk["held_open_stop_risk"] not in (None, "")
-        else (Decimal("0") if os.getenv("TRADING_AGENT_TESTING") == "1" else None)
-    )
+    if latest_risk is None:
+        held_open_risk_decimal = Decimal("0") if os.getenv("TRADING_AGENT_TESTING") == "1" else None
+    else:
+        try:
+            held_open_risk_decimal = require_exact_decimal(
+                latest_risk,
+                "held_open_stop_risk_decimal",
+                minimum=Decimal("0"),
+            )
+        except ValueError as exc:
+            raise RuntimeError("latest risk snapshot lacks exact held-open-stop-risk evidence") from exc
+        assert held_open_risk_decimal is not None
     try:
         candidate_sizing = canonical_sizing(candidate)
         candidate_stop_risk = candidate_sizing.stop_risk

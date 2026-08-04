@@ -18,7 +18,7 @@ from app.crypto_proposals import (
     CryptoProposalStore,
     format_crypto_proposal_preview,
 )
-from app.crypto_research import CryptoResearchEngine
+from app.crypto_research import CryptoResearchEngine, _oldest_crypto_lot_opened_at
 from app.cross_asset_runtime import CrossAssetRuntimeCoordinator
 from app.crypto_risk import CryptoRiskError, CryptoRiskStore
 from app.crypto_sizing import CryptoSizingRequest
@@ -268,6 +268,51 @@ def test_hourly_crypto_research_persists_strategy_decision_without_proposal(tmp_
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_proposal_previews")[0]["n"] == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0
     assert broker.submit_calls == 0
+
+
+def test_shadow_outcome_persists_quantity_and_r_multiple_from_configured_paper_notional(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    _, _, decision = _strategy(storage, config, Broker())
+    engine = CryptoResearchEngine(config, storage, run_id="shadow-quantity")
+    horizon = int(config["crypto"]["profitability_policy"]["outcome_horizon_hours"])
+    bars = [
+        {
+            "timestamp": (NOW + timedelta(hours=index)).isoformat(),
+            "high": "101",
+            "low": "99",
+            "close": "100",
+        }
+        for index in range(1, horizon + 1)
+    ]
+
+    engine._settle_crypto_shadow_outcomes(
+        "BTC/USD", bars, now=NOW + timedelta(hours=horizon),
+        exclude_strategy_decision_id=None,
+    )
+
+    row = storage.fetch_all(
+        """SELECT quantity,net_pnl,net_r_multiple
+           FROM crypto_profitability_observations WHERE strategy_decision_id=?""",
+        (decision.id,),
+    )[0]
+    assert D(row["quantity"]) > 0
+    assert row["net_pnl"] is not None
+    assert row["net_r_multiple"] is not None
+
+
+def test_crypto_position_age_uses_oldest_verified_lot_not_management_row_time():
+    with pytest.raises(ValueError, match="opened_at"):
+        _oldest_crypto_lot_opened_at([
+            {"opened_at": "2026-07-10T04:00:00+00:00"},
+            {"opened_at": "2026-07-15T04:00:00+00:00"},
+            {"opened_at": "not-a-timestamp"},
+        ])
+    opened = _oldest_crypto_lot_opened_at([
+        {"opened_at": "2026-07-10T04:00:00+00:00"},
+        {"opened_at": "2026-07-15T04:00:00+00:00"},
+    ])
+    assert opened == datetime(2026, 7, 10, 4, tzinfo=UTC)
 
 
 def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp_path, monkeypatch):

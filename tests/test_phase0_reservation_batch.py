@@ -46,6 +46,32 @@ def test_batch_combined_total_exposure_exhaustion(tmp_path):
     assert store.active_reservations()["active_reserved_notional"] == 60
 
 
+def test_authoritative_reservation_aggregate_ignores_legacy_real_projection(tmp_path):
+    storage, store = _store(tmp_path)
+    intent = _create(store, _candidate("exact", "SPY", 60))
+    storage.execute(
+        "UPDATE risk_reservations SET active_notional=999999,active_stop_risk=999999 WHERE intent_id=?",
+        (intent["id"],),
+    )
+
+    aggregate = store.active_reservations()
+
+    assert aggregate["active_reserved_notional_decimal"] == "60"
+    assert aggregate["active_reserved_stop_risk_decimal"] == "6"
+
+
+def test_authoritative_reservation_aggregate_fails_closed_without_decimal_sidecar(tmp_path):
+    storage, store = _store(tmp_path)
+    intent = _create(store, _candidate("missing-exact", "SPY", 60))
+    storage.execute(
+        "UPDATE risk_reservations SET active_notional_decimal=NULL WHERE intent_id=?",
+        (intent["id"],),
+    )
+
+    with pytest.raises(ValueError, match="exact decimal evidence is missing"):
+        store.active_reservations()
+
+
 def test_batch_combined_open_risk_exhaustion(tmp_path):
     _, store = _store(tmp_path)
     limits = {"open_risk_ceiling": 15}

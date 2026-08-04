@@ -163,7 +163,16 @@ def test_performance_lab_links_actual_order_and_fill(tmp_path):
         "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         ("order-1", "run-lab", "prop-1", "broker-1", "client-1", "QQQ", "buy", 5.0, 0.05, "filled", now.isoformat(), now.isoformat()),
     )
-    storage.execute("INSERT INTO fills(run_id,order_id,qty,price,filled_at) VALUES(?,?,?,?,?)", ("run-lab", "order-1", 0.05, 101.0, now.isoformat()))
+    storage.execute(
+        """INSERT INTO fills(
+               run_id,order_id,qty,price,filled_at,qty_decimal,price_decimal,
+               decimal_provenance,decimal_accounting_version)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            "run-lab", "order-1", 0.05, 101.0, now.isoformat(),
+            "0.05", "101", "exact_source_decimal", "fixed_point_accounting_v1",
+        ),
+    )
 
     service._sync_performance_lab_order_links()
 
@@ -228,8 +237,21 @@ def test_unrelated_newer_order_cannot_downgrade_durable_fill(tmp_path):
         ("filled-order", "run-lab", "prop-1", "paper-filled", "client-filled", "QQQ", "buy", 5.0, 0.05, "filled", now.isoformat(), now.isoformat()),
     )
     storage.execute(
-        "INSERT INTO fills(run_id,order_id,qty,price,filled_at) VALUES(?,?,?,?,?)",
-        ("run-lab", "filled-order", 0.05, 101.0, now.isoformat()),
+        """INSERT INTO fills(
+            run_id,order_id,qty,price,filled_at,
+            qty_decimal,price_decimal,decimal_provenance,decimal_accounting_version
+        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            "run-lab",
+            "filled-order",
+            0.05,
+            101.0,
+            now.isoformat(),
+            "0.05",
+            "101",
+            "exact_source_decimal",
+            "fixed_point_accounting_v1",
+        ),
     )
     storage.execute(
         "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version) VALUES(?,?,?,?,?,?,?,?,?)",

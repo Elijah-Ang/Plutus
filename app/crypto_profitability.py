@@ -466,16 +466,28 @@ class CryptoProfitabilityStore:
             for row in declared_rows
         )
         observations: list[ValidationObservation] = []
+        required_economic_fields = (
+            "quantity",
+            "exit_timestamp",
+            "exit_price",
+            "holding_hours",
+            "gross_return",
+            "net_return",
+            "gross_pnl",
+            "net_pnl",
+            "risk_amount",
+            "gross_r_multiple",
+            "net_r_multiple",
+        )
         for row in rows:
             selected = _required(row.get("selected_strategy"), "selected_strategy")
             strategy_versions.add(selected)
             if str(row.get("status") or "").lower() != "completed":
                 continue
-            if row.get("net_r_multiple") is None:
-                # A return without an exact stop-risk denominator is not a
-                # validation observation.  Aggregate return evidence may
-                # still report it as unavailable, but it cannot pass the
-                # walk-forward R gates.
+            if any(row.get(field) in (None, "") for field in required_economic_fields):
+                # A closed row without complete quantity, P&L, risk, return,
+                # and lifecycle evidence is unavailable.  It must not become
+                # a validation sample merely because net_return exists.
                 continue
             if row.get("exit_timestamp") is None:
                 raise CryptoProfitabilityError(

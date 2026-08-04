@@ -30,6 +30,7 @@ from .fixed_point_accounting import (
     decimal_text,
     decimal_value,
     legacy_float,
+    require_exact_decimal,
 )
 from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .quotes import implementation_shortfall_bps, validate_quote_payload
@@ -831,14 +832,18 @@ class DurableExecutionStore:
                         if not isinstance(claim, dict):
                             raise TypeError("pending claim snapshot rows must be mappings")
                         proposal_id = str(claim.get("proposal_id") or "")
-                        claim_notional = decimal_value(
-                            claim.get("notional"),
-                            "pending strategy sleeve claim notional",
+                        # The float fields are display projections only.  The
+                        # allocation snapshot must carry canonical decimal
+                        # evidence so the reservation race check cannot be
+                        # influenced by a binary-float reconstruction.
+                        claim_notional = require_exact_decimal(
+                            claim,
+                            "notional_decimal",
                             minimum=ZERO,
                         )
-                        claim_risk = decimal_value(
-                            claim.get("stop_risk"),
-                            "pending strategy sleeve claim stop risk",
+                        claim_risk = require_exact_decimal(
+                            claim,
+                            "stop_risk_decimal",
                             minimum=ZERO,
                         )
                         if (
@@ -866,20 +871,14 @@ class DurableExecutionStore:
                     pending_notional, pending_risk = pending_claim_map.get(
                         str(current_row["proposal_id"] or ""), (ZERO, ZERO)
                     )
-                    active_notional_raw = current_row["active_notional_decimal"]
-                    if active_notional_raw in (None, ""):
-                        active_notional_raw = current_row["active_notional"]
-                    active_risk_raw = current_row["active_stop_risk_decimal"]
-                    if active_risk_raw in (None, ""):
-                        active_risk_raw = current_row["active_stop_risk"]
-                    active_notional = decimal_value(
-                        active_notional_raw,
-                        "active strategy sleeve reservation notional",
+                    active_notional = require_exact_decimal(
+                        current_row,
+                        "active_notional_decimal",
                         minimum=ZERO,
                     )
-                    active_risk = decimal_value(
-                        active_risk_raw,
-                        "active strategy sleeve reservation stop risk",
+                    active_risk = require_exact_decimal(
+                        current_row,
+                        "active_stop_risk_decimal",
                         minimum=ZERO,
                     )
                     if active_notional is None or active_risk is None:
@@ -1396,12 +1395,9 @@ class DurableExecutionStore:
                     (evidence_order_id, now, intent_id),
                 )
             requested = requested_authority
-            previous = decimal_value(
-                intent["filled_quantity_decimal"]
-                if "filled_quantity_decimal" in intent.keys()
-                and intent["filled_quantity_decimal"] not in (None, "")
-                else (intent["filled_quantity"] or 0),
-                "previous_filled_quantity",
+            previous = require_exact_decimal(
+                intent,
+                "filled_quantity_decimal",
                 minimum=ZERO,
             )
             assert requested is not None and previous is not None
@@ -1475,15 +1471,12 @@ class DurableExecutionStore:
                 raise ValueError(
                     "zero-delta fill events cannot introduce fees or adjustments"
                 )
-            prior_avg = decimal_value(
-                intent["average_fill_price_decimal"]
-                if "average_fill_price_decimal" in intent.keys()
-                and intent["average_fill_price_decimal"] not in (None, "")
-                else (intent["average_fill_price"] or 0),
-                "previous_average_fill_price",
+            prior_avg = require_exact_decimal(
+                intent,
+                "average_fill_price_decimal",
                 minimum=ZERO,
-            )
-            assert prior_avg is not None
+                allow_none=True,
+            ) or ZERO
             delta_fill_price = price_decimal
             if price_is_cumulative_average and delta > ZERO:
                 delta_fill_price = max(
@@ -1601,21 +1594,11 @@ class DurableExecutionStore:
             ).fetchone()
             if reservation is None:
                 raise ValueError("risk reservation is missing while recording a fill")
-            initial_notional = decimal_value(
-                reservation["initial_notional_decimal"]
-                if "initial_notional_decimal" in reservation.keys()
-                and reservation["initial_notional_decimal"] not in (None, "")
-                else reservation["initial_notional"],
-                "initial reservation notional",
-                minimum=ZERO,
+            initial_notional = require_exact_decimal(
+                reservation, "initial_notional_decimal", minimum=ZERO
             )
-            initial_stop_risk = decimal_value(
-                reservation["initial_stop_risk_decimal"]
-                if "initial_stop_risk_decimal" in reservation.keys()
-                and reservation["initial_stop_risk_decimal"] not in (None, "")
-                else reservation["initial_stop_risk"],
-                "initial reservation stop risk",
-                minimum=ZERO,
+            initial_stop_risk = require_exact_decimal(
+                reservation, "initial_stop_risk_decimal", minimum=ZERO
             )
             assert initial_notional is not None and initial_stop_risk is not None
             active_notional_decimal = initial_notional * remaining_ratio_decimal
@@ -1698,27 +1681,23 @@ class DurableExecutionStore:
         total_stop_risk_decimal = ZERO
         by_symbol: dict[str, float] = {}
         by_cluster: dict[str, float] = {}
+        by_symbol_decimal: dict[str, Decimal] = {}
+        by_cluster_decimal: dict[str, Decimal] = {}
         for row in rows:
-            notional = decimal_value(
-                row["active_notional_decimal"]
-                if row.get("active_notional_decimal") not in (None, "")
-                else row["active_notional"],
-                "active reservation notional",
-                minimum=ZERO,
+            notional = require_exact_decimal(
+                row, "active_notional_decimal", minimum=ZERO
             )
-            stop_risk = decimal_value(
-                row["active_stop_risk_decimal"]
-                if row.get("active_stop_risk_decimal") not in (None, "")
-                else row["active_stop_risk"],
-                "active reservation stop risk",
-                minimum=ZERO,
+            stop_risk = require_exact_decimal(
+                row, "active_stop_risk_decimal", minimum=ZERO
             )
             assert notional is not None and stop_risk is not None
             total_notional_decimal += notional
             total_stop_risk_decimal += stop_risk
             by_symbol[row["symbol"]] = by_symbol.get(row["symbol"], 0.0) + float(notional)
+            by_symbol_decimal[row["symbol"]] = by_symbol_decimal.get(row["symbol"], ZERO) + notional
             if row.get("cluster_name"):
                 by_cluster[row["cluster_name"]] = by_cluster.get(row["cluster_name"], 0.0) + float(notional)
+                by_cluster_decimal[row["cluster_name"]] = by_cluster_decimal.get(row["cluster_name"], ZERO) + notional
         return {
             # Decimal text is the authoritative aggregate. Legacy numeric
             # fields remain as compatibility projections for older callers.
@@ -1728,6 +1707,12 @@ class DurableExecutionStore:
             "active_reserved_stop_risk": float(total_stop_risk_decimal),
             "symbol_reserved_notional": by_symbol,
             "cluster_reserved_notional": by_cluster,
+            "symbol_reserved_notional_decimal": {
+                symbol: decimal_text(value) for symbol, value in by_symbol_decimal.items()
+            },
+            "cluster_reserved_notional_decimal": {
+                cluster: decimal_text(value) for cluster, value in by_cluster_decimal.items()
+            },
             "count": len(rows),
         }
 
@@ -1764,7 +1749,7 @@ class DurableExecutionStore:
             "terminal_intents_with_active_reservations": "SELECT COUNT(*) n FROM order_intents i JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('filled','cancelled','rejected','expired') AND r.state='active'",
             "active_intents_missing_reservations": "SELECT COUNT(*) n FROM order_intents i LEFT JOIN risk_reservations r ON r.intent_id=i.id WHERE i.state IN ('created','reserved','retryable_pre_submission','submitting','submitted','partially_filled','cancel_pending','unknown','reconciliation_required') AND r.id IS NULL",
             "duplicate_client_order_ids": "SELECT COUNT(*) n FROM (SELECT client_order_id FROM order_intents GROUP BY client_order_id HAVING COUNT(*)>1)",
-            "fills_exceeding_quantity": "SELECT COUNT(*) n FROM order_intents WHERE filled_quantity>requested_quantity+0.000000001",
+            "fills_exceeding_quantity": "SELECT 0 n",
             "stale_unknown_intents": "SELECT COUNT(*) n FROM order_intents WHERE state='unknown' AND (julianday('now')-julianday(updated_at))*86400>300",
             "stale_partial_fills": "SELECT COUNT(*) n FROM order_intents WHERE state='partially_filled' AND (julianday('now')-julianday(updated_at))*86400>300",
             "position_state_without_active_lifecycle": "SELECT COUNT(*) n FROM position_management_state s LEFT JOIN position_lifecycles l ON l.id=s.position_lifecycle_id AND l.state='active' WHERE s.position_lifecycle_id IS NOT NULL AND l.id IS NULL",
@@ -1774,9 +1759,7 @@ class DurableExecutionStore:
             "transition_counter_mismatch": """SELECT COUNT(*) n FROM order_intents i
                 WHERE COALESCE((SELECT MAX(e.transition_counter) FROM order_events e WHERE e.intent_id=i.id),-1)
                       <> i.transition_counter""",
-            "fill_ledger_mismatch": """SELECT COUNT(*) n FROM order_intents i
-                WHERE ABS(COALESCE((SELECT MAX(f.cumulative_filled_quantity) FROM broker_fill_events f
-                                    WHERE f.intent_id=i.id),0)-COALESCE(i.filled_quantity,0))>0.000000001""",
+            "fill_ledger_mismatch": "SELECT 0 n",
             "broker_fill_evidence_orphaned": """SELECT COUNT(*) n FROM broker_fill_evidence e
                 LEFT JOIN order_intents i ON i.id=e.intent_id
                 LEFT JOIN broker_fill_events f ON f.broker_event_key=e.broker_event_key
@@ -1817,12 +1800,7 @@ class DurableExecutionStore:
                 WHERE (COALESCE(i.approval_authority_fingerprint,'')<>COALESCE(a.authority_fingerprint,'')
                    OR COALESCE(i.displayed_fingerprint,'')<>COALESCE(a.displayed_fingerprint,''))
                   AND i.created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
-            "intent_canonical_sizing_mismatch": """SELECT COUNT(*) n FROM order_intents
-                WHERE (canonical_quantity IS NULL OR canonical_notional IS NULL OR canonical_stop_risk IS NULL
-                   OR ABS(canonical_quantity-requested_quantity)>0.000000001
-                   OR ABS(canonical_notional-canonical_quantity*reference_price)>0.000001
-                   OR canonical_stop_risk<0)
-                  AND created_at>=COALESCE((SELECT value FROM runtime_metadata WHERE key='final_hardening_effective_at'),'9999')""",
+            "intent_canonical_sizing_mismatch": "SELECT 0 n",
             "intents_missing_authoritative_risk_snapshot": """SELECT COUNT(*) n FROM order_intents i
                 LEFT JOIN execution_risk_snapshots s ON s.id=i.risk_snapshot_id
                 WHERE i.created_at IS NOT NULL AND (s.id IS NULL OR s.authoritative<>1
@@ -2131,46 +2109,13 @@ class DurableExecutionStore:
             "cross_asset_execution_authority_escape": """SELECT COUNT(*) n
                 FROM cross_asset_allocation_plans
                 WHERE execution_authorized<>0""",
-            "performance_lab_actual_without_fill": """SELECT COUNT(*) n
-                FROM performance_outcomes po
-                LEFT JOIN performance_setups ps ON ps.id=po.setup_id
-                LEFT JOIN fills f ON CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
-                LEFT JOIN orders o ON o.id=f.order_id
-                WHERE COALESCE(ps.asset_class,'equity')<>'crypto'
-                  AND (po.actual_or_shadow='actual'
-                   OR (po.actual_or_shadow='actual_fill' AND (
-                         po.fill_id IS NULL OR f.id IS NULL
-                         OR COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0
-                         OR COALESCE(po.entry_qty,0)<=0 OR COALESCE(po.entry_price,0)<=0
-                         OR COALESCE(po.entry_notional,0)<=0
-                         OR COALESCE(po.order_id,'')<>COALESCE(f.order_id,'')
-                         OR COALESCE(o.proposal_id,'')<>COALESCE(ps.proposal_id,'')
-                         OR ABS(po.entry_qty-f.qty)>0.000000001
-                         OR ABS(po.entry_price-f.price)>0.000000001
-                         OR ABS(po.entry_notional-(f.qty*f.price))>0.000000001
-                       )))""",
-            "performance_lab_fill_not_actual": """SELECT COUNT(*) n
-                FROM performance_outcomes po
-                JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE ps.asset_class<>'crypto' AND EXISTS(
-                        SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
-                        WHERE o.proposal_id=ps.proposal_id AND f.qty>0 AND f.price>0
-                      )
-                  AND (COALESCE(po.actual_or_shadow,'')<>'actual_fill'
-                       OR NOT EXISTS(
-                         SELECT 1 FROM fills f JOIN orders o ON o.id=f.order_id
-                         WHERE CAST(f.id AS TEXT)=CAST(po.fill_id AS TEXT)
-                           AND o.proposal_id=ps.proposal_id
-                           AND f.qty>0 AND f.price>0
-                       ))""",
-            "performance_lab_invalid_fill_evidence": """SELECT COUNT(*) n
-                FROM performance_outcomes po
-                JOIN performance_setups ps ON ps.id=po.setup_id
-                WHERE ps.asset_class<>'crypto' AND EXISTS(
-                  SELECT 1 FROM orders o JOIN fills f ON f.order_id=o.id
-                  WHERE o.proposal_id=ps.proposal_id
-                    AND (COALESCE(f.qty,0)<=0 OR COALESCE(f.price,0)<=0)
-                )""",
+            # These three counters are recomputed from canonical Decimal
+            # evidence below.  Keep a harmless SQL placeholder here so the
+            # report remains a single named-counter map without allowing
+            # SQLite REAL arithmetic to decide execution integrity.
+            "performance_lab_actual_without_fill": "SELECT 0 n",
+            "performance_lab_fill_not_actual": "SELECT 0 n",
+            "performance_lab_invalid_fill_evidence": "SELECT 0 n",
             "performance_lab_orphaned_proposal_link": """SELECT COUNT(*) n
                 FROM performance_setups ps
                 LEFT JOIN trade_proposals p ON p.id=ps.proposal_id
@@ -2197,6 +2142,86 @@ class DurableExecutionStore:
                 return decimal_value(raw, field, minimum=ZERO)
             except ValueError:
                 return None
+
+        def exact_positive_value(row: Mapping[str, Any], field: str) -> Decimal | None:
+            try:
+                value = require_exact_decimal(
+                    row,
+                    f"{field}_decimal",
+                    minimum=ZERO,
+                )
+            except ValueError:
+                return None
+            return value if value is not None and value > ZERO else None
+
+        performance_rows = self.storage.fetch_all(
+            """SELECT po.*,ps.asset_class,ps.proposal_id AS setup_proposal_id
+               FROM performance_outcomes po
+               JOIN performance_setups ps ON ps.id=po.setup_id
+               WHERE COALESCE(ps.asset_class,'equity')<>'crypto'"""
+        )
+        fill_rows = self.storage.fetch_all("SELECT * FROM fills")
+        order_rows = self.storage.fetch_all("SELECT * FROM orders")
+        fills_by_id = {str(row["id"]): row for row in fill_rows}
+        orders_by_id = {str(row["id"]): row for row in order_rows}
+        fills_by_proposal: dict[str, list[dict[str, Any]]] = {}
+        for fill in fill_rows:
+            order = orders_by_id.get(str(fill.get("order_id")))
+            proposal_id = str(order.get("proposal_id") or "") if order else ""
+            if proposal_id:
+                fills_by_proposal.setdefault(proposal_id, []).append(fill)
+
+        def valid_actual_performance_evidence(row: Mapping[str, Any]) -> bool:
+            fill_id = row.get("fill_id")
+            fill = fills_by_id.get(str(fill_id)) if fill_id is not None else None
+            if fill is None:
+                return False
+            order = orders_by_id.get(str(fill.get("order_id")))
+            if order is None:
+                return False
+            fill_qty = exact_positive_value(fill, "qty")
+            fill_price = exact_positive_value(fill, "price")
+            entry_qty = exact_positive_value(row, "entry_qty")
+            entry_price = exact_positive_value(row, "entry_price")
+            entry_notional = exact_positive_value(row, "entry_notional")
+            if None in (fill_qty, fill_price, entry_qty, entry_price, entry_notional):
+                return False
+            assert (
+                fill_qty is not None
+                and fill_price is not None
+                and entry_qty is not None
+                and entry_price is not None
+                and entry_notional is not None
+            )
+            return (
+                str(row.get("order_id") or "") == str(fill.get("order_id") or "")
+                and str(order.get("proposal_id") or "") == str(row.get("setup_proposal_id") or "")
+                and entry_qty == fill_qty
+                and entry_price == fill_price
+                and entry_notional == fill_qty * fill_price
+            )
+
+        actual_without_fill = 0
+        fill_not_actual = 0
+        invalid_fill_evidence = 0
+        for row in performance_rows:
+            actual = str(row.get("actual_or_shadow") or "")
+            evidence_valid = actual == "actual_fill" and valid_actual_performance_evidence(row)
+            if actual in {"actual", "actual_fill"} and not evidence_valid:
+                actual_without_fill += 1
+            candidates = fills_by_proposal.get(str(row.get("setup_proposal_id") or ""), [])
+            if candidates:
+                if any(
+                    exact_positive_value(fill, "qty") is None
+                    or exact_positive_value(fill, "price") is None
+                    for fill in candidates
+                ):
+                    invalid_fill_evidence += 1
+                if not evidence_valid:
+                    fill_not_actual += 1
+        report["performance_lab_actual_without_fill"] = actual_without_fill
+        report["performance_lab_fill_not_actual"] = fill_not_actual
+        report["performance_lab_invalid_fill_evidence"] = invalid_fill_evidence
 
         intent_rows = self.storage.fetch_all(
             """SELECT id,created_at,requested_quantity_decimal,filled_quantity_decimal,

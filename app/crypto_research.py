@@ -615,7 +615,7 @@ class CryptoResearchEngine:
             if bid <= Decimal("0"):
                 continue
             basis_rows = self.storage.fetch_all(
-                "SELECT remaining_quantity,unit_cost FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
+                "SELECT remaining_quantity,unit_cost,opened_at FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
                 (symbol,),
             )
             basis_quantity = sum((_crypto_decimal(row["remaining_quantity"], "crypto lot quantity") for row in basis_rows), Decimal("0"))
@@ -646,8 +646,19 @@ class CryptoResearchEngine:
                 stop_price = max(stop_price, _crypto_decimal(previous["stop_price"], "crypto persisted stop"))
             target_r = _crypto_decimal(strategy_cfg.get("target_reward_r_multiple"), "crypto target reward")
             profit_target = average_entry + (average_entry - stop_price) * target_r
-            created_at = previous["created_at"] if previous else now.isoformat()
-            created_dt = _parse_dt(created_at)
+            try:
+                lot_opened_at = _oldest_crypto_lot_opened_at(basis_rows)
+            except ValueError:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_position_management_blocked",
+                    {"symbol": symbol, "reason": "crypto_lot_opened_at_missing_or_invalid"},
+                )
+                continue
+            # Position age is anchored to the oldest verified open lot, never
+            # to the timestamp of a management row created by the scanner.
+            created_at = lot_opened_at.isoformat()
+            created_dt = lot_opened_at
             time_stop_cfg = management_cfg.get("time_stop") or {}
             hold_days = _crypto_decimal(time_stop_cfg.get("min_hold_days_before_time_stop") or "3", "crypto time stop days")
             time_stop_at = created_dt + timedelta(seconds=int(hold_days * Decimal("86400")))
@@ -741,7 +752,7 @@ class CryptoResearchEngine:
                    time_stop_at=excluded.time_stop_at,thesis_fingerprint=excluded.thesis_fingerprint,
                    last_action=COALESCE(excluded.last_action,crypto_paper_position_management.last_action),
                    last_proposal_id=COALESCE(excluded.last_proposal_id,crypto_paper_position_management.last_proposal_id),
-                   updated_at=excluded.updated_at""",
+                   updated_at=excluded.updated_at,created_at=excluded.created_at""",
                 (
                     str(uuid.uuid4()), symbol, _decimal_text(quantity), _decimal_text(average_entry), _decimal_text(peak),
                     _decimal_text(stop_price), _decimal_text(profit_target), time_stop_at.isoformat(), thesis_fingerprint,
@@ -1060,6 +1071,13 @@ class CryptoResearchEngine:
                 target = row["target_price"]
                 if entry in (None, "") or stop in (None, "") or target in (None, ""):
                     continue
+                entry_decimal = _crypto_decimal(entry, "crypto shadow entry price")
+                shadow_notional = _crypto_decimal(
+                    sizing.get("maximum_order_notional_usd"),
+                    "crypto shadow sizing notional",
+                )
+                if entry_decimal <= Decimal("0") or shadow_notional <= Decimal("0"):
+                    raise ValueError("crypto shadow sizing basis must be positive")
                 setup = {
                     "symbol": symbol,
                     "strategy_decision_id": str(row["id"]),
@@ -1071,6 +1089,12 @@ class CryptoResearchEngine:
                     "horizon_hours": horizon_hours,
                     "cost_model": cost_model.to_payload(),
                     "side": "long",
+                    # Forward shadow outcomes use the configured paper order
+                    # notional as a deterministic hypothetical sizing basis.
+                    # This is not execution authority; it ensures P&L and
+                    # risk-multiple evidence is available for profitability
+                    # ranking instead of silently remaining quantity-less.
+                    "quantity": _decimal_text(shadow_notional / entry_decimal),
                 }
                 observation = calculate_shadow_outcome(
                     setup,
@@ -1609,6 +1633,22 @@ def _parse_dt(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _oldest_crypto_lot_opened_at(rows: list[Mapping[str, Any]]) -> datetime | None:
+    """Return the oldest opened_at, failing closed on any active-lot defect."""
+
+    opened_at: datetime | None = None
+    for row in rows:
+        raw_opened_at = row.get("opened_at")
+        if raw_opened_at in (None, ""):
+            raise ValueError("active crypto lot opened_at is missing")
+        try:
+            parsed = _parse_dt(str(raw_opened_at))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("active crypto lot opened_at is invalid") from exc
+        opened_at = parsed if opened_at is None else min(opened_at, parsed)
+    return opened_at
 
 
 def _crypto_decimal(value: Any, label: str) -> Decimal:
