@@ -225,10 +225,10 @@ def test_stale_paper_run_recovery_is_terminal_and_audited(tmp_path) -> None:
     storage = Storage(tmp_path / "runtime.db")
     storage.initialize()
     stale_run_id = storage.start_run("paper")
-    listener_run_id = storage.start_run("listener")
+    stale_listener_run_id = storage.start_run("listener")
     current_run_id = storage.start_run("paper")
 
-    recovered = storage.recover_stale_paper_runs(current_run_id)
+    recovered = storage.recover_stale_runs(current_run_id, "paper")
 
     assert recovered == [stale_run_id]
     stale = storage.fetch_all(
@@ -238,13 +238,14 @@ def test_stale_paper_run_recovery_is_terminal_and_audited(tmp_path) -> None:
     assert stale["ended_at"]
     detail = json.loads(stale["detail"])
     assert detail == {
-        "reason": "scanner_restart_after_previous_process_lost_authority",
+        "mode": "paper",
+        "reason": "runtime_restart_after_previous_process_lost_authority",
         "recovered_by_run_id": current_run_id,
         "started_at": detail["started_at"],
         "trading_ledger_unchanged": True,
     }
     assert (
-        storage.fetch_all("SELECT status FROM runs WHERE id=?", (listener_run_id,))[0]["status"]
+        storage.fetch_all("SELECT status FROM runs WHERE id=?", (stale_listener_run_id,))[0]["status"]
         == "running"
     )
     assert (
@@ -252,12 +253,24 @@ def test_stale_paper_run_recovery_is_terminal_and_audited(tmp_path) -> None:
         == "running"
     )
     audit = storage.fetch_all(
-        "SELECT run_id,event_type FROM audit_events WHERE event_type LIKE '%paper_run%' ORDER BY id"
+        """SELECT run_id,event_type FROM audit_events
+           WHERE event_type IN ('runtime_run_recovered_after_restart', 'stale_runtime_run_recovered')
+           ORDER BY id"""
     )
     assert audit == [
-        {"run_id": stale_run_id, "event_type": "paper_run_recovered_after_restart"},
-        {"run_id": current_run_id, "event_type": "stale_paper_run_recovered"},
+        {"run_id": stale_run_id, "event_type": "runtime_run_recovered_after_restart"},
+        {"run_id": current_run_id, "event_type": "stale_runtime_run_recovered"},
     ]
+
+    current_listener_id = storage.start_run("listener")
+    assert storage.recover_stale_runs(current_listener_id, "listener") == [
+        stale_listener_run_id
+    ]
+    listener = storage.fetch_all(
+        "SELECT status,detail FROM runs WHERE id=?", (stale_listener_run_id,)
+    )[0]
+    assert listener["status"] == "stale_recovered"
+    assert json.loads(listener["detail"])["mode"] == "listener"
 
 
 def test_missing_scanner_identity_fails_closed(tmp_path) -> None:

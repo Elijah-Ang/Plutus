@@ -66,7 +66,7 @@ def run_once(config_path: str | Path | None = None) -> int:
     if os.getenv("TRADING_AGENT_STALE_LOCK_RECOVERED") == "1":
         storage.audit(run_id, "stale_lock_recovered", {"lock": "logs/runtime/agent.lockdir"})
     if os.getenv("TRADING_AGENT_LOCK_HELD") == "1":
-        stale_runs = storage.recover_stale_paper_runs(run_id)
+        stale_runs = storage.recover_stale_runs(run_id, "paper")
         if stale_runs:
             storage.audit(
                 run_id,
@@ -276,6 +276,14 @@ def run_listener(config_path: str | Path | None = None) -> int:
     identity = record_process_identity("telegram_listener", run_id)
     storage.audit(run_id, "process_started", identity)
     storage.audit(run_id, "listener_started", {"poll_interval": poll_interval})
+    if os.getenv("TRADING_AGENT_LOCK_HELD") == "1":
+        stale_runs = storage.recover_stale_runs(run_id, "listener")
+        if stale_runs:
+            storage.audit(
+                run_id,
+                "stale_listener_run_recovery_summary",
+                {"recovered_run_ids": stale_runs, "count": len(stale_runs)},
+            )
     
     try:
         broker = AlpacaBroker(config)
