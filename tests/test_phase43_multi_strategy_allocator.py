@@ -6,7 +6,10 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
-from app.allocation_authority import Phase4AllocationStore
+from app.allocation_authority import (
+    Phase4AllocationStore,
+    allocation_authority_integrity_report,
+)
 from app.formula_versions import (
     EVIDENCE_VERSION,
     STRATEGY_PERFORMANCE_SCHEMA_VERSION,
@@ -100,12 +103,26 @@ def test_zero_authorized_strategies_preserves_cash_through_empty_vector_path(tmp
     strategies = ("alpha_v1",)
     config = _config(*strategies)
     storage, allocator = _allocator(tmp_path, config, strategies, "zero")
+    registry = StrategyExecutionRegistry(
+        config,
+        available_implementations={"implementation:alpha_v1": "implementation_v1"},
+    ).evaluate(
+        {"alpha_v1": _policy(config, "alpha_v1", "SUSPENDED")},
+        as_of=AS_OF,
+    )
+    registry_id = str(persist(storage, "zero", registry)["snapshot_id"])
 
     result = allocator.run(
         regime="normal",
         drawdown_pct=0.0,
         strategy_policy_map={"alpha_v1": _policy(config, "alpha_v1", "SUSPENDED")},
-        portfolio_snapshot={"phase3_available_risk_pct": 1.0, "portfolio_equity": 100.0, "as_of": AS_OF, "equity_as_of": AS_OF},
+        portfolio_snapshot={
+            "phase3_available_risk_pct": 1.0,
+            "portfolio_equity": 100.0,
+            "as_of": AS_OF,
+            "equity_as_of": AS_OF,
+            "strategy_registry_snapshot_id": registry_id,
+        },
         as_of=AS_OF,
     )
 
@@ -118,6 +135,9 @@ def test_zero_authorized_strategies_preserves_cash_through_empty_vector_path(tmp
     assert result["unallocated_available_risk"] == 1.0
     assert result["risk_reconciliation_residual"] == 0.0
     assert storage.fetch_all("SELECT payload FROM phase4_allocation_decisions")
+    assert allocation_authority_integrity_report(storage) == {
+        "invalid_phase4_allocation_authority": 0
+    }
 
 
 def test_one_authorized_strategy_uses_valid_degenerate_covariance_and_exact_sleeve(tmp_path) -> None:
