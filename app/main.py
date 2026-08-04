@@ -65,6 +65,14 @@ def run_once(config_path: str | Path | None = None) -> int:
     storage.audit(run_id, "process_started", identity)
     if os.getenv("TRADING_AGENT_STALE_LOCK_RECOVERED") == "1":
         storage.audit(run_id, "stale_lock_recovered", {"lock": "logs/runtime/agent.lockdir"})
+    if os.getenv("TRADING_AGENT_LOCK_HELD") == "1":
+        stale_runs = storage.recover_stale_paper_runs(run_id)
+        if stale_runs:
+            storage.audit(
+                run_id,
+                "stale_paper_run_recovery_summary",
+                {"recovered_run_ids": stale_runs, "count": len(stale_runs)},
+            )
     effective_config_json = json.dumps(redact(config), sort_keys=True, separators=(",", ":"))
     storage.execute(
         """INSERT INTO config_snapshots(

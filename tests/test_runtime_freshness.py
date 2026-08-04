@@ -221,6 +221,45 @@ def test_exact_runtime_authority_and_both_fresh_processes_pass(tmp_path) -> None
     assert report["components"]["database"]["quick_check"] == "ok"
 
 
+def test_stale_paper_run_recovery_is_terminal_and_audited(tmp_path) -> None:
+    storage = Storage(tmp_path / "runtime.db")
+    storage.initialize()
+    stale_run_id = storage.start_run("paper")
+    listener_run_id = storage.start_run("listener")
+    current_run_id = storage.start_run("paper")
+
+    recovered = storage.recover_stale_paper_runs(current_run_id)
+
+    assert recovered == [stale_run_id]
+    stale = storage.fetch_all(
+        "SELECT status,ended_at,detail FROM runs WHERE id=?", (stale_run_id,)
+    )[0]
+    assert stale["status"] == "stale_recovered"
+    assert stale["ended_at"]
+    detail = json.loads(stale["detail"])
+    assert detail == {
+        "reason": "scanner_restart_after_previous_process_lost_authority",
+        "recovered_by_run_id": current_run_id,
+        "started_at": detail["started_at"],
+        "trading_ledger_unchanged": True,
+    }
+    assert (
+        storage.fetch_all("SELECT status FROM runs WHERE id=?", (listener_run_id,))[0]["status"]
+        == "running"
+    )
+    assert (
+        storage.fetch_all("SELECT status FROM runs WHERE id=?", (current_run_id,))[0]["status"]
+        == "running"
+    )
+    audit = storage.fetch_all(
+        "SELECT run_id,event_type FROM audit_events WHERE event_type LIKE '%paper_run%' ORDER BY id"
+    )
+    assert audit == [
+        {"run_id": stale_run_id, "event_type": "paper_run_recovered_after_restart"},
+        {"run_id": current_run_id, "event_type": "stale_paper_run_recovered"},
+    ]
+
+
 def test_missing_scanner_identity_fails_closed(tmp_path) -> None:
     paths = _fixture(tmp_path)
     (paths["state_root"] / "runtime" / "scanner_identity.json").unlink()
