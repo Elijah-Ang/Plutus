@@ -9,6 +9,7 @@ import pytest
 from app.service import TradingService
 from app.storage import Storage
 from app.execution import DurableExecutionStore
+from app.fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
 from app.formula_versions import PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION
 from app.performance_lab import classify_performance_outcome
 from app.utils import format_digest_message, load_config
@@ -154,8 +155,20 @@ def test_performance_lab_records_proposed_setup_linked_to_proposal(tmp_path):
 
     row = storage.fetch_all("SELECT proposed, proposal_id, not_proposed_reason FROM performance_setups")[0]
     assert row == {"proposed": 1, "proposal_id": "prop-1", "not_proposed_reason": None}
-    outcome = storage.fetch_all("SELECT actual_or_shadow FROM performance_outcomes")[0]
+    outcome = storage.fetch_all(
+        """SELECT actual_or_shadow,entry_price_decimal,entry_qty_decimal,
+                  entry_notional_decimal,decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
+    )[0]
     assert outcome["actual_or_shadow"] == "proposal_unfilled"
+    assert outcome["entry_price_decimal"] == "100"
+    assert outcome["entry_qty_decimal"] == "0.05"
+    assert outcome["entry_notional_decimal"] == "5"
+    assert outcome["decimal_provenance"] == RECONSTRUCTED_REAL_PROVENANCE
+    assert outcome["decimal_accounting_version"] == "fixed_point_fifo_accounting_v1"
+    integrity = DurableExecutionStore(storage).integrity_report()
+    assert integrity["fixed_point_missing_canonical_evidence"] == 0
+    assert integrity["fixed_point_wrong_version_or_provenance"] == 0
     summary = storage.fetch_all("SELECT total_actual_trades FROM performance_lab_summaries")[0]
     assert summary["total_actual_trades"] == 0
 

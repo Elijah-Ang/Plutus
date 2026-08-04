@@ -159,8 +159,10 @@ def apply_performance_lab_classification_schema(
                        broker_order_id=COALESCE(?,broker_order_id),
                        fill_id=COALESCE(?,fill_id),fill_price=COALESCE(?,fill_price),
                        fill_qty=COALESCE(?,fill_qty),updated_at=?,
-                       fill_price_decimal=?,fill_qty_decimal=?,
-                       decimal_provenance=?,decimal_accounting_version=?
+                       fill_price_decimal=COALESCE(?,fill_price_decimal),
+                       fill_qty_decimal=COALESCE(?,fill_qty_decimal),
+                       decimal_provenance=COALESCE(?,decimal_provenance),
+                       decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                    WHERE id=? AND (
                      (? IS NOT NULL AND COALESCE(order_id,'')<>?)
                      OR (? IS NOT NULL AND COALESCE(broker_order_id,'')<>?)
@@ -177,7 +179,9 @@ def apply_performance_lab_classification_schema(
                     iso_now(),
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, row[0],
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
+                    row[0],
                     row[5], row[5],
                     row[6], row[6],
                     row[7] if valid_fill else None, row[7],
@@ -192,8 +196,11 @@ def apply_performance_lab_classification_schema(
                        broker_order_id=COALESCE(?,broker_order_id),
                        fill_id=COALESCE(?,fill_id),entry_price=COALESCE(?,entry_price),
                        entry_qty=COALESCE(?,entry_qty),entry_notional=COALESCE(?,entry_notional),
-                       updated_at=?,entry_price_decimal=?,entry_qty_decimal=?,entry_notional_decimal=?,
-                       decimal_provenance=?,decimal_accounting_version=?
+                       updated_at=?,entry_price_decimal=COALESCE(?,entry_price_decimal),
+                       entry_qty_decimal=COALESCE(?,entry_qty_decimal),
+                       entry_notional_decimal=COALESCE(?,entry_notional_decimal),
+                       decimal_provenance=COALESCE(?,decimal_provenance),
+                       decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                    WHERE setup_id=? AND (
                      COALESCE(actual_or_shadow,'')<>?
                      OR (? IS NOT NULL AND COALESCE(order_id,'')<>?)
@@ -216,7 +223,8 @@ def apply_performance_lab_classification_schema(
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
                     decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
-                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
                     row[0],
                     classification,
                     row[5], row[5],

@@ -14743,7 +14743,10 @@ class TradingService:
                     order_id=COALESCE(?, order_id), broker_order_id=COALESCE(?, broker_order_id),
                     fill_id=COALESCE(?, fill_id), order_status=COALESCE(?, order_status),
                     fill_price=COALESCE(?, fill_price), fill_qty=COALESCE(?, fill_qty), updated_at=?,
-                    fill_price_decimal=?,fill_qty_decimal=?,decimal_provenance=?,decimal_accounting_version=?
+                    fill_price_decimal=COALESCE(?,fill_price_decimal),
+                    fill_qty_decimal=COALESCE(?,fill_qty_decimal),
+                    decimal_provenance=COALESCE(?,decimal_provenance),
+                    decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                 WHERE id=?
                 """,
                 (
@@ -14754,7 +14757,9 @@ class TradingService:
                     now_iso,
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, row.get("setup_id"),
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
+                    row.get("setup_id"),
                 ),
             )
             self.storage.execute(
@@ -14764,8 +14769,11 @@ class TradingService:
                     broker_order_id=COALESCE(?, broker_order_id), fill_id=COALESCE(?, fill_id),
                     entry_price=COALESCE(?, entry_price), entry_qty=COALESCE(?, entry_qty),
                     entry_notional=COALESCE(?, entry_notional), actual_or_shadow=?, updated_at=?,
-                    entry_price_decimal=?,entry_qty_decimal=?,entry_notional_decimal=?,
-                    decimal_provenance=?,decimal_accounting_version=?
+                    entry_price_decimal=COALESCE(?,entry_price_decimal),
+                    entry_qty_decimal=COALESCE(?,entry_qty_decimal),
+                    entry_notional_decimal=COALESCE(?,entry_notional_decimal),
+                    decimal_provenance=COALESCE(?,decimal_provenance),
+                    decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                 WHERE setup_id=?
                 """,
                 (
@@ -14778,7 +14786,9 @@ class TradingService:
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
                     decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
-                    EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, row.get("setup_id"),
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
+                    row.get("setup_id"),
                 ),
             )
         for affected_run_id in sorted(affected_run_ids - {""}):
