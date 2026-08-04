@@ -311,6 +311,41 @@ def test_candidate_allocation_ranks_globally_but_cannot_cross_sleeves_and_exits_
     assert entries[0]["candidate_id"] != entries[1]["candidate_id"]
     assert entries[2]["decision"] == "REJECT"
     assert first["allocated_by_strategy"] == {"alpha_v1": 0.20, "beta_v1": 0.20}
+    assert first["allocated_by_strategy_decimal"] == {"alpha_v1": "0.2", "beta_v1": "0.2"}
     assert first["allocated_risk"] == 0.40
+    assert first["allocated_risk_decimal"] == "0.4"
     assert first["global_remaining_risk"] == 0.0
+    assert first["global_remaining_risk_decimal"] == "0"
     assert first["reconciliation_residual"] == 0.0
+
+
+def test_candidate_allocation_uses_authoritative_decimal_sleeve_sidecar() -> None:
+    result = allocate_candidates_to_sleeves(
+        [{
+            "candidate_id": "exact-sidecar",
+            "strategy_version": "alpha_v1",
+            "symbol": "SPY",
+            "action": "entry",
+            "side": "buy",
+            "setup_score": 95,
+            "evidence_quality": 95,
+            "risk_value": 0.5,
+            "risk_value_decimal": "0.5",
+            "risk_unit": "stop_risk_dollars",
+        }],
+        {
+            "alpha_v1": {
+                "remaining_risk": 999.0,
+                "remaining_risk_decimal": "0.2",
+                "risk_unit": "stop_risk_dollars",
+            }
+        },
+        global_available_risk=1.0,
+        global_risk_unit="stop_risk_dollars",
+        conversion_equity=100.0,
+        conversion_equity_as_of=AS_OF,
+        evaluation_time=AS_OF,
+    )
+
+    assert result["allocated_risk_decimal"] == "0.2"
+    assert result["decisions"][0]["allocated_risk_decimal"] == "0.2"

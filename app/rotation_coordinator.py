@@ -8,6 +8,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
@@ -23,6 +24,14 @@ from .utils import iso_now, json_dumps
 from .strategy_execution_registry import (
     StrategyRegistryIntegrityError,
     StrategyRegistryStore,
+)
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    ZERO,
+    decimal_text,
+    decimal_value,
+    require_exact_decimal,
 )
 
 class RotationState(StrEnum):
@@ -125,6 +134,27 @@ class RevalidatedRotationEntry:
     reason: str
 
 
+def _rotation_decimal(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite decimal") from exc
+    if not result.is_finite() or result < minimum:
+        raise ValueError(f"{label} must be a finite non-negative decimal")
+    return result
+
+
+def _rotation_exact_projection(
+    row: Mapping[str, Any], canonical_field: str, legacy_field: str
+) -> Decimal:
+    exact = require_exact_decimal(row, canonical_field, minimum=ZERO)
+    assert exact is not None
+    legacy = row.get(legacy_field) if hasattr(row, "get") else row[legacy_field]
+    if legacy is not None and _rotation_decimal(legacy, legacy_field) != exact:
+        raise RuntimeError(f"{legacy_field} compatibility projection disagrees with exact evidence")
+    return exact
+
+
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -165,6 +195,9 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
              approval_id TEXT,approved_at TEXT,estimated_release_notional REAL NOT NULL DEFAULT 0,
              actual_released_notional REAL NOT NULL DEFAULT 0,actual_released_risk REAL NOT NULL DEFAULT 0,
              reconciled_cash REAL,reconciled_buying_power REAL,reconciliation_fingerprint TEXT,
+             estimated_release_notional_decimal TEXT,actual_released_notional_decimal TEXT,
+             actual_released_risk_decimal TEXT,reconciled_cash_decimal TEXT,reconciled_buying_power_decimal TEXT,
+             decimal_provenance TEXT,decimal_accounting_version TEXT,
              registry_snapshot_id TEXT,allocation_id TEXT,origin_run_id TEXT,
              revalidation_run_id TEXT,revalidation_registry_snapshot_id TEXT,
              revalidation_allocation_id TEXT,revalidated_at TEXT,terminal_reason TEXT,
@@ -175,12 +208,17 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
              proposal_id TEXT,intent_id TEXT,symbol TEXT NOT NULL,side TEXT NOT NULL,state TEXT NOT NULL,
              requested_quantity REAL,filled_quantity REAL NOT NULL DEFAULT 0,filled_notional REAL NOT NULL DEFAULT 0,
              released_risk REAL NOT NULL DEFAULT 0,reason TEXT,payload TEXT NOT NULL,updated_at TEXT NOT NULL,
+             requested_quantity_decimal TEXT,filled_quantity_decimal TEXT,filled_notional_decimal TEXT,
+             released_risk_decimal TEXT,decimal_provenance TEXT,decimal_accounting_version TEXT,
              UNIQUE(group_id,sequence,role))""",
         """CREATE TABLE IF NOT EXISTS rotation_contingent_entries(
              id TEXT PRIMARY KEY,group_id TEXT NOT NULL,candidate_key TEXT NOT NULL,strategy_version TEXT NOT NULL,
              symbol TEXT NOT NULL,displayed_max_quantity REAL NOT NULL,displayed_max_notional REAL NOT NULL,
              displayed_max_stop_risk REAL NOT NULL,expires_at TEXT NOT NULL,state TEXT NOT NULL,
              final_quantity REAL,final_notional REAL,final_stop_risk REAL,binding_cap TEXT,
+             displayed_max_quantity_decimal TEXT,displayed_max_notional_decimal TEXT,
+             displayed_max_stop_risk_decimal TEXT,final_quantity_decimal TEXT,final_notional_decimal TEXT,
+             final_stop_risk_decimal TEXT,decimal_provenance TEXT,decimal_accounting_version TEXT,
              proposal_id TEXT,intent_id TEXT,payload TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
              UNIQUE(group_id,candidate_key))""",
         """CREATE TABLE IF NOT EXISTS rotation_events(
@@ -212,11 +250,35 @@ def apply_rotation_schema(conn: Any, *, record_migration: bool = True) -> None:
         "revalidation_registry_snapshot_id": "TEXT",
         "revalidation_allocation_id": "TEXT",
         "revalidated_at": "TEXT",
+        "estimated_release_notional_decimal": "TEXT",
+        "actual_released_notional_decimal": "TEXT",
+        "actual_released_risk_decimal": "TEXT",
+        "reconciled_cash_decimal": "TEXT",
+        "reconciled_buying_power_decimal": "TEXT",
+        "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
     }
     present = {row[1] for row in conn.execute("PRAGMA table_info(rotation_groups)")}
     for name, kind in additions.items():
         if name not in present:
             conn.execute(f"ALTER TABLE rotation_groups ADD COLUMN {name} {kind}")
+    for table, columns in {
+        "rotation_steps": {
+            "requested_quantity_decimal": "TEXT", "filled_quantity_decimal": "TEXT",
+            "filled_notional_decimal": "TEXT", "released_risk_decimal": "TEXT",
+            "decimal_provenance": "TEXT", "decimal_accounting_version": "TEXT",
+        },
+        "rotation_contingent_entries": {
+            "displayed_max_quantity_decimal": "TEXT", "displayed_max_notional_decimal": "TEXT",
+            "displayed_max_stop_risk_decimal": "TEXT", "final_quantity_decimal": "TEXT",
+            "final_notional_decimal": "TEXT", "final_stop_risk_decimal": "TEXT",
+            "decimal_provenance": "TEXT", "decimal_accounting_version": "TEXT",
+        },
+    }.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns.items():
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
     approval_additions = {
         "display_envelope_id": "TEXT",
         "display_fingerprint": "TEXT",
@@ -457,32 +519,47 @@ class RotationCoordinator:
                      id,run_id,origin_run_id,state,expires_at,estimated_release_notional,registry_snapshot_id,allocation_id,
                      schema_version,formula_version,config_hash,decision_fingerprint,created_at,updated_at,
                      position_lifecycle_id,exit_proposal_fingerprint,contingent_candidate_fingerprint,
-                     displayed_approval_fingerprint,workflow_structure_fingerprint)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     displayed_approval_fingerprint,workflow_structure_fingerprint,
+                     estimated_release_notional_decimal,actual_released_notional_decimal,actual_released_risk_decimal,
+                     reconciled_cash_decimal,reconciled_buying_power_decimal,decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (group_id, run_id, run_id, RotationState.PENDING_GROUP_APPROVAL.value, expiry.isoformat(),
-                 sum(row["estimated_notional"] for row in canonical_exits), registry_snapshot_id, allocation_id,
+                 float(sum(row["estimated_notional"] for row in canonical_exits)), registry_snapshot_id, allocation_id,
                  ROTATION_SCHEMA_VERSION, ROTATION_FORMULA_VERSION, self.config_hash, fingerprint, now, now,
                  lifecycle_id, exit_fingerprint, candidate_fingerprint, displayed_fingerprint,
-                 structure_fingerprint),
+                 structure_fingerprint,
+                 decimal_text(sum((_rotation_decimal(row["estimated_notional"], "estimated release notional") for row in canonical_exits), ZERO)),
+                 "0", "0", None, None, EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION),
             )
             for sequence, leg in enumerate(canonical_exits):
                 conn.execute(
                     """INSERT INTO rotation_steps(
-                         id,group_id,sequence,role,proposal_id,symbol,side,state,requested_quantity,payload,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                         id,group_id,sequence,role,proposal_id,symbol,side,state,requested_quantity,payload,updated_at,
+                         requested_quantity_decimal,filled_quantity_decimal,filled_notional_decimal,released_risk_decimal,
+                         decimal_provenance,decimal_accounting_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(uuid.uuid4()), group_id, sequence, "rotation_exit", leg["proposal_id"], leg["symbol"],
-                     "sell", "pending", leg["quantity"], json_dumps(leg), now),
+                     "sell", "pending", leg["quantity"], json_dumps(leg), now,
+                     decimal_text(_rotation_decimal(leg["quantity"], "requested rotation quantity")),
+                     "0", "0", "0", EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION),
                 )
             for candidate in canonical_entries:
                 entry_id = _fingerprint([group_id, candidate["candidate_key"]])[:32]
                 conn.execute(
                     """INSERT INTO rotation_contingent_entries(
                          id,group_id,candidate_key,strategy_version,symbol,displayed_max_quantity,
-                         displayed_max_notional,displayed_max_stop_risk,expires_at,state,proposal_id,payload,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         displayed_max_notional,displayed_max_stop_risk,expires_at,state,proposal_id,payload,created_at,updated_at,
+                         displayed_max_quantity_decimal,displayed_max_notional_decimal,displayed_max_stop_risk_decimal,
+                         final_quantity_decimal,final_notional_decimal,final_stop_risk_decimal,
+                         decimal_provenance,decimal_accounting_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (entry_id, group_id, candidate["candidate_key"], candidate["strategy_version"], candidate["symbol"],
                      candidate["max_quantity"], candidate["max_notional"], candidate["max_stop_risk"],
-                     expiry.isoformat(), "contingent", candidate["proposal_id"], json_dumps(candidate["payload"]), now, now),
+                     expiry.isoformat(), "contingent", candidate["proposal_id"], json_dumps(candidate["payload"]), now, now,
+                     decimal_text(_rotation_decimal(candidate["max_quantity"], "displayed maximum quantity")),
+                     decimal_text(_rotation_decimal(candidate["max_notional"], "displayed maximum notional")),
+                     decimal_text(_rotation_decimal(candidate["max_stop_risk"], "displayed maximum stop risk")),
+                     None, None, None, EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION),
                 )
             self._event(conn, group_id, "created", "rotation_group_created", None,
                         RotationState.PENDING_GROUP_APPROVAL, {"capital_reserved": False, "estimated_release_only": True})
@@ -515,7 +592,7 @@ class RotationCoordinator:
                 "step_id": str(step["id"]),
                 "proposal_id": str(step["proposal_id"] or ""),
                 "symbol": str(step["symbol"] or "").upper(),
-                "quantity": float(step["requested_quantity"]),
+                "quantity": float(_rotation_exact_projection(step, "requested_quantity_decimal", "requested_quantity")),
                 "position_lifecycle_id": str(payload.get("position_lifecycle_id") or ""),
                 "reason": str(step["reason"] or payload.get("reason") or ""),
                 "role": str(step["role"]),
@@ -530,9 +607,9 @@ class RotationCoordinator:
                 "proposal_id": str(entry.get("proposal_id") or ""),
                 "symbol": str(entry["symbol"]).upper(),
                 "strategy_version": str(entry["strategy_version"]),
-                "displayed_max_quantity": float(entry["displayed_max_quantity"]),
-                "displayed_max_notional": float(entry["displayed_max_notional"]),
-                "displayed_max_stop_risk": float(entry["displayed_max_stop_risk"]),
+                "displayed_max_quantity": float(_rotation_exact_projection(entry, "displayed_max_quantity_decimal", "displayed_max_quantity")),
+                "displayed_max_notional": float(_rotation_exact_projection(entry, "displayed_max_notional_decimal", "displayed_max_notional")),
+                "displayed_max_stop_risk": float(_rotation_exact_projection(entry, "displayed_max_stop_risk_decimal", "displayed_max_stop_risk")),
             },
         }
         return {
@@ -772,12 +849,14 @@ class RotationCoordinator:
         released_risk: float,
         exit_complete: bool,
     ) -> dict[str, Any]:
-        values = (float(cumulative_quantity), float(cumulative_notional), float(released_risk))
-        if any(not math.isfinite(value) or value < 0 for value in values) or cumulative_quantity <= 0:
+        cumulative_quantity_decimal = _rotation_decimal(cumulative_quantity, "cumulative rotation quantity")
+        cumulative_notional_decimal = _rotation_decimal(cumulative_notional, "cumulative rotation notional")
+        released_risk_decimal = _rotation_decimal(released_risk, "released rotation risk")
+        if cumulative_quantity_decimal <= ZERO:
             raise ValueError("authoritative cumulative fill values must be finite and non-negative")
         now = iso_now()
         target = RotationState.EXIT_FILLED if exit_complete else RotationState.EXIT_PARTIALLY_FILLED
-        event_key = f"exit-fill:{intent_id}:{cumulative_quantity:.12f}:{cumulative_notional:.8f}"
+        event_key = f"exit-fill:{intent_id}:{decimal_text(cumulative_quantity_decimal)}:{decimal_text(cumulative_notional_decimal)}"
         with self.storage.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             group = conn.execute("SELECT * FROM rotation_groups WHERE id=?", (group_id,)).fetchone()
@@ -787,7 +866,14 @@ class RotationCoordinator:
             ).fetchone()
             if not group or not step:
                 raise RuntimeError("rotation exit intent linkage is missing")
-            if cumulative_quantity + 1e-12 < float(step["filled_quantity"] or 0) or cumulative_notional + 1e-9 < float(step["filled_notional"] or 0):
+            previous_quantity_decimal = require_exact_decimal(
+                step, "filled_quantity_decimal", minimum=ZERO
+            )
+            previous_notional_decimal = require_exact_decimal(
+                step, "filled_notional_decimal", minimum=ZERO
+            )
+            assert previous_quantity_decimal is not None and previous_notional_decimal is not None
+            if cumulative_quantity_decimal < previous_quantity_decimal or cumulative_notional_decimal < previous_notional_decimal:
                 raise RuntimeError("cumulative exit fill cannot move backward")
             current = RotationState(group["state"])
             exit_dependency_active = current in {
@@ -798,9 +884,12 @@ class RotationCoordinator:
                 self._require_transition(current, target)
             conn.execute(
                 """UPDATE rotation_steps SET state=?,filled_quantity=?,filled_notional=?,released_risk=?,updated_at=?
-                   WHERE id=?""",
-                ("filled" if exit_complete else "partially_filled", cumulative_quantity, cumulative_notional,
-                 released_risk, now, step["id"]),
+                   ,filled_quantity_decimal=?,filled_notional_decimal=?,released_risk_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=? WHERE id=?""",
+                ("filled" if exit_complete else "partially_filled", float(cumulative_quantity_decimal), float(cumulative_notional_decimal),
+                 float(released_risk_decimal), now, decimal_text(cumulative_quantity_decimal),
+                 decimal_text(cumulative_notional_decimal), decimal_text(released_risk_decimal),
+                 EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, step["id"]),
             )
             remaining = conn.execute(
                 "SELECT COUNT(*) FROM rotation_steps WHERE group_id=? AND role='rotation_exit' AND state!='filled'",
@@ -809,14 +898,30 @@ class RotationCoordinator:
             target = RotationState.EXIT_FILLED if int(remaining) == 0 else RotationState.EXIT_PARTIALLY_FILLED
             if exit_dependency_active:
                 self._require_transition(current, target)
-            totals = conn.execute(
-                "SELECT COALESCE(SUM(filled_notional),0),COALESCE(SUM(released_risk),0) FROM rotation_steps WHERE group_id=? AND role='rotation_exit'",
+            total_rows = conn.execute(
+                "SELECT filled_notional_decimal,released_risk_decimal FROM rotation_steps WHERE group_id=? AND role='rotation_exit'",
                 (group_id,),
-            ).fetchone()
+            ).fetchall()
+            try:
+                total_notional = sum(
+                    (require_exact_decimal(row, "filled_notional_decimal", minimum=ZERO) for row in total_rows),
+                    ZERO,
+                )
+                total_risk = sum(
+                    (require_exact_decimal(row, "released_risk_decimal", minimum=ZERO) for row in total_rows),
+                    ZERO,
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("rotation exit totals are not valid exact decimal evidence") from exc
+            assert total_notional is not None and total_risk is not None
             persisted_state = target if exit_dependency_active else current
             conn.execute(
-                "UPDATE rotation_groups SET state=?,actual_released_notional=?,actual_released_risk=?,updated_at=? WHERE id=?",
-                (persisted_state.value, float(totals[0]), float(totals[1]), now, group_id),
+                """UPDATE rotation_groups SET state=?,actual_released_notional=?,actual_released_risk=?,updated_at=?,
+                   actual_released_notional_decimal=?,actual_released_risk_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=? WHERE id=?""",
+                (persisted_state.value, float(total_notional), float(total_risk), now,
+                 decimal_text(total_notional), decimal_text(total_risk),
+                 EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, group_id),
             )
             event_type = (
                 "exit_filled" if target == RotationState.EXIT_FILLED else "exit_partially_filled"
@@ -824,9 +929,9 @@ class RotationCoordinator:
             self._event(conn, group_id, event_key, event_type,
                         current, persisted_state, {"intent_id": intent_id, "actual_capacity_only": True,
                                                    "additional_capacity_not_reused": not exit_dependency_active,
-                                                   "cumulative_quantity": cumulative_quantity,
-                                                   "cumulative_notional": cumulative_notional,
-                                                   "released_risk": released_risk})
+                                                   "cumulative_quantity": decimal_text(cumulative_quantity_decimal),
+                                                   "cumulative_notional": decimal_text(cumulative_notional_decimal),
+                                                   "released_risk": decimal_text(released_risk_decimal)})
         return self.get_group(group_id)
 
     def record_exit_terminal(
@@ -863,8 +968,10 @@ class RotationCoordinator:
                 conn, group_id, f"exit-terminal:{intent_id}:{terminal_state}",
                 "exit_terminal_reconciled", RotationState(group["state"]),
                 RotationState(group["state"]),
-                {"intent_id": intent_id, "terminal_state": terminal_state,
-                 "known_partial_fill_accounted": float(step["filled_quantity"] or 0.0)},
+                 {"intent_id": intent_id, "terminal_state": terminal_state,
+                 "known_partial_fill_accounted": decimal_text(
+                     require_exact_decimal(step, "filled_quantity_decimal", minimum=ZERO) or ZERO
+                 )},
             )
         return self.get_group(group_id)
 
@@ -880,7 +987,9 @@ class RotationCoordinator:
         buying_power: float,
         snapshot_fingerprint: str,
     ) -> dict[str, Any]:
-        if not snapshot_fingerprint or any(not math.isfinite(float(value)) or float(value) < 0 for value in (cash, buying_power)):
+        cash_decimal = _rotation_decimal(cash, "reconciled cash")
+        buying_power_decimal = _rotation_decimal(buying_power, "reconciled buying power")
+        if not snapshot_fingerprint:
             raise ValueError("reconciliation requires finite account capacity and a snapshot fingerprint")
         now = iso_now()
         with self.storage.connect() as conn:
@@ -890,12 +999,19 @@ class RotationCoordinator:
                 raise KeyError(group_id)
             current = RotationState(group["state"])
             self._require_transition(current, RotationState.RECONCILED)
-            if float(group["actual_released_notional"] or 0) <= 0:
+            actual_released_notional = require_exact_decimal(
+                group, "actual_released_notional_decimal", minimum=ZERO
+            )
+            assert actual_released_notional is not None
+            if actual_released_notional <= ZERO:
                 raise RuntimeError("reconciliation cannot authorize capacity without an actual exit fill")
             conn.execute(
                 """UPDATE rotation_groups SET state=?,reconciled_cash=?,reconciled_buying_power=?,
-                   reconciliation_fingerprint=?,updated_at=? WHERE id=?""",
-                (RotationState.RECONCILED.value, float(cash), float(buying_power), snapshot_fingerprint, now, group_id),
+                   reconciliation_fingerprint=?,updated_at=?,reconciled_cash_decimal=?,reconciled_buying_power_decimal=?,
+                   decimal_provenance=?,decimal_accounting_version=? WHERE id=?""",
+                (RotationState.RECONCILED.value, float(cash_decimal), float(buying_power_decimal), snapshot_fingerprint, now,
+                 decimal_text(cash_decimal), decimal_text(buying_power_decimal),
+                 EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, group_id),
             )
             self._event(conn, group_id, f"reconciled:{snapshot_fingerprint}", "reconciliation_complete",
                         current, RotationState.RECONCILED, {"actual_fill_required": True})
@@ -918,10 +1034,15 @@ class RotationCoordinator:
         allocation_id: str,
         evaluation_time: str | datetime | None = None,
     ) -> RevalidatedRotationEntry:
-        numbers = (price, requested_quantity, stop_risk_per_share, allocation_notional_cap,
-                   allocation_risk_cap, other_available_cash, minimum_notional)
-        if any(not math.isfinite(float(value)) or float(value) < 0 for value in numbers) or price <= 0:
-            raise ValueError("rotation entry revalidation inputs must be finite and non-negative")
+        price_decimal = _rotation_decimal(price, "rotation entry price")
+        requested_quantity_decimal = _rotation_decimal(requested_quantity, "requested rotation quantity")
+        stop_risk_per_share_decimal = _rotation_decimal(stop_risk_per_share, "rotation stop risk per share")
+        allocation_notional_cap_decimal = _rotation_decimal(allocation_notional_cap, "rotation allocation notional cap")
+        allocation_risk_cap_decimal = _rotation_decimal(allocation_risk_cap, "rotation allocation risk cap")
+        other_available_cash_decimal = _rotation_decimal(other_available_cash, "other available cash")
+        minimum_notional_decimal = _rotation_decimal(minimum_notional, "minimum rotation notional")
+        if price_decimal <= ZERO:
+            raise ValueError("rotation entry price must be positive")
         group = self.get_group(group_id)
         if RotationState(group["state"]) != RotationState.RECONCILED:
             raise RuntimeError("contingent entry cannot revalidate before fill reconciliation")
@@ -948,29 +1069,38 @@ class RotationCoordinator:
         except (RuntimeError, ValueError) as exc:
             self.transition(group_id, RotationState.ENTRY_BLOCKED, reason=f"rotation authority blocked: {exc}")
             raise
-        displayed_qty = float(entry["displayed_max_quantity"])
-        displayed_notional = float(entry["displayed_max_notional"])
-        displayed_risk = float(entry["displayed_max_stop_risk"])
+        displayed_qty = require_exact_decimal(entry, "displayed_max_quantity_decimal", minimum=ZERO)
+        displayed_notional = require_exact_decimal(entry, "displayed_max_notional_decimal", minimum=ZERO)
+        displayed_risk = require_exact_decimal(entry, "displayed_max_stop_risk_decimal", minimum=ZERO)
+        actual_released = require_exact_decimal(group, "actual_released_notional_decimal", minimum=ZERO)
+        reconciled_cash = require_exact_decimal(group, "reconciled_cash_decimal", minimum=ZERO)
+        reconciled_buying_power = require_exact_decimal(group, "reconciled_buying_power_decimal", minimum=ZERO)
+        assert displayed_qty is not None and displayed_notional is not None and displayed_risk is not None
+        assert actual_released is not None and reconciled_cash is not None and reconciled_buying_power is not None
         caps = {
-            "displayed_quantity": displayed_qty * price,
+            "displayed_quantity": displayed_qty * price_decimal,
             "displayed_notional": displayed_notional,
-            "actual_exit_release": float(group["actual_released_notional"] or 0),
-            "reconciled_cash": float(group["reconciled_cash"] or 0),
-            "reconciled_buying_power": float(group["reconciled_buying_power"] or 0),
-            "other_available_cash": float(other_available_cash),
-            "current_strategy_allocation": float(allocation_notional_cap),
-            "requested_quantity": float(requested_quantity) * price,
+            "actual_exit_release": actual_released,
+            "reconciled_cash": reconciled_cash,
+            "reconciled_buying_power": reconciled_buying_power,
+            "other_available_cash": other_available_cash_decimal,
+            "current_strategy_allocation": allocation_notional_cap_decimal,
+            "requested_quantity": requested_quantity_decimal * price_decimal,
         }
         binding_cap, final_notional = min(caps.items(), key=lambda item: (item[1], item[0]))
         risk_qty = displayed_qty
-        if stop_risk_per_share > 0:
-            risk_qty = min(risk_qty, displayed_risk / stop_risk_per_share, allocation_risk_cap / stop_risk_per_share)
+        if stop_risk_per_share_decimal > ZERO:
+            risk_qty = min(
+                risk_qty,
+                displayed_risk / stop_risk_per_share_decimal,
+                allocation_risk_cap_decimal / stop_risk_per_share_decimal,
+            )
         else:
-            risk_qty = 0.0
-        final_quantity = min(displayed_qty, requested_quantity, final_notional / price, risk_qty)
-        final_notional = max(0.0, final_quantity * price)
-        final_risk = max(0.0, final_quantity * stop_risk_per_share)
-        if final_notional < minimum_notional or final_quantity <= 0:
+            risk_qty = ZERO
+        final_quantity = min(displayed_qty, requested_quantity_decimal, final_notional / price_decimal, risk_qty)
+        final_notional = max(ZERO, final_quantity * price_decimal)
+        final_risk = max(ZERO, final_quantity * stop_risk_per_share_decimal)
+        if final_notional < minimum_notional_decimal or final_quantity <= ZERO:
             self.transition(group_id, RotationState.ENTRY_BLOCKED, reason="actual released capacity leaves no executable entry")
             return RevalidatedRotationEntry(False, group_id, contingent_entry_id, entry["symbol"], 0, 0, 0,
                                             binding_cap, "entry blocked after fresh post-fill allocation")
@@ -989,23 +1119,27 @@ class RotationCoordinator:
             )
             conn.execute(
                 """UPDATE rotation_contingent_entries SET state='revalidated',final_quantity=?,final_notional=?,
-                   final_stop_risk=?,binding_cap=?,updated_at=? WHERE id=? AND state='contingent'""",
-                (final_quantity, final_notional, final_risk, binding_cap, now, contingent_entry_id),
+                   final_stop_risk=?,binding_cap=?,updated_at=?,final_quantity_decimal=?,final_notional_decimal=?,
+                   final_stop_risk_decimal=?,decimal_provenance=?,decimal_accounting_version=?
+                   WHERE id=? AND state='contingent'""",
+                (float(final_quantity), float(final_notional), float(final_risk), binding_cap, now,
+                 decimal_text(final_quantity), decimal_text(final_notional), decimal_text(final_risk),
+                 EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, contingent_entry_id),
             )
             self._event(conn, group_id, f"entry-revalidated:{contingent_entry_id}:{allocation_id}",
                         (
                             "entry_reduced"
-                            if final_quantity < displayed_qty - 1e-12
-                            or final_notional < displayed_notional - 1e-9
-                            or final_risk < displayed_risk - 1e-9
+                            if final_quantity < displayed_qty - Decimal("0.000000000001")
+                            or final_notional < displayed_notional - Decimal("0.000000001")
+                            or final_risk < displayed_risk - Decimal("0.000000001")
                             else "contingent_entry_revalidated"
                         ), RotationState.RECONCILED,
                         RotationState.ENTRY_REVALIDATING,
                         {"preserve_reduce_or_block_only": True, "binding_cap": binding_cap,
-                         "final_quantity": final_quantity, "final_notional": final_notional,
-                         "final_stop_risk": final_risk})
-        return RevalidatedRotationEntry(True, group_id, contingent_entry_id, entry["symbol"], final_quantity,
-                                        final_notional, final_risk, binding_cap,
+                         "final_quantity": decimal_text(final_quantity), "final_notional": decimal_text(final_notional),
+                         "final_stop_risk": decimal_text(final_risk)})
+        return RevalidatedRotationEntry(True, group_id, contingent_entry_id, entry["symbol"], float(final_quantity),
+                                        float(final_notional), float(final_risk), binding_cap,
                                         "fresh post-fill allocation passed without enlargement")
 
     def record_entry_reserved(self, group_id: str, contingent_entry_id: str, *, intent_id: str) -> dict[str, Any]:
@@ -1132,25 +1266,55 @@ class RotationCoordinator:
 
     def recovery_actions(self) -> list[dict[str, Any]]:
         terminal = tuple(state.value for state in sorted(TERMINAL_STATES, key=lambda value: value.value))
-        placeholders = ",".join("?" for _ in terminal)
         rows = self.storage.fetch_all(
-            f"""SELECT * FROM rotation_groups g
-                WHERE g.state NOT IN ({placeholders})
-                    OR EXISTS (
-                       SELECT 1 FROM rotation_steps s
-                       LEFT JOIN order_intents i ON i.id=s.intent_id
-                       WHERE s.group_id=g.id AND s.role='rotation_exit'
-                         AND s.intent_id IS NOT NULL
-                         AND (
-                           s.state NOT IN ('filled','terminal_cancelled','terminal_rejected','terminal_expired')
-                           OR COALESCE(i.filled_quantity,0)>COALESCE(s.filled_quantity,0)+0.000000000001
-                         )
-                   )
-                ORDER BY g.created_at,g.id""",
-            terminal,
+            "SELECT * FROM rotation_groups ORDER BY created_at,id"
         )
-        actions: list[dict[str, Any]] = []
+        exit_rows = self.storage.fetch_all(
+            """SELECT s.group_id,s.state,s.intent_id,
+                      s.filled_quantity_decimal AS step_filled_quantity_decimal,
+                      i.filled_quantity_decimal AS intent_filled_quantity_decimal
+               FROM rotation_steps s
+               LEFT JOIN order_intents i ON i.id=s.intent_id
+               WHERE s.role='rotation_exit' AND s.intent_id IS NOT NULL"""
+        )
+        exits_by_group: dict[str, list[dict[str, Any]]] = {}
+        for exit_row in exit_rows:
+            exits_by_group.setdefault(str(exit_row["group_id"]), []).append(exit_row)
+
+        active_exit_states = {
+            "filled",
+            "terminal_cancelled",
+            "terminal_rejected",
+            "terminal_expired",
+        }
+        recovery_rows: list[dict[str, Any]] = []
         for row in rows:
+            state = str(row["state"])
+            needs_recovery = state not in terminal
+            if not needs_recovery:
+                for exit_row in exits_by_group.get(str(row["id"]), []):
+                    if str(exit_row["state"]) not in active_exit_states:
+                        needs_recovery = True
+                        break
+                    intent_filled = require_exact_decimal(
+                        exit_row,
+                        "intent_filled_quantity_decimal",
+                        minimum=ZERO,
+                    )
+                    step_filled = require_exact_decimal(
+                        exit_row,
+                        "step_filled_quantity_decimal",
+                        minimum=ZERO,
+                    )
+                    assert intent_filled is not None and step_filled is not None
+                    if intent_filled > step_filled:
+                        needs_recovery = True
+                        break
+            if needs_recovery:
+                recovery_rows.append(row)
+
+        actions: list[dict[str, Any]] = []
+        for row in recovery_rows:
             state = RotationState(row["state"])
             if state in {RotationState.EXIT_SUBMITTED, RotationState.EXIT_PARTIALLY_FILLED, RotationState.EXIT_FILLED}:
                 action = "reconcile_exit_only"

@@ -497,11 +497,14 @@ def test_matching_broker_order_and_durable_reservation_are_counted_once(tmp_path
     storage.execute(
         """INSERT INTO risk_reservations(
           id,intent_id,symbol,cluster_name,initial_notional,active_notional,
-          initial_stop_risk,active_stop_risk,state,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+          initial_stop_risk,active_stop_risk,state,created_at,updated_at,
+          initial_notional_decimal,active_notional_decimal,initial_stop_risk_decimal,
+          active_stop_risk_decimal,decimal_provenance,decimal_accounting_version
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             "reservation-crypto-1", "intent-crypto-1", "BTC/USD", "crypto_major",
             4, 4, 0.2, 0.2, "active", created, created,
+            "4", "4", "0.2", "0.2", "exact_source_decimal", "fixed_point_fifo_accounting_v1",
         ),
     )
 

@@ -9,7 +9,7 @@ from .fixed_point_accounting import (
     FIXED_POINT_ACCOUNTING_VERSION,
     decimal_text,
     legacy_float,
-    row_decimal,
+    require_exact_decimal,
 )
 from .utils import iso_now, json_dumps
 
@@ -59,18 +59,26 @@ class PositionLifecycleManager:
                 (lifecycle["id"], lifecycle["symbol"]),
             ).fetchall():
                 try:
-                    if (row_decimal(dict(candidate), "filled_quantity_decimal", "filled_quantity") or ZERO) > ZERO:
+                    if (require_exact_decimal(dict(candidate), "filled_quantity_decimal", minimum=ZERO) or ZERO) > ZERO:
                         entry = candidate
                         break
-                except (TypeError, ValueError):
-                    continue
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "position lifecycle entry intent lacks exact fill evidence"
+                    ) from exc
             if not entry:
                 return
             try:
-                cumulative_filled = row_decimal(dict(entry), "filled_quantity_decimal", "filled_quantity") or ZERO
-                prior_opening = row_decimal(dict(lifecycle), "opening_quantity_decimal", "opening_quantity") or ZERO
-            except (TypeError, ValueError):
-                return
+                cumulative_filled = require_exact_decimal(
+                    dict(entry), "filled_quantity_decimal", minimum=ZERO
+                ) or ZERO
+                prior_opening = require_exact_decimal(
+                    dict(lifecycle), "opening_quantity_decimal", minimum=ZERO
+                ) or ZERO
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "position lifecycle opening quantity lacks exact decimal evidence"
+                ) from exc
             if int(lifecycle["opening_quantity_frozen"] or 0) == 1:
                 return
             entry_terminal = str(entry["state"] or "").lower() in {
@@ -128,11 +136,13 @@ class PositionLifecycleManager:
             ).fetchall()
             for candidate in candidates:
                 try:
-                    filled = row_decimal(
-                        dict(candidate), "filled_quantity_decimal", "filled_quantity"
+                    filled = require_exact_decimal(
+                        dict(candidate), "filled_quantity_decimal", minimum=ZERO
                     ) or ZERO
-                except (TypeError, ValueError, InvalidOperation):
-                    continue
+                except (TypeError, ValueError, InvalidOperation) as exc:
+                    raise RuntimeError(
+                        "position lifecycle entry intent lacks exact fill evidence"
+                    ) from exc
                 if filled <= ZERO:
                     continue
                 conn.execute(

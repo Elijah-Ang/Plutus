@@ -15,6 +15,7 @@ from .formula_versions import (
     PHASE4_ALLOCATOR_VERSION,
     PHASE4_SCHEMA_VERSION,
 )
+from .fixed_point_accounting import ZERO, require_exact_decimal
 from .strategy_execution_registry import (
     REGISTRY_FORMULA_VERSION,
     StrategyRegistryIntegrityError,
@@ -357,6 +358,22 @@ class Phase4AllocationStore:
                     raise AllocationAuthorityError(
                         "allocation sleeve capacity is not finite and nonnegative"
                     )
+                if require_executable:
+                    try:
+                        require_exact_decimal(
+                            raw_sleeve,
+                            "remaining_risk_decimal",
+                            minimum=ZERO,
+                        )
+                        require_exact_decimal(
+                            raw_sleeve,
+                            "remaining_notional_decimal",
+                            minimum=ZERO,
+                        )
+                    except ValueError as exc:
+                        raise AllocationAuthorityError(
+                            "executable allocation sleeve exact capacity is unavailable"
+                        ) from exc
         if registry_binding_exact and authorized != tuple(
             verified_registry.evaluation.authorized_versions
         ):
@@ -427,7 +444,7 @@ def allocation_authority_integrity_report(storage: Any) -> dict[str, int]:
     store = Phase4AllocationStore(storage)
     for row in rows:
         try:
-            store.load_verified(str(row["id"]))
+            store.load_verified(str(row["id"]), require_executable=True)
         except (AllocationAuthorityError, sqlite3.Error):
             invalid += 1
     return {"invalid_phase4_allocation_authority": invalid}

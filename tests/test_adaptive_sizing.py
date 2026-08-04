@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -48,7 +49,73 @@ def _inputs(**overrides):
         "hard_limits_pct": {"portfolio_heat": 1.25, "gross_exposure": 50.0, "symbol_exposure": 6.0, "cluster_exposure": 15.0},
     }
     values.update(overrides)
+    for key in (
+        "authoritative_equity", "entry_price", "stop_distance_dollars",
+        "current_portfolio_heat_pct", "current_gross_exposure_pct",
+        "current_symbol_exposure_pct", "current_cluster_exposure_pct",
+    ):
+        decimal_key = f"{key}_decimal"
+        if decimal_key not in overrides:
+            values[decimal_key] = str(values[key])
+    conviction = values["adaptive_conviction"]
+    for key in ("recommended_stop_risk_pct", "portfolio_heat_target_pct", "gross_exposure_target_pct"):
+        conviction[f"{key}_decimal"] = str(conviction[key])
+    operational = values["operational_sizing"]
+    for key in ("score_adjusted_notional", "final_notional", "suggested_shares", "stop_risk_dollars", "minimum_executable_notional"):
+        operational[f"{key}_decimal"] = str(operational[key])
+    operational["sizing_caps_decimal"] = {
+        name: str(value) for name, value in operational["sizing_caps"].items()
+    }
+    values["active_reservations"] = {
+        **values["active_reservations"],
+        "notional_decimal": str(values["active_reservations"]["notional"]),
+        "stop_risk_decimal": str(values["active_reservations"]["stop_risk"]),
+    }
     return values
+
+
+def _sync_exact(values):
+    """Keep mutable compatibility projections paired with test sidecars."""
+
+    def sync(mapping, key):
+        value = mapping.get(key)
+        exact_key = f"{key}_decimal"
+        existing = mapping.get(exact_key)
+        if existing not in (None, ""):
+            try:
+                Decimal(existing)
+            except Exception:
+                return
+        mapping[exact_key] = None if value is None else str(value)
+
+    for key in (
+        "authoritative_equity", "entry_price", "stop_distance_dollars",
+        "current_portfolio_heat_pct", "current_gross_exposure_pct",
+        "current_symbol_exposure_pct", "current_cluster_exposure_pct",
+        "displayed_adaptive_ceiling", "displayed_quantity_ceiling",
+        "displayed_stop_risk_dollars",
+    ):
+        sync(values, key)
+    conviction = values.get("adaptive_conviction") or {}
+    for key in ("recommended_stop_risk_pct", "portfolio_heat_target_pct", "gross_exposure_target_pct"):
+        sync(conviction, key)
+    operational = values.get("operational_sizing") or {}
+    for key in (
+        "score_adjusted_notional", "final_notional", "suggested_shares",
+        "stop_risk_dollars", "minimum_executable_notional",
+    ):
+        sync(operational, key)
+    operational["sizing_caps_decimal"] = {
+        name: str(value) for name, value in (operational.get("sizing_caps") or {}).items()
+    }
+    reservations = values.get("active_reservations") or {}
+    sync(reservations, "notional")
+    sync(reservations, "stop_risk")
+    return values
+
+
+def _evaluate(values):
+    return _engine().evaluate(_sync_exact(values))
 
 
 @pytest.mark.parametrize(
@@ -62,13 +129,13 @@ def test_all_four_comparison_directions(direction, operational, cap, risk_pct):
     inputs["operational_sizing"]["final_notional"] = operational
     inputs["operational_sizing"]["suggested_shares"] = operational / 100.0
     inputs["operational_sizing"]["sizing_caps"]["cash"] = cap
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert decision.comparison_direction == direction
 
 
 def test_stop_risk_to_notional_conversion_reuses_canonical_helper():
-    decision = _engine().evaluate(_inputs())
+    decision = _evaluate(_inputs())
     assert decision is not None
     assert decision.conviction_stop_risk_dollars == 200.0
     assert decision.adaptive_requested_notional == 4_000.0
@@ -76,30 +143,30 @@ def test_stop_risk_to_notional_conversion_reuses_canonical_helper():
 
 
 def test_every_operational_adaptive_ceiling_can_bind():
-    base = _engine().evaluate(_inputs())
+    base = _evaluate(_inputs())
     assert base is not None
     canonical = [name for name in base.ceilings if name not in {"deployment_mode_heat", "deployment_mode_gross"}]
     for cap_name in canonical:
         inputs = _inputs()
         inputs["operational_sizing"]["sizing_caps"][cap_name] = 50.0
-        decision = _engine().evaluate(inputs)
+        decision = _evaluate(inputs)
         assert decision is not None
         assert decision.adaptive_constrained_notional == 50.0, cap_name
         assert decision.binding_adaptive_cap == cap_name
     heat = _inputs()
     heat["current_portfolio_heat_pct"] = 0.0
     heat["adaptive_conviction"]["portfolio_heat_target_pct"] = 0.0025
-    assert _engine().evaluate(heat).binding_adaptive_cap == "deployment_mode_heat"
+    assert _evaluate(heat).binding_adaptive_cap == "deployment_mode_heat"
     gross = _inputs()
     gross["current_gross_exposure_pct"] = 0.0
     gross["adaptive_conviction"]["gross_exposure_target_pct"] = 0.05
-    assert _engine().evaluate(gross).binding_adaptive_cap == "deployment_mode_gross"
+    assert _evaluate(gross).binding_adaptive_cap == "deployment_mode_gross"
 
 
 def test_fixed_stage_caps_are_not_operational_ceilings():
     inputs = _inputs()
     inputs["operational_sizing"]["sizing_caps"]["stage"] = 100.0
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert "stage" not in decision.ceilings
     assert decision.adaptive_constrained_notional > 250.0
@@ -109,7 +176,7 @@ def test_active_conviction_can_expand_above_old_baseline_stop_risk_to_hard_envel
     inputs = _inputs(strategy_policy_state="ACTIVE")
     inputs["adaptive_conviction"]["recommended_stop_risk_pct"] = 0.35
     inputs["operational_sizing"]["sizing_caps"]["stop_risk"] = 4_000.0
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert decision.adaptive_constrained_notional == 7_000.0
     assert decision.adaptive_constrained_stop_risk_pct == 0.35
@@ -120,7 +187,7 @@ def test_stop_risk_percentage_dollars_quantity_and_notional_units_at_extremes():
     inputs = _inputs(strategy_policy_state="ACTIVE")
     inputs["adaptive_conviction"]["recommended_stop_risk_pct"] = 0.35
     inputs["operational_sizing"]["sizing_caps"] = {"cash": 1_000_000.0, "buying_power": 1_000_000.0}
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert decision.conviction_stop_risk_dollars == 350.0
     assert decision.adaptive_requested_notional == 7_000.0
@@ -139,7 +206,7 @@ def test_final_handoff_is_one_way_and_records_drift(recomputed, blocked, outcome
     inputs["operational_sizing"]["sizing_caps"]["cash"] = recomputed
     if recomputed == 0:
         inputs["operational_sizing"]["blocked_reason"] = "current authoritative ceiling is zero"
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert decision.final_revalidation_outcome == outcome
     assert decision.future_activation_notional == future
@@ -153,7 +220,7 @@ def test_final_quantity_and_stop_risk_cannot_exceed_displayed_approval():
         displayed_adaptive_ceiling=10_000.0, proposal_adaptive_notional=4_000.0,
         displayed_quantity_ceiling=12.0, displayed_stop_risk_dollars=50.0,
     )
-    decision = _engine().evaluate(inputs)
+    decision = _evaluate(inputs)
     assert decision is not None
     assert decision.adaptive_constrained_notional == 1_000.0
     assert decision.final_operational_quantity == 10.0
@@ -162,17 +229,40 @@ def test_final_quantity_and_stop_risk_cannot_exceed_displayed_approval():
 
 
 def test_missing_and_degraded_inputs_reject_without_exception():
-    decision = _engine().evaluate(_inputs(authoritative_equity=None, entry_price=None, stop_distance_dollars=None))
+    decision = _evaluate(_inputs(authoritative_equity=None, entry_price=None, stop_distance_dollars=None))
     assert decision is not None
     assert decision.comparison_direction == "REJECT"
     assert {"authoritative_equity", "entry_price", "stop_distance_dollars"} <= set(decision.missing_inputs)
     assert decision.confidence < 0.90
 
 
+def test_malformed_exact_sidecar_cannot_fall_back_to_float_execution():
+    decision = _evaluate(_inputs(authoritative_equity_decimal="not-a-decimal"))
+    assert decision is not None
+    assert decision.comparison_direction == "REJECT"
+    assert decision.final_operational_notional == 0.0
+    assert decision.final_operational_quantity == 0.0
+    assert decision.binding_adaptive_cap == "exact_authority_unavailable"
+    assert "exact_sizing_authority" in decision.missing_inputs
+    assert decision.exact_values == {}
+
+
+def test_missing_exact_sidecar_cannot_fall_back_to_float_execution():
+    inputs = _inputs()
+    inputs.pop("authoritative_equity_decimal")
+    decision = _engine().evaluate(inputs)
+    assert decision is not None
+    assert decision.comparison_direction == "REJECT"
+    assert decision.final_operational_notional == 0.0
+    assert decision.binding_adaptive_cap == "exact_authority_unavailable"
+    assert "exact_sizing_authority" in decision.missing_inputs
+    assert decision.exact_values == {}
+
+
 def test_add_is_compared_without_enabling_new_add_behavior_and_exits_bypass():
-    add = _engine().evaluate(_inputs(action="add"))
+    add = _evaluate(_inputs(action="add"))
     assert add is not None and add.action == "add" and add.report_only is False
-    assert _engine().evaluate(_inputs(action="exit", side="sell")) is None
+    assert _evaluate(_inputs(action="exit", side="sell")) is None
     source = inspect.getsource(TradingService._record_adaptive_sizing)
     assert "Executor" not in source and "order_intents" not in source and "risk_reservations" not in source
 
@@ -209,8 +299,8 @@ def test_deterministic_persistence_reporting_and_no_trading_state_mutation(tmp_p
     storage = Storage(tmp_path / "adaptive-sizing.sqlite3")
     storage.initialize()
     engine = _engine()
-    first = engine.evaluate(_inputs())
-    second = engine.evaluate(_inputs())
+    first = engine.evaluate(_sync_exact(_inputs()))
+    second = engine.evaluate(_sync_exact(_inputs()))
     assert first is not None and second is not None
     assert first.decision_fingerprint == second.decision_fingerprint
     tables = ("trade_proposals", "approvals", "risk_reservations", "order_intents", "orders", "fills")
@@ -265,7 +355,7 @@ def test_service_persistence_hook_does_not_mutate_operational_proposal(tmp_path)
 def test_durable_reservation_uses_exact_adaptive_operational_size_and_risk(tmp_path):
     storage = Storage(tmp_path / "adaptive-reservation.sqlite3")
     storage.initialize()
-    decision = _engine().evaluate(_inputs(strategy_policy_state="ACTIVE"))
+    decision = _evaluate(_inputs(strategy_policy_state="ACTIVE"))
     assert decision is not None
     proposal = {
         "id": "proposal-adaptive", "run_id": "run-1", "symbol": "SPY",
@@ -370,7 +460,7 @@ def test_proposal_message_labels_operational_adaptive_size():
 def test_evidence_report_uses_persisted_rows_only(tmp_path):
     storage = Storage(tmp_path / "evidence.sqlite3")
     storage.initialize()
-    decision = _engine().evaluate(_inputs())
+    decision = _evaluate(_inputs())
     assert decision is not None
     _engine().persist(storage, decision)
     with storage.connect() as conn:

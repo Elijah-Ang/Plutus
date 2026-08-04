@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.risk_snapshot import RiskSnapshotBuilder
+from app.fixed_point_accounting import fixed_point_integrity_report
 from app.storage import Storage
 
 
@@ -64,3 +65,23 @@ def test_missing_current_mark_or_unsupported_short_fails_closed(tmp_path) -> Non
 
     assert missing.held_open_stop_risk is None
     assert short.held_open_stop_risk is None
+
+
+def test_persisted_snapshot_uses_exact_fixed_point_evidence(tmp_path) -> None:
+    storage = _storage(tmp_path)
+    _position_state(storage, initial=90.0, trailing=102.0, authoritative=104.0)
+    snapshot = RiskSnapshotBuilder(storage).build(
+        [{"symbol": "SPY", "qty": 10, "avg_entry_price": 100.0,
+          "current_price": 110.0, "market_value": 1100.0}],
+        {"equity": 10_000.0, "cash": 8_900.0, "buying_power": 8_900.0},
+    )
+
+    identifier = RiskSnapshotBuilder(storage).persist("run", snapshot)
+    row = storage.fetch_all(
+        "SELECT * FROM risk_snapshots_v2 WHERE id=?", (identifier,)
+    )[0]
+
+    assert row["held_open_stop_risk_decimal"] == "60"
+    assert row["decimal_provenance"] == "exact_source_decimal"
+    assert row["decimal_accounting_version"] == "fixed_point_fifo_accounting_v1"
+    assert not any(fixed_point_integrity_report(storage).values())

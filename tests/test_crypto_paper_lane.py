@@ -785,6 +785,85 @@ def test_submit_response_cannot_become_verified_fill_without_reconciliation(tmp_
     assert D(reservation["active_notional"]) > 0
 
 
+@pytest.mark.parametrize("terminal_status", ["rejected", "cancelled", "expired"])
+def test_terminal_submit_response_persists_durable_unverified_evidence(tmp_path, terminal_status):
+    class TerminalResponseBroker(Broker):
+        def submit_crypto_order(self, *args, **kwargs):
+            self.submit_calls.append((args, kwargs))
+            return {
+                "id": f"crypto-broker-order-{terminal_status}",
+                "status": terminal_status,
+            }
+
+    broker = TerminalResponseBroker()
+    storage, config, _unused, lane, _proposal, intent = _ready(
+        tmp_path, broker=broker,
+    )
+    result = lane.execute_intent(intent.id, config, broker, now=NOW)
+
+    assert result["state"] == "reconciliation_required"
+    evidence = storage.fetch_all(
+        "SELECT status,verified,verification_error FROM crypto_paper_order_evidence WHERE intent_id=?",
+        (intent.id,),
+    )
+    assert len(evidence) == 1
+    assert evidence[0]["status"] == terminal_status
+    assert evidence[0]["verified"] == 0
+    assert evidence[0]["verification_error"] == "terminal_submit_response_requires_durable_reconciliation"
+    events = storage.fetch_all(
+        "SELECT event_type FROM crypto_paper_reconciliation_events WHERE intent_id=?",
+        (intent.id,),
+    )
+    assert [row["event_type"] for row in events] == ["submit_terminal_response"]
+    reservation = storage.fetch_all(
+        "SELECT state,active_notional,active_stop_risk FROM crypto_paper_reservations WHERE intent_id=?",
+        (intent.id,),
+    )[0]
+    assert reservation["state"] == "active"
+    assert D(reservation["active_notional"]) > 0
+    assert D(reservation["active_stop_risk"]) > 0
+    proposal_state = storage.fetch_all(
+        "SELECT status FROM crypto_paper_proposals WHERE id=?",
+        (intent.proposal_id,),
+    )[0]
+    assert proposal_state["status"] == "manual_review"
+
+
+def test_terminal_submit_response_releases_only_after_verified_reconciliation(tmp_path):
+    class ReconcileTerminalBroker(Broker):
+        def submit_crypto_order(self, *args, **kwargs):
+            self.submit_calls.append((args, kwargs))
+            return {"id": "crypto-broker-order-rejected", "status": "rejected"}
+
+        def get_order_by_client_order_id(self, client_order_id):
+            return {
+                "id": "crypto-broker-order-rejected",
+                "client_order_id": client_order_id,
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "status": "rejected",
+                "qty": "5",
+                "filled_qty": "0",
+                "fees": "0",
+            }
+
+    broker = ReconcileTerminalBroker()
+    storage, config, _unused, lane, _proposal, intent = _ready(
+        tmp_path, broker=broker,
+    )
+    submitted = lane.execute_intent(intent.id, config, broker, now=NOW)
+    assert submitted["state"] == "reconciliation_required"
+    reconciled = lane.reconcile_intent(intent.id, config, broker, now=NOW)
+    assert reconciled["state"] == "rejected"
+    reservation = storage.fetch_all(
+        "SELECT state,active_notional,active_stop_risk FROM crypto_paper_reservations WHERE intent_id=?",
+        (intent.id,),
+    )[0]
+    assert reservation["state"] == "released"
+    assert reservation["active_notional"] == "0"
+    assert reservation["active_stop_risk"] == "0"
+
+
 def test_duplicate_crypto_fill_is_idempotent_but_conflicting_payload_fails(tmp_path):
     storage, config, broker, lane, proposal, intent = _ready(tmp_path)
     evidence = {

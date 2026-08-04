@@ -294,9 +294,16 @@ def test_probe_sizing_respects_score_stage_risk_and_active_count(monkeypatch, tm
     )
     storage.execute(
         """INSERT INTO position_lots(id,symbol,source_fill_event_key,opened_at,original_quantity,remaining_quantity,
-           unit_cost,source,provenance,confidence,created_at,updated_at,strategy_version,entry_proposal_id,initial_risk_dollars)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("probe-lot", "SPY", "probe-fill", "2026-07-13T00:00:00+00:00", 1, 1, 100, "test", "test", "verified", "2026-07-13T00:00:00+00:00", "2026-07-13T00:00:00+00:00", "rule_based_v2", "existing-probe", 30),
+           unit_cost,source,provenance,confidence,created_at,updated_at,strategy_version,entry_proposal_id,initial_risk_dollars,
+           original_quantity_decimal,remaining_quantity_decimal,unit_cost_decimal,initial_risk_dollars_decimal,
+           decimal_provenance,decimal_accounting_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "probe-lot", "SPY", "probe-fill", "2026-07-13T00:00:00+00:00", 1, 1, 100,
+            "test", "test", "verified", "2026-07-13T00:00:00+00:00",
+            "2026-07-13T00:00:00+00:00", "rule_based_v2", "existing-probe", 30,
+            "1", "1", "100", "30", "exact_source_decimal", "fixed_point_fifo_accounting_v1",
+        ),
     )
     blocked = service._calculate_dynamic_size("QQQ", 90, "normal", 100, bars, account, strategy_version="rule_based_v2")
     assert blocked["final_notional"] == 0 and "active position" in blocked["blocked_reason"]

@@ -13,7 +13,7 @@ from .fixed_point_accounting import (
     decimal_text,
     decimal_value,
     legacy_float,
-    row_decimal,
+    require_exact_decimal,
 )
 from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .lot_ledger import LotLedger
@@ -124,16 +124,34 @@ class BrokerReconciler:
         if self.telegram is None:
             return
         rows = self.storage.fetch_all(
-            """SELECT o.*,f.qty AS retry_fill_qty,f.price AS retry_fill_price
+            """SELECT o.*,f.qty_decimal AS retry_fill_qty_decimal,
+                      f.price_decimal AS retry_fill_price_decimal
                FROM fills f JOIN orders o ON o.id=f.order_id
                WHERE f.fill_notification_status='pending' AND f.fill_notified_at IS NULL"""
         )
         for row in rows:
+            try:
+                retry_fill_qty = require_exact_decimal(
+                    row, "retry_fill_qty_decimal", minimum=ZERO
+                )
+                retry_fill_price = require_exact_decimal(
+                    row, "retry_fill_price_decimal", minimum=ZERO
+                )
+                assert retry_fill_qty is not None and retry_fill_price is not None
+                if retry_fill_qty <= ZERO or retry_fill_price <= ZERO:
+                    raise ValueError("fill notification evidence is not positive")
+            except (TypeError, ValueError):
+                self.storage.audit(
+                    self.run_id,
+                    "fill_notification_blocked_missing_exact_evidence",
+                    {"order_id": row.get("id")},
+                )
+                continue
             self._maybe_notify_fill(
                 row,
                 "filled" if row.get("status") == "filled" else "partially_filled",
-                float(row.get("retry_fill_qty") or 0),
-                float(row.get("retry_fill_price") or 0),
+                float(retry_fill_qty),
+                float(retry_fill_price),
             )
 
     def _lookup(self, row: dict[str, Any]) -> tuple[Any, str, str]:
@@ -247,7 +265,9 @@ class BrokerReconciler:
                 _value(remote, "execution_id", "")
                 or f"{broker_order_id or intent['client_order_id']}:{decimal_text(filled_qty_decimal)}:{decimal_text(fill_price_decimal)}"
             )
-            before = decimal_value(intent.get("filled_quantity_decimal") or intent.get("filled_quantity") or 0, "prior filled quantity", minimum=ZERO)
+            before = require_exact_decimal(
+                intent, "filled_quantity_decimal", minimum=ZERO
+            )
             assert before is not None
             updated = self.intent_store.record_fill(
                 intent["id"],
@@ -271,13 +291,21 @@ class BrokerReconciler:
                     "payload": _broker_evidence_safe(remote if isinstance(remote, Mapping) else vars(remote) if hasattr(remote, "__dict__") else {}),
                 },
             )
-            updated_quantity = decimal_value(updated.get("filled_quantity_decimal") or updated.get("filled_quantity") or 0, "updated filled quantity", minimum=ZERO)
+            updated_quantity = require_exact_decimal(
+                updated, "filled_quantity_decimal", minimum=ZERO
+            )
             assert updated_quantity is not None
             if updated_quantity > before:
                 outcome["fills_upserted"] = 1
             self.storage.link_executed_order_records(intent["id"])
             self.storage.upsert_actual_trade_outcome_for_order(intent["id"])
-            self._maybe_notify_fill(intent, updated["state"], float(updated_quantity), float(updated.get("average_fill_price_decimal") or updated.get("average_fill_price") or fill_price_decimal))
+            updated_average = require_exact_decimal(
+                updated, "average_fill_price_decimal", minimum=ZERO
+            )
+            assert updated_average is not None
+            self._maybe_notify_fill(
+                intent, updated["state"], float(updated_quantity), float(updated_average)
+            )
             target = OrderState(updated["state"])
         elif OrderState(intent["state"]) != target:
             # Broker REST snapshots and stream events may arrive out of order. A
@@ -397,19 +425,16 @@ class BrokerReconciler:
         prior = prior_rows[0] if prior_rows else {}
         components = separate_accounting_components(
             current_equity=current_equity,
-            previous_equity=row_decimal(
-                prior, "equity_decimal", "equity", allow_none=True
+            previous_equity=require_exact_decimal(
+                prior, "equity_decimal", allow_none=True
             ) if prior else None,
             current_realized_fifo_pnl=current_realized,
-            previous_realized_fifo_pnl=row_decimal(
-                prior,
-                "realized_fifo_pnl_decimal",
-                "realized_fifo_pnl",
-                allow_none=True,
+            previous_realized_fifo_pnl=require_exact_decimal(
+                prior, "realized_fifo_pnl_decimal", allow_none=True
             ) if prior else None,
             current_unrealized_pl=unrealized,
-            previous_unrealized_pl=row_decimal(
-                prior, "unrealized_pl_decimal", "unrealized_pl", allow_none=True
+            previous_unrealized_pl=require_exact_decimal(
+                prior, "unrealized_pl_decimal", allow_none=True
             ) if prior else None,
         )
         self.storage.execute(

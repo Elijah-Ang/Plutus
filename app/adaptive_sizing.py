@@ -12,8 +12,9 @@ import json
 import math
 import statistics
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 from .formula_versions import (
@@ -38,6 +39,7 @@ CANONICAL_CEILING_ORDER = (
     "phase3_heat_cap", "gross_exposure_cap", "exploration_heat_cap", "exploration_strategy_cap",
     "exploration_gross_cap", "probe_heat_cap", "probe_gross_cap", "probe_active_count_cap",
 )
+ZERO = Decimal("0")
 TRADING_STATE_TABLES = (
     "trade_proposals", "approvals", "risk_reservations", "order_intents", "orders", "fills",
 )
@@ -51,6 +53,30 @@ def _finite(value: Any) -> float | None:
         return result if math.isfinite(result) else None
     except (TypeError, ValueError):
         return None
+
+
+def _exact(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{label} is missing")
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is invalid") from exc
+    if not result.is_finite() or result < minimum:
+        raise ValueError(f"{label} is invalid")
+    return result
+
+
+def _exact_text(value: Decimal) -> str:
+    if value == ZERO:
+        return "0"
+    rendered = format(value, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def _mapping_exact(mapping: Mapping[str, Any], key: str, label: str) -> Decimal:
+    raw = mapping.get(f"{key}_decimal")
+    return _exact(raw, label)
 
 
 def _fingerprint(payload: Mapping[str, Any]) -> str:
@@ -134,6 +160,7 @@ class AdaptiveSizingDecision:
     operating_mode: str
     operational_enforced: bool
     report_only: bool = False
+    exact_values: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -157,6 +184,7 @@ class AdaptiveSizingDecision:
             "final_revalidation_outcome": self.final_revalidation_outcome,
             "confidence": self.confidence,
             "missing_inputs": list(self.missing_inputs),
+            "exact_values": dict(self.exact_values),
         }
 
 
@@ -359,38 +387,263 @@ class AdaptiveSizingEngine:
         adaptive_stop_dollars = adaptive_quantity * stop_distance if stop_distance > 0 else 0.0
         adaptive_stop_pct = adaptive_stop_dollars / equity * 100.0 if equity > 0 else 0.0
 
-        difference = constrained - operational_constrained
-        tolerance = 1e-8
-        if constrained <= tolerance:
-            direction = "REJECT"
-        elif difference > tolerance:
-            direction = "INCREASE"
-        elif difference < -tolerance:
-            direction = "REDUCE"
-        else:
-            direction = "UNCHANGED"
+        # The public decision remains float-shaped for compatibility, but the
+        # operational gate is recomputed from canonical Decimal inputs before
+        # any projection is returned.  Callers may provide explicit sidecars;
+        # older direct callers are parsed once at this boundary.
+        exact_values: dict[str, Any] = {}
+        exact_authority_error = False
+        try:
+            equity_exact = _mapping_exact(raw, "authoritative_equity", "authoritative equity")
+            entry_exact = _mapping_exact(raw, "entry_price", "entry price")
+            stop_distance_exact = _mapping_exact(raw, "stop_distance_dollars", "stop distance")
+            recommended_pct_exact = _mapping_exact(
+                conviction, "recommended_stop_risk_pct", "conviction stop-risk percentage"
+            )
+            operational_constrained_exact = _mapping_exact(
+                operational, "final_notional", "operational constrained notional"
+            )
+            operational_requested_exact = _mapping_exact(
+                operational,
+                "score_adjusted_notional",
+                "operational requested notional",
+            ) if operational.get("score_adjusted_notional") is not None or operational.get("score_adjusted_notional_decimal") is not None else operational_constrained_exact
+            exact_adaptive_requested = (
+                equity_exact * recommended_pct_exact / Decimal("100")
+                * entry_exact / stop_distance_exact
+                if equity_exact > ZERO and entry_exact > ZERO and stop_distance_exact > ZERO
+                and not {"authoritative_equity", "entry_price", "stop_distance_dollars", "conviction_recommended_stop_risk_pct"}.intersection(missing)
+                else ZERO
+            )
+            exact_ceilings: dict[str, Decimal] = {}
+            ceiling_sidecars = operational.get("sizing_caps_decimal")
+            if not isinstance(ceiling_sidecars, Mapping):
+                raise ValueError("exact sizing-cap sidecars are missing")
+            derived_ceiling_names = {"deployment_mode_heat", "deployment_mode_gross"}
+            if policy_state == "ACTIVE":
+                derived_ceiling_names.add("stop_risk")
+            for name in ceilings:
+                if name not in ceiling_sidecars:
+                    if name in derived_ceiling_names:
+                        continue
+                    raise ValueError(f"{name} sizing ceiling exact sidecar is missing")
+                raw_ceiling = ceiling_sidecars[name]
+                try:
+                    exact_ceilings[str(name)] = _exact(raw_ceiling, f"{name} sizing ceiling")
+                except ValueError:
+                    # Non-finite compatibility ceilings are intentionally
+                    # omitted, matching _ordered_ceilings semantics.
+                    if _finite(raw_ceiling) is not None:
+                        raise
+            if policy_state == "ACTIVE" and equity_exact > ZERO and entry_exact > ZERO and stop_distance_exact > ZERO:
+                hard_trade_pct_exact = _exact(
+                    ((self.config.get("phase3", {}) or {}).get("risk_profile", {}) or {}).get(
+                        "max_trade_stop_risk_pct", "0.35"
+                    ),
+                    "maximum trade stop-risk percentage",
+                )
+                exact_ceilings["stop_risk"] = (
+                    equity_exact * hard_trade_pct_exact / Decimal("100")
+                    * entry_exact / stop_distance_exact
+                )
+            heat_before_exact = _mapping_exact(raw, "current_portfolio_heat_pct", "current portfolio heat")
+            gross_before_exact = _mapping_exact(raw, "current_gross_exposure_pct", "current gross exposure")
+            heat_target_exact = _mapping_exact(conviction, "portfolio_heat_target_pct", "portfolio heat target")
+            gross_target_exact = _mapping_exact(conviction, "gross_exposure_target_pct", "gross exposure target")
+            if equity_exact > ZERO and entry_exact > ZERO and stop_distance_exact > ZERO:
+                exact_ceilings["deployment_mode_heat"] = (
+                    equity_exact * max(ZERO, heat_target_exact - heat_before_exact) / Decimal("100")
+                    * entry_exact / stop_distance_exact
+                )
+            if equity_exact > ZERO:
+                exact_ceilings["deployment_mode_gross"] = (
+                    equity_exact * max(ZERO, gross_target_exact - gross_before_exact) / Decimal("100")
+                )
+            if stage == "final_revalidation":
+                displayed_quantity_exact = raw.get("displayed_quantity_ceiling_decimal")
+                displayed_stop_exact = raw.get("displayed_stop_risk_dollars_decimal")
+                if raw.get("displayed_quantity_ceiling") not in (None, "") and displayed_quantity_exact in (None, ""):
+                    raise ValueError("displayed quantity ceiling exact sidecar is missing")
+                if raw.get("displayed_stop_risk_dollars") not in (None, "") and displayed_stop_exact in (None, ""):
+                    raise ValueError("displayed stop-risk ceiling exact sidecar is missing")
+                if displayed_quantity_exact not in (None, "") and entry_exact > ZERO:
+                    exact_ceilings["displayed_quantity"] = _exact(
+                        displayed_quantity_exact, "displayed quantity ceiling"
+                    ) * entry_exact
+                if displayed_stop_exact not in (None, "") and entry_exact > ZERO and stop_distance_exact > ZERO:
+                    exact_ceilings["displayed_stop_risk"] = (
+                        _exact(displayed_stop_exact, "displayed stop-risk ceiling")
+                        * entry_exact / stop_distance_exact
+                    )
 
-        displayed = max(0.0, _finite(raw.get("displayed_adaptive_ceiling")) or (constrained if stage == "proposal" else 0.0))
+            exact_constrained = exact_adaptive_requested
+            exact_ceiling_path: dict[str, str] = {}
+            exact_binding = "conviction_stop_risk"
+            ordered_names = [
+                name for name in CANONICAL_CEILING_ORDER if name in exact_ceilings
+            ]
+            ordered_names.extend(sorted(set(exact_ceilings) - set(ordered_names)))
+            for name in ordered_names:
+                prior_exact = exact_constrained
+                exact_constrained = min(exact_constrained, exact_ceilings[name])
+                exact_ceiling_path[name] = _exact_text(exact_constrained)
+                if exact_constrained < prior_exact - Decimal("0.00000001"):
+                    exact_binding = name
+            minimum_exact = _exact(
+                operational.get("minimum_executable_notional_decimal"),
+                "minimum executable notional",
+            )
+            if critical_missing:
+                exact_constrained = ZERO
+                exact_binding = "missing_critical_inputs"
+            elif blocked_reason or (exact_constrained > ZERO and exact_constrained < minimum_exact):
+                exact_constrained = ZERO
+                exact_binding = "operational_block" if blocked_reason else "minimum_executable_notional"
+            if missing and exact_adaptive_requested <= ZERO and not critical_missing:
+                exact_binding = "missing_inputs"
+            exact_quantity = exact_constrained / entry_exact if entry_exact > ZERO else ZERO
+            exact_stop_dollars = exact_quantity * stop_distance_exact
+            exact_stop_pct = exact_stop_dollars / equity_exact * Decimal("100") if equity_exact > ZERO else ZERO
+            if raw.get("displayed_adaptive_ceiling_decimal") is not None:
+                exact_displayed = _exact(
+                    raw.get("displayed_adaptive_ceiling_decimal"),
+                    "displayed adaptive ceiling",
+                )
+            elif stage == "proposal":
+                exact_displayed = exact_constrained
+            else:
+                raise ValueError("displayed adaptive ceiling exact sidecar is missing")
+            exact_future = exact_constrained
+            exact_final_outcome = None
+            if stage == "final_revalidation":
+                exact_future = min(exact_displayed, exact_constrained, *[exact_ceilings[name] for name in ordered_names]) if ordered_names else min(exact_displayed, exact_constrained)
+                if bool(raw.get("final_revalidation_blocked")) or exact_constrained <= ZERO:
+                    exact_final_outcome = "BECAME_BLOCKED"
+                    exact_future = ZERO
+                elif exact_constrained > exact_displayed + Decimal("0.00000001"):
+                    exact_final_outcome = "INCREASE_CONSTRAINED_BY_DISPLAYED_CEILING"
+                elif exact_future < exact_displayed - Decimal("0.00000001"):
+                    exact_final_outcome = "REDUCED"
+                else:
+                    exact_final_outcome = "STAYED_EQUAL"
+            exact_difference = exact_constrained - operational_constrained_exact
+            exact_direction = (
+                "REJECT" if exact_constrained <= Decimal("0.00000001")
+                else "INCREASE" if exact_difference > Decimal("0.00000001")
+                else "REDUCE" if exact_difference < -Decimal("0.00000001")
+                else "UNCHANGED"
+            )
+            constrained = float(exact_constrained)
+            adaptive_requested = float(exact_adaptive_requested)
+            adaptive_quantity = float(exact_quantity)
+            adaptive_stop_dollars = float(exact_stop_dollars)
+            adaptive_stop_pct = float(exact_stop_pct)
+            operational_constrained = float(operational_constrained_exact)
+            operational_requested = float(operational_requested_exact)
+            operational_quantity = float(
+                _mapping_exact(operational, "suggested_shares", "operational quantity")
+                if operational.get("suggested_shares") is not None or operational.get("suggested_shares_decimal") is not None
+                else operational_constrained_exact / entry_exact
+            )
+            conviction_dollars = float(equity_exact * recommended_pct_exact / Decimal("100"))
+            recommended_pct = float(recommended_pct_exact)
+            difference = float(exact_difference)
+            direction = exact_direction
+            binding = exact_binding
+            ceilings = {name: float(value) for name, value in exact_ceilings.items() if value.is_finite()}
+            ceiling_path = {name: float(value) for name, value in exact_ceiling_path.items()}
+            displayed = float(exact_displayed)
+            future_activation = float(exact_future)
+            final_operational = future_activation if stage == "final_revalidation" else constrained
+            final_quantity = float(exact_future / entry_exact if stage == "final_revalidation" and entry_exact > ZERO else exact_quantity)
+            adaptive_stop_dollars = float(exact_stop_dollars)
+            adaptive_stop_pct = float(exact_stop_dollars / equity_exact * Decimal("100") if equity_exact > ZERO else ZERO)
+            final_outcome = exact_final_outcome
+            exact_values = {
+                "operational_requested_notional_decimal": _exact_text(operational_requested_exact),
+                "operational_constrained_notional_decimal": _exact_text(operational_constrained_exact),
+                "operational_quantity_decimal": _exact_text(_mapping_exact(operational, "suggested_shares", "operational quantity") if operational.get("suggested_shares") is not None or operational.get("suggested_shares_decimal") is not None else operational_constrained_exact / entry_exact),
+                "adaptive_requested_notional_decimal": _exact_text(exact_adaptive_requested),
+                "adaptive_constrained_notional_decimal": _exact_text(exact_constrained),
+                "adaptive_quantity_decimal": _exact_text(exact_quantity),
+                "adaptive_constrained_stop_risk_dollars_decimal": _exact_text(exact_stop_dollars),
+                "adaptive_constrained_stop_risk_pct_decimal": _exact_text(exact_stop_pct),
+                "displayed_adaptive_ceiling_decimal": _exact_text(exact_displayed),
+                "future_activation_notional_decimal": _exact_text(exact_future),
+                "final_operational_notional_decimal": _exact_text(exact_future if stage == "final_revalidation" else exact_constrained),
+                "final_operational_quantity_decimal": _exact_text(exact_future / entry_exact if stage == "final_revalidation" and entry_exact > ZERO else exact_quantity),
+                "operational_stop_risk_dollars_decimal": _exact_text(_mapping_exact(operational, "stop_risk_dollars", "operational stop risk") if operational.get("stop_risk_dollars") is not None or operational.get("stop_risk_dollars_decimal") is not None else ZERO),
+                "conviction_stop_risk_dollars_decimal": _exact_text(equity_exact * recommended_pct_exact / Decimal("100")),
+                "difference_dollars_decimal": _exact_text(exact_difference),
+                "ceilings_decimal": {name: _exact_text(value) for name, value in exact_ceilings.items() if value.is_finite()},
+            }
+        except ValueError:
+            # Degraded callers retain the diagnostic decision shape, but the
+            # executable size is forced to zero below when critical inputs are
+            # otherwise present.
+            exact_authority_error = True
+            exact_values = {}
+
+        exact_authoritative = bool(exact_values)
+        if exact_authority_error and not critical_missing:
+            # A valid-looking compatibility projection must never become an
+            # executable fallback when its canonical exact inputs are missing
+            # or malformed.  Preserve the diagnostic shape, but fail closed.
+            constrained = 0.0
+            adaptive_requested = 0.0
+            adaptive_quantity = 0.0
+            adaptive_stop_dollars = 0.0
+            adaptive_stop_pct = 0.0
+            difference = -operational_constrained
+            direction = "REJECT"
+            binding = "exact_authority_unavailable"
+            missing = sorted(set([*missing, "exact_sizing_authority"]))
+        elif exact_authority_error:
+            # Critical-input failures already produced a zero-size
+            # diagnostic decision above; keep the public decision shape
+            # deterministic even though exact recomputation could not run.
+            direction = "REJECT"
+            binding = "missing_critical_inputs"
+        if not exact_authoritative:
+            difference = constrained - operational_constrained
+        tolerance = 1e-8
+        if not exact_authoritative and not exact_authority_error:
+            if constrained <= tolerance:
+                direction = "REJECT"
+            elif difference > tolerance:
+                direction = "INCREASE"
+            elif difference < -tolerance:
+                direction = "REDUCE"
+            else:
+                direction = "UNCHANGED"
+
+        if not exact_authoritative:
+            displayed = max(0.0, _finite(raw.get("displayed_adaptive_ceiling")) or (constrained if stage == "proposal" else 0.0))
         proposal_adaptive = _finite(raw.get("proposal_adaptive_notional"))
-        final_blocked = bool(raw.get("final_revalidation_blocked")) or constrained <= 0
-        future_activation = constrained
-        final_outcome = None
         drift_dollars = None
         drift_pct = None
-        if stage == "final_revalidation":
-            future_activation = min(displayed, constrained, *[value for _name, value in _ordered_ceilings(ceilings)]) if ceilings else min(displayed, constrained)
-            if final_blocked:
-                final_outcome = "BECAME_BLOCKED"
-                future_activation = 0.0
-            elif constrained > displayed + tolerance:
-                final_outcome = "INCREASE_CONSTRAINED_BY_DISPLAYED_CEILING"
-            elif future_activation < displayed - tolerance:
-                final_outcome = "REDUCED"
-            else:
-                final_outcome = "STAYED_EQUAL"
+        if exact_authoritative:
             if proposal_adaptive is not None:
                 drift_dollars = constrained - proposal_adaptive
                 drift_pct = _percentage_difference(drift_dollars, proposal_adaptive)
+        else:
+            final_blocked = bool(raw.get("final_revalidation_blocked")) or constrained <= 0
+            future_activation = constrained
+            final_outcome = None
+            if stage == "final_revalidation":
+                future_activation = min(displayed, constrained, *[value for _name, value in _ordered_ceilings(ceilings)]) if ceilings else min(displayed, constrained)
+                if final_blocked:
+                    final_outcome = "BECAME_BLOCKED"
+                    future_activation = 0.0
+                elif constrained > displayed + tolerance:
+                    final_outcome = "INCREASE_CONSTRAINED_BY_DISPLAYED_CEILING"
+                elif future_activation < displayed - tolerance:
+                    final_outcome = "REDUCED"
+                else:
+                    final_outcome = "STAYED_EQUAL"
+                if proposal_adaptive is not None:
+                    drift_dollars = constrained - proposal_adaptive
+                    drift_pct = _percentage_difference(drift_dollars, proposal_adaptive)
 
         heat_before = _finite(raw.get("current_portfolio_heat_pct"))
         gross_before = _finite(raw.get("current_gross_exposure_pct"))
@@ -430,6 +683,8 @@ class AdaptiveSizingEngine:
             "canonical_ceiling_order": list(CANONICAL_CEILING_ORDER),
             "approval_contract": "min(displayed_approved_adaptive_ceiling, approval_recomputed_adaptive_size, current_phase3_capacity, reservation_adjusted_capacity, all_hard_ceilings)",
             "operational_authority": "adaptive sizing controls paper proposal and submitted quantity through Executor",
+            "exact_values": dict(exact_values),
+            "exact_authority_error": exact_authority_error,
         }
         fingerprint_payload = {
             "stage": stage,
@@ -471,11 +726,13 @@ class AdaptiveSizingEngine:
             configuration_version=CONFIGURATION_SCHEMA_VERSION, sizing_policy_version=SIZING_POLICY_VERSION,
             stop_policy_version=STOP_POLICY_VERSION, config_hash=self.config.get("effective_config_hash"),
             decision_fingerprint=fingerprint, operating_mode="operational_paper", operational_enforced=True, report_only=False,
+            exact_values=exact_values,
         )
 
     @staticmethod
     def persist(storage: Any, decision: AdaptiveSizingDecision) -> None:
         values = asdict(decision)
+        values.pop("exact_values", None)
         for name in ("ceilings", "ceiling_path", "missing_inputs", "contradictions", "raw_inputs"):
             values[name + "_json"] = json_dumps(values.pop(name))
         values["would_exceed_hard_limit"] = int(values["would_exceed_hard_limit"])

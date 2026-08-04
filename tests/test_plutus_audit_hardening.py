@@ -170,6 +170,8 @@ def test_phase4_risk_units_are_explicit_canonical_and_fail_closed() -> None:
         conversion_equity_as_of=AS_OF, evaluation_time=AS_OF,
     )
     assert converted["risk_value"] == pytest.approx(200.0)
+    assert converted["risk_value_decimal"] == "200"
+    assert converted["source_risk_value_decimal"] == "0.2"
     assert converted["risk_unit"] == "stop_risk_dollars"
     with pytest.raises(ValueError, match="stale"):
         normalize_risk_to_dollars(
