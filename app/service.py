@@ -1752,11 +1752,12 @@ class TradingService:
         """Route crypto replies before the generic equity approval parser.
 
         A direct Telegram reply identifies the crypto proposal, so the normal
-        stock-style ``YES``/``NO`` commands are the primary UX.  The legacy
-        ``YES/NO CRYPTO <uuid>`` form remains accepted only when it is also a
-        direct reply to the bound message.  Any other crypto-looking text is
-        consumed and answered with an explicit instruction rather than being
-        allowed to fall through to an unrelated equity proposal.
+        stock-style ``YES``/``NO`` commands are the primary UX.  The explicit
+        ``YES/NO CRYPTO <uuid>`` forms are also accepted when a reply is not
+        available; the lane binds that command to the already stored Telegram
+        display and chat identity.  Any other crypto-looking text is consumed
+        and answered with an explicit instruction rather than being allowed to
+        fall through to an unrelated equity proposal.
         """
 
         raw_text = str(text).strip()

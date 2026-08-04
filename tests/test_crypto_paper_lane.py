@@ -608,10 +608,11 @@ def test_proposal_display_binds_full_crypto_authority_and_manual_command(tmp_pat
     assert "expected reward" in rendered
     assert "Expected execution cost" in rendered
     assert "Total portfolio exposure" in rendered
-    assert "Reply to this message with:" in rendered
+    assert "Type and send one exact action" in rendered
     assert "YES = approve this Buy BTC/USD paper trade" in rendered
     assert "NO = reject this Buy BTC/USD paper trade" in rendered
-    assert proposal.id not in rendered
+    assert f"YES CRYPTO {proposal.id}" in rendered
+    assert f"NO CRYPTO {proposal.id}" in rendered
     assert proposal.display["paper_only_warning"].startswith("PAPER ONLY")
     assert proposal.display["approval_command"] == f"YES CRYPTO {proposal.id}"
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0

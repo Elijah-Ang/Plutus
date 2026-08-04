@@ -16,6 +16,11 @@ from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, forma
 from .crypto_risk import CryptoRiskError, CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest
 from .crypto_outcomes import CryptoCostModel, calculate_shadow_outcome, persist_observation
+from .crypto_profitability import CryptoProfitabilityStore
+from .cross_asset_allocation import (
+    _policy as cross_asset_policy,
+    build_crypto_exploration_evidence,
+)
 from .fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
 from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .storage import Storage
@@ -440,6 +445,7 @@ class CryptoResearchEngine:
 
         current = (now or datetime.now(UTC)).astimezone(UTC)
         by_source: dict[str, Any] = {}
+        by_candidate: dict[str, Any] = {}
         for raw in allocation_decisions or ():
             if not isinstance(raw, dict):
                 continue
@@ -457,11 +463,21 @@ class CryptoResearchEngine:
             source_id = str(raw.get("source_id") or "").strip()
             if source_id:
                 by_source[source_id] = raw
+            candidate_id = str(raw.get("candidate_id") or "").strip()
+            if candidate_id:
+                by_candidate[candidate_id] = raw
 
         proposal_ids: list[str] = []
         for result in results:
             source_id = str(result.strategy_decision_id or "").strip()
             allocation = by_source.get(source_id)
+            if allocation is None:
+                for action in ("entry", "add"):
+                    allocation = by_candidate.get(
+                        f"crypto:{result.symbol}:{source_id}:{action}"
+                    )
+                    if allocation is not None:
+                        break
             if allocation is None or not result.strategy_signal_eligible:
                 continue
             if not result.capability_snapshot_id or not result.market_evidence_id:
@@ -496,24 +512,41 @@ class CryptoResearchEngine:
                     or allocation.get("order_authority") is not False
                 ):
                     continue
-                expected_source_fingerprint = hashlib.sha256(
-                    json_dumps(
-                        {
-                            "strategy": strategy.decision_fingerprint,
-                            "market": market_evidence.evidence_fingerprint,
-                            "capability": capability.snapshot_fingerprint,
-                            "config": self.config.get("effective_config_hash"),
-                            "action": allocation_action,
-                        }
-                    ).encode("utf-8")
-                ).hexdigest()
-                if str(allocation.get("source_fingerprint") or "") != expected_source_fingerprint:
+                profitability = CryptoProfitabilityStore(self.storage).load_verified(
+                    str(allocation.get("source_id") or "")
+                )
+                if (
+                    str(allocation.get("source_type") or "")
+                    != "candidate_profitability_decision"
+                    or str(allocation.get("source_fingerprint") or "")
+                    != profitability.decision_fingerprint
+                    or profitability.strategy_decision_id != strategy.id
+                    or profitability.config_hash
+                    != str(self.config.get("effective_config_hash") or "")
+                ):
                     self.storage.audit(
                         self.run_id,
                         "crypto_deferred_proposal_failed_closed",
-                        {"symbol": result.symbol, "error": "allocation_source_fingerprint_mismatch"},
+                        {
+                            "symbol": result.symbol,
+                            "error": "allocation_source_fingerprint_mismatch",
+                        },
                     )
                     continue
+                if allocation.get("exploration_eligible") is True:
+                    expected_exploration = build_crypto_exploration_evidence(
+                        profitability, cross_asset_policy(self.config)
+                    )
+                    if json_dumps(dict(allocation.get("exploration_evidence") or {})) != json_dumps(expected_exploration):
+                        self.storage.audit(
+                            self.run_id,
+                            "crypto_deferred_proposal_failed_closed",
+                            {
+                                "symbol": result.symbol,
+                                "error": "exploration_evidence_mismatch",
+                            },
+                        )
+                        continue
                 requested = Decimal(str(allocation["requested_notional"]))
                 allocated = Decimal(str(allocation["allocated_notional"]))
                 if (

@@ -19,6 +19,8 @@ from .cross_asset_allocation import (
     CrossAssetAllocationStore,
     CrossAssetCandidate,
     CrossAssetPortfolioSnapshot,
+    _policy as cross_asset_policy,
+    build_crypto_exploration_evidence,
 )
 from .crypto_capabilities import CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore
@@ -700,6 +702,7 @@ class CrossAssetRuntimeCoordinator:
         max_order = _decimal(sizing_cfg.get("maximum_order_notional_usd"), "crypto maximum order", positive=True)
         current_crypto_exposure = Decimal(portfolio.asset_class_exposure["crypto"])
         max_crypto_exposure = equity * _decimal(allocation_cfg.get("maximum_crypto_exposure_pct"), "cross asset crypto exposure") / HUNDRED
+        allocation_policy = cross_asset_policy(self.config)
         for research in results:
             if not getattr(research, "strategy_signal_eligible", False):
                 continue
@@ -744,21 +747,67 @@ class CrossAssetRuntimeCoordinator:
                     validation_policy=policy_from_config(self.config),
                     validation_configuration=self.config,
                 )
+                exploration_eligible = False
+                exploration_evidence = None
                 if not profitability.eligible:
+                    try:
+                        exploration_evidence = build_crypto_exploration_evidence(
+                            profitability, allocation_policy
+                        )
+                    except Exception as exc:
+                        self.storage.audit(
+                            self.run_id,
+                            "crypto_profitability_candidate_excluded",
+                            {
+                                "symbol": market.symbol,
+                                "strategy_version": strategy.selected_strategy,
+                                "profitability_decision_id": profitability.decision_id,
+                                "reasons": list(profitability.rejection_reasons),
+                                "sample_count": profitability.sample_count,
+                                "exploration_blocker": type(exc).__name__,
+                            },
+                        )
+                        continue
+                    exploration_eligible = True
                     self.storage.audit(
                         self.run_id,
-                        "crypto_profitability_candidate_excluded",
+                        "crypto_exploration_candidate_authorized",
                         {
                             "symbol": market.symbol,
                             "strategy_version": strategy.selected_strategy,
                             "profitability_decision_id": profitability.decision_id,
-                            "reasons": list(profitability.rejection_reasons),
+                            "profitability_decision_fingerprint": profitability.decision_fingerprint,
                             "sample_count": profitability.sample_count,
+                            "maximum_completed_samples": exploration_evidence[
+                                "maximum_completed_samples"
+                            ],
+                            "maximum_notional_usd": exploration_evidence[
+                                "maximum_notional_usd"
+                            ],
+                            "prior_win_probability": exploration_evidence[
+                                "prior_win_probability"
+                            ],
+                            "prior_uncertainty": exploration_evidence[
+                                "prior_uncertainty"
+                            ],
+                            "correlation_authority": exploration_evidence[
+                                "correlation_authority"
+                            ],
+                        },
+                    )
+                held_position = held.get(market.symbol)
+                current_position = held_position is not None
+                if exploration_eligible and current_position:
+                    self.storage.audit(
+                        self.run_id,
+                        "crypto_exploration_candidate_excluded",
+                        {
+                            "symbol": market.symbol,
+                            "reason": "exploration_add_not_permitted",
+                            "profitability_decision_id": profitability.decision_id,
                         },
                     )
                     continue
-                held_position = held.get(market.symbol)
-                current_position = held_position is not None
                 action = "add" if current_position else "entry"
                 winner = False
                 if held_position:
@@ -774,15 +823,63 @@ class CrossAssetRuntimeCoordinator:
                 loss_fraction = (entry - stop) / entry + (fee_bps * Decimal("2") + slippage_bps * Decimal("2")) / BPS
                 risk_budget = equity * _decimal(allocation_cfg.get("maximum_crypto_trade_stop_risk_pct"), "cross asset crypto trade risk") / HUNDRED
                 exposure_budget = max(ZERO, max_crypto_exposure - current_crypto_exposure)
-                proposed = min(max_order, exposure_budget if exposure_budget > ZERO else max_order, risk_budget / loss_fraction if loss_fraction > ZERO else ZERO)
+                exploration_max_order = (
+                    _decimal(
+                        exploration_evidence["maximum_notional_usd"],
+                        f"{market.symbol} exploration maximum order",
+                        positive=True,
+                    )
+                    if exploration_eligible and exploration_evidence is not None
+                    else max_order
+                )
+                proposed = min(
+                    max_order,
+                    exploration_max_order,
+                    exposure_budget if exposure_budget > ZERO else max_order,
+                    risk_budget / loss_fraction if loss_fraction > ZERO else ZERO,
+                )
                 proposed = proposed.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                 if proposed <= ZERO:
                     continue
                 quantity = proposed / entry
                 downside = quantity * (entry - stop)
                 costs = quantity * spread_cost + proposed * (fee_bps * Decimal("2") + slippage_bps * Decimal("2")) / BPS
-                probability = _decimal(profitability.win_probability, f"{market.symbol} verified win probability", positive=True)
-                uncertainty = _decimal(profitability.uncertainty, f"{market.symbol} verified uncertainty")
+                if exploration_eligible and exploration_evidence is not None:
+                    probability = _decimal(
+                        exploration_evidence["prior_win_probability"],
+                        f"{market.symbol} exploration prior win probability",
+                        positive=True,
+                    )
+                    uncertainty = _decimal(
+                        exploration_evidence["prior_uncertainty"],
+                        f"{market.symbol} exploration prior uncertainty",
+                    )
+                    holding_hours = _decimal(
+                        exploration_evidence["expected_holding_hours"],
+                        f"{market.symbol} exploration holding hours",
+                        positive=True,
+                    )
+                    correlation = _decimal(
+                        exploration_evidence["correlation_bound"],
+                        f"{market.symbol} exploration correlation bound",
+                    )
+                    severe_loss_rate = ONE - probability
+                else:
+                    probability = _decimal(profitability.win_probability, f"{market.symbol} verified win probability", positive=True)
+                    uncertainty = _decimal(profitability.uncertainty, f"{market.symbol} verified uncertainty")
+                    holding_hours = _decimal(
+                        profitability.average_holding_hours,
+                        f"{market.symbol} holding hours",
+                        positive=True,
+                    )
+                    correlation = _decimal(
+                        profitability.correlation_to_portfolio,
+                        f"{market.symbol} portfolio correlation",
+                    )
+                    severe_loss_rate = _decimal(
+                        profitability.severe_loss_rate,
+                        f"{market.symbol} severe-loss rate",
+                    )
                 conservative_probability = max(ZERO, probability - uncertainty)
                 expected_gross_profit = probability * quantity * (target - entry) - (ONE - probability) * downside
                 expected_net_profit = expected_gross_profit - costs
@@ -804,6 +901,8 @@ class CrossAssetRuntimeCoordinator:
                     for order in orders
                 )
                 profitability_eligible = (
+                    profitability.eligible
+                    and
                     expected_net_profit > ZERO
                     and conservative_profit > ZERO
                     and (not current_position or winner)
@@ -814,31 +913,28 @@ class CrossAssetRuntimeCoordinator:
                     source_fingerprint=profitability.decision_fingerprint, source_authoritative=True,
                     run_id=self.run_id, asset_class="crypto", symbol=market.symbol,
                     cluster="crypto_major", strategy_version=str(strategy.selected_strategy),
-                    strategy_state="ACTIVE" if strategy.lifecycle == "PAPER_ACTIVE" else "RESEARCH_ONLY",
+                    strategy_state=(
+                        "EXPLORATION"
+                        if exploration_eligible
+                        else ("ACTIVE" if strategy.lifecycle == "PAPER_ACTIVE" else "RESEARCH_ONLY")
+                    ),
                     action=action, execution_lane="supervised_paper", evidence_as_of=market.captured_at,
                     proposed_notional=_text(proposed), economic_risk_dollars=_text(downside),
                     stop_risk_dollars=_text(downside + costs), expected_net_profit=_text(expected_net_profit),
                     expected_net_r=_text(expected_r), conservative_expected_net_r=_text(conservative_r),
                     expected_capital_efficiency=_text(expected_net_profit / proposed),
                     expected_r_per_day=_text(
-                        expected_r / max(
-                            Decimal("0.000000000001"),
-                            _decimal(profitability.average_holding_hours, f"{market.symbol} holding hours") / Decimal("24"),
-                        )
+                        expected_r
+                        / max(Decimal("0.000000000001"), holding_hours / Decimal("24"))
                     ),
                     marginal_portfolio_contribution_r=_text(marginal),
                     probability_positive_return=_text(probability),
-                    probability_severe_loss=_text(
-                        _decimal(profitability.severe_loss_rate, f"{market.symbol} severe-loss rate")
-                    ),
+                    probability_severe_loss=_text(severe_loss_rate),
                     uncertainty=_text(uncertainty), cost_to_gross_edge_ratio=_text(cost_ratio),
-                    expected_holding_days=_text(
-                        _decimal(profitability.average_holding_hours, f"{market.symbol} holding hours") / Decimal("24")
-                    ), annualized_volatility=_text(volatility),
+                    expected_holding_days=_text(holding_hours / Decimal("24")),
+                    annualized_volatility=_text(volatility),
                     liquidity_notional=_text(liquidity),
-                    correlation_to_portfolio=_text(
-                        _decimal(profitability.correlation_to_portfolio, f"{market.symbol} portfolio correlation")
-                    ),
+                    correlation_to_portfolio=_text(correlation),
                     marginal_drawdown_r=_text(max(ZERO, (downside + costs) / equity)),
                     current_position=current_position, conflict_free=conflict_free,
                     profitability_eligible=profitability_eligible,
@@ -848,6 +944,8 @@ class CrossAssetRuntimeCoordinator:
                         "profitability_ranking": formulas["profitability_ranking"],
                         "cross_asset_allocation": formulas["cross_asset_allocation"],
                     },
+                    exploration_eligible=exploration_eligible,
+                    exploration_evidence=exploration_evidence,
                 ))
             except Exception:
                 continue

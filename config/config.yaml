@@ -84,8 +84,8 @@ cross_asset_allocation:
   enabled: true
   mode: research_advisory
   produce_order_authority: false
-  formula_version: cross_asset_normalized_constrained_allocator_v1
-  schema_version: cross_asset_research_allocation_plans_v1
+  formula_version: cross_asset_normalized_constrained_allocator_v2_bounded_exploration
+  schema_version: cross_asset_research_allocation_plans_v2_bounded_exploration
   candidate_ttl_seconds: 300
   portfolio_snapshot_ttl_seconds: 300
   plan_ttl_seconds: 300
@@ -434,7 +434,7 @@ formula_versions:
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
   crypto_paper_execution: crypto_supervised_paper_execution_v1_manual_limit_orders
   crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v3_fingerprinted_lifecycle
-  cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
+  cross_asset_allocation: cross_asset_normalized_constrained_allocator_v2_bounded_exploration
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
   phase4_allocation: phase4_multi_strategy_allocation_v7_stop_risk_dollars
@@ -565,6 +565,19 @@ crypto:
     require_verified_correlation: true
     correlation_snapshot_max_age_seconds: 300
     outcome_horizon_hours: 72
+    # A separately governed paper-only cold-start budget.  This does not make
+    # profitability evidence eligible: it authorizes at most three tiny,
+    # manually approved discovery trials while the normal evidence gate is
+    # still insufficient.  The prior and worst-case correlation bound are
+    # displayed and fingerprinted as policy assumptions, never as outcomes.
+    exploration_policy:
+      enabled: true
+      maximum_completed_samples: 3
+      maximum_notional_usd: 250.00
+      prior_win_probability: 0.65
+      prior_uncertainty: 0.05
+      expected_holding_hours: 72
+      correlation_bound: 1.0
   # Explicitly separate from the non-executable research-preview policy above.
   # Every risk-increasing order requires an exact Telegram approval.
   supervised_paper_lane:

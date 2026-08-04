@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,8 @@ from app.cross_asset_allocation import (
     CrossAssetAllocationStore,
     CrossAssetCandidate,
     CrossAssetPortfolioSnapshot,
+    _policy as cross_asset_policy,
+    build_crypto_exploration_evidence,
     optimize_cross_asset_allocation,
 )
 from app.execution import DurableExecutionStore
@@ -815,3 +818,51 @@ def test_version_constants_are_bound_to_configuration():
         config["cross_asset_allocation"]["schema_version"]
         == CROSS_ASSET_ALLOCATION_SCHEMA_VERSION
     )
+
+
+def test_crypto_exploration_is_explicit_bounded_and_never_replaces_profitability_evidence():
+    config = deepcopy(load_config())
+    config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
+    config["effective_config_hash"] = effective_config_hash(config)
+    policy = cross_asset_policy(config)
+    base = {
+        "eligible": False,
+        "decision_id": "profitability-decision-1",
+        "decision_fingerprint": "a" * 64,
+        "sample_count": 0,
+        "unavailable_count": 0,
+        "rejection_reasons": (
+            "crypto_profitability_completed_samples_not_met",
+            "crypto_profitability_mean_return_unavailable",
+            "crypto_profitability_minimum_samples_not_met",
+            "crypto_profitability_verified_correlation_unavailable",
+            "crypto_profitability_walk_forward_validation_insufficient",
+        ),
+        "walk_forward_status": "insufficient",
+        "mean_net_return": None,
+        "minimum_mean_net_return": D("0"),
+    }
+    evidence = build_crypto_exploration_evidence(SimpleNamespace(**base), policy)
+    assert evidence["mode"] == "bounded_paper_discovery"
+    assert evidence["maximum_completed_samples"] == 3
+    assert evidence["correlation_authority"] == "conservative_bootstrap_bound"
+    assert evidence["profitability_decision_fingerprint"] == "a" * 64
+
+    with pytest.raises(CrossAssetAllocationError, match="nonpositive observed"):
+        build_crypto_exploration_evidence(
+            SimpleNamespace(
+                **{
+                    **base,
+                    "mean_net_return": D("-0.01"),
+                }
+            ),
+            policy,
+        )
+    with pytest.raises(CrossAssetAllocationError, match="budget is exhausted"):
+        build_crypto_exploration_evidence(
+            SimpleNamespace(**{**base, "sample_count": 3}), policy
+        )
+    with pytest.raises(CrossAssetAllocationError, match="failed walk-forward"):
+        build_crypto_exploration_evidence(
+            SimpleNamespace(**{**base, "walk_forward_status": "failed"}), policy
+        )

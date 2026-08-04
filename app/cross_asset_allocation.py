@@ -36,10 +36,158 @@ ASSET_CLASSES = frozenset({"equity", "etf", "crypto"})
 EXECUTION_LANES = frozenset({"operational_paper", "research_only", "supervised_paper"})
 ACTIONS = frozenset({"entry", "add", "rotation_entry"})
 SOURCE_TYPES = frozenset({"candidate_profitability_decision"})
+CRYPTO_EXPLORATION_ALLOWED_REJECTION_REASONS = frozenset(
+    {
+        "crypto_profitability_minimum_samples_not_met",
+        "crypto_profitability_completed_samples_not_met",
+        "crypto_profitability_mean_return_unavailable",
+        "crypto_profitability_verified_correlation_unavailable",
+        "crypto_profitability_walk_forward_validation_insufficient",
+    }
+)
 
 
 class CrossAssetAllocationError(ValueError):
     """Raised when allocation evidence is incomplete or inconsistent."""
+
+
+def _crypto_exploration_policy(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the separately configured, bounded paper-discovery policy.
+
+    Exploration is intentionally not a profitability decision.  It is a small
+    paper-only learning budget that can bridge the cold-start gap until the
+    normal cost-adjusted validation gate has enough completed outcomes.
+    """
+
+    crypto = config.get("crypto") or {}
+    raw = (crypto.get("profitability_policy") or {}).get("exploration_policy") or {}
+    if not isinstance(raw, Mapping) or raw.get("enabled") is not True:
+        return {
+            "enabled": False,
+            "maximum_completed_samples": 0,
+            "maximum_notional_usd": "0",
+            "prior_win_probability": "0",
+            "prior_uncertainty": "0",
+            "expected_holding_hours": "0",
+            "correlation_bound": "1",
+        }
+    try:
+        maximum_completed_samples = int(raw.get("maximum_completed_samples"))
+    except (TypeError, ValueError) as exc:
+        raise CrossAssetAllocationError(
+            "crypto exploration maximum_completed_samples must be an integer"
+        ) from exc
+    if isinstance(raw.get("maximum_completed_samples"), bool) or not 1 <= maximum_completed_samples <= 5:
+        raise CrossAssetAllocationError(
+            "crypto exploration maximum_completed_samples must be between 1 and 5"
+        )
+    maximum_notional = _trusted_decimal(
+        raw.get("maximum_notional_usd"),
+        "crypto.profitability_policy.exploration_policy.maximum_notional_usd",
+        minimum=Decimal("5"),
+        maximum=Decimal("500"),
+    )
+    prior_win_probability = _trusted_decimal(
+        raw.get("prior_win_probability"),
+        "crypto.profitability_policy.exploration_policy.prior_win_probability",
+        minimum=Decimal("0.50"),
+        maximum=Decimal("0.90"),
+    )
+    prior_uncertainty = _trusted_decimal(
+        raw.get("prior_uncertainty"),
+        "crypto.profitability_policy.exploration_policy.prior_uncertainty",
+        minimum=ZERO,
+        maximum=Decimal("0.25"),
+    )
+    if prior_win_probability - prior_uncertainty <= ZERO:
+        raise CrossAssetAllocationError(
+            "crypto exploration prior must retain a positive conservative probability"
+        )
+    expected_holding_hours = _trusted_decimal(
+        raw.get("expected_holding_hours"),
+        "crypto.profitability_policy.exploration_policy.expected_holding_hours",
+        minimum=ONE,
+        maximum=Decimal("720"),
+    )
+    correlation_bound = _trusted_decimal(
+        raw.get("correlation_bound"),
+        "crypto.profitability_policy.exploration_policy.correlation_bound",
+        minimum=ONE,
+        maximum=ONE,
+    )
+    return {
+        "enabled": True,
+        "maximum_completed_samples": maximum_completed_samples,
+        "maximum_notional_usd": _text(maximum_notional),
+        "prior_win_probability": _text(prior_win_probability),
+        "prior_uncertainty": _text(prior_uncertainty),
+        "expected_holding_hours": _text(expected_holding_hours),
+        "correlation_bound": _text(correlation_bound),
+    }
+
+
+def build_crypto_exploration_evidence(
+    decision: Any, policy: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build the immutable evidence envelope for one cold-start trial.
+
+    Only insufficient-evidence blockers are allowed.  Negative observed
+    returns, failed validation, malformed observations, or an already-complete
+    discovery budget cannot be bypassed by this path.
+    """
+
+    if policy.get("crypto_exploration_enabled") is not True:
+        raise CrossAssetAllocationError("crypto paper exploration is disabled")
+    if bool(getattr(decision, "eligible", False)):
+        raise CrossAssetAllocationError(
+            "validated crypto profitability must use the normal candidate path"
+        )
+    sample_count = getattr(decision, "sample_count", None)
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise CrossAssetAllocationError("crypto exploration sample_count is invalid")
+    if sample_count >= int(policy["crypto_exploration_maximum_completed_samples"]):
+        raise CrossAssetAllocationError("crypto exploration budget is exhausted")
+    unavailable_count = getattr(decision, "unavailable_count", None)
+    if isinstance(unavailable_count, bool) or not isinstance(unavailable_count, int):
+        raise CrossAssetAllocationError("crypto exploration unavailable_count is invalid")
+    if unavailable_count:
+        raise CrossAssetAllocationError(
+            "crypto exploration cannot bypass incomplete outcome evidence"
+        )
+    rejection_reasons = tuple(sorted(set(getattr(decision, "rejection_reasons", ()))))
+    if not rejection_reasons or set(rejection_reasons) - CRYPTO_EXPLORATION_ALLOWED_REJECTION_REASONS:
+        raise CrossAssetAllocationError(
+            "crypto exploration can bypass insufficient evidence only"
+        )
+    if str(getattr(decision, "walk_forward_status", "")) == "failed":
+        raise CrossAssetAllocationError(
+            "crypto exploration cannot bypass failed walk-forward validation"
+        )
+    mean_net_return = getattr(decision, "mean_net_return", None)
+    minimum_mean_net_return = getattr(decision, "minimum_mean_net_return", None)
+    if mean_net_return is not None and minimum_mean_net_return is not None:
+        if Decimal(str(mean_net_return)) <= Decimal(str(minimum_mean_net_return)):
+            raise CrossAssetAllocationError(
+                "crypto exploration cannot bypass nonpositive observed profitability"
+            )
+    return {
+        "mode": "bounded_paper_discovery",
+        "profitability_decision_id": str(getattr(decision, "decision_id", "")),
+        "profitability_decision_fingerprint": str(
+            getattr(decision, "decision_fingerprint", "")
+        ),
+        "sample_count": sample_count,
+        "maximum_completed_samples": int(
+            policy["crypto_exploration_maximum_completed_samples"]
+        ),
+        "rejection_reasons": list(rejection_reasons),
+        "prior_win_probability": str(policy["crypto_exploration_prior_win_probability"]),
+        "prior_uncertainty": str(policy["crypto_exploration_prior_uncertainty"]),
+        "expected_holding_hours": str(policy["crypto_exploration_expected_holding_hours"]),
+        "correlation_bound": str(policy["crypto_exploration_correlation_bound"]),
+        "correlation_authority": "conservative_bootstrap_bound",
+        "maximum_notional_usd": str(policy["crypto_exploration_maximum_notional_usd"]),
+    }
 
 
 def _canonical_json(value: Any) -> str:
@@ -208,6 +356,8 @@ class CrossAssetCandidate:
     profitability_eligible: bool
     config_hash: str
     formula_versions: Mapping[str, str]
+    exploration_eligible: bool = False
+    exploration_evidence: Mapping[str, Any] | None = None
 
     def canonical(
         self,
@@ -234,6 +384,36 @@ class CrossAssetCandidate:
             raise CrossAssetAllocationError(
                 "supervised_paper execution lane is reserved for crypto"
             )
+        exploration_eligible = _bool(
+            self.exploration_eligible, "exploration_eligible"
+        )
+        if exploration_eligible:
+            if asset_class != "crypto" or lane != "supervised_paper":
+                raise CrossAssetAllocationError(
+                    "exploration is reserved for supervised-paper crypto"
+                )
+            if _required_text(self.strategy_state, "strategy_state").upper() != "EXPLORATION":
+                raise CrossAssetAllocationError(
+                    "exploration candidates must use EXPLORATION strategy state"
+                )
+            if self.profitability_eligible:
+                raise CrossAssetAllocationError(
+                    "exploration and validated profitability cannot both be asserted"
+                )
+            if not isinstance(self.exploration_evidence, Mapping):
+                raise CrossAssetAllocationError(
+                    "exploration_evidence is required for exploration candidates"
+                )
+            exploration_evidence = {
+                str(key): value
+                for key, value in sorted(self.exploration_evidence.items(), key=lambda item: str(item[0]))
+            }
+        else:
+            if self.exploration_evidence not in (None, {}):
+                raise CrossAssetAllocationError(
+                    "non-exploration candidates cannot carry exploration evidence"
+                )
+            exploration_evidence = None
         evidence_time = _timestamp(self.evidence_as_of, "evidence_as_of")
         age = Decimal(str((evaluation_time - evidence_time).total_seconds()))
         if age < Decimal("-5"):
@@ -383,6 +563,8 @@ class CrossAssetCandidate:
             "profitability_eligible": _bool(
                 self.profitability_eligible, "profitability_eligible"
             ),
+            "exploration_eligible": exploration_eligible,
+            "exploration_evidence": exploration_evidence,
             "config_hash": config_hash,
             "formula_versions": formulas,
         }
@@ -432,7 +614,7 @@ class CrossAssetCandidate:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "CrossAssetCandidate":
         fields = cls.__dataclass_fields__
-        return cls(**{name: value[name] for name in fields})
+        return cls(**{name: value[name] for name in fields if name in value})
 
 
 @dataclass(frozen=True)
@@ -668,6 +850,11 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         raise CrossAssetAllocationError(
             "cross-asset allocation requires verified crypto research or supervised-paper capability"
         )
+    exploration = _crypto_exploration_policy(config)
+    if exploration["enabled"] and not crypto_supervised:
+        raise CrossAssetAllocationError(
+            "crypto paper exploration requires the supervised-paper capability"
+        )
     raw = config.get("cross_asset_allocation") or {}
     if raw.get("enabled") is not True or raw.get("mode") != "research_advisory":
         raise CrossAssetAllocationError("cross-asset allocation policy is not enabled")
@@ -731,6 +918,29 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
                 positive=name.startswith("target_") or name.endswith("ttl_seconds"),
             )
         )
+    policy.update(
+        {
+            "crypto_exploration_enabled": bool(exploration["enabled"]),
+            "crypto_exploration_maximum_completed_samples": int(
+                exploration["maximum_completed_samples"]
+            ),
+            "crypto_exploration_maximum_notional_usd": str(
+                exploration["maximum_notional_usd"]
+            ),
+            "crypto_exploration_prior_win_probability": str(
+                exploration["prior_win_probability"]
+            ),
+            "crypto_exploration_prior_uncertainty": str(
+                exploration["prior_uncertainty"]
+            ),
+            "crypto_exploration_expected_holding_hours": str(
+                exploration["expected_holding_hours"]
+            ),
+            "crypto_exploration_correlation_bound": str(
+                exploration["correlation_bound"]
+            ),
+        }
+    )
     if Decimal(policy["drawdown_throttle_start_pct"]) >= Decimal(
         policy["drawdown_halt_pct"]
     ):
@@ -953,8 +1163,20 @@ def optimize_cross_asset_allocation(
         reasons: list[str] = []
         if not row["source_authoritative"]:
             reasons.append("source_not_authoritative")
-        if not row["profitability_eligible"]:
+        if not row["profitability_eligible"] and not row["exploration_eligible"]:
             reasons.append("profitability_ineligible")
+        if row["exploration_eligible"]:
+            if (
+                row["asset_class"] != "crypto"
+                or row["execution_lane"] != "supervised_paper"
+                or row["strategy_state"] != "EXPLORATION"
+                or not policy["crypto_exploration_enabled"]
+            ):
+                reasons.append("exploration_authority_invalid")
+            if Decimal(row["proposed_notional"]) > Decimal(
+                policy["crypto_exploration_maximum_notional_usd"]
+            ):
+                reasons.append("exploration_notional_exceeds_policy")
         if not row["conflict_free"]:
             reasons.append("order_or_position_conflict")
         if row["strategy_state"] not in {"ACTIVE", "EXPLORATION"}:
@@ -1180,6 +1402,9 @@ def optimize_cross_asset_allocation(
                 "strategy_version": row["strategy_version"],
                 "action": row["action"],
                 "execution_lane": row["execution_lane"],
+                "profitability_eligible": row["profitability_eligible"],
+                "exploration_eligible": row["exploration_eligible"],
+                "exploration_evidence": row["exploration_evidence"],
                 "decision": decision,
                 "ranking_score": _text(score),
                 "ranking_components": components,
@@ -1398,18 +1623,37 @@ class CrossAssetAllocationStore:
         from .crypto_profitability import CryptoProfitabilityStore
         crypto_store = CryptoProfitabilityStore(self.storage)
         current_hash = _hash(self.config.get("effective_config_hash"), "effective_config_hash")
+        allocation_policy = _policy(self.config)
         for candidate in candidates:
             if candidate.source_type != "candidate_profitability_decision":
                 raise CrossAssetAllocationError("candidate source type is not a persisted profitability decision")
             if candidate.asset_class == "crypto":
                 decision = crypto_store.load_verified(candidate.source_id)
-                if (
-                    not decision.eligible
-                    or decision.symbol != _required_text(candidate.symbol, "candidate.symbol").upper()
-                    or decision.config_hash != current_hash
-                    or candidate.source_fingerprint != decision.decision_fingerprint
-                    or candidate.source_authoritative is not True
-                ):
+                identity_valid = (
+                    decision.symbol == _required_text(candidate.symbol, "candidate.symbol").upper()
+                    and decision.config_hash == current_hash
+                    and candidate.source_fingerprint == decision.decision_fingerprint
+                    and candidate.source_authoritative is True
+                )
+                if not identity_valid:
+                    raise CrossAssetAllocationError("crypto candidate profitability authority is not current")
+                if candidate.exploration_eligible:
+                    if (
+                        candidate.strategy_state.upper() != "EXPLORATION"
+                        or candidate.execution_lane != "supervised_paper"
+                        or candidate.profitability_eligible
+                    ):
+                        raise CrossAssetAllocationError(
+                            "crypto exploration candidate state is invalid"
+                        )
+                    expected = build_crypto_exploration_evidence(
+                        decision, allocation_policy
+                    )
+                    if _canonical_json(dict(candidate.exploration_evidence or {})) != _canonical_json(expected):
+                        raise CrossAssetAllocationError(
+                            "crypto exploration evidence is not current"
+                        )
+                elif not decision.eligible:
                     raise CrossAssetAllocationError("crypto candidate profitability authority is not current")
 
     @staticmethod
@@ -1601,11 +1845,13 @@ class CrossAssetAllocationStore:
 
 
 __all__ = [
+    "CRYPTO_EXPLORATION_ALLOWED_REJECTION_REASONS",
     "CrossAssetAllocationError",
     "CrossAssetAllocationPlan",
     "CrossAssetAllocationStore",
     "CrossAssetCandidate",
     "CrossAssetPortfolioSnapshot",
     "apply_cross_asset_allocation_schema",
+    "build_crypto_exploration_evidence",
     "optimize_cross_asset_allocation",
 ]
