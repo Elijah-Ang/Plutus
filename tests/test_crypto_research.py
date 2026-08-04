@@ -12,6 +12,7 @@ from app.crypto_research import (
     format_crypto_digest,
     normalize_crypto_symbol,
 )
+from app.fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
 from app.reports import SHEETS
 from app.risk_engine import RiskEngine
 from app.service import TradingService
@@ -263,6 +264,18 @@ def test_btc_and_eth_enter_crypto_research_lane_sol_optional_by_default(tmp_path
     snapshots = storage.fetch_all("SELECT * FROM crypto_research_snapshots ORDER BY symbol")
     assert all(row["market_evidence_id"] for row in snapshots)
     assert all(int(row["market_evidence_authoritative"]) == 1 for row in snapshots)
+    outcomes = storage.fetch_all(
+        """SELECT symbol,entry_price,entry_qty,entry_notional,entry_price_decimal,
+                  entry_qty_decimal,entry_notional_decimal,decimal_provenance,
+                  decimal_accounting_version
+           FROM performance_outcomes ORDER BY symbol"""
+    )
+    assert len(outcomes) == 2
+    assert all(row["entry_price_decimal"] for row in outcomes)
+    assert all(row["entry_qty_decimal"] for row in outcomes)
+    assert all(row["entry_notional_decimal"] for row in outcomes)
+    assert all(row["decimal_provenance"] == RECONSTRUCTED_REAL_PROVENANCE for row in outcomes)
+    assert all(row["decimal_accounting_version"] == "fixed_point_fifo_accounting_v1" for row in outcomes)
 
 
 def test_crypto_symbols_are_normalized_consistently():
