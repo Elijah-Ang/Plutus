@@ -649,6 +649,16 @@ def test_migration_repairs_unfilled_submitted_notional_sidecar(tmp_path):
     }
     assert DurableExecutionStore(storage).integrity_report()["fixed_point_legacy_projection_mismatch"] == 0
 
+    # The inverse stale state must be repaired too: a current sidecar with a
+    # legacy REAL projection that drifted back to the hypothetical notional.
+    storage.execute("UPDATE performance_outcomes SET entry_notional=5.0")
+    storage.apply_explicit_migrations()
+    repaired = storage.fetch_all(
+        "SELECT entry_notional,entry_notional_decimal FROM performance_outcomes"
+    )[0]
+    assert repaired == {"entry_notional": 6.0, "entry_notional_decimal": "6"}
+    assert DurableExecutionStore(storage).integrity_report()["fixed_point_legacy_projection_mismatch"] == 0
+
 
 def test_performance_forward_returns_wait_until_horizon_elapsed(tmp_path):
     service, storage, _broker = _service(tmp_path)

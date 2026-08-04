@@ -235,6 +235,7 @@ def apply_performance_lab_classification_schema(
                        OR COALESCE(decimal_accounting_version,'')<>?
                      ))
                      OR (? IS NOT NULL AND COALESCE(entry_notional_decimal,'')<>?)
+                     OR (? IS NOT NULL AND COALESCE(entry_notional,0)<>?)
                    )""",
                 (
                     classification,
@@ -275,6 +276,12 @@ def apply_performance_lab_classification_schema(
                     decimal_text(performance_entry_notional_decimal)
                     if performance_entry_notional_decimal is not None
                     else "",
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                 ),
             )
             if row[1]:
