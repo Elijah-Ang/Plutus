@@ -482,6 +482,17 @@ def test_migration_promotes_only_matching_durable_fill_and_repairs_links(tmp_pat
            FROM performance_outcomes"""
     )[0]
     assert repaired_canonical == canonical
+    repaired_setup = storage.fetch_all(
+        """SELECT fill_price_decimal,fill_qty_decimal,decimal_provenance,
+                  decimal_accounting_version
+           FROM performance_setups"""
+    )[0]
+    assert repaired_setup == {
+        "fill_price_decimal": "101",
+        "fill_qty_decimal": "0.05",
+        "decimal_provenance": EXACT_DECIMAL_PROVENANCE,
+        "decimal_accounting_version": FIXED_POINT_ACCOUNTING_VERSION,
+    }
     assert all(value == 0 for value in DurableExecutionStore(storage).integrity_report().values())
     storage.apply_explicit_migrations()
     assert storage.fetch_all(
@@ -562,6 +573,42 @@ def test_performance_lab_submitted_without_fill_remains_nonactual(
     service._sync_performance_lab_order_links()
     assert storage.fetch_all("SELECT actual_or_shadow FROM performance_outcomes")[0]["actual_or_shadow"] == expected
     assert storage.fetch_all("SELECT total_actual_trades FROM performance_lab_summaries")[0]["total_actual_trades"] == 0
+
+
+def test_unfilled_submitted_notional_updates_decimal_sidecar(tmp_path):
+    service, storage, _broker = _service(tmp_path)
+    now = datetime(2026, 1, 2, 15, 0, tzinfo=UTC)
+    storage.execute(
+        "INSERT INTO trade_proposals(id,run_id,symbol,side,notional,status,created_at,expires_at,strategy_version) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("prop-1", "run-lab", "QQQ", "buy", 5.0, "submitted", now.isoformat(), (now + timedelta(minutes=10)).isoformat(), "rule_based_v1"),
+    )
+    res = _result(
+        "QQQ", LabSignal("ENTRY", "buy", "QQQ", "trend passed"), now=now,
+        proposal_generated=True, proposal_id="prop-1",
+        performance_action_decision="proposed", performance_proposed_notional=5.0,
+    )
+    service._run_performance_lab([res], ["QQQ"], [], now, {"portfolio_equity": 1000, "total_exposure_pct": 0, "single_exposures": {}, "cluster_exposures": {}})
+    storage.execute(
+        "INSERT INTO orders(id,run_id,proposal_id,broker_order_id,client_order_id,symbol,side,notional,qty,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("order-1", "run-lab", "prop-1", "broker-1", "client-1", "QQQ", "buy", 6.0, 0.05, "submitted", now.isoformat(), now.isoformat()),
+    )
+
+    service._sync_performance_lab_order_links()
+
+    outcome = storage.fetch_all(
+        """SELECT actual_or_shadow,entry_notional,entry_notional_decimal,
+                  decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
+    )[0]
+    assert outcome == {
+        "actual_or_shadow": "submitted_unfilled",
+        "entry_notional": 6.0,
+        "entry_notional_decimal": "6",
+        "decimal_provenance": RECONSTRUCTED_REAL_PROVENANCE,
+        "decimal_accounting_version": FIXED_POINT_ACCOUNTING_VERSION,
+    }
+    integrity = DurableExecutionStore(storage).integrity_report()
+    assert integrity["fixed_point_legacy_projection_mismatch"] == 0
 
 
 def test_performance_forward_returns_wait_until_horizon_elapsed(tmp_path):

@@ -14736,6 +14736,16 @@ class TradingService:
                 fill_qty=fill_qty_decimal,
             )
             valid_fill = evidence_class == "actual_fill"
+            performance_entry_notional_decimal = filled_notional_decimal
+            if not valid_fill:
+                try:
+                    performance_entry_notional_decimal = _service_decimal(
+                        row.get("submitted_notional"),
+                        "Performance Lab submitted notional",
+                        minimum=ZERO,
+                    )
+                except (TypeError, ValueError, ArithmeticError):
+                    performance_entry_notional_decimal = None
             self.storage.execute(
                 """
                 UPDATE performance_setups
@@ -14781,11 +14791,15 @@ class TradingService:
                     str(row.get("fill_id")) if valid_fill else None,
                     float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    float(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else row.get("submitted_notional"),
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                     evidence_class, now_iso,
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                     EXACT_DECIMAL_PROVENANCE if valid_fill else None,
                     FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
                     row.get("setup_id"),
