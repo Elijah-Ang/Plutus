@@ -1186,6 +1186,63 @@ class Storage:
             )
         return run_id
 
+    def recover_stale_runs(self, current_run_id: str, mode: str) -> list[str]:
+        """Close process sessions left running by a process restart.
+
+        The corresponding runtime lock is acquired before this method is
+        called, so any older session in the same mode still marked ``running``
+        no longer has process authority. Keep the recovery explicit and
+        auditable without touching orders, intents, fills, or any other trading
+        ledger state.
+        """
+        if mode not in {"paper", "listener"}:
+            raise ValueError(f"unsupported runtime session mode: {mode}")
+        now = iso_now()
+        recovered: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT id, started_at FROM runs
+                   WHERE mode=? AND status='running' AND id<>?
+                   ORDER BY started_at""",
+                (mode, current_run_id),
+            ).fetchall()
+            for row in rows:
+                detail = json_dumps(
+                    {
+                        "mode": mode,
+                        "reason": "runtime_restart_after_previous_process_lost_authority",
+                        "recovered_by_run_id": current_run_id,
+                        "started_at": row["started_at"],
+                        "trading_ledger_unchanged": True,
+                    }
+                )
+                updated = conn.execute(
+                    """UPDATE runs
+                       SET ended_at=?, status='stale_recovered', detail=?
+                       WHERE id=? AND mode=? AND status='running'""",
+                    (now, detail, row["id"], mode),
+                )
+                if updated.rowcount != 1:
+                    continue
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event_type,actor,detail,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (row["id"], "runtime_run_recovered_after_restart", "system", detail, now),
+                )
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event_type,actor,detail,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (
+                        current_run_id,
+                        "stale_runtime_run_recovered",
+                        "system",
+                        json_dumps({"stale_run_id": row["id"], "detail": detail}),
+                        now,
+                    ),
+                )
+                recovered.append(str(row["id"]))
+        return recovered
+
     def finish_run(self, run_id: str, status: str, detail: str = "") -> None:
         self.execute("UPDATE runs SET ended_at=?, status=?, detail=? WHERE id=?", (iso_now(), status, detail, run_id))
         rows = self.fetch_all("SELECT mode FROM runs WHERE id=?", (run_id,))
