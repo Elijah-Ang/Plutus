@@ -784,6 +784,8 @@ def format_crypto_paper_proposal(proposal: CryptoPaperProposal) -> str:
     projected_crypto = _display_money(d.get("projected_crypto_exposure_usd"))
     existing_total = _display_money(d.get("total_portfolio_exposure_usd"))
     projected_total = _display_money(d.get("projected_total_portfolio_exposure_usd"))
+    approval_command = str(d.get("approval_command") or f"YES CRYPTO {proposal.id}")
+    rejection_command = str(d.get("rejection_command") or f"NO CRYPTO {proposal.id}")
     expiry = format_sgt(d["expires_at"])
     amount_line = (
         f"Amount: {notional} | Quantity: {quantity} {base_asset}"
@@ -802,9 +804,12 @@ def format_crypto_paper_proposal(proposal: CryptoPaperProposal) -> str:
         f"Existing crypto exposure: {existing_crypto} → {projected_crypto}\n"
         f"Total portfolio exposure: {existing_total} → {projected_total}\n"
         f"Expires: {expiry}\n\n"
-        "Reply to this message with:\n"
+        "Type and send one exact action (replying to this message is recommended):\n"
         f"YES = approve this {trade_label} paper trade\n"
         f"NO = reject this {trade_label} paper trade\n\n"
+        "If a direct reply is unavailable, send:\n"
+        f"{approval_command}\n"
+        f"{rejection_command}\n\n"
         "No reply = expires and no order is placed.\n"
         "YES means permission to attempt; final safety checks still run before placement.\n\n"
         f"{d.get('paper_only_warning') or 'PAPER ONLY • MANUAL APPROVAL REQUIRED • NO LIVE OR AUTONOMOUS EXECUTION'}"
