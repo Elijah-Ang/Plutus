@@ -170,6 +170,12 @@ def apply_performance_lab_classification_schema(
                      OR (? IS NOT NULL AND (
                        COALESCE(fill_price,0)<>? OR COALESCE(fill_qty,0)<>?
                      ))
+                     OR (?=1 AND (
+                       COALESCE(fill_price_decimal,'')<>?
+                       OR COALESCE(fill_qty_decimal,'')<>?
+                       OR COALESCE(decimal_provenance,'')<>?
+                       OR COALESCE(decimal_accounting_version,'')<>?
+                     ))
                    )""",
                 (
                     row[5], row[6],
@@ -188,6 +194,11 @@ def apply_performance_lab_classification_schema(
                     row[7] if valid_fill else None,
                     float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    1 if valid_fill else 0,
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else "",
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else "",
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else "",
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else "",
                 ),
             )
             conn.execute(
@@ -209,6 +220,13 @@ def apply_performance_lab_classification_schema(
                      OR (? IS NOT NULL AND (
                        COALESCE(entry_price,0)<>? OR COALESCE(entry_qty,0)<>?
                        OR COALESCE(entry_notional,0)<>?
+                     ))
+                     OR (?=1 AND (
+                       COALESCE(entry_price_decimal,'')<>?
+                       OR COALESCE(entry_qty_decimal,'')<>?
+                       OR COALESCE(entry_notional_decimal,'')<>?
+                       OR COALESCE(decimal_provenance,'')<>?
+                       OR COALESCE(decimal_accounting_version,'')<>?
                      ))
                    )""",
                 (
@@ -234,6 +252,12 @@ def apply_performance_lab_classification_schema(
                     float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
                     float(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
+                    1 if valid_fill else 0,
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else "",
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else "",
+                    decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else "",
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else "",
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else "",
                 ),
             )
             if row[1]:

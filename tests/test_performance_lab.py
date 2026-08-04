@@ -9,7 +9,11 @@ import pytest
 from app.service import TradingService
 from app.storage import Storage
 from app.execution import DurableExecutionStore
-from app.fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
+from app.fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    RECONSTRUCTED_REAL_PROVENANCE,
+)
 from app.formula_versions import PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION
 from app.performance_lab import classify_performance_outcome
 from app.utils import format_digest_message, load_config
@@ -199,19 +203,36 @@ def test_performance_lab_links_actual_order_and_fill(tmp_path):
 
     service._sync_performance_lab_order_links()
 
-    linked = storage.fetch_all("SELECT order_id, broker_order_id, fill_id, fill_price, fill_qty FROM performance_setups")[0]
+    linked = storage.fetch_all(
+        """SELECT order_id, broker_order_id, fill_id, fill_price, fill_qty,
+                  fill_price_decimal,fill_qty_decimal,decimal_provenance,
+                  decimal_accounting_version
+           FROM performance_setups"""
+    )[0]
     assert linked["order_id"] == "order-1"
     assert linked["broker_order_id"] == "broker-1"
     assert linked["fill_id"] is not None
     assert linked["fill_price"] == 101.0
     assert linked["fill_qty"] == 0.05
+    assert linked["fill_price_decimal"] == "101"
+    assert linked["fill_qty_decimal"] == "0.05"
+    assert linked["decimal_provenance"] == EXACT_DECIMAL_PROVENANCE
+    assert linked["decimal_accounting_version"] == FIXED_POINT_ACCOUNTING_VERSION
     outcome = storage.fetch_all(
-        "SELECT actual_or_shadow,entry_price,entry_qty,entry_notional FROM performance_outcomes"
+        """SELECT actual_or_shadow,entry_price,entry_qty,entry_notional,
+                  entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                  decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
     )[0]
     assert outcome["actual_or_shadow"] == "actual_fill"
     assert outcome["entry_price"] == 101.0
     assert outcome["entry_qty"] == 0.05
     assert outcome["entry_notional"] == pytest.approx(5.05)
+    assert outcome["entry_price_decimal"] == "101"
+    assert outcome["entry_qty_decimal"] == "0.05"
+    assert outcome["entry_notional_decimal"] == "5.05"
+    assert outcome["decimal_provenance"] == EXACT_DECIMAL_PROVENANCE
+    assert outcome["decimal_accounting_version"] == FIXED_POINT_ACCOUNTING_VERSION
     summary = storage.fetch_all("SELECT total_actual_trades FROM performance_lab_summaries")[0]
     assert summary["total_actual_trades"] == 1
     assert DurableExecutionStore(storage).integrity_report()["performance_lab_actual_without_fill"] == 0
@@ -405,20 +426,69 @@ def test_migration_promotes_only_matching_durable_fill_and_repairs_links(tmp_pat
     assert first["entry_price"] == 101.0
     assert first["entry_qty"] == 0.05
     assert first["entry_notional"] == pytest.approx(5.05)
+    canonical = storage.fetch_all(
+        """SELECT entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                  decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
+    )[0]
+    assert canonical == {
+        "entry_price_decimal": "101",
+        "entry_qty_decimal": "0.05",
+        "entry_notional_decimal": "5.05",
+        "decimal_provenance": EXACT_DECIMAL_PROVENANCE,
+        "decimal_accounting_version": FIXED_POINT_ACCOUNTING_VERSION,
+    }
     setup = storage.fetch_all(
-        "SELECT order_id,broker_order_id,fill_id,fill_price,fill_qty FROM performance_setups"
+        """SELECT order_id,broker_order_id,fill_id,fill_price,fill_qty,
+                  fill_price_decimal,fill_qty_decimal,decimal_provenance,
+                  decimal_accounting_version
+           FROM performance_setups"""
     )[0]
     assert setup["order_id"] == "order-1"
     assert setup["broker_order_id"] == "paper-1"
     assert setup["fill_id"] == first["fill_id"]
     assert setup["fill_price"] == 101.0
     assert setup["fill_qty"] == 0.05
+    assert setup["fill_price_decimal"] == "101"
+    assert setup["fill_qty_decimal"] == "0.05"
+    assert setup["decimal_provenance"] == EXACT_DECIMAL_PROVENANCE
+    assert setup["decimal_accounting_version"] == FIXED_POINT_ACCOUNTING_VERSION
     assert storage.fetch_all("SELECT total_actual_trades FROM performance_lab_summaries")[0]["total_actual_trades"] == 1
+    integrity = DurableExecutionStore(storage).integrity_report()
+    assert integrity["fixed_point_missing_canonical_evidence"] == 0
+    assert integrity["fixed_point_wrong_version_or_provenance"] == 0
+    assert all(value == 0 for value in DurableExecutionStore(storage).integrity_report().values())
+
+    # Simulate a prior fixed-point backfill that had the right Decimal values
+    # but reconstructed provenance.  Classification must still revisit an
+    # otherwise unchanged actual fill and upgrade its evidence to exact.
+    storage.execute(
+        "UPDATE performance_outcomes SET decimal_provenance=?,decimal_accounting_version=?",
+        (RECONSTRUCTED_REAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION),
+    )
+    storage.execute(
+        "UPDATE performance_setups SET decimal_provenance=?,decimal_accounting_version=?",
+        (RECONSTRUCTED_REAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION),
+    )
+    storage.apply_explicit_migrations()
+    repaired = storage.fetch_all(
+        """SELECT actual_or_shadow,order_id,broker_order_id,fill_id,entry_price,
+                  entry_qty,entry_notional,updated_at
+           FROM performance_outcomes"""
+    )[0]
+    repaired_canonical = storage.fetch_all(
+        """SELECT entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                  decimal_provenance,decimal_accounting_version
+           FROM performance_outcomes"""
+    )[0]
+    assert repaired_canonical == canonical
     assert all(value == 0 for value in DurableExecutionStore(storage).integrity_report().values())
     storage.apply_explicit_migrations()
     assert storage.fetch_all(
-        "SELECT actual_or_shadow,order_id,broker_order_id,fill_id,entry_price,entry_qty,entry_notional,updated_at FROM performance_outcomes"
-    )[0] == first
+        """SELECT actual_or_shadow,order_id,broker_order_id,fill_id,entry_price,
+                  entry_qty,entry_notional,updated_at
+           FROM performance_outcomes"""
+    )[0] == repaired
 
 
 def test_migration_preserves_blocked_shadow_candidate_ids_but_flags_claimed_proposal(
