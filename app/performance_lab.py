@@ -126,7 +126,8 @@ def apply_performance_lab_classification_schema(
                              WHERE a.proposal_id=ps.proposal_id AND a.authorized=1)
                         approval_exists,
                       e.order_status,e.order_id,e.broker_order_id,
-                      e.fill_id,e.fill_price,e.fill_qty,e.filled_notional
+                      e.fill_id,e.fill_price,e.fill_qty,e.filled_notional,
+                      e.submitted_notional,po.entry_notional
                FROM performance_setups ps
                JOIN performance_outcomes po ON po.setup_id=ps.id
                JOIN trade_proposals p ON p.id=ps.proposal_id
@@ -153,6 +154,11 @@ def apply_performance_lab_classification_schema(
                 fill_qty=fill_qty_decimal,
             )
             valid_fill = classification == "actual_fill"
+            performance_entry_notional_decimal = filled_notional_decimal
+            if not valid_fill:
+                performance_entry_notional_decimal = (
+                    _exact_positive(row[11]) or _exact_positive(row[12])
+                )
             conn.execute(
                 """UPDATE performance_setups
                    SET order_id=COALESCE(?,order_id),
@@ -228,6 +234,7 @@ def apply_performance_lab_classification_schema(
                        OR COALESCE(decimal_provenance,'')<>?
                        OR COALESCE(decimal_accounting_version,'')<>?
                      ))
+                     OR (? IS NOT NULL AND COALESCE(entry_notional_decimal,'')<>?)
                    )""",
                 (
                     classification,
@@ -236,11 +243,15 @@ def apply_performance_lab_classification_schema(
                     str(row[7]) if valid_fill else None,
                     float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    float(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                     iso_now(),
                     decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
                     decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
-                    decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                     EXACT_DECIMAL_PROVENANCE if valid_fill else None,
                     FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
                     row[0],
@@ -258,6 +269,12 @@ def apply_performance_lab_classification_schema(
                     decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else "",
                     EXACT_DECIMAL_PROVENANCE if valid_fill else "",
                     FIXED_POINT_ACCOUNTING_VERSION if valid_fill else "",
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else "",
                 ),
             )
             if row[1]:
