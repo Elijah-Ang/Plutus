@@ -103,9 +103,9 @@ def test_persisted_quote_midpoint_and_limit_are_revalidated():
 
 def test_capabilities_keep_only_protective_paper_exit_path():
     assert LIVE_TRADING_SUPPORTED is False
-    assert AUTO_EXECUTION_SUPPORTED is False
-    assert AUTONOMOUS_ENTRIES_SUPPORTED is False
-    assert AUTONOMOUS_EXITS_SUPPORTED is False
+    assert AUTO_EXECUTION_SUPPORTED is True
+    assert AUTONOMOUS_ENTRIES_SUPPORTED is True
+    assert AUTONOMOUS_EXITS_SUPPORTED is True
     assert PROTECTIVE_PAPER_EXITS_SUPPORTED is True
 
 

@@ -196,8 +196,16 @@ class AdaptiveConvictionEngine:
             raise ValueError("Kelly must remain a ceiling diagnostic and covariance must constrain allocation")
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             raise ValueError("operational conviction requires paper-only mode")
-        if self.config.get("auto_execution_enabled") is not False or self.config.get("auto_execution_mode") != "manual_only":
-            raise ValueError("operational conviction requires manual approval")
+        autonomous_paper = (
+            self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+        )
+        manual_paper = (
+            self.config.get("auto_execution_enabled") is False
+            and self.config.get("auto_execution_mode") == "manual_only"
+        )
+        if not (manual_paper or autonomous_paper):
+            raise ValueError("operational conviction requires an explicit paper authority mode")
         if float(self.cfg.get("hard_trade_risk_ceiling_pct", -1)) != 0.35:
             raise ValueError("adaptive conviction hard trade-risk ceiling must be 0.35%")
 

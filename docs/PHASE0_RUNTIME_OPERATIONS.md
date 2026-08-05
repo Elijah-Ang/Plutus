@@ -28,7 +28,7 @@ TRADINGAGENT_ALLOW_PRODUCTION_DB_MIGRATION=YES_I_AM_DEPLOYING \
 ```
 
 The command fails closed unless both launchd writers are absent and the exact
-immutable release manifest binds paper/manual-only controls, successful
+immutable release manifest binds bounded paper authority, successful
 artifact tests, CI, schema versions, and source-tree authority. It checks disk
 capacity before creating a collision-resistant exclusive backup, verifies
 `quick_check`, `integrity_check`, foreign keys, schema, page counts, and every

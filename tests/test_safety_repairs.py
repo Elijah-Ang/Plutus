@@ -347,7 +347,7 @@ def test_auto_execution_is_hard_quarantined(tmp_path):
     service.config["auto_execution_mode"] = "paper_high_confidence_only"
     assert service._should_auto_execute({"score": 100, "asset_score": 100, "notional": 1}) is False
     assert storage.fetch_all("SELECT count(*) n FROM approvals")[0]["n"] == 0
-    assert storage.fetch_all("SELECT count(*) n FROM audit_events WHERE event_type='auto_execution_blocked'")[0]["n"] == 1
+    assert storage.fetch_all("SELECT count(*) n FROM audit_events WHERE event_type='auto_execution_blocked'")[0]["n"] == 0
 
 
 def test_live_is_impossible_even_when_yaml_gates_are_true():

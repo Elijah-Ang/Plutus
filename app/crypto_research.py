@@ -16,6 +16,7 @@ from .crypto_paper_lane import CryptoPaperLaneError, CryptoPaperLaneStore, forma
 from .crypto_risk import CryptoRiskError, CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest
 from .crypto_outcomes import CryptoCostModel, calculate_shadow_outcome, persist_observation
+from .cross_asset_allocation import cold_start_source_fingerprint
 from .storage import Storage
 from .utils import json_dumps
 
@@ -160,25 +161,27 @@ def format_crypto_digest(results: list[CryptoResearchResult]) -> str:
     elif mode == "paper_proposal":
         suffix = "Stage 3 readiness-report only. No proposals/orders until a separate approved config-change commit."
     elif mode == "supervised_paper":
-        suffix = "Supervised paper lane. Every order requires a fresh Telegram display and explicit manual approval."
+        suffix = "Paper lane. Every order still needs fresh risk, market, and broker checks before submission."
     else:
         suffix = "Research-only. No proposals/orders."
     return f"Crypto research: {scores}. {suffix}"
 
 
 class CryptoResearchEngine:
-    def __init__(self, config: dict[str, Any], storage: Storage, broker: Any | None = None, telegram: Any | None = None, run_id: str | None = None) -> None:
+    def __init__(self, config: dict[str, Any], storage: Storage, broker: Any | None = None, telegram: Any | None = None, run_id: str | None = None, control_providers: Mapping[str, Any] | None = None) -> None:
         self.config = config
         self.storage = storage
         self.broker = broker
         self.telegram = telegram
         self.run_id = run_id or str(uuid.uuid4())
+        self.control_providers = dict(control_providers or {})
 
     def run_due(
         self,
         now: datetime | None = None,
         *,
         defer_entry_proposals: bool = False,
+        send_digest: bool = True,
     ) -> list[CryptoResearchResult]:
         now = now or datetime.now(UTC)
         cfg = self.config.get("crypto") or {}
@@ -191,9 +194,9 @@ class CryptoResearchEngine:
             now=now,
             defer_entry_proposals=defer_entry_proposals,
         )
-        if self._digest_due(now) and not crypto_quiet_hours_active(self.config, now):
+        if send_digest and self._digest_due(now) and not crypto_quiet_hours_active(self.config, now):
             self._send_digest(results, now)
-        elif crypto_quiet_hours_active(self.config, now):
+        elif send_digest and crypto_quiet_hours_active(self.config, now):
             self._set_state("crypto_last_digest_suppressed_at", now.isoformat())
         return results
 
@@ -490,21 +493,30 @@ class CryptoResearchEngine:
                     != str(strategy.selected_strategy)
                     or str(allocation.get("candidate_id") or "")
                     != f"crypto:{strategy.symbol}:{strategy.id}:{allocation_action}"
-                    or allocation.get("manual_approval_required") is not True
+                    or not (
+                        allocation.get("manual_approval_required") is True
+                        or allocation.get("autonomous_execution") is True
+                    )
                     or allocation.get("order_authority") is not False
                 ):
                     continue
-                expected_source_fingerprint = hashlib.sha256(
-                    json_dumps(
-                        {
-                            "strategy": strategy.decision_fingerprint,
-                            "market": market_evidence.evidence_fingerprint,
-                            "capability": capability.snapshot_fingerprint,
-                            "config": self.config.get("effective_config_hash"),
-                            "action": allocation_action,
-                        }
-                    ).encode("utf-8")
-                ).hexdigest()
+                allocation_source_type = str(allocation.get("source_type") or "")
+                if allocation_source_type == "candidate_cold_start_discovery":
+                    expected_source_fingerprint = cold_start_source_fingerprint(
+                        source_id=str(strategy.id),
+                        strategy_version=str(strategy.selected_strategy),
+                        symbol=str(strategy.symbol),
+                        config_hash=str(self.config.get("effective_config_hash") or ""),
+                    )
+                elif allocation_source_type == "candidate_profitability_decision":
+                    from .crypto_profitability import CryptoProfitabilityStore
+
+                    source_authority = CryptoProfitabilityStore(self.storage).load_verified(
+                        str(allocation.get("source_id") or "")
+                    )
+                    expected_source_fingerprint = source_authority.decision_fingerprint
+                else:
+                    expected_source_fingerprint = ""
                 if str(allocation.get("source_fingerprint") or "") != expected_source_fingerprint:
                     self.storage.audit(
                         self.run_id,
@@ -559,6 +571,7 @@ class CryptoResearchEngine:
                     strategy,
                     current,
                     risk_fraction=fraction,
+                    requested_notional_cap=allocated,
                 )
                 proposal_id = str(result.risk_metrics.get("supervised_paper_proposal_id") or "")
                 if proposal_id:
@@ -571,6 +584,69 @@ class CryptoResearchEngine:
                 )
         return proposal_ids
 
+    def _execute_autonomous_crypto_proposal(
+        self,
+        lane: CryptoPaperLaneStore,
+        proposal: Any,
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Authorize and submit through the isolated crypto durable ledger."""
+
+        authority = lane.authorize_autonomous_proposal(proposal.id, self.config, now=now)
+        intent = lane.create_intent(proposal.id, self.config, now=now)
+        outcome = lane.execute_intent(intent.id, self.config, self.broker, now=now)
+        state = str(outcome.get("state") or "")
+        symbol = str(proposal.symbol)
+
+        def notify(message: str) -> None:
+            if self.telegram is None:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_autonomous_paper_notification_deferred",
+                    {"proposal_id": proposal.id, "reason": "Telegram client is unavailable"},
+                )
+                return
+            try:
+                self.telegram.send_message(message)
+            except Exception as exc:
+                # Notification is a post-order side effect.  It must never
+                # rewrite a submitted/ambiguous durable state or invite a
+                # second broker attempt.
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_autonomous_paper_notification_failed",
+                    {"proposal_id": proposal.id, "error_type": type(exc).__name__},
+                )
+
+        if state in {"submitted", "partially_filled", "filled"}:
+            direction = "Buy" if str(proposal.side).lower() == "buy" else "Sell"
+            amount = proposal.notional if str(proposal.side).lower() == "buy" else proposal.quantity
+            unit = f"${float(amount):.2f}" if str(proposal.side).lower() == "buy" else f"{amount} units"
+            notify(f"Paper crypto order submitted: {direction} {unit} of {symbol}.")
+            result = {**outcome, "autonomous_authority_id": authority["approval_fingerprint"], "status": "submitted"}
+        elif state in {"unknown", "reconciliation_required", "cancel_pending"}:
+            reason = str(outcome.get("last_error") or state or "crypto broker status could not be verified")
+            notify(
+                f"Paper crypto order status is ambiguous for {symbol}: {reason}. Reconciliation is required; no retry was issued."
+            )
+            result = {
+                **outcome,
+                "autonomous_authority_id": authority["approval_fingerprint"],
+                "status": "unknown",
+                "reason": reason,
+            }
+        else:
+            reason = str(outcome.get("last_error") or state or "crypto paper controls blocked submission")
+            notify(f"No crypto order placed for {symbol}: {reason}.")
+            result = {**outcome, "autonomous_authority_id": authority["approval_fingerprint"], "status": "blocked", "reason": reason}
+        self.storage.audit(
+            self.run_id,
+            "crypto_autonomous_paper_execution",
+            {"proposal_id": proposal.id, "intent_id": intent.id, "state": state, "authority": "deterministic"},
+        )
+        return result
+
     def _monitor_crypto_positions(
         self,
         results: list[CryptoResearchResult],
@@ -579,10 +655,12 @@ class CryptoResearchEngine:
     ) -> None:
         """Continuously evaluate held crypto positions and stage approved exits.
 
-        This loop is deliberately one-way: it may persist an evidence-backed
-        SELL proposal, but it cannot approve, reserve, submit, add to, or
-        rotate a position.  The Telegram listener remains the only authority
-        that can turn one of these proposals into a paper intent.
+        This loop is deliberately one-way with respect to research: it may
+        persist an evidence-backed SELL proposal, but the separate paper-lane
+        authority is the only component allowed to approve, reserve, submit,
+        add to, or rotate a position.  That authority is either the durable
+        Telegram workflow or the deterministic autonomous-paper workflow,
+        depending on the active lane policy.
         """
 
         lane_cfg = (self.config.get("crypto") or {}).get("supervised_paper_lane") or {}
@@ -711,14 +789,17 @@ class CryptoResearchEngine:
                         now=now,
                     )
                     if evaluation.risk_eligible:
-                        lane = CryptoPaperLaneStore(self.storage)
+                        lane = CryptoPaperLaneStore(self.storage, control_providers=self.control_providers)
                         proposal = lane.create_proposal(self.config, None, evaluation.decision_id, now=now)
                         # The proposal itself remains immutable; the stable key
                         # is persisted in the position-management state and in
                         # the audit record for deduplication/recovery.
                         proposal_id = proposal.id
-                        rendered = format_crypto_paper_proposal(proposal)
-                        self._deliver_crypto_proposal(lane, proposal, rendered, now=now)
+                        if lane_cfg.get("autonomous_execution") is True:
+                            self._execute_autonomous_crypto_proposal(lane, proposal, now=now)
+                        else:
+                            rendered = format_crypto_paper_proposal(proposal)
+                            self._deliver_crypto_proposal(lane, proposal, rendered, now=now)
                         self.storage.audit(
                             self.run_id,
                             "crypto_position_management_proposal_created",
@@ -758,15 +839,14 @@ class CryptoResearchEngine:
         now: datetime,
         *,
         risk_fraction: Decimal | None = None,
+        requested_notional_cap: Decimal | None = None,
     ) -> None:
         """Create an executable paper proposal only for the explicit lane gate.
 
-        The default configuration never enters this method.  When the
-        separately reviewed supervised lane is enabled, risk authority is
-        rebuilt from the current broker account and the proposal is persisted
-        before (and independently of) any Telegram send.  A Telegram failure
-        therefore leaves an unapprovable, durable paper proposal rather than
-        inventing a fallback or submitting anything.
+        When the separately reviewed supervised lane is enabled, risk
+        authority is rebuilt from the current broker account and the proposal
+        is persisted before the selected manual or autonomous paper authority
+        path runs.  Notification delivery is never a broker-order fallback.
         """
 
         lane = (self.config.get("crypto") or {}).get("supervised_paper_lane") or {}
@@ -824,12 +904,19 @@ class CryptoResearchEngine:
                 requested_risk *= min(Decimal("1"), risk_fraction)
             if not requested_risk.is_finite() or requested_risk <= 0:
                 return
+            if requested_notional_cap is not None:
+                if (
+                    not requested_notional_cap.is_finite()
+                    or requested_notional_cap <= Decimal("0")
+                ):
+                    return
             request = CryptoSizingRequest(
                 source_type="crypto_strategy_decision",
                 source_id=f"{strategy.id}:{action}",
                 source_fingerprint=hashlib.sha256(f"{strategy.decision_fingerprint}:{action}".encode("utf-8")).hexdigest(),
                 symbol=str(strategy.symbol), side="buy", action=action, request_basis="notional",
                 requested_stop_risk_dollars=requested_risk, stop_price=str(strategy.stop_price),
+                requested_notional_cap=requested_notional_cap,
             )
             evaluation = CryptoRiskStore(self.storage).evaluate(
                 self.config, self.broker, self.run_id, capability.id, market_evidence.id, request, now=now,
@@ -837,15 +924,20 @@ class CryptoResearchEngine:
             if not evaluation.risk_eligible:
                 result.risk_metrics["supervised_paper_blockers"] = list(evaluation.reasons)
                 return
-            lane_store = CryptoPaperLaneStore(self.storage)
+            lane_store = CryptoPaperLaneStore(self.storage, control_providers=self.control_providers)
             proposal = lane_store.create_proposal(
                 self.config, strategy.id, evaluation.decision_id, now=now,
             )
             result.risk_metrics["supervised_paper_proposal_id"] = proposal.id
             result.status = "supervised_paper"
-            result.reason = "fresh_manual_approval_required"
-            rendered = format_crypto_paper_proposal(proposal)
-            self._deliver_crypto_proposal(lane_store, proposal, rendered, now=now)
+            if lane.get("autonomous_execution") is True:
+                result.reason = "autonomous_paper_execution_attempted"
+                outcome = self._execute_autonomous_crypto_proposal(lane_store, proposal, now=now)
+                result.risk_metrics["autonomous_paper_state"] = outcome.get("state")
+            else:
+                result.reason = "fresh_manual_approval_required"
+                rendered = format_crypto_paper_proposal(proposal)
+                self._deliver_crypto_proposal(lane_store, proposal, rendered, now=now)
         except (CryptoPaperLaneError, CryptoRiskError, InvalidOperation, TypeError, ValueError) as exc:
             result.risk_metrics["supervised_paper_blockers"] = [type(exc).__name__]
         except Exception as exc:

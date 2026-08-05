@@ -2719,7 +2719,10 @@ class Executor:
                 recovery_intent_id=(str(existing_intent["id"]) if recovery_exclusion_allowed else None),
                 recovery_logical_action_key=(action_key if recovery_exclusion_allowed else None),
                 recovery_proven_no_invocation=self.recovery_proven_no_submit,
-                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
+                telegram_required=(
+                    str(candidate.get("action") or "entry").lower() in {"entry", "add"}
+                    and source_type not in {"autonomous_system"}
+                ),
             )
         except Exception as exc:
             return ExecutionResult(
@@ -2867,7 +2870,10 @@ class Executor:
                 source_type=source_type,
                 trusted_providers=self.trusted_evidence_providers,
                 cluster_provider=self.cluster_provider,
-                telegram_required=str(candidate.get("action") or "entry").lower() in {"entry", "add"},
+                telegram_required=(
+                    str(candidate.get("action") or "entry").lower() in {"entry", "add"}
+                    and source_type not in {"autonomous_system"}
+                ),
             )
             refreshed_intent = store.get_intent(intent_id)
             refreshed_context = {

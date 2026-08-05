@@ -7,8 +7,8 @@ persisted in an immutable, fingerprinted snapshot.
 
 This module is read-only with respect to Alpaca.  It cannot build or submit an
 order.  The separately reviewed ``crypto_paper_lane`` binds sizing, risk,
-display, approval, intent and reconciliation to this evidence when explicitly
-enabled; the installed configuration keeps that lane disabled.
+display, deterministic paper authority, intent and reconciliation to this
+evidence when explicitly enabled.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from .formula_versions import (
 from .utils import iso_now, json_dumps
 
 
-CRYPTO_OFFICIAL_CONTRACT_VERSION = "alpaca_spot_crypto_contract_2026_07_17"
+CRYPTO_OFFICIAL_CONTRACT_VERSION = "alpaca_spot_crypto_contract_2026_08_05"
 CRYPTO_DATA_FEED = "us"
 CRYPTO_MARKET_PROFILE = "continuous_24_7"
 CRYPTO_PROVIDER = "alpaca"
@@ -120,8 +120,8 @@ def _official_contract() -> dict[str, Any]:
         "leverage": False,
         "borrowing": False,
         "derivatives": False,
-        "manual_approval_required": True,
-        "autonomous_execution": False,
+        "manual_approval_required": False,
+        "autonomous_execution": True,
         "market_profile": CRYPTO_MARKET_PROFILE,
         "trading_hours": "24_hours_7_days",
         "data_feed": CRYPTO_DATA_FEED,

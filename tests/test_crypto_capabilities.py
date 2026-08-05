@@ -100,7 +100,7 @@ def test_official_contract_is_separate_versioned_spot_paper_lane():
     assert contract["asset_exchange"] == "CRYPTO"
     assert contract["long_only"] is True
     assert contract["leverage"] is False
-    assert contract["autonomous_execution"] is False
+    assert contract["autonomous_execution"] is True
     assert contract["bar_semantics"].startswith("trade_or_quote_midpoint")
     assert contract["fees"]["tier_1_taker_bps"] == 25
 

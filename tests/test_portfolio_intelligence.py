@@ -24,6 +24,18 @@ def base_config():
     config = load_config()
     config["mode"] = "paper"
     config["live_enabled"] = False
+    config["auto_execution_enabled"] = False
+    config["auto_execution_mode"] = "manual_only"
+    config["execution_capabilities"].update({
+        "autonomous_entries_enabled": False,
+        "autonomous_exits_enabled": False,
+    })
+    config["phase3"]["require_manual_approval"] = True
+    config["phase4"]["require_manual_approval"] = True
+    config["crypto"]["supervised_paper_lane"].update({
+        "manual_approval_required": True,
+        "autonomous_execution": False,
+    })
 
     # Portfolio intelligence config
     config["portfolio_behavior"] = {

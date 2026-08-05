@@ -1,14 +1,15 @@
-"""Compile-time capability gates for unsupported high-risk features.
+"""Compile-time capability gates for paper execution.
 
+Paper autonomy is supported only through the durable authority and final
+revalidation path. Live trading remains permanently disabled in this build.
 These constants are intentionally not configurable through YAML, environment
-variables, Telegram, or runtime state. Enabling either capability requires a
-future reviewed code change and new safety tests.
+variables, Telegram, or runtime state.
 """
 
 LIVE_TRADING_SUPPORTED = False
-AUTO_EXECUTION_SUPPORTED = False
-AUTONOMOUS_ENTRIES_SUPPORTED = False
-AUTONOMOUS_EXITS_SUPPORTED = False
+AUTO_EXECUTION_SUPPORTED = True
+AUTONOMOUS_ENTRIES_SUPPORTED = True
+AUTONOMOUS_EXITS_SUPPORTED = True
 PROTECTIVE_PAPER_EXITS_SUPPORTED = True
 
 

@@ -535,7 +535,7 @@ def test_performance_lab_safety_config_invariants():
     config = load_config()
     assert config["mode"] == "paper"
     assert config["live_enabled"] is False
-    assert config["auto_execution_enabled"] is False
-    assert config["auto_execution_mode"] == "manual_only"
-    assert config["telegram"]["approval_enabled"] is True
+    assert config["auto_execution_enabled"] is True
+    assert config["auto_execution_mode"] == "autonomous_paper"
+    assert config["telegram"]["approval_enabled"] is False
     assert config["risk"]["require_final_revalidation"] is True

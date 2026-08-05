@@ -649,17 +649,16 @@ def test_required_control_probe_changes_after_snapshot_blocks_before_broker_io(t
     assert broker.submit_calls == []
 
 
-def test_required_telegram_health_change_blocks_before_broker_io(tmp_path):
+def test_required_telegram_health_change_is_not_a_crypto_autonomous_execution_gate(tmp_path):
     providers = {"telegram": lambda: False}
     storage, config, broker, lane, proposal, intent = _ready(
         tmp_path, control_providers=providers,
     )
     config["telegram"]["crypto_execution_health_required"] = True
     result = lane.execute_intent(intent.id, config, broker, now=NOW)
-    assert result["state"] == "retryable_pre_submission"
-    assert result["broker_invocation_occurred"] == 0
-    assert "telegram_health_not_verified" in result["last_error"]
-    assert broker.submit_calls == []
+    assert result["state"] == "submitted"
+    assert result["broker_invocation_occurred"] == 1
+    assert broker.submit_calls
 
 
 def test_loss_evidence_becoming_stale_blocks_before_broker_io(tmp_path):
@@ -1285,6 +1284,38 @@ def test_crypto_cancel_is_marked_before_broker_call_and_reconciles_terminal_stat
         "SELECT state FROM crypto_paper_reservations WHERE intent_id=?", (intent.id,)
     )[0]
     assert reservation["state"] == "released"
+
+
+def test_cancel_pending_is_in_active_reservation_integrity_coverage(tmp_path):
+    storage, config, broker, lane, proposal, intent = _ready(tmp_path)
+    storage.execute(
+        "UPDATE crypto_paper_intents SET state='cancel_pending' WHERE id=?",
+        (intent.id,),
+    )
+    storage.execute(
+        "DELETE FROM crypto_paper_reservations WHERE intent_id=?",
+        (intent.id,),
+    )
+
+    report = lane.integrity_report()
+
+    assert report["crypto_paper_active_intents_without_active_reservation"] == 1
+
+
+def test_cancel_pending_reservation_fingerprint_is_verified(tmp_path):
+    storage, config, broker, lane, proposal, intent = _ready(tmp_path)
+    storage.execute(
+        "UPDATE crypto_paper_intents SET state='cancel_pending' WHERE id=?",
+        (intent.id,),
+    )
+    storage.execute(
+        "UPDATE crypto_paper_reservations SET reservation_fingerprint='tampered' WHERE intent_id=?",
+        (intent.id,),
+    )
+
+    report = lane.integrity_report()
+
+    assert report["crypto_paper_reservation_fingerprint_mismatch"] == 1
 
 
 def test_crypto_filled_status_without_cumulative_fill_is_reconciliation_required(tmp_path):

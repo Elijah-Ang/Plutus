@@ -19,7 +19,7 @@ plutil -p "$HOME/Library/LaunchAgents/com.elijah.tradingagent.telegram.plist"
 ```
 
 Start services only as the last step of the controlled deployment/start
-procedure, after release, CI, database-migration, paper/manual-only and
+procedure, after release, CI, database-migration, bounded-paper-authority and
 stopped-writer gates pass. A source checkout is never launch authority.
 
 To stop and remove the exact launchd services, run

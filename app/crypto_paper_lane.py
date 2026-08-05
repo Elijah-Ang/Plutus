@@ -2,8 +2,9 @@
 
 The research modules intentionally never create ordinary ``trade_proposals``
 or call the equity order adapter.  This module is the separately gated stage
-which turns a *verified* crypto strategy/risk/sizing chain into a durable,
-manually approved paper order.  It is disabled unless
+which turns a *verified* crypto strategy/risk/sizing chain into a durable
+paper order under either manual or deterministic autonomous authority.  It is
+disabled unless
 ``crypto.supervised_paper_lane.enabled`` is explicitly enabled in a separately
 reviewed configuration.
 
@@ -48,7 +49,10 @@ from .utils import kill_switch_active
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
-ACTIVE_INTENT_STATES = {"reserved", "submitting", "submitted", "partially_filled", "retryable_pre_submission"}
+ACTIVE_INTENT_STATES = {
+    "reserved", "submitting", "submitted", "partially_filled",
+    "retryable_pre_submission", "cancel_pending",
+}
 TERMINAL_INTENT_STATES = {"filled", "cancelled", "rejected", "expired"}
 AMBIGUOUS_INTENT_STATES = {"unknown", "reconciliation_required"}
 
@@ -236,10 +240,10 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         failures.append("supervised_crypto_paper_lane_disabled")
     if policy.get("paper_only") is not True:
         failures.append("supervised_crypto_lane_not_paper_only")
-    if policy.get("manual_approval_required") is not True:
-        failures.append("supervised_crypto_lane_manual_approval_required")
-    if policy.get("autonomous_execution") is not False:
-        failures.append("supervised_crypto_autonomous_execution_must_be_false")
+    manual = policy.get("manual_approval_required") is True
+    autonomous = policy.get("autonomous_execution") is True
+    if manual == autonomous:
+        failures.append("crypto_lane_requires_exactly_one_authority_mode")
     if policy.get("live_enabled") is not False:
         failures.append("supervised_crypto_live_execution_must_be_false")
     if policy.get("execution_enabled") is not True:
@@ -628,7 +632,7 @@ def apply_crypto_paper_lane_schema(conn: Any, *, record_migration: bool = True) 
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
-            (CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION, iso_now(), "isolated supervised manual crypto paper execution ledger"),
+            (CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION, iso_now(), "isolated supervised crypto paper execution ledger"),
         )
 
 
@@ -984,8 +988,10 @@ class CryptoPaperLaneStore:
             "stop_price": sizing.stop_price, "stop_risk": sizing.canonical_stop_risk,
             "status": "pending", "created_at": current.isoformat(), "expires_at": expires_at.isoformat(),
             "config_hash": config_hash, "formula_versions": formulas, "schema_version": CRYPTO_PAPER_EXECUTION_SCHEMA_VERSION, "display": display,
-            "display_fingerprint": _hash(display), "paper_only": True, "manual_approval_required": True,
-            "autonomous_execution": False, "live_enabled": False,
+            "display_fingerprint": _hash(display), "paper_only": True,
+            "manual_approval_required": bool(policy.get("manual_approval_required") is True),
+            "autonomous_execution": bool(policy.get("autonomous_execution") is True),
+            "live_enabled": False,
         }
         fingerprint = _hash(payload)
         existing_row: dict[str, Any] | None = None
@@ -1020,6 +1026,71 @@ class CryptoPaperLaneStore:
         if existing_row is not None:
             return self._verify_proposal_row(existing_row, config, now=current)
         return self.load_proposal(preview_id, config, now=current)
+
+    def authorize_autonomous_proposal(
+        self,
+        proposal_id: str,
+        config: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Bind deterministic system authority without a Telegram send."""
+
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        policy = _policy(config)
+        if policy.get("autonomous_execution") is not True:
+            raise CryptoPaperLaneError("autonomous crypto authority is not enabled")
+        proposal = self.load_proposal(proposal_id, config, now=current)
+        if proposal.status not in {"pending", "approved", "intent_created"}:
+            raise CryptoPaperLaneError("crypto paper proposal is not eligible for autonomous authority")
+        message_id = f"autonomous:{proposal.id}"
+        chat_id = "system"
+        rendered = f"AUTONOMOUS PAPER AUTHORITY {proposal.id}"
+        rendered_fingerprint = _sha256(rendered)
+        approval_id = f"autonomous:{proposal.id}"
+        current_iso = current.isoformat()
+        body = {
+            "id": approval_id,
+            "proposal_id": proposal.id,
+            "sender_id": "plutus:autonomous",
+            "raw_message": "SYSTEM AUTONOMOUS PAPER AUTHORITY",
+            "reply_to_message_id": message_id,
+            "parsed_action": "approve",
+            "telegram_chat_id": chat_id,
+            "display_fingerprint": proposal.display_fingerprint,
+            "telegram_message_fingerprint": rendered_fingerprint,
+            "approved_at": current_iso,
+        }
+        approval_fingerprint = _hash(body)
+        with self.storage.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM crypto_paper_proposals WHERE id=?", (proposal.id,)).fetchone()
+            if row is None:
+                raise CryptoPaperLaneError("crypto paper proposal disappeared before autonomous authority")
+            existing = conn.execute("SELECT * FROM crypto_paper_approvals WHERE proposal_id=?", (proposal.id,)).fetchone()
+            if existing is not None:
+                if str(existing["id"]) != approval_id:
+                    raise CryptoPaperLaneError("crypto paper proposal already has a different approval")
+                return {**body, "approval_fingerprint": existing["approval_fingerprint"], "status": existing["status"]}
+            conn.execute(
+                """UPDATE crypto_paper_proposals SET telegram_message_id=?,telegram_chat_id=?,
+                   telegram_display_text=?,telegram_display_fingerprint=?,telegram_bound_at=?
+                   WHERE id=? AND status IN ('pending','approved','intent_created')""",
+                (message_id, chat_id, rendered, rendered_fingerprint, current_iso, proposal.id),
+            )
+            conn.execute(
+                """INSERT INTO crypto_paper_approvals(
+                   id,proposal_id,sender_id,raw_message,reply_to_message_id,parsed_action,status,
+                   approved_at,display_fingerprint,telegram_chat_id,telegram_message_fingerprint,approval_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    approval_id, proposal.id, body["sender_id"], body["raw_message"], message_id,
+                    "approve", "active", current_iso, proposal.display_fingerprint,
+                    chat_id, rendered_fingerprint, approval_fingerprint,
+                ),
+            )
+            conn.execute("UPDATE crypto_paper_proposals SET status='approved' WHERE id=? AND status='pending'", (proposal.id,))
+        return {**body, "approval_fingerprint": approval_fingerprint, "status": "active"}
 
     def load_proposal(self, proposal_id: str, config: Mapping[str, Any], *, now: datetime | None = None) -> CryptoPaperProposal:
         row = self._load_proposal_row(proposal_id)
@@ -1542,7 +1613,7 @@ class CryptoPaperLaneStore:
             )
             conn.execute(
                 "INSERT INTO crypto_paper_order_events(id,intent_id,event_key,from_state,to_state,event_type,safe_detail,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), intent_id, f"{intent_id}:reserved", None, "reserved", "intent_reserved", "manual approval and authoritative risk capacity committed", current.isoformat()),
+                (str(uuid.uuid4()), intent_id, f"{intent_id}:reserved", None, "reserved", "intent_reserved", "paper authority and authoritative risk capacity committed", current.isoformat()),
             )
             conn.execute(
                 "UPDATE crypto_paper_approvals SET status='consumed',consumed_at=? WHERE id=? AND status='active'",
@@ -2232,7 +2303,9 @@ class CryptoPaperLaneStore:
 
     def _final_controls(self, conn: Any, row: Mapping[str, Any], config: Mapping[str, Any], broker: Any, *, now: datetime) -> list[str]:
         failures: list[str] = []
-        for name in ("power", "internet", "database", "telegram"):
+        policy = _policy(config)
+        required_controls = ("power", "internet", "database") if policy.get("autonomous_execution") is True else ("power", "internet", "database", "telegram")
+        for name in required_controls:
             probe = self.control_providers.get(name)
             if probe is None:
                 failures.append(f"{name}_health_probe_missing")
@@ -2426,7 +2499,7 @@ class CryptoPaperLaneStore:
         other_intent = conn.execute(
             """SELECT i.id FROM crypto_paper_intents i
                JOIN crypto_paper_reservations r ON r.intent_id=i.id
-               WHERE i.symbol=? AND i.id<>? AND i.state IN ('reserved','submitting','submitted','partially_filled','retryable_pre_submission','unknown','reconciliation_required')
+               WHERE i.symbol=? AND i.id<>? AND i.state IN ('reserved','submitting','submitted','partially_filled','retryable_pre_submission','cancel_pending','unknown','reconciliation_required')
                  AND r.state='active' LIMIT 1""",
             (row["symbol"], row["id"]),
         ).fetchone()
@@ -4421,7 +4494,7 @@ class CryptoPaperLaneStore:
             "crypto_paper_orphan_approvals": "SELECT COUNT(*) n FROM crypto_paper_approvals a LEFT JOIN crypto_paper_proposals p ON p.id=a.proposal_id WHERE p.id IS NULL",
             "crypto_paper_duplicate_active_approvals": "SELECT COUNT(*) n FROM (SELECT proposal_id FROM crypto_paper_approvals WHERE status='active' GROUP BY proposal_id HAVING COUNT(*)>1)",
             "crypto_paper_intents_without_reservation": "SELECT COUNT(*) n FROM crypto_paper_intents i LEFT JOIN crypto_paper_reservations r ON r.intent_id=i.id WHERE r.id IS NULL",
-            "crypto_paper_active_intents_without_active_reservation": "SELECT COUNT(*) n FROM crypto_paper_intents i LEFT JOIN crypto_paper_reservations r ON r.intent_id=i.id WHERE i.state IN ('reserved','submitting','submitted','partially_filled','retryable_pre_submission') AND r.state<>'active'",
+            "crypto_paper_active_intents_without_active_reservation": "SELECT COUNT(*) n FROM crypto_paper_intents i LEFT JOIN crypto_paper_reservations r ON r.intent_id=i.id WHERE i.state IN ('reserved','submitting','submitted','partially_filled','retryable_pre_submission','cancel_pending') AND COALESCE(r.state,'')<>'active'",
             "crypto_paper_terminal_intents_with_active_reservation": "SELECT COUNT(*) n FROM crypto_paper_intents i JOIN crypto_paper_reservations r ON r.intent_id=i.id WHERE i.state IN ('filled','rejected','cancelled','expired') AND r.state='active'",
             "crypto_paper_duplicate_logical_actions": "SELECT COUNT(*) n FROM (SELECT logical_action_key FROM crypto_paper_intents GROUP BY logical_action_key HAVING COUNT(*)>1)",
             "crypto_paper_duplicate_client_order_ids": "SELECT COUNT(*) n FROM (SELECT client_order_id FROM crypto_paper_intents GROUP BY client_order_id HAVING COUNT(*)>1)",

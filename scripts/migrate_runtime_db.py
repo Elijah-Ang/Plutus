@@ -24,6 +24,7 @@ from app.runtime_guard import (  # noqa: E402
     RELEASE_ROOT,
     REQUIRED_SCHEMA_VERSION,
     STATE_ROOT,
+    paper_authority_mode,
 )
 from app.storage import Storage  # noqa: E402
 
@@ -166,8 +167,8 @@ def validate_release_manifest(manifest: dict[str, Any]) -> None:
     }
     if manifest.get("mode") != "paper":
         raise RuntimeError("release manifest is not paper-only")
-    if manifest.get("manual_approval_only") is not True:
-        raise RuntimeError("release manifest does not require manual approval")
+    if paper_authority_mode(manifest) is None:
+        raise RuntimeError("release manifest paper authority is missing or unbounded")
     if manifest.get("live_capability") is not False:
         raise RuntimeError("release manifest permits live capability")
     if manifest.get("tests_verified") is not True:

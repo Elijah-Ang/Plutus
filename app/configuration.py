@@ -263,9 +263,16 @@ STRICT_NESTED_KEYS = {
         "execution_enabled",
     },
     "crypto.profitability_policy": {
-        "minimum_samples", "severe_loss_threshold", "minimum_mean_net_return",
+        "minimum_samples", "cold_start_enabled", "cold_start_trade_count",
+        "cold_start_prior_win_probability", "cold_start_prior_uncertainty",
+        "cold_start_prior_correlation", "cold_start_notional_tiers",
+        "severe_loss_threshold", "minimum_mean_net_return",
         "require_verified_correlation", "correlation_snapshot_max_age_seconds",
         "outcome_horizon_hours",
+    },
+    "crypto.profitability_policy.cold_start_notional_tiers": {
+        "first_trade_count", "first_notional_usd", "second_trade_count",
+        "second_notional_usd", "final_notional_usd",
     },
     "cross_asset_allocation.score_weights": {
         "uncertainty_adjusted_net_expectancy", "expected_net_expectancy",
@@ -423,6 +430,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             and 0 <= float(value) <= 1,
             f"profitability_validation.{key} must be between 0 and 1",
         )
+    for key, expected in {
+        "minimum_samples": 30,
+        "minimum_train_observations": 20,
+        "test_observations": 5,
+        "minimum_positive_fold_ratio": 0.50,
+        "minimum_parameter_stability_ratio": 0.50,
+    }.items():
+        require(validation.get(key) == expected, f"profitability_validation.{key} must be {expected}")
 
     conviction = config.get("adaptive_conviction", {}) or {}
     require(conviction.get("enabled") is True, "adaptive_conviction.enabled must be true")
@@ -495,8 +510,15 @@ def validate_config(config: dict[str, Any]) -> list[str]:
                         f"executable strategy {strategy_version} requires an available implementation")
                 require(entry.get("paper_eligible") is True,
                         f"executable strategy {strategy_version} must be explicitly paper eligible")
-                require(entry.get("human_authorized") is True and entry.get("config_authorized") is True,
-                        f"executable strategy {strategy_version} requires explicit human and configuration authorization")
+                autonomous_paper_requested = (
+                    config.get("auto_execution_enabled") is True
+                    and config.get("auto_execution_mode") == "autonomous_paper"
+                )
+                require(
+                    (entry.get("human_authorized") is True or autonomous_paper_requested)
+                    and entry.get("config_authorized") is True,
+                    f"executable strategy {strategy_version} requires explicit paper authority and configuration authorization",
+                )
                 require(bool(entry.get("authorization_id")),
                         f"executable strategy {strategy_version} requires an authorization ID")
             try:
@@ -516,8 +538,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             f"winner expansion formula must be {WINNER_EXPANSION_FORMULA_VERSION}")
     require(winner.get("position_risk_formula_version") == POSITION_RISK_FORMULA_VERSION,
             f"winner expansion position risk formula must be {POSITION_RISK_FORMULA_VERSION}")
-    require(winner.get("require_manual_approval") is True,
-            "every winner ADD must retain explicit manual approval")
+    require(
+        winner.get("require_manual_approval") is (not (
+            config.get("auto_execution_enabled") is True
+            and config.get("auto_execution_mode") == "autonomous_paper"
+        )),
+        "winner ADD authority mode must match the configured paper execution path",
+    )
     require(winner.get("require_authoritative_current_stop") is True,
             "winner expansion requires a current authoritative protective stop")
     allowances = winner.get("mode_incremental_risk_allowance_pct") or {}
@@ -540,8 +567,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "trend management must be active operational_paper")
     require(trend.get("formula_version") == TREND_MANAGEMENT_FORMULA_VERSION,
             f"trend management formula must be {TREND_MANAGEMENT_FORMULA_VERSION}")
-    require(trend.get("require_manual_approval_for_sells") is True,
-            "trend-management SELLs require explicit manual approval")
+    require(
+        trend.get("require_manual_approval_for_sells") is (not (
+            config.get("auto_execution_enabled") is True
+            and config.get("auto_execution_mode") == "autonomous_paper"
+        )),
+        "trend-management SELL authority mode must match the configured paper execution path",
+    )
     require(trend.get("stop_never_moves_down") is True,
             "long protective stops must be monotonic")
     try:
@@ -624,12 +656,12 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         ("maximum_symbol_exposure_pct", 0.01, 6.0),
         ("maximum_cluster_exposure_pct", 0.01, 15.0),
         ("maximum_equity_exposure_pct", 0.01, 50.0),
-        ("maximum_crypto_exposure_pct", 0.01, 1.0),
+        ("maximum_crypto_exposure_pct", 0.01, 5.0),
         ("maximum_strategy_stop_heat_pct", 0.01, 0.6125),
         ("maximum_exploration_stop_heat_pct", 0.01, 0.10),
-        ("maximum_crypto_stop_heat_pct", 0.01, 0.05),
+        ("maximum_crypto_stop_heat_pct", 0.01, 0.20),
         ("maximum_equity_trade_stop_risk_pct", 0.01, 0.35),
-        ("maximum_crypto_trade_stop_risk_pct", 0.001, 0.01),
+        ("maximum_crypto_trade_stop_risk_pct", 0.001, 0.05),
         ("maximum_equity_annualized_volatility", 0.01, 0.45),
         ("maximum_crypto_annualized_volatility", 0.01, 1.50),
         ("minimum_cash_reserve_pct", 20.0, 100.0),
@@ -759,8 +791,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     require(mode in {"paper", "live"}, "mode must be paper or live")
     require(mode == "paper", "this build is paper-only; mode=live is contradictory")
     require(config.get("live_enabled") is False, "live_enabled must be false in this build")
-    require(config.get("auto_execution_enabled", False) is False, "auto_execution_enabled must remain false")
-    require(config.get("auto_execution_mode", "manual_only") == "manual_only", "auto_execution_mode must be manual_only")
+    auto_enabled = config.get("auto_execution_enabled", False)
+    auto_mode = config.get("auto_execution_mode", "manual_only")
+    autonomous_paper = auto_enabled is True and auto_mode == "autonomous_paper"
+    manual_paper = auto_enabled is False and auto_mode == "manual_only"
+    require(manual_paper or autonomous_paper, "paper execution must select manual_only or autonomous_paper authority")
     alpaca = config.get("alpaca", {}) or {}
     require(
         alpaca.get("equity_realtime_data_feed") in {"iex", "sip"},
@@ -768,14 +803,14 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     )
     capabilities = config.get("execution_capabilities", {}) or {}
     require(capabilities.get("live_execution_enabled", False) is False, "live execution capability must remain disabled")
-    require(capabilities.get("autonomous_entries_enabled", False) is False, "autonomous ordinary entries must remain disabled")
-    require(capabilities.get("autonomous_exits_enabled", False) is False, "autonomous ordinary exits must remain disabled")
+    require(capabilities.get("autonomous_entries_enabled", False) is autonomous_paper, "autonomous entry capability must match the selected paper authority mode")
+    require(capabilities.get("autonomous_exits_enabled", False) is autonomous_paper, "autonomous exit capability must match the selected paper authority mode")
     require(capabilities.get("protective_paper_exit_enabled", True) is True, "validated protective paper exit capability must remain enabled")
     phase3 = config.get("phase3", {}) or {}
     if phase3.get("active"):
         require(phase3.get("enabled") is True, "active Phase 3 must be enabled")
         require(phase3.get("mode") == "ACTIVE_PAPER", "Phase 3 mode must be ACTIVE_PAPER")
-        require(phase3.get("require_manual_approval") is True, "Phase 3 requires manual approval for entries and adds")
+        require(phase3.get("require_manual_approval") is (not autonomous_paper), "Phase 3 authority mode must match the selected paper execution mode")
         require(phase3.get("allow_score_based_sizing") is False, "uncalibrated score-based sizing is forbidden")
         require(phase3.get("allow_kelly_sizing") is False, "Kelly sizing is Phase 4 and forbidden")
         require(phase3.get("allow_leverage") is False, "Phase 3 leverage is forbidden")
@@ -794,7 +829,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(phase4.get("operational_kelly_enabled") is False, "Kelly may bound but never directly size an order")
         require(phase4.get("operational_allocation_mode") == "bounded_evidence_aware", "Phase 4 must use bounded evidence-aware allocation")
         require(phase4.get("uncalibrated_score_sizing") is False, "uncalibrated score sizing is forbidden")
-        require(phase4.get("require_manual_approval") is True, "Phase 4 exploration and probe entries require manual approval")
+        require(phase4.get("require_manual_approval") is (not autonomous_paper), "Phase 4 authority mode must match the selected paper execution mode")
         kelly = _bounded(phase4.get("fractional_kelly"), "phase4.fractional_kelly", errors, 0.01, 0.25)
         require(kelly is not None and kelly <= 0.25, "Phase 4 fractional Kelly cannot exceed one quarter")
         max_strategy_weight = _bounded(phase4.get("max_strategy_weight"), "phase4.max_strategy_weight", errors, 0.0, 1.0)
@@ -813,20 +848,20 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         require(exploration_risk is not None and exploration_max is not None and exploration_risk <= exploration_max, "Phase 4 per-strategy exploration stop risk exceeds its maximum")
         require(exploration_gross is not None and exploration_gross <= 7.5, "Phase 4 exploration gross exposure exceeds the 7.5% bound")
         probe_risk = _bounded(phase4.get("probe_stop_risk_pct"), "phase4.probe_stop_risk_pct", errors, 0, 0.03)
-        probe_heat = _bounded(phase4.get("probe_portfolio_heat_pct"), "phase4.probe_portfolio_heat_pct", errors, 0, 0.10)
-        probe_gross = _bounded(phase4.get("probe_gross_exposure_pct"), "phase4.probe_gross_exposure_pct", errors, 0, 2.5)
+        probe_heat = _bounded(phase4.get("probe_portfolio_heat_pct"), "phase4.probe_portfolio_heat_pct", errors, 0, 0.25)
+        probe_gross = _bounded(phase4.get("probe_gross_exposure_pct"), "phase4.probe_gross_exposure_pct", errors, 0, 7.5)
         require(probe_risk == 0.03, "Phase 4 probe stop risk must be exactly 0.03%")
-        require(probe_heat == 0.10, "Phase 4 probe portfolio heat must be exactly 0.10%")
-        require(probe_gross == 2.5, "Phase 4 probe gross exposure must be exactly 2.5%")
-        require(phase4.get("probe_max_active_count") == 1, "Phase 4 permits exactly one active probe position or reserved intent")
-        require(phase4.get("probe_min_setup_score") == 85, "Phase 4 probe setup score must be at least 85")
+        require(probe_heat == 0.25, "Phase 4 probe portfolio heat must be exactly 0.25%")
+        require(probe_gross == 7.5, "Phase 4 probe gross exposure must be exactly 7.5%")
+        require(phase4.get("probe_max_active_count") == 3, "Phase 4 permits exactly three active probes or reserved intents")
+        require(phase4.get("probe_min_setup_score") == 72, "Phase 4 probe setup score must be at least 72")
 
     profitability = config.get("profitability_engine", {}) or {}
     required_profitability_settings = {
-        "minimum_shadow_oos_samples": 100,
-        "minimum_actual_paper_for_throttled": 20,
-        "minimum_actual_paper_for_active": 50,
-        "minimum_samples_per_regime": 10,
+        "minimum_shadow_oos_samples": 30,
+        "minimum_actual_paper_for_throttled": 8,
+        "minimum_actual_paper_for_active": 20,
+        "minimum_samples_per_regime": 5,
         "minimum_actual_paper_for_divergence_penalty": 20,
     }
     for key, expected in required_profitability_settings.items():
@@ -953,15 +988,15 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     )
     crypto_gross = _bounded(
         crypto_risk.get("maximum_gross_exposure_pct_equity"),
-        "crypto.risk_policy.maximum_gross_exposure_pct_equity", errors, 0, 1,
+        "crypto.risk_policy.maximum_gross_exposure_pct_equity", errors, 0, 5,
     )
     crypto_symbol = _bounded(
         crypto_risk.get("maximum_symbol_exposure_pct_equity"),
-        "crypto.risk_policy.maximum_symbol_exposure_pct_equity", errors, 0, 1,
+        "crypto.risk_policy.maximum_symbol_exposure_pct_equity", errors, 0, 3,
     )
     crypto_cluster = _bounded(
         crypto_risk.get("maximum_cluster_exposure_pct_equity"),
-        "crypto.risk_policy.maximum_cluster_exposure_pct_equity", errors, 0, 1,
+        "crypto.risk_policy.maximum_cluster_exposure_pct_equity", errors, 0, 5,
     )
     require(
         None not in {total_crypto_portfolio, crypto_gross, crypto_symbol, crypto_cluster}
@@ -970,11 +1005,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     )
     crypto_trade_risk = _bounded(
         crypto_risk.get("maximum_stop_risk_per_trade_pct_equity"),
-        "crypto.risk_policy.maximum_stop_risk_per_trade_pct_equity", errors, 0, 0.01,
+        "crypto.risk_policy.maximum_stop_risk_per_trade_pct_equity", errors, 0, 0.05,
     )
     crypto_heat = _bounded(
         crypto_risk.get("maximum_stop_heat_pct_equity"),
-        "crypto.risk_policy.maximum_stop_heat_pct_equity", errors, 0, 0.05,
+        "crypto.risk_policy.maximum_stop_heat_pct_equity", errors, 0, 0.20,
     )
     require(
         crypto_trade_risk is not None and crypto_heat is not None
@@ -1027,8 +1062,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "crypto must remain cash-funded without margin")
     require(crypto_risk.get("require_verified_loss_evidence") is True,
             "crypto requires verified daily and weekly loss evidence")
-    require(crypto_risk.get("block_on_any_open_crypto_order") is True,
-            "new crypto BUYs must block on any open crypto order")
+    require(crypto_risk.get("block_on_any_open_crypto_order") is False,
+            "crypto BUY capacity must be governed by the two-order, one-per-symbol policy")
     require(crypto_risk.get("loss_session_timezone") == "UTC",
             "continuous crypto loss sessions must use UTC")
     clusters = crypto_risk.get("correlation_clusters") or {}
@@ -1100,7 +1135,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         ("stop_atr_multiple", 0.1, 10),
         ("minimum_stop_distance_pct", 0.000001, 0.25),
         ("maximum_stop_distance_pct", 0.000001, 0.25),
-        ("target_reward_r_multiple", 1.5, 10),
+        ("target_reward_r_multiple", 1.25, 10),
     ):
         _bounded(crypto_strategy.get(key), f"crypto.strategy_policy.{key}", errors, minimum, maximum)
     require(
@@ -1120,6 +1155,38 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     _bounded(
         crypto_profitability.get("minimum_samples"),
         "crypto.profitability_policy.minimum_samples", errors, 1, 100000,
+    )
+    require(
+        crypto_profitability.get("cold_start_enabled") is True,
+        "crypto cold-start discovery must be explicitly enabled",
+    )
+    cold_start_count = crypto_profitability.get("cold_start_trade_count")
+    require(
+        isinstance(cold_start_count, int)
+        and not isinstance(cold_start_count, bool)
+        and cold_start_count == 20,
+        "crypto cold-start trade count must be 20",
+    )
+    _bounded(
+        crypto_profitability.get("cold_start_prior_win_probability"),
+        "crypto.profitability_policy.cold_start_prior_win_probability", errors, 0, 1,
+    )
+    _bounded(
+        crypto_profitability.get("cold_start_prior_uncertainty"),
+        "crypto.profitability_policy.cold_start_prior_uncertainty", errors, 0, 1,
+    )
+    _bounded(
+        crypto_profitability.get("cold_start_prior_correlation"),
+        "crypto.profitability_policy.cold_start_prior_correlation", errors, -1, 1,
+    )
+    cold_start_tiers = crypto_profitability.get("cold_start_notional_tiers") or {}
+    require(
+        cold_start_tiers.get("first_trade_count") == 5
+        and cold_start_tiers.get("first_notional_usd") == 250.0
+        and cold_start_tiers.get("second_trade_count") == 10
+        and cold_start_tiers.get("second_notional_usd") == 500.0
+        and cold_start_tiers.get("final_notional_usd") == 1000.0,
+        "crypto cold-start notional tiers must be $250 for trades 1-5, $500 for 6-10, and $1,000 for 11-20",
     )
     _bounded(
         crypto_profitability.get("severe_loss_threshold"),
@@ -1166,17 +1233,17 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     # The executable crypto lane is deliberately separate from the ordinary
     # research-preview policy.  Its default remains disabled; an explicit
-    # paper/manual-only configuration may opt in after its own review without
-    # weakening the global live/autonomous boundary.
+    # A paper-only configuration may select manual or deterministic autonomous
+    # authority after its own review without weakening the global live boundary.
     supervised_lane = crypto.get("supervised_paper_lane") or {}
     if supervised_lane:
         if supervised_lane.get("enabled") is True:
             require(supervised_lane.get("paper_only") is True,
                     "crypto.supervised_paper_lane.paper_only must be true")
-            require(supervised_lane.get("manual_approval_required") is True,
-                    "crypto.supervised_paper_lane.manual_approval_required must be true")
-            require(supervised_lane.get("autonomous_execution") is False,
-                    "crypto.supervised_paper_lane.autonomous_execution must be false")
+            require(supervised_lane.get("manual_approval_required") is (not autonomous_paper),
+                    "crypto.supervised_paper_lane.manual_approval_required must match the global paper authority mode")
+            require(supervised_lane.get("autonomous_execution") is autonomous_paper,
+                    "crypto.supervised_paper_lane.autonomous_execution must match the global paper authority mode")
             require(supervised_lane.get("live_enabled") is False,
                     "crypto.supervised_paper_lane.live_enabled must be false")
             require(supervised_lane.get("execution_enabled") is True,

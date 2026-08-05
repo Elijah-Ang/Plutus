@@ -107,7 +107,7 @@ def test_phase4_exploration_defaults_are_bounded():
     assert cfg["exploration_stop_risk_pct"] == .05
     assert cfg["max_exploration_stop_risk_pct"] == .10
     assert cfg["exploration_gross_exposure_pct"] == 7.5
-    assert cfg["require_manual_approval"] is True
+    assert cfg["require_manual_approval"] is False
 
 
 def test_fractional_kelly_is_bounded_and_phase3_authoritative():

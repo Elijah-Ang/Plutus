@@ -23,6 +23,7 @@ from scripts.build_isolated_wheel import (
     REQUIRED_SETUPTOOLS,
     verify_wheel_evidence,
 )
+from app.runtime_guard import paper_authority_mode
 
 REQUIRED_PYTHON = "3.13.9"
 
@@ -133,10 +134,10 @@ def verify(
         raise ValueError("release Python version mismatch")
     if (
         manifest.get("mode") != "paper"
-        or manifest.get("manual_approval_only") is not True
+        or paper_authority_mode(manifest) is None
         or manifest.get("live_capability") is not False
     ):
-        raise ValueError("release manifest is not paper-only and manual-approval-only")
+        raise ValueError("release manifest is not bounded paper-only authority")
     if (
         manifest.get("tests_verified") is not True
         or tests.get("tests_verified") is not True

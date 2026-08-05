@@ -37,6 +37,32 @@ def _observation(index: int, value: float = 0.5) -> PerformanceObservation:
     )
 
 
+def _probe_test_config() -> dict:
+    config = load_config()
+    config.update({
+        "auto_execution_enabled": False,
+        "auto_execution_mode": "manual_only",
+    })
+    config["execution_capabilities"].update({
+        "autonomous_entries_enabled": False,
+        "autonomous_exits_enabled": False,
+    })
+    config["phase3"]["require_manual_approval"] = True
+    config["phase4"].update({
+        "require_manual_approval": True,
+        "probe_portfolio_heat_pct": 0.10,
+        "probe_gross_exposure_pct": 2.5,
+        "probe_max_active_count": 1,
+        "probe_min_setup_score": 85,
+    })
+    config["profitability_engine"]["minimum_shadow_oos_samples"] = 100
+    config["profitability_validation"].update({
+        "enabled": False,
+        "enforcement_enabled": False,
+    })
+    return config
+
+
 def _refresh_with(
     monkeypatch,
     storage,
@@ -53,7 +79,7 @@ def _refresh_with(
             max(datetime.fromisoformat(row.exit_session) for row in all_rows)
             + timedelta(days=1)
         ).isoformat()
-    engine = StrategyPerformanceEngine(storage, load_config(), as_of=as_of)
+    engine = StrategyPerformanceEngine(storage, _probe_test_config(), as_of=as_of)
     monkeypatch.setattr(engine, "_shadow_observations", lambda: observations)
     monkeypatch.setattr(engine, "_actual_observations", lambda: list(actual_observations or []))
     monkeypatch.setattr(
@@ -244,7 +270,7 @@ def test_phase4_emits_distinct_probe_policy(monkeypatch, tmp_path):
     storage = _db(tmp_path)
     _snapshot, engine = _refresh_with(monkeypatch, storage, [_observation(i) for i in range(50)])
     policy = engine.latest_valid_policy("rule_based_v2")
-    result = AdaptiveAllocator(storage, load_config(), "probe-allocation").run(
+    result = AdaptiveAllocator(storage, _probe_test_config(), "probe-allocation").run(
         regime="normal", drawdown_pct=0.0, strategy_policy_map={"rule_based_v2": policy},
         as_of="2026-07-14T08:00:00+00:00",
         portfolio_snapshot={"portfolio_equity": 100.0, "as_of": "2026-07-14T08:00:00+00:00", "equity_as_of": "2026-07-14T08:00:00+00:00"},
@@ -269,7 +295,7 @@ def test_probe_sizing_respects_score_stage_risk_and_active_count(monkeypatch, tm
     storage = _db(tmp_path)
     _snapshot, engine = _refresh_with(monkeypatch, storage, [_observation(i) for i in range(50)])
     policy = engine.latest_valid_policy("rule_based_v2")
-    service = TradingService(load_config(), storage, None, "probe-sizing")
+    service = TradingService(_probe_test_config(), storage, None, "probe-sizing")
     service._strategy_policy_map = {"rule_based_v2": policy}
     service._authoritative_runtime_state = lambda force=False: {
         "positions": [], "account": {"equity": 100000, "cash": 90000, "buying_power": 360000},

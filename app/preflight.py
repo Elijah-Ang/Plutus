@@ -88,8 +88,19 @@ def run_trading_preflight(config: dict[str, Any], storage: Any, broker: Any | No
     return _run_checks(build, recorder)
 
 
-def run_research_preflight(config: dict[str, Any], storage: Any, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
-    research_cfg = config.get("preflight", {}).get("research_only", {})
+def run_equity_research_preflight(config: dict[str, Any], storage: Any, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
+    """Check the dependencies for Dynamic Universe/equity research only.
+
+    The legacy ``research_only`` configuration key remains a fallback so
+    older local configurations continue to work.  This lane is the only
+    research lane that is allowed to depend on the EODHD credential.
+    """
+
+    preflight_cfg = config.get("preflight", {}) or {}
+    research_cfg = {
+        **(preflight_cfg.get("research_only") or {}),
+        **(preflight_cfg.get("equity_research") or {}),
+    }
 
     def cfg_bool(name: str, fallback: bool) -> bool:
         return bool(research_cfg.get(name, fallback))
@@ -100,14 +111,90 @@ def run_research_preflight(config: dict[str, Any], storage: Any, recorder: Calla
         add("research_power", not require_ac or power.connected is True, power.detail if require_ac else f"warning-only: {power.detail}")
         add("research_internet", not cfg_bool("require_internet", True) or internet_available(), "internet connectivity required for provider research")
         add("research_database", storage.writable(), "SQLite database must be writable")
-        provider_needed = bool(config.get("dynamic_universe", {}).get("enabled", False))
+        dynamic_cfg = config.get("dynamic_universe", {}) or {}
+        provider_name = str(
+            dynamic_cfg.get("provider")
+            or config.get("dynamic_universe_provider")
+            or "eodhd"
+        ).strip().lower()
+        provider_needed = bool(dynamic_cfg.get("enabled", False)) and provider_name == "eodhd"
         provider_cfg = config.get("eodhd", {})
         provider_key_name = str(provider_cfg.get("api_key_secret_name", "TradingAgent.EODHD_API_KEY")).replace("TradingAgent.", "")
-        add("research_provider_key", not provider_needed or secret_present(provider_key_name) or secret_present(str(provider_cfg.get("api_key_secret_name", ""))), "provider key required when provider calls are needed")
+        add(
+            "research_provider_key",
+            not provider_needed
+            or secret_present(provider_key_name)
+            or secret_present(str(provider_cfg.get("api_key_secret_name", ""))),
+            "EODHD key required when Dynamic Universe uses EODHD",
+        )
         add("research_market_closed_allowed", cfg_bool("allow_market_closed", True), "research-only tasks may run while market is closed")
         add("research_no_trading_actions", True, "research-only preflight does not permit proposals or broker order actions")
 
     return _run_checks(build, recorder)
+
+
+def run_crypto_research_preflight(
+    config: dict[str, Any],
+    storage: Any,
+    broker: Any | None = None,
+    recorder: Callable[[PreflightCheck], None] | None = None,
+) -> PreflightResult:
+    """Check the independent Alpaca-backed 24/7 crypto research lane.
+
+    This preflight deliberately has no EODHD/provider-key check.  Crypto
+    market evidence is sourced from Alpaca, so equity-provider failures must
+    not disable this lane.
+    """
+
+    preflight_cfg = config.get("preflight", {}) or {}
+    crypto_preflight_cfg = preflight_cfg.get("crypto_research") or {}
+    crypto_cfg = config.get("crypto", {}) or {}
+    crypto_enabled = bool(crypto_cfg.get("enabled", False))
+
+    def cfg_bool(name: str, fallback: bool) -> bool:
+        return bool(crypto_preflight_cfg.get(name, fallback))
+
+    def build(add: Callable[[str, bool, str], None]) -> None:
+        power = get_power_status()
+        require_ac = cfg_bool("require_ac_power", False)
+        add(
+            "crypto_research_power",
+            not crypto_enabled or not require_ac or power.connected is True,
+            power.detail if require_ac else f"warning-only: {power.detail}",
+        )
+        add(
+            "crypto_research_internet",
+            not crypto_enabled or not cfg_bool("require_internet", True) or internet_available(),
+            "internet connectivity required for Alpaca crypto research",
+        )
+        add("crypto_research_database", not crypto_enabled or storage.writable(), "SQLite database must be writable")
+
+        require_broker = cfg_bool("require_broker", True)
+        if not crypto_enabled:
+            add("crypto_research_broker", True, "crypto research lane is disabled")
+        elif broker is None:
+            add("crypto_research_broker", not require_broker, "Alpaca broker required for crypto market evidence")
+        else:
+            try:
+                broker.get_account()
+                add("crypto_research_broker", True, "Alpaca broker reachable for crypto research")
+            except Exception as exc:
+                add("crypto_research_broker", not require_broker, f"Alpaca broker unavailable: {type(exc).__name__}")
+
+        add(
+            "crypto_research_market_closed_allowed",
+            not crypto_enabled or cfg_bool("allow_market_closed", True),
+            "crypto research runs continuously and does not require the US equity market to be open",
+        )
+        add("crypto_research_no_trading_actions", True, "crypto research preflight does not permit broker order actions")
+
+    return _run_checks(build, recorder)
+
+
+def run_research_preflight(config: dict[str, Any], storage: Any, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:
+    """Backward-compatible alias for the equity research preflight."""
+
+    return run_equity_research_preflight(config, storage, recorder=recorder)
 
 
 def run_preflight(config: dict[str, Any], storage: Any, broker: Any | None = None, lock_held: bool = True, recorder: Callable[[PreflightCheck], None] | None = None) -> PreflightResult:

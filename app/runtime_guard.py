@@ -14,6 +14,37 @@ REQUIRED_SCHEMA_VERSION = "runtime_safety_accounting_v1"
 REQUIRED_PYTHON_VERSION = "3.13.9"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+PAPER_AUTHORITY_MODES = frozenset({"manual_only", "autonomous_paper"})
+
+
+def paper_authority_mode(manifest: dict) -> str | None:
+    """Return the manifest's bounded paper authority, or fail closed."""
+
+    mode = str(manifest.get("paper_authority_mode") or "").strip()
+    if not mode and manifest.get("manual_approval_only") is True:
+        mode = "manual_only"
+    if mode not in PAPER_AUTHORITY_MODES:
+        return None
+    if manifest.get("manual_approval_only") is not (mode == "manual_only"):
+        return None
+    autonomous_flag = manifest.get("autonomous_execution_enabled")
+    if autonomous_flag is not None and autonomous_flag is not (mode == "autonomous_paper"):
+        return None
+    return mode
+
+
+def config_paper_authority_mode(config: dict) -> str | None:
+    """Return the configured bounded paper authority, or fail closed."""
+
+    if config.get("mode") != "paper" or config.get("live_enabled") is not False:
+        return None
+    auto_enabled = config.get("auto_execution_enabled")
+    mode = config.get("auto_execution_mode")
+    if auto_enabled is False and mode == "manual_only":
+        return "manual_only"
+    if auto_enabled is True and mode == "autonomous_paper":
+        return "autonomous_paper"
+    return None
 
 # These generated-evidence identities are part of the release authority.  A
 # manifest that predates the isolated-wheel and final-inventory gates must not
@@ -425,10 +456,10 @@ def validate_production_runtime() -> dict:
     if manifest.get("mode") != "paper":
         raise RuntimeGuardError("release manifest is not paper-only")
     if (
-        manifest.get("manual_approval_only") is not True
+        paper_authority_mode(manifest) is None
         or manifest.get("live_capability") is not False
     ):
-        raise RuntimeGuardError("release manifest is not manual-only and live-disabled")
+        raise RuntimeGuardError("release manifest is not bounded paper-authority and live-disabled")
     if manifest.get("tests_verified") is not True:
         raise RuntimeGuardError("release artifact tests are not verified")
     if (

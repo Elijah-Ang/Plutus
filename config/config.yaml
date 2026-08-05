@@ -20,14 +20,14 @@ phase3:
   active: true
   mode: ACTIVE_PAPER
   profile_version: adaptive_operational_paper_risk_v2
-  require_manual_approval: true
+  require_manual_approval: false
   require_paper_account_identity: true
   require_healthy_reconciliation: true
   allow_score_based_sizing: false
   allow_kelly_sizing: false
   allow_leverage: false
   promotion:
-    minimum_completed_oos: 100
+    minimum_completed_oos: 30
     minimum_regimes: 2
     require_positive_cost_adjusted_expectancy: true
   risk_profile:
@@ -57,7 +57,7 @@ phase4:
   full_kelly_allowed: false
   llm_trading_decisions: false
   uncalibrated_score_sizing: false
-  minimum_oos_samples: 100
+  minimum_oos_samples: 30
   minimum_regimes: 2
   shrinkage_prior_samples: 100
   confidence_z: 1.96
@@ -73,12 +73,12 @@ phase4:
   max_exploration_stop_risk_pct: 0.10
   exploration_gross_exposure_pct: 7.5
   probe_stop_risk_pct: 0.03
-  probe_portfolio_heat_pct: 0.10
-  probe_gross_exposure_pct: 2.5
-  probe_max_active_count: 1
-  probe_min_setup_score: 85
+  probe_portfolio_heat_pct: 0.25
+  probe_gross_exposure_pct: 7.5
+  probe_max_active_count: 3
+  probe_min_setup_score: 72
   preserve_cash_on_unreliable_evidence: true
-  require_manual_approval: true
+  require_manual_approval: false
   phase3_hard_limits_authoritative: true
 cross_asset_allocation:
   enabled: true
@@ -94,12 +94,12 @@ cross_asset_allocation:
   maximum_symbol_exposure_pct: 6.0
   maximum_cluster_exposure_pct: 15.0
   maximum_equity_exposure_pct: 50.0
-  maximum_crypto_exposure_pct: 1.0
+  maximum_crypto_exposure_pct: 5.0
   maximum_strategy_stop_heat_pct: 0.6125
   maximum_exploration_stop_heat_pct: 0.10
-  maximum_crypto_stop_heat_pct: 0.05
+  maximum_crypto_stop_heat_pct: 0.20
   maximum_equity_trade_stop_risk_pct: 0.35
-  maximum_crypto_trade_stop_risk_pct: 0.01
+  maximum_crypto_trade_stop_risk_pct: 0.05
   maximum_equity_annualized_volatility: 0.45
   maximum_crypto_annualized_volatility: 1.50
   minimum_cash_reserve_pct: 20.0
@@ -116,11 +116,11 @@ cross_asset_allocation:
   maximum_positions: 5
   maximum_equity_positions: 3
   maximum_crypto_positions: 2
-  target_conservative_net_r: 0.15
-  target_expected_net_r: 0.25
-  target_capital_efficiency: 0.02
-  target_r_per_day: 0.02
-  target_marginal_contribution_r: 0.15
+  target_conservative_net_r: 0.05
+  target_expected_net_r: 0.10
+  target_capital_efficiency: 0.005
+  target_r_per_day: 0.005
+  target_marginal_contribution_r: 0.05
   score_weights:
     uncertainty_adjusted_net_expectancy: 0.25
     expected_net_expectancy: 0.10
@@ -181,77 +181,77 @@ strategy_execution_registry:
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
     pullback_uptrend_v1:
-      strategy_name: Pullback Uptrend Research
+      strategy_name: Pullback Uptrend
       strategy_version: pullback_uptrend_v1
-      implementation_id: pullback_uptrend_shadow
-      implementation_version: shadow_v1
-      implementation_available: false
-      execution_eligible: false
-      paper_eligible: false
+      implementation_id: pullback_uptrend_evaluator
+      implementation_version: equity_multi_strategy_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
       live_eligible: false
-      human_authorized: false
-      config_authorized: false
-      authorization_id: null
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-pullback-uptrend-v1-20260805
       effective_at: "2026-07-14T00:00:00+00:00"
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
     breakout_continuation_v1:
-      strategy_name: Breakout Continuation Research
+      strategy_name: Breakout Continuation
       strategy_version: breakout_continuation_v1
-      implementation_id: breakout_continuation_shadow
-      implementation_version: shadow_v1
-      implementation_available: false
-      execution_eligible: false
-      paper_eligible: false
+      implementation_id: breakout_continuation_evaluator
+      implementation_version: equity_multi_strategy_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
       live_eligible: false
-      human_authorized: false
-      config_authorized: false
-      authorization_id: null
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-breakout-continuation-v1-20260805
       effective_at: "2026-07-14T00:00:00+00:00"
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
     time_series_trend_v1:
-      strategy_name: Time Series Trend Research
+      strategy_name: Time Series Trend
       strategy_version: time_series_trend_v1
-      implementation_id: time_series_trend_shadow
-      implementation_version: shadow_v1
-      implementation_available: false
-      execution_eligible: false
-      paper_eligible: false
+      implementation_id: time_series_trend_evaluator
+      implementation_version: equity_multi_strategy_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
       live_eligible: false
-      human_authorized: false
-      config_authorized: false
-      authorization_id: null
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-time-series-trend-v1-20260805
       effective_at: "2026-07-14T00:00:00+00:00"
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
     cross_sectional_momentum_v1:
-      strategy_name: Cross Sectional Momentum Research
+      strategy_name: Cross Sectional Momentum
       strategy_version: cross_sectional_momentum_v1
-      implementation_id: cross_sectional_momentum_shadow
-      implementation_version: shadow_v1
-      implementation_available: false
-      execution_eligible: false
-      paper_eligible: false
+      implementation_id: cross_sectional_momentum_evaluator
+      implementation_version: equity_multi_strategy_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
       live_eligible: false
-      human_authorized: false
-      config_authorized: false
-      authorization_id: null
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-cross-sectional-momentum-v1-20260805
       effective_at: "2026-07-14T00:00:00+00:00"
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
     etf_sector_rotation_v1:
-      strategy_name: ETF Sector Rotation Research
+      strategy_name: ETF Sector Rotation
       strategy_version: etf_sector_rotation_v1
-      implementation_id: etf_sector_rotation_shadow
-      implementation_version: shadow_v1
-      implementation_available: false
-      execution_eligible: false
-      paper_eligible: false
+      implementation_id: etf_sector_rotation_evaluator
+      implementation_version: equity_multi_strategy_evaluator_v1
+      implementation_available: true
+      execution_eligible: true
+      paper_eligible: true
       live_eligible: false
-      human_authorized: false
-      config_authorized: false
-      authorization_id: null
+      human_authorized: true
+      config_authorized: true
+      authorization_id: paper-etf-sector-rotation-v1-20260805
       effective_at: "2026-07-14T00:00:00+00:00"
       expires_at: "2027-07-14T00:00:00+00:00"
       suspended: false
@@ -262,7 +262,7 @@ winner_expansion:
   schema_version: phase4_2c_winner_expansion_v1
   formula_version: winner_expansion_v1_operational_paper
   position_risk_formula_version: position_open_risk_v1_operational_paper
-  require_manual_approval: true
+  require_manual_approval: false
   require_authoritative_current_stop: true
   stop_freshness_seconds: 300
   rounding_tolerance_dollars: 0.01
@@ -282,7 +282,7 @@ trend_management:
   enabled: true
   mode: operational_paper
   formula_version: trend_management_v2_final_mode_invariants
-  require_manual_approval_for_sells: true
+  require_manual_approval_for_sells: false
   stop_never_moves_down: true
   mode_policies:
     DEFENSIVE_HARVEST: {atr_multiplier: 1.50, partial_exit_fraction: 0.33}
@@ -313,10 +313,10 @@ profitability_engine:
   policy_version: strategy_policy_v2_4_validation_attribution
   schema_version: strategy_profitability_engine_v1
   primary_horizon_sessions: 20
-  minimum_shadow_oos_samples: 100
-  minimum_actual_paper_for_throttled: 20
-  minimum_actual_paper_for_active: 50
-  minimum_samples_per_regime: 10
+  minimum_shadow_oos_samples: 30
+  minimum_actual_paper_for_throttled: 8
+  minimum_actual_paper_for_active: 20
+  minimum_samples_per_regime: 5
   minimum_actual_paper_for_divergence_penalty: 20
   minimum_regimes: 2
   evidence_stale_after_days: 90
@@ -377,25 +377,38 @@ profitability_validation:
   mode: operational_paper
   formula_version: profitability_validation_v1
   schema_version: profitability_validation_authority_v1
-  minimum_samples: 50
+  minimum_samples: 30
   minimum_folds: 2
-  minimum_train_observations: 30
-  test_observations: 10
+  minimum_train_observations: 20
+  test_observations: 5
   embargo_periods: 1
   block_length: 5
   bootstrap_draws: 2000
   fdr_alpha: 0.10
-  minimum_positive_fold_ratio: 0.60
-  minimum_parameter_stability_ratio: 0.60
+  minimum_positive_fold_ratio: 0.50
+  minimum_parameter_stability_ratio: 0.50
 execution_capabilities:
   live_execution_enabled: false
-  autonomous_entries_enabled: false
-  autonomous_exits_enabled: false
+  autonomous_entries_enabled: true
+  autonomous_exits_enabled: true
   protective_paper_exit_enabled: true
 broker: alpaca
 require_power: true
 require_market_open: true
 preflight:
+  # Dynamic Universe/equity research is the only lane coupled to EODHD.
+  equity_research:
+    require_ac_power: false
+    require_internet: true
+    allow_market_closed: true
+  # Crypto research is Alpaca-backed and may run continuously, including
+  # while the US equity market is closed.
+  crypto_research:
+    require_ac_power: false
+    require_internet: true
+    require_broker: true
+    allow_market_closed: true
+  # Legacy alias retained for older local configurations.
   research_only:
     require_ac_power: false
     require_internet: true
@@ -406,11 +419,11 @@ preflight:
     require_internet: true
     require_broker: true
     require_market_open: true
-watchlist: [SPY, QQQ, DIA, IWM]
+watchlist: [AAPL, MSFT, NVDA, AMZN, META, GOOGL, AVGO, TSLA, BRK.B, JPM, V, MA, UNH, LLY, XOM, COST, WMT, HD, PG, JNJ, SPY, QQQ, DIA, IWM, XLK, XLF, XLV, XLE, XLY, XLI, XLP, XLU, XLB, XLC, XLRE, VTI, VOO, TLT, GLD]
 strategies:
   rule_based_v2:
     enabled: true
-    maximum_volatility_20d: 0.45
+    maximum_volatility_20d: 0.50
     require_ma_200: true
     stop_drawdown_pct: 0.08
 
@@ -432,7 +445,7 @@ formula_versions:
   crypto_risk: alpaca_crypto_portfolio_risk_authority_v1
   crypto_strategy: crypto_multi_strategy_point_in_time_v2_hourly_cadence
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
-  crypto_paper_execution: crypto_supervised_paper_execution_v1_manual_limit_orders
+  crypto_paper_execution: crypto_supervised_paper_execution_v1_paper_authority_limit_orders
   crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v3_fingerprinted_lifecycle
   cross_asset_allocation: cross_asset_normalized_constrained_allocator_v1
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
@@ -440,7 +453,7 @@ formula_versions:
   phase4_allocation: phase4_multi_strategy_allocation_v7_stop_risk_dollars
   strategy_registry: strategy_execution_registry_formula_v2_full_policy
 
-# Crypto supervised paper lane: continuous research and manual execution are
+# Crypto supervised paper lane: continuous research and paper execution are
 # isolated from equity proposal frequency, sizing, scanner, and execution.
 crypto:
   enabled: true
@@ -473,10 +486,10 @@ crypto:
   allow_shorting: false
   require_fresh_price: true
   max_price_age_seconds: 300
-  min_score_for_paper_watch: 70
-  min_score_for_proposal: 80
-  min_risk_reward_ratio: 1.5
-  max_spread_bps: 50
+  min_score_for_paper_watch: 55
+  min_score_for_proposal: 68
+  min_risk_reward_ratio: 1.25
+  max_spread_bps: 80
   minimum_top_of_book_notional_usd: 1000.00
   sizing_policy:
     mode: supervised_paper
@@ -499,11 +512,11 @@ crypto:
     snapshot_ttl_seconds: 60
     maximum_positions: 2
     maximum_total_portfolio_gross_exposure_pct_equity: 50.0
-    maximum_gross_exposure_pct_equity: 1.0
-    maximum_symbol_exposure_pct_equity: 0.60
-    maximum_cluster_exposure_pct_equity: 1.0
-    maximum_stop_risk_per_trade_pct_equity: 0.01
-    maximum_stop_heat_pct_equity: 0.05
+    maximum_gross_exposure_pct_equity: 5.0
+    maximum_symbol_exposure_pct_equity: 3.0
+    maximum_cluster_exposure_pct_equity: 5.0
+    maximum_stop_risk_per_trade_pct_equity: 0.05
+    maximum_stop_heat_pct_equity: 0.20
     minimum_cash_reserve_pct_equity: 20.0
     daily_account_loss_halt_pct_equity: 1.0
     weekly_account_loss_halt_pct_equity: 2.5
@@ -519,7 +532,7 @@ crypto:
     volatility_latest_bar_max_age_seconds: 7200
     require_cash_funded: true
     require_verified_loss_evidence: true
-    block_on_any_open_crypto_order: true
+    block_on_any_open_crypto_order: false
     loss_session_timezone: UTC
     correlation_clusters:
       crypto_major: [BTC/USD, ETH/USD]
@@ -536,17 +549,17 @@ crypto:
     trend_slow_hours: 72
     breakout_lookback_hours: 48
     volatility_lookback_hours: 72
-    trend_minimum_24h_return: 0.005
-    breakout_buffer_pct: 0.001
-    breakout_minimum_4h_return: 0.001
-    pullback_minimum_pct: 0.01
-    pullback_maximum_pct: 0.04
-    momentum_minimum_vol_adjusted_score: 0.01
+    trend_minimum_24h_return: 0.0025
+    breakout_buffer_pct: 0.0005
+    breakout_minimum_4h_return: 0.0005
+    pullback_minimum_pct: 0.005
+    pullback_maximum_pct: 0.06
+    momentum_minimum_vol_adjusted_score: 0.005
     maximum_annualized_volatility: 1.50
     stop_atr_multiple: 2.0
     minimum_stop_distance_pct: 0.01
     maximum_stop_distance_pct: 0.08
-    target_reward_r_multiple: 1.75
+    target_reward_r_multiple: 1.25
   proposal_policy:
     mode: research_only_preview
     formula_version: crypto_research_proposal_authority_v2_net_cost_target
@@ -557,21 +570,36 @@ crypto:
     manual_approval_enabled: false
     execution_enabled: false
   profitability_policy:
-    # No crypto candidate is executable without this many completed,
+    # The full profitability authority requires this many completed,
     # cost-adjusted observations for the selected strategy family.
-    minimum_samples: 50
+    minimum_samples: 20
+    # Before the full profitability authority has 20 closed paper
+    # observations, permit a bounded discovery sleeve using the explicit
+    # prior below.  Discovery remains paper-only and stops on negative
+    # accumulated net evidence.
+    cold_start_enabled: true
+    cold_start_trade_count: 20
+    cold_start_prior_win_probability: 0.55
+    cold_start_prior_uncertainty: 0.10
+    cold_start_prior_correlation: 0.50
+    cold_start_notional_tiers:
+      first_trade_count: 5
+      first_notional_usd: 250.00
+      second_trade_count: 10
+      second_notional_usd: 500.00
+      final_notional_usd: 1000.00
     severe_loss_threshold: -0.02
     minimum_mean_net_return: 0.0
     require_verified_correlation: true
     correlation_snapshot_max_age_seconds: 300
     outcome_horizon_hours: 72
   # Explicitly separate from the non-executable research-preview policy above.
-  # Every risk-increasing order requires an exact Telegram approval.
+  # Every order still requires fresh crypto authority and reconciliation.
   supervised_paper_lane:
     enabled: true
     paper_only: true
-    manual_approval_required: true
-    autonomous_execution: false
+    manual_approval_required: false
+    autonomous_execution: true
     live_enabled: false
     execution_enabled: true
     order_type: limit
@@ -586,7 +614,7 @@ crypto:
   limit_price_source: midpoint_or_last_with_slippage_cap
   fallback_market_orders: false
   allow_new_entries: true
-  # Adds are permitted only as manually approved supervised-paper proposals.
+  # Adds are permitted only as freshly authorized supervised-paper proposals.
   # The crypto risk authority proves current bid > broker average entry before
   # an ADD can become proposal-eligible; no autonomous add is permitted.
   allow_add_to_winner: true
@@ -604,8 +632,8 @@ crypto:
     max_cycle_age_hours: 72
   schedule:
     enabled: true
-    research_interval_minutes: 60
-    digest_interval_minutes: 240
+    research_interval_minutes: 30
+    digest_interval_minutes: 30
     quiet_hours_sgt:
       enabled: true
       start: "01:00"
@@ -621,8 +649,8 @@ market_profiles:
     execution_enabled: true
     proposals_enabled: true
     broker: alpaca
-    watchlist: [SPY, QQQ, DIA, IWM]
-    observation_watchlist: [XLK, XLF, XLV, XLE, XLY]
+    watchlist: [AAPL, MSFT, NVDA, AMZN, META, GOOGL, AVGO, TSLA, BRK.B, JPM, V, MA, UNH, LLY, XOM, COST, WMT, HD, PG, JNJ, SPY, QQQ, DIA, IWM, XLK, XLF, XLV, XLE, XLY, XLI, XLP, XLU, XLB, XLC, XLRE, VTI, VOO, TLT, GLD]
+    observation_watchlist: []
   sgx_observation:
     name: "SGX Singapore Market"
     status: observation_only
@@ -652,9 +680,11 @@ proposal_expiry_notify_on_expiry: true
 proposal_expiry_high_volatility_threshold: 0.20
 proposal_expiry_low_volatility_threshold: 0.12
 
-# Manual approval is mandatory for ordinary paper entries and exits.
-auto_execution_enabled: false
-auto_execution_mode: manual_only
+# Paper execution uses the durable autonomous authority; the manual-only
+# proposal settings below remain compatibility controls for an explicit mode
+# change and are inactive in the configured autonomous paper mode.
+auto_execution_enabled: true
+auto_execution_mode: autonomous_paper
 
 portfolio_execution_mode: risk_budgeted
 proposal_mode:
@@ -891,7 +921,7 @@ position_management:
     fallback_level_3_sell_fraction: 0.50
     minimum_notional_to_sell: 1.00
     never_sell_more_than_position: true
-    require_telegram_approval: true
+    require_telegram_approval: false
   profit_protection:
     enabled: true
     activate_at_r: 1.0
@@ -901,7 +931,7 @@ position_management:
     min_peak_profit_pct: 2.0
     protect_sell_fraction: 0.25
     exit_sell_fraction: 0.50
-    require_telegram_approval: true
+    require_telegram_approval: false
   trailing_stop:
     enabled: true
     activate_at_r: 1.0
@@ -912,7 +942,7 @@ position_management:
     fallback_trailing_pct: 1.5
     require_close_below_stop: true
     sell_fraction: 0.50
-    require_telegram_approval: true
+    require_telegram_approval: false
   time_stop:
     enabled: true
     min_hold_cycles_before_time_stop: 12
@@ -923,7 +953,7 @@ position_management:
     deteriorating_score_delta_below: -5
     proposal_enabled: true
     sell_fraction: 1.0
-    require_telegram_approval: true
+    require_telegram_approval: false
   healthy_pullback_add:
     enabled: true
     minimum_unrealized_profit_pct: 0.5
@@ -939,13 +969,13 @@ position_management:
     require_no_profit_protection_warning: true
     require_no_exit_signal: true
     require_normal_or_elevated_volatility_only: true
-    require_telegram_approval: true
+    require_telegram_approval: false
 
 telegram:
-  approval_enabled: true
+  approval_enabled: false
   proposal_expiry_minutes: 15
   allow_plain_yes_only_when_single_pending_proposal: true
-  telegram_approval_listener_enabled: true
+  telegram_approval_listener_enabled: false
   telegram_approval_poll_interval_seconds: 30
   telegram_approval_listener_mode: approval_only
   market_scan_processes_telegram_updates: false

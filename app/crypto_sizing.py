@@ -115,6 +115,10 @@ class CryptoSizingRequest:
     stop_price: Decimal | str | int | None = None
     requested_exit_quantity: Decimal | str | int | None = None
     close_entire_position: bool = False
+    # Optional strategy-side notional ceiling used by the bounded crypto
+    # discovery sleeve.  It can only reduce the independently verified risk
+    # authority; it can never widen it.
+    requested_notional_cap: Decimal | str | int | None = None
 
     def payload(self) -> dict[str, Any]:
         def value(raw: Any, label: str) -> str | None:
@@ -136,6 +140,9 @@ class CryptoSizingRequest:
                 self.requested_exit_quantity, "requested_exit_quantity"
             ),
             "close_entire_position": self.close_entire_position is True,
+            "requested_notional_cap": value(
+                self.requested_notional_cap, "requested_notional_cap"
+            ),
         }
 
 
@@ -393,6 +400,15 @@ def calculate_crypto_sizing(
 
         config_notional_cap = policy["maximum_order_notional_usd"]
         effective_notional_cap = min(config_notional_cap, authority.hard_notional_ceiling)
+        requested_notional_cap = request_payload.get("requested_notional_cap")
+        if requested_notional_cap is not None:
+            requested_cap = _decimal_input(
+                requested_notional_cap,
+                "requested_notional_cap",
+                positive=True,
+            )
+            effective_notional_cap = min(effective_notional_cap, requested_cap)
+            binding_caps.append("strategy_requested_notional_cap")
         effective_risk_cap = min(requested_risk, authority.hard_stop_risk_ceiling)
         if effective_notional_cap <= ZERO:
             blockers.append("no_authoritative_crypto_notional_capacity")

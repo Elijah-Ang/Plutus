@@ -309,7 +309,7 @@ def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp
     assert plan.execution_authorized is False
     assert plan.summary["candidate_count"] == 0
     assert plan.decisions == ()
-    assert storage.fetch_all(
+    assert not storage.fetch_all(
         "SELECT event_type FROM audit_events WHERE event_type='crypto_profitability_candidate_excluded'"
     )
     assert storage.fetch_all("SELECT COUNT(*) n FROM cross_asset_allocation_plans")[0]["n"] == 1
@@ -563,7 +563,7 @@ def test_preview_binds_strategy_risk_sizing_and_complete_display(tmp_path):
     assert D(preview.display["expected_net_reward_after_estimated_cost_usd"]) == net_reward
     assert net_reward / maximum_loss == D(preview.display["expected_reward_r"])
     assert gross_reward / maximum_loss == D(preview.display["gross_reward_r"])
-    assert D(preview.display["expected_reward_r"]) >= D("1.75")
+    assert D(preview.display["expected_reward_r"]) >= D("1.25")
     assert net_reward > 0
     assert broker.submit_calls == 0
     assert storage.fetch_all("SELECT COUNT(*) n FROM trade_proposals")[0]["n"] == 0

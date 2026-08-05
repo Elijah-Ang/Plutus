@@ -1192,13 +1192,18 @@ class AdaptiveAllocator:
         if weights_vector.sum() > 0:
             decision, reason, allocation_class = "ALLOCATE_ADAPTIVELY", "qualified strategies sized below fractional Kelly and Phase 3 risk", "adaptive"
         elif probe_weights:
-            decision, reason, allocation_class = "ALLOCATE_PROBE", "authorized PROBE strategies receive bounded manual-approved paper risk", "probe"
+            decision, reason, allocation_class = "ALLOCATE_PROBE", "authorized PROBE strategies receive bounded paper risk", "probe"
         elif exploration_weights:
-            decision, reason, allocation_class = "ALLOCATE_EXPLORATION", "authorized immature strategies receive bounded manual-approved paper exploration", "exploration"
+            decision, reason, allocation_class = "ALLOCATE_EXPLORATION", "authorized immature strategies receive bounded paper exploration", "exploration"
         else:
             decision, reason, allocation_class = "PRESERVE_CASH", "no registry-authorized strategy has allocatable risk", "unallocated"
         cash = max(0.0, 1.0 - float(weights_vector.sum()))
 
+        autonomous_paper = (
+            self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+            and (self.config.get("execution_capabilities", {}) or {}).get("autonomous_entries_enabled") is True
+        )
         strategy_policies: dict[str, dict[str, Any]] = {}
         for strategy in strategy_order:
             state = operational_states[strategy]
@@ -1206,8 +1211,8 @@ class AdaptiveAllocator:
             if strategy in probe_weights:
                 emitted = {"mode": "probe", "state": "PROBE", "stop_risk_pct": probe_weights[strategy], "portfolio_heat_cap_pct": probe_heat_cap,
                            "gross_exposure_cap_pct": float(self.cfg.get("probe_gross_exposure_pct", 2.5)), "max_active_count": int(self.cfg.get("probe_max_active_count", 1)),
-                           "minimum_setup_score": float(self.cfg.get("probe_min_setup_score", 85)), "entries_only": True, "adds_allowed": False,
-                           "autonomous_execution_allowed": False, "allocation_class": "probe"}
+                           "minimum_setup_score": float(self.cfg.get("probe_min_setup_score", 72)), "entries_only": True, "adds_allowed": False,
+                           "autonomous_execution_allowed": autonomous_paper, "allocation_class": "probe"}
             elif strategy in exploration_weights:
                 emitted = {"mode": "exploration", "state": state, "stop_risk_pct": exploration_weights[strategy], "max_stop_risk_pct": exploration_max,
                            "gross_exposure_cap_pct": float(self.cfg.get("exploration_gross_exposure_pct", 7.5)), "allocation_class": "exploration"}
@@ -1224,7 +1229,9 @@ class AdaptiveAllocator:
             emitted.update({
                 "operationally_executable": strategy in authorized_set,
                 "kelly_used": False, "kelly_diagnostic_only": True, "score_sizing_used": False,
-                "manual_approval_required": strategy in authorized_set, "evidence_version": EVIDENCE_VERSION,
+                "manual_approval_required": strategy in authorized_set and not autonomous_paper,
+                "autonomous_execution_allowed": strategy in authorized_set and autonomous_paper,
+                "evidence_version": EVIDENCE_VERSION,
                 "performance_snapshot_id": policy_value(strategy, "performance_snapshot_id"), "policy_decision_id": policy_value(strategy, "id"),
                 "quality_score": policy_value(strategy, "quality_score"), "policy_version": policy_value(strategy, "policy_version"),
                 "binding_policy_reason": operational_reasons[strategy], "policy_authoritative": policy_authoritative,

@@ -1,11 +1,10 @@
 # Crypto data and broker capability boundary
 
-This stage adds read-only, durable capability evidence for the separate Alpaca
-spot-crypto lane. The installed research settings remain
-`paper_trading_enabled: false`, `proposals_enabled: false`, and
-`live_enabled: false`. A separately reviewed `supervised_paper_lane` may use
-this evidence for manual paper orders, but it is never an equity-adapter or
-live/autonomous authority.
+This stage adds durable capability evidence for the separate Alpaca
+spot-crypto lane. The lane remains paper-only and `live_enabled: false`; its
+manual/autonomous authority is separate from the equity adapter. Every
+risk-increasing order still requires the complete capability, market, sizing,
+reservation, and final-reconciliation chain.
 
 ## Primary-source contract
 

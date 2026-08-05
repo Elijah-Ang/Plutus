@@ -19,6 +19,7 @@ from .cross_asset_allocation import (
     CrossAssetAllocationStore,
     CrossAssetCandidate,
     CrossAssetPortfolioSnapshot,
+    cold_start_source_fingerprint,
 )
 from .crypto_capabilities import CryptoCapabilityStore
 from .crypto_market_data import CryptoMarketDataStore
@@ -700,6 +701,7 @@ class CrossAssetRuntimeCoordinator:
         max_order = _decimal(sizing_cfg.get("maximum_order_notional_usd"), "crypto maximum order", positive=True)
         current_crypto_exposure = Decimal(portfolio.asset_class_exposure["crypto"])
         max_crypto_exposure = equity * _decimal(allocation_cfg.get("maximum_crypto_exposure_pct"), "cross asset crypto exposure") / HUNDRED
+        cold_start = self._crypto_cold_start_authority()
         for research in results:
             if not getattr(research, "strategy_signal_eligible", False):
                 continue
@@ -744,7 +746,8 @@ class CrossAssetRuntimeCoordinator:
                     validation_policy=policy_from_config(self.config),
                     validation_configuration=self.config,
                 )
-                if not profitability.eligible:
+                use_cold_start = cold_start is not None and not profitability.eligible
+                if not profitability.eligible and not use_cold_start:
                     self.storage.audit(
                         self.run_id,
                         "crypto_profitability_candidate_excluded",
@@ -757,6 +760,61 @@ class CrossAssetRuntimeCoordinator:
                         },
                     )
                     continue
+                if use_cold_start:
+                    prior_probability = _decimal(
+                        profitability_cfg.get("cold_start_prior_win_probability"),
+                        "crypto cold-start prior win probability",
+                        minimum=ZERO,
+                        maximum=ONE,
+                    )
+                    prior_uncertainty = _decimal(
+                        profitability_cfg.get("cold_start_prior_uncertainty"),
+                        "crypto cold-start prior uncertainty",
+                        minimum=ZERO,
+                        maximum=ONE,
+                    )
+                    prior_correlation = _decimal(
+                        profitability_cfg.get("cold_start_prior_correlation"),
+                        "crypto cold-start prior correlation",
+                        minimum=Decimal("-1"),
+                        maximum=ONE,
+                    )
+                    probability = prior_probability
+                    uncertainty = prior_uncertainty
+                    correlation = prior_correlation
+                    holding_hours = Decimal("24")
+                    source_type = "candidate_cold_start_discovery"
+                    source_id = str(strategy.id)
+                    source_fingerprint = cold_start_source_fingerprint(
+                        source_id=source_id,
+                        strategy_version=str(strategy.selected_strategy),
+                        symbol=strategy.symbol,
+                        config_hash=str(self.config.get("effective_config_hash") or ""),
+                    )
+                    discovery_cap = cold_start["notional_cap"]
+                else:
+                    probability = _decimal(
+                        profitability.win_probability,
+                        f"{market.symbol} verified win probability",
+                        positive=True,
+                    )
+                    uncertainty = _decimal(
+                        profitability.uncertainty,
+                        f"{market.symbol} verified uncertainty",
+                    )
+                    correlation = _decimal(
+                        profitability.correlation_to_portfolio,
+                        f"{market.symbol} portfolio correlation",
+                    )
+                    holding_hours = _decimal(
+                        profitability.average_holding_hours,
+                        f"{market.symbol} holding hours",
+                        positive=True,
+                    )
+                    source_type = "candidate_profitability_decision"
+                    source_id = str(profitability.decision_id)
+                    source_fingerprint = profitability.decision_fingerprint
+                    discovery_cap = max_order
                 held_position = held.get(market.symbol)
                 current_position = held_position is not None
                 action = "add" if current_position else "entry"
@@ -774,15 +832,18 @@ class CrossAssetRuntimeCoordinator:
                 loss_fraction = (entry - stop) / entry + (fee_bps * Decimal("2") + slippage_bps * Decimal("2")) / BPS
                 risk_budget = equity * _decimal(allocation_cfg.get("maximum_crypto_trade_stop_risk_pct"), "cross asset crypto trade risk") / HUNDRED
                 exposure_budget = max(ZERO, max_crypto_exposure - current_crypto_exposure)
-                proposed = min(max_order, exposure_budget if exposure_budget > ZERO else max_order, risk_budget / loss_fraction if loss_fraction > ZERO else ZERO)
+                proposed = min(
+                    max_order,
+                    discovery_cap,
+                    exposure_budget if exposure_budget > ZERO else max_order,
+                    risk_budget / loss_fraction if loss_fraction > ZERO else ZERO,
+                )
                 proposed = proposed.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                 if proposed <= ZERO:
                     continue
                 quantity = proposed / entry
                 downside = quantity * (entry - stop)
                 costs = quantity * spread_cost + proposed * (fee_bps * Decimal("2") + slippage_bps * Decimal("2")) / BPS
-                probability = _decimal(profitability.win_probability, f"{market.symbol} verified win probability", positive=True)
-                uncertainty = _decimal(profitability.uncertainty, f"{market.symbol} verified uncertainty")
                 conservative_probability = max(ZERO, probability - uncertainty)
                 expected_gross_profit = probability * quantity * (target - entry) - (ONE - probability) * downside
                 expected_net_profit = expected_gross_profit - costs
@@ -810,8 +871,8 @@ class CrossAssetRuntimeCoordinator:
                 )
                 result.append(CrossAssetCandidate(
                     candidate_id=f"crypto:{market.symbol}:{strategy.id}:{action}",
-                    source_type="candidate_profitability_decision", source_id=profitability.decision_id,
-                    source_fingerprint=profitability.decision_fingerprint, source_authoritative=True,
+                    source_type=source_type, source_id=source_id,
+                    source_fingerprint=source_fingerprint, source_authoritative=True,
                     run_id=self.run_id, asset_class="crypto", symbol=market.symbol,
                     cluster="crypto_major", strategy_version=str(strategy.selected_strategy),
                     strategy_state="ACTIVE" if strategy.lifecycle == "PAPER_ACTIVE" else "RESEARCH_ONLY",
@@ -823,7 +884,7 @@ class CrossAssetRuntimeCoordinator:
                     expected_r_per_day=_text(
                         expected_r / max(
                             Decimal("0.000000000001"),
-                            _decimal(profitability.average_holding_hours, f"{market.symbol} holding hours") / Decimal("24"),
+                            holding_hours / Decimal("24"),
                         )
                     ),
                     marginal_portfolio_contribution_r=_text(marginal),
@@ -833,12 +894,10 @@ class CrossAssetRuntimeCoordinator:
                     ),
                     uncertainty=_text(uncertainty), cost_to_gross_edge_ratio=_text(cost_ratio),
                     expected_holding_days=_text(
-                        _decimal(profitability.average_holding_hours, f"{market.symbol} holding hours") / Decimal("24")
+                        holding_hours / Decimal("24")
                     ), annualized_volatility=_text(volatility),
                     liquidity_notional=_text(liquidity),
-                    correlation_to_portfolio=_text(
-                        _decimal(profitability.correlation_to_portfolio, f"{market.symbol} portfolio correlation")
-                    ),
+                    correlation_to_portfolio=_text(correlation),
                     marginal_drawdown_r=_text(max(ZERO, (downside + costs) / equity)),
                     current_position=current_position, conflict_free=conflict_free,
                     profitability_eligible=profitability_eligible,
@@ -852,6 +911,58 @@ class CrossAssetRuntimeCoordinator:
             except Exception:
                 continue
         return result
+
+    def _crypto_cold_start_authority(self) -> dict[str, Any] | None:
+        """Return the current bounded discovery cap, or no discovery authority."""
+
+        policy = (self.config.get("crypto") or {}).get("profitability_policy") or {}
+        if policy.get("cold_start_enabled") is not True:
+            return None
+        try:
+            maximum_trades = int(policy["cold_start_trade_count"])
+            tiers = policy["cold_start_notional_tiers"]
+            first_count = int(tiers["first_trade_count"])
+            second_count = int(tiers["second_trade_count"])
+            first_cap = _decimal(tiers["first_notional_usd"], "crypto cold-start first cap", positive=True)
+            second_cap = _decimal(tiers["second_notional_usd"], "crypto cold-start second cap", positive=True)
+            final_cap = _decimal(tiers["final_notional_usd"], "crypto cold-start final cap", positive=True)
+            rows = self.storage.fetch_all(
+                """SELECT net_pnl,net_return
+                   FROM crypto_profitability_observations
+                   WHERE evidence_type='actual' AND status='completed'
+                   ORDER BY exit_timestamp,observation_id"""
+            )
+            count = len(rows)
+            accumulated = ZERO
+            for row in rows:
+                raw = row.get("net_pnl") if row.get("net_pnl") not in (None, "") else row.get("net_return")
+                accumulated += _decimal(raw, "crypto cold-start accumulated evidence")
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_cold_start_blocked",
+                {"reason": "cold-start policy or evidence is invalid", "error": type(exc).__name__},
+            )
+            return None
+        if (
+            maximum_trades <= 0
+            or not (0 < first_count < second_count < maximum_trades)
+            or count >= maximum_trades
+            or accumulated < ZERO
+        ):
+            return None
+        if count < first_count:
+            cap = first_cap
+        elif count < second_count:
+            cap = second_cap
+        else:
+            cap = final_cap
+        return {
+            "completed_trades": count,
+            "accumulated_evidence": accumulated,
+            "notional_cap": cap,
+            "maximum_trades": maximum_trades,
+        }
 
     def _crypto_correlation_snapshot(
         self,

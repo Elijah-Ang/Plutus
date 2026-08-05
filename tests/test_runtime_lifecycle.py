@@ -206,8 +206,8 @@ def test_production_startup_accepts_exact_manual_only_release_authority(
 @pytest.mark.parametrize(
     ("override", "message"),
     (
-        ({"manual_approval_only": False}, "manual-only"),
-        ({"live_capability": True}, "manual-only"),
+        ({"manual_approval_only": False}, "bounded paper-authority"),
+        ({"live_capability": True}, "bounded paper-authority"),
         ({"tests_verified": False}, "tests are not verified"),
         ({"python_version": "3.13.8"}, "Python identity"),
         ({"release_file_inventory_sha256": None}, "artifact evidence hash"),

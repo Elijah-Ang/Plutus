@@ -17,8 +17,9 @@ from zoneinfo import ZoneInfo
 from .ai_review import AIReviewer, deterministic_review
 from .adaptive_conviction import AdaptiveConvictionEngine
 from .adaptive_sizing import AdaptiveSizingEngine
+from .autonomous_authority import authorize_proposal as authorize_autonomous_proposal
 from .capabilities import AUTO_EXECUTION_SUPPORTED, require_protective_paper_exit_support
-from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active
+from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active, format_crypto_digest
 
 logger = logging.getLogger("trading_agent")
 
@@ -79,6 +80,7 @@ from .rotation_coordinator import RotationCoordinator
 from .runtime_guards import WallClockTimeout, wall_clock_timeout
 from .strategy_rule_based import evaluate_symbol
 from .strategy_rule_based import STRATEGY_VERSION
+from .shadow_strategies import evaluate_promoted_signal
 from .telegram_bot import TelegramBot
 from .utils import (
     format_proposal_message,
@@ -261,11 +263,20 @@ class TradingService:
         # following scanner pass so cross-asset allocation compares one crypto
         # evidence set with the current equity candidates.
         self._crypto_research_preloaded_for_run = False
+        # ``main.run_once`` supplies the independent crypto research
+        # preflight result.  ``None`` preserves the service's standalone
+        # behavior for callers that do not run the scanner preflight.
+        self._crypto_research_preflight_passed: bool | None = None
         self._cross_asset_plan: Any | None = None
         self._auto_block_audited = False
         self.listener_started_at = time.time()
         if self.storage is not None:
             self._recover_local_workflows()
+
+    def set_crypto_research_preflight(self, passed: bool) -> None:
+        """Gate the crypto research call made from the scanner path."""
+
+        self._crypto_research_preflight_passed = bool(passed)
 
     def _recover_local_workflows(self) -> dict[str, int]:
         """Idempotently surface unfinished local work without submitting orders."""
@@ -3347,7 +3358,12 @@ class TradingService:
             )
             self.storage.audit(self.run_id, "emergency_exit_auto_timeout_suppressed", {
                 "symbol": symbol, "proposal_id": proposal_id,
-                "reason": "manual approval is mandatory for every paper order",
+                "reason": (
+                    "autonomous paper authority was unavailable before the emergency "
+                    "timeout; no paper order was submitted"
+                    if self._autonomous_paper_enabled()
+                    else "manual approval is mandatory for every paper order"
+                ),
             })
 
         stale_timed = self.storage.fetch_all(
@@ -3776,7 +3792,7 @@ class TradingService:
             bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
             clock = self.broker.get_clock()
             strategy_config = {
-                "maximum_volatility_20d": 0.45,
+                "maximum_volatility_20d": 0.50,
                 "stop_drawdown_pct": 0.08,
                 **((self.config.get("strategies", {}) or {}).get(strategy, {}) or {}),
             }
@@ -5236,8 +5252,8 @@ class TradingService:
                 f"No order placed for {prop_symbol}. The Alpaca paper broker was "
                 "unavailable before final quote validation; no broker request was "
                 "attempted. Restore paper-broker connectivity, wait for fresh "
-                "spread-valid data, then create a new proposal and obtain a new "
-                "manual approval."
+                "spread-valid data, then create a new proposal with current "
+                "paper authority."
             )
             self.storage.audit(
                 self.run_id,
@@ -5396,7 +5412,7 @@ class TradingService:
                     block_reason = (
                         f"No order placed for {prop_symbol}. Final validation did not "
                         "produce a valid fresh Alpaca quote; no broker request was "
-                        "attempted. A new proposal and new manual approval are "
+                        "attempted. A new proposal with current paper authority is "
                         "required."
                     )
                 elif refreshed_price_age_seconds is None or refreshed_price_age_seconds > max_price_age or refreshed_price_age_seconds < -5:
@@ -5780,6 +5796,11 @@ class TradingService:
             proposal["notional"] = float(proposal.get("qty") or 0.0) * reference
         proposal.pop("stop_risk_dollars", None)
         context["execution_path"] = proposal.get("execution_path")
+        authority_source_type = (
+            "emergency"
+            if row.get("emergency_exit_triggered") == 1
+            else str(proposal.get("approval_source_type") or row.get("approval_source_type") or "proposal")
+        )
         result = Executor(
             self.broker,
             self._risk_engine(row.get("id"), "final"),
@@ -5790,7 +5811,7 @@ class TradingService:
         ).execute(
             proposal,
             context,
-            source_type="emergency" if row.get("emergency_exit_triggered") == 1 else "proposal",
+            source_type=authority_source_type,
             approval_id=approval_id,
         )
         if proposal.get("action") == "add" and proposal.get("pyramiding_milestone_key"):
@@ -5960,14 +5981,184 @@ class TradingService:
             self.telegram.send_message(f"⚠️ Approved, but no order was placed for {prop_symbol}. Reason: {result.reason}.")
         return False, "blocked", result.reason
 
+    def _autonomous_paper_enabled(self) -> bool:
+        return bool(
+            self.config.get("mode") == "paper"
+            and self.config.get("live_enabled") is False
+            and self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+        )
+
     def _should_auto_execute(self, proposal: dict[str, Any]) -> bool:
-        # Quarantined: YAML cannot enable this unsupported capability.
-        requested = self.config.get("auto_execution_enabled", False) or self.config.get("auto_execution_mode") != "manual_only"
-        if requested and not self._auto_block_audited:
-            self.storage.audit(self.run_id, "auto_execution_blocked", {"reason": "unsupported capability"})
-            self._auto_block_audited = True
-        assert AUTO_EXECUTION_SUPPORTED is False
-        return False
+        requested = self._autonomous_paper_enabled()
+        if requested and not AUTO_EXECUTION_SUPPORTED:
+            if not self._auto_block_audited:
+                self.storage.audit(self.run_id, "auto_execution_blocked", {"reason": "unsupported capability"})
+                self._auto_block_audited = True
+            return False
+        return requested
+
+    def _execute_autonomous_proposal(self, proposal: dict[str, Any]) -> None:
+        """Execute one already-authorized paper proposal through final controls."""
+        proposal_id = str(proposal.get("id") or proposal.get("proposal_id") or "")
+        if not proposal_id:
+            return
+        rows = self.storage.fetch_all("SELECT * FROM trade_proposals WHERE id=?", (proposal_id,))
+        if not rows:
+            return
+        row = dict(rows[0])
+        if str(row.get("status") or "") != "pending":
+            return
+
+        def notify(message: str) -> None:
+            """Report an outcome without changing the durable order outcome."""
+
+            if self.telegram is None:
+                self.storage.audit(
+                    self.run_id,
+                    "autonomous_paper_notification_deferred",
+                    {"proposal_id": proposal_id, "reason": "Telegram client is unavailable"},
+                )
+                return
+            try:
+                self.telegram.send_message(message)
+            except Exception as exc:
+                # A notification failure must not turn an already-submitted
+                # paper order into a false execution failure or invite a retry.
+                self.storage.audit(
+                    self.run_id,
+                    "autonomous_paper_notification_failed",
+                    {"proposal_id": proposal_id, "error_type": type(exc).__name__},
+                )
+
+        try:
+            authority = authorize_autonomous_proposal(self.storage, proposal_id, run_id=self.run_id)
+            approval_id = str(authority["approval_id"])
+            # The authority helper persists the autonomous source and execution
+            # path into the immutable proposal payload.  Reload that exact row
+            # before final validation so a proposal created by an older worker
+            # cannot be interpreted as an ordinary/manual order in memory.
+            refreshed_rows = self.storage.fetch_all(
+                "SELECT * FROM trade_proposals WHERE id=?",
+                (proposal_id,),
+            )
+            if len(refreshed_rows) != 1:
+                raise RuntimeError("autonomous proposal disappeared after authority binding")
+            row = dict(refreshed_rows[0])
+            workflow_store = ApprovalWorkflowStore(self.storage)
+            workflow = workflow_store.get_by_approval(approval_id)
+            if workflow is None:
+                raise RuntimeError("autonomous approval workflow is unavailable")
+            if workflow["state"] == ApprovalWorkflowState.TARGET_RESOLVED.value:
+                workflow_store.transition(
+                    workflow["id"],
+                    ApprovalWorkflowState.VALIDATING,
+                    expected_state=ApprovalWorkflowState.TARGET_RESOLVED,
+                    safe_detail="autonomous final local validation started",
+                )
+            elif workflow["state"] != ApprovalWorkflowState.VALIDATING.value:
+                # Recovery can re-enter this method after the first worker has
+                # already created an intent or submitted it.  Do not replay it.
+                if workflow["state"] in {
+                    ApprovalWorkflowState.SUBMITTED.value,
+                    ApprovalWorkflowState.UNKNOWN.value,
+                    ApprovalWorkflowState.TERMINAL.value,
+                }:
+                    return
+                raise RuntimeError("autonomous approval workflow is not validating")
+
+            hydrated = _hydrate_proposal_row(row)
+            is_add = str(hydrated.get("action") or "").lower() == "add" or bool(hydrated.get("is_add"))
+            result, refreshed_price, _refreshed_at, refreshed_at, refreshed_age, price_move = self._execute_final_revalidation(
+                row,
+                hydrated,
+                str(row.get("symbol") or ""),
+                str(row.get("side") or "").lower(),
+                is_add,
+                approval_id,
+            )
+            final_started_at = iso_now()
+            self.storage.execute(
+                """UPDATE approvals SET final_revalidation_started_at=COALESCE(final_revalidation_started_at,?),
+                   final_revalidation_completed_at=?,price_refreshed_at=?,refreshed_price=?,
+                   refreshed_price_age_seconds=?,price_move_bps_since_proposal=?,
+                   final_order_decision=?,final_block_reason=?,acknowledgement_status=?
+                   WHERE id=?""",
+                (
+                    final_started_at,
+                    iso_now(),
+                    refreshed_at,
+                    refreshed_price,
+                    refreshed_age,
+                    price_move,
+                    "submitted" if result.submitted else ("unknown" if result.status == "unknown" else "blocked"),
+                    None if result.submitted else result.reason,
+                    "submitted" if result.submitted else ("unknown" if result.status == "unknown" else "blocked"),
+                    approval_id,
+                ),
+            )
+            self._persist_approval_directional_validation(approval_id, hydrated)
+            if result.intent_id:
+                self.storage.link_executed_order_records(result.intent_id)
+                self.storage.upsert_actual_trade_outcome_for_order(result.intent_id)
+
+            workflow = workflow_store.get(workflow["id"])
+            if result.submitted:
+                if workflow["state"] == ApprovalWorkflowState.INTENT_CREATED.value:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_PENDING)
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
+                elif workflow["state"] == ApprovalWorkflowState.SUBMISSION_PENDING.value:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMISSION_STARTED)
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
+                elif workflow["state"] == ApprovalWorkflowState.SUBMISSION_STARTED.value:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.SUBMITTED)
+                self.storage.execute("UPDATE trade_proposals SET status='submitted' WHERE id=?", (proposal_id,))
+                self._mark_position_management_proposal_handled(hydrated, "submitted")
+                price_used = refreshed_price or hydrated.get("latest_price") or 0.0
+                if str(row.get("side") or "").lower() == "buy":
+                    notify(
+                        f"Paper order submitted: Buy ${float(hydrated.get('notional') or row.get('notional') or 0.0):.2f} of {row.get('symbol')}."
+                    )
+                else:
+                    notify(
+                        f"Paper order submitted: Sell {float(hydrated.get('qty') or 0.0):.4f} shares of {row.get('symbol')} at about ${float(price_used):.2f}."
+                    )
+                if str(row.get("side") or "").lower() == "buy":
+                    self._supersede_equivalent_pending_buys(hydrated)
+            else:
+                current_state = ApprovalWorkflowState(workflow["state"])
+                if result.status == "unknown" and current_state in {
+                    ApprovalWorkflowState.INTENT_CREATED,
+                    ApprovalWorkflowState.SUBMISSION_PENDING,
+                    ApprovalWorkflowState.SUBMISSION_STARTED,
+                }:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.UNKNOWN, safe_detail=result.reason)
+                elif result.status != "unknown" and current_state in {
+                    ApprovalWorkflowState.VALIDATING,
+                    ApprovalWorkflowState.APPROVED_PENDING_INTENT,
+                }:
+                    workflow_store.transition(workflow["id"], ApprovalWorkflowState.BLOCKED, validation_status="blocked", safe_detail=result.reason)
+                self.storage.execute("UPDATE trade_proposals SET status=? WHERE id=?", ("unknown" if result.status == "unknown" else "blocked", proposal_id))
+                self._mark_position_management_proposal_handled(hydrated, "unknown" if result.status == "unknown" else "blocked")
+                if result.status == "unknown":
+                    notify(
+                        f"Paper order status is ambiguous for {row.get('symbol')}: {result.reason or 'broker status could not be verified'}. Reconciliation is required; no retry was issued."
+                    )
+                else:
+                    notify(f"No order placed for {row.get('symbol')}: {result.reason or 'final controls blocked the paper order'}.")
+        except Exception as exc:
+            logger.warning("autonomous paper execution failed closed: %s", type(exc).__name__)
+            self.storage.audit(
+                self.run_id,
+                "autonomous_paper_execution_blocked",
+                {"proposal_id": proposal_id, "error_type": type(exc).__name__},
+            )
+            try:
+                self.storage.execute("UPDATE trade_proposals SET status='blocked' WHERE id=? AND status='pending'", (proposal_id,))
+                notify(f"No order placed for {row.get('symbol')}: autonomous paper controls were unavailable.")
+            except Exception:
+                pass
 
     def calculate_emergency_exit_risk_score(
         self,
@@ -6058,7 +6249,7 @@ class TradingService:
         vol_points = 0
         if vol_20 is None:
             vol_points = 0
-        elif vol_20 > 0.45:
+        elif vol_20 > 0.50:
             vol_points = 10
         elif vol_20 > 0.35:
             vol_points = 7
@@ -6239,6 +6430,17 @@ class TradingService:
             (proposal["id"],),
         )
         approval_id = approval_rows[0]["id"] if approval_rows else None
+        if approval_id is None and self._autonomous_paper_enabled():
+            try:
+                approval_id = str(
+                    authorize_autonomous_proposal(
+                        self.storage,
+                        str(proposal["id"]),
+                        run_id=self.run_id,
+                    )["approval_id"]
+                )
+            except Exception as exc:
+                return False, f"autonomous paper authority unavailable: {type(exc).__name__}"
         if approval_id is None:
             return False, "manual approval is required before every protective paper exit"
         executable = {
@@ -6515,10 +6717,10 @@ class TradingService:
         vol_20 = signal.indicators.get("volatility_20")
         if vol_20 is None:
             score_vol, regime, gate = 0.0, "missing", "fail-safe HOLD"
-        elif float(vol_20) > 0.45:
+        elif float(vol_20) >= 0.50:
             score_vol, regime, gate = 0.0, "extreme", "blocked"
         elif float(vol_20) > 0.35:
-            score_vol, regime, gate = 5.0, "high", "watch only"
+            score_vol, regime, gate = 5.0, "high", "eligible"
         elif float(vol_20) >= 0.25:
             score_vol, regime, gate = 10.0, "elevated", "eligible"
         elif float(vol_20) >= 0.08:
@@ -6611,7 +6813,7 @@ class TradingService:
         vol_20 = indicators.get("volatility_20")
         if vol_20 is None:
             vol_regime = "missing"
-        elif vol_20 > 0.45:
+        elif vol_20 > 0.50:
             vol_regime = "extreme"
         elif vol_20 > 0.35:
             vol_regime = "high"
@@ -6648,7 +6850,7 @@ class TradingService:
         orders = self.broker.get_open_orders()
         market_open = self.broker.is_market_open()
         strategy_config = {
-            "maximum_volatility_20d": 0.45,
+            "maximum_volatility_20d": 0.50,
             "stop_drawdown_pct": 0.08,
             **((self.config.get("strategies", {}) or {}).get(STRATEGY_VERSION, {}) or {}),
         }
@@ -6717,10 +6919,26 @@ class TradingService:
             pos_symbols = [str(_value(p, "symbol", "")).upper() for p in positions if _value(p, "symbol")]
             all_symbols = list(dict.fromkeys(active_watchlist + obs_watchlist + pos_symbols))
 
+            # Fetch one point-in-time bar set per symbol before evaluating the
+            # cross-sectional and sector sleeves.  The same cache is consumed
+            # by the runtime signal and the immutable shadow writer, so a
+            # promoted strategy cannot rank against a different data slice.
+            bar_cache: dict[str, pd.DataFrame] = {}
+            for cache_symbol in all_symbols:
+                try:
+                    bar_cache[cache_symbol] = normalize_bars(
+                        self.broker.get_historical_bars(cache_symbol, "1Day", 250),
+                        cache_symbol,
+                    )
+                except Exception:
+                    bar_cache[cache_symbol] = pd.DataFrame()
+
             spy_ret_20d = None
             if "SPY" in all_symbols or any(p.get("watchlist") and "SPY" in p.get("watchlist") for p in profiles.values()):
                 try:
-                    spy_bars = normalize_bars(self.broker.get_historical_bars("SPY", "1Day", 50), "SPY")
+                    spy_bars = bar_cache.get("SPY")
+                    if spy_bars is None or len(spy_bars) < 20:
+                        spy_bars = normalize_bars(self.broker.get_historical_bars("SPY", "1Day", 50), "SPY")
                     if not spy_bars.empty and len(spy_bars) >= 20:
                         spy_ret_20d = float(spy_bars["close"].iloc[-1] / spy_bars["close"].iloc[-20]) - 1.0
                 except Exception:
@@ -6737,7 +6955,7 @@ class TradingService:
                     price = 0.0
                     price_at = now
 
-                bars = normalize_bars(self.broker.get_historical_bars(symbol, "1Day", 250), symbol)
+                bars = bar_cache.get(symbol, pd.DataFrame())
                 volume = float(bars.iloc[-1]["volume"]) if not bars.empty else 0.0
 
                 self.storage.execute(
@@ -6791,16 +7009,32 @@ class TradingService:
                             "error": str(e)
                         })
 
-                signal = evaluate_symbol(
-                    symbol,
-                    bars,
-                    has_position,
-                    has_order,
-                    market_open,
-                    strategy_config["maximum_volatility_20d"],
-                    strategy_config["stop_drawdown_pct"],
-                    position_drawdown_pct=position_drawdown_pct
-                )
+                if self._autonomous_paper_enabled():
+                    signal = evaluate_promoted_signal(
+                        symbol,
+                        bars,
+                        peer_bars=bar_cache,
+                        fallback_evaluator=evaluate_symbol,
+                        has_position=has_position,
+                        has_open_order=has_order,
+                        market_open=market_open,
+                        maximum_volatility_20d=strategy_config["maximum_volatility_20d"],
+                        position_drawdown_pct=position_drawdown_pct,
+                    )
+                else:
+                    # Keep the compatibility/manual lane on the canonical
+                    # evaluator. Promoted strategies are an explicit
+                    # autonomous-paper capability, not an implicit change to
+                    # legacy/manual proposal semantics or test doubles.
+                    signal = evaluate_symbol(
+                        symbol,
+                        bars,
+                        has_position=has_position,
+                        has_open_order=has_order,
+                        market_open=market_open,
+                        maximum_volatility_20d=strategy_config["maximum_volatility_20d"],
+                        position_drawdown_pct=position_drawdown_pct,
+                    )
 
                 # Make sure exits only happen with real position
                 if signal.action == "EXIT" and not has_position:
@@ -7721,6 +7955,7 @@ class TradingService:
                 (self.config.get("rotation", {}) or {}).get("enabled")
                 and exit_candidates_exist
                 and buy_candidates
+                and not self._autonomous_paper_enabled()
             )
 
             # Sort profile_results: EXITS first, then BUYS, then HOLDS
@@ -8493,7 +8728,7 @@ class TradingService:
                                         else:
                                             proposal["status"] = "pending"
                                             proposal["emergency_exit_final_decision"] = emergency_exit_final_decision
-                                        if emergency_exit_mode != "blocked":
+                                        if emergency_exit_mode != "blocked" and not self._autonomous_paper_enabled():
                                             self.telegram.send_message(
                                                 f"🚨 [EMERGENCY EXIT ALERT] Paper sell proposal created for {symbol} ({qty_held} shares). Risk score: {emergency_exit_score:.1f}. Reason: {emergency_exit_trigger_reason}.\n\n"
                                                 f"Reply YES to approve or NO to reject. Final validation is still required before any paper order."
@@ -8580,6 +8815,14 @@ class TradingService:
                         "risk_formula_version": res.get("risk_formula_version"),
                         "sleeve_notional_ceiling": res.get("sleeve_notional_ceiling"),
                     })
+                    if self._autonomous_paper_enabled() and proposal.get("status", "pending") == "pending":
+                        autonomous_emergency = int(emergency_exit_triggered or 0) == 1
+                        proposal.update({
+                            "approval_source_type": "emergency" if autonomous_emergency else "autonomous_system",
+                            "execution_path": "protective_paper_exit" if autonomous_emergency else "autonomous_paper_order",
+                            "autonomous_entry_requested": bool(is_buy and not autonomous_emergency),
+                            "autonomous_exit_requested": bool(is_exit),
+                        })
 
                 res["proposal_allowed"] = proposal_allowed
                 res["proposal_generated"] = proposal_generated
@@ -8797,7 +9040,9 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
 
-                if rotation_candidate_available and is_buy and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
+                if self._autonomous_paper_enabled() and proposal.get("status", "pending") == "pending":
+                    self._execute_autonomous_proposal(proposal)
+                elif rotation_candidate_available and is_buy and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
                     # The grouped message is the sole approval surface for the
                     # displayed contingent BUY.
                     pass
@@ -8934,6 +9179,75 @@ class TradingService:
             + f"\nPortfolio rationale: {allocation.get('reason') or 'bounded by Phase 3 risk and allocation constraints'}."
         )
 
+    def _crypto_digest_text(self) -> str | None:
+        """Return the latest crypto evidence in the shared digest vocabulary."""
+
+        if self._last_crypto_research_results:
+            return format_crypto_digest(list(self._last_crypto_research_results))
+        rows = self.storage.fetch_all(
+            "SELECT symbol,score FROM crypto_observation_state ORDER BY symbol"
+        )
+        if not rows:
+            return None
+        scores = ", ".join(
+            f"{row['symbol']} {float(row.get('score') or 0):.0f}"
+            for row in rows[:2]
+        )
+        lane = str((self.config.get("crypto") or {}).get("mode") or "research_only")
+        if lane == "supervised_paper":
+            suffix = "Paper lane. Orders require fresh risk, market, broker, and reconciliation checks."
+        else:
+            suffix = "Research-only. No proposals/orders."
+        return f"Crypto research: {scores}. {suffix}"
+
+    def _send_standalone_crypto_digest(self, now: datetime, *, prefix: str = "") -> bool:
+        """Send a crypto-only 30-minute digest when the equity digest is absent."""
+
+        crypto_cfg = self.config.get("crypto") or {}
+        schedule = crypto_cfg.get("schedule") or {}
+        if not crypto_cfg.get("enabled", False) or crypto_quiet_hours_active(self.config, now):
+            return False
+        text = self._crypto_digest_text()
+        if not text:
+            return False
+        last = self.storage.get_control_state("crypto_last_digest_at")
+        interval = float(schedule.get("digest_interval_minutes", 30) or 30)
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=UTC)
+                if (now - last_dt.astimezone(UTC)).total_seconds() < max(0.0, interval - 2.0) * 60.0:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        message = f"{prefix}{text}" if prefix else text
+        try:
+            self.telegram.send_message(message)
+        except Exception as exc:
+            self.storage.audit(
+                self.run_id,
+                "crypto_digest_send_failed",
+                {"error": type(exc).__name__, "standalone": True},
+            )
+            return False
+        self.storage.set_control_state(
+            "crypto_last_digest_at",
+            now.isoformat(),
+            "system",
+            "crypto_digest",
+            "",
+            None,
+            None,
+            None,
+        )
+        self.storage.audit(
+            self.run_id,
+            "crypto_digest_sent",
+            {"standalone": True, "prefix": prefix, "interval_minutes": interval},
+        )
+        return True
+
     def check_and_send_digest(self) -> None:
         digest_config = self.config.get("digest", {})
         if not digest_config.get("telegram_digest_enabled", True):
@@ -8949,6 +9263,7 @@ class TradingService:
             market_open = False
 
         if not market_open and not digest_config.get("telegram_digest_send_when_market_closed", False):
+            self._send_standalone_crypto_digest(now, prefix="Stocks closed. ")
             self.storage.audit(self.run_id, "digest_blocked_reason", {"reason": "market_closed"})
             return
 
@@ -9325,7 +9640,12 @@ class TradingService:
             if policy is not None:
                 strategy_policy_line = f"{policy.state} (quality {policy.quality_score:.2f})"
                 if policy.state == "PROBE":
-                    strategy_policy_line += "; entry-only, no adds, manual approval, controlled probe limits"
+                    authority_label = (
+                        "autonomous paper authority"
+                        if self._autonomous_paper_enabled()
+                        else "manual approval"
+                    )
+                    strategy_policy_line += f"; entry-only, no adds, {authority_label}, controlled probe limits"
         except Exception:
             strategy_policy_line = "unavailable or invalid; new entries fail closed"
         adaptive_conviction_line = None
@@ -9356,16 +9676,7 @@ class TradingService:
             adaptive_conviction_line = f"{adaptive_conviction_line}; {sizing_line}" if adaptive_conviction_line else sizing_line
         crypto_research_line = None
         if self.config.get("crypto", {}).get("enabled", False) and not crypto_quiet_hours_active(self.config, now):
-            crypto_rows = self.storage.fetch_all(
-                """
-                SELECT symbol, score
-                FROM crypto_observation_state
-                ORDER BY symbol
-                """
-            )
-            if crypto_rows:
-                crypto_scores = ", ".join(f"{row['symbol']} {float(row['score'] or 0):.0f}" for row in crypto_rows[:2])
-                crypto_research_line = f"Crypto research: {crypto_scores}. Research-only. No proposals/orders."
+            crypto_research_line = self._crypto_digest_text()
 
         digest_data = {
             "market_open_status": "Open" if market_open else "Closed",
@@ -9411,6 +9722,17 @@ class TradingService:
         try:
             self.telegram.send_message(message_text)
             status = "sent"
+            if crypto_research_line:
+                self.storage.set_control_state(
+                    "crypto_last_digest_at",
+                    now.isoformat(),
+                    "system",
+                    "shared_digest",
+                    "",
+                    None,
+                    None,
+                    None,
+                )
         except Exception as e:
             status = "error"
             self.storage.audit(self.run_id, "digest_send_failed", {"error": type(e).__name__})
@@ -9726,7 +10048,10 @@ class TradingService:
             healthy, report = controller.reconciliation_health()
             self.storage.audit(self.run_id, "phase3_active_risk_cycle", {
                 "profile": "adaptive_operational_paper_risk_v2", "reconciliation_healthy": healthy,
-                "strategy_states": states, "integrity": report, "manual_approval_required": True,
+                "strategy_states": states,
+                "integrity": report,
+                "manual_approval_required": not self._autonomous_paper_enabled(),
+                "autonomous_execution_enabled": self._autonomous_paper_enabled(),
             })
         if self.config.get("phase4", {}).get("active"):
             from .phase4_allocator import AdaptiveAllocator
@@ -9780,7 +10105,9 @@ class TradingService:
                 "binding_caps": self._phase4_allocation_cache.get("binding_caps", {}),
                 "evidence_versions": self._phase4_allocation_cache.get("evidence_versions", {}),
                 "strategy_states": {key: value.state for key, value in self._phase4_allocation_cache.get("estimates", {}).items()},
-                "manual_approval_required": True, "phase3_limits_authoritative": True,
+                "manual_approval_required": not self._autonomous_paper_enabled(),
+                "autonomous_execution_enabled": self._autonomous_paper_enabled(),
+                "phase3_limits_authoritative": True,
             })
         # Reconciliation has refreshed account/position state; force the next
         # proposal/final context to retrieve an authoritative fresh snapshot.
@@ -11377,7 +11704,9 @@ class TradingService:
                 "score_used_for_sizing": False, "kelly_used": False, "kelly_diagnostic_only": phase3_context.get("phase4_mode") == "adaptive",
                 "phase4_mode": phase3_context.get("phase4_mode"), "sizing_caps": sizing_caps,
                 "binding_caps": binding_caps, "pending_exposure_unknown": bool(pending.get("unknown")),
-                "manual_approval_required": True, "formula_version": PHASE3_DECISION_VERSION,
+                "manual_approval_required": not self._autonomous_paper_enabled(),
+                "autonomous_execution_enabled": self._autonomous_paper_enabled(),
+                "formula_version": PHASE3_DECISION_VERSION,
                 "evidence_version": EVIDENCE_VERSION, "config_hash": self.config.get("effective_config_hash"),
                 "strategy_version": strategy_version,
                 "performance_snapshot_id": phase3_context.get("policy").performance_snapshot_id if phase3_context.get("policy") else None,
@@ -12024,6 +12353,8 @@ class TradingService:
 
     def _ranked_batch_mode_enabled(self) -> bool:
         return (
+            not self._autonomous_paper_enabled()
+            and
             self.config.get("portfolio_execution_mode") == "risk_budgeted"
             and self.config.get("proposal_mode", {}).get("type") == "ranked_batch"
         )
@@ -13272,6 +13603,11 @@ class TradingService:
             return None
 
     def _run_crypto_research_due(self, *, preload: bool = False) -> list[Any]:
+        if self._crypto_research_preflight_passed is False:
+            self._crypto_research_engine = None
+            self._last_crypto_research_results = []
+            self._crypto_research_preloaded_for_run = False
+            return []
         if not preload and self._crypto_research_preloaded_for_run:
             self._crypto_research_preloaded_for_run = False
             return list(self._last_crypto_research_results)
@@ -13287,11 +13623,13 @@ class TradingService:
                 self.broker,
                 self.telegram,
                 self.run_id,
+                control_providers=self._crypto_paper_control_providers(),
             )
             self._crypto_research_engine = engine
             results = engine.run_due(
                 datetime.now(UTC),
                 defer_entry_proposals=True,
+                send_digest=False,
             )
             self._last_crypto_research_results = results
             self._crypto_research_preloaded_for_run = bool(preload)

@@ -29,6 +29,7 @@ APP_IMPORTING_SCRIPTS = (
     "test_fake_paper_proposal.py",
     "test_paper_order_proposal.py",
     "test_paper_sell_proposal.py",
+    "verify_release_artifact.py",
 )
 
 HELP_ENTRYPOINTS = (

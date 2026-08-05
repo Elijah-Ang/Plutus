@@ -62,6 +62,7 @@ from app.formula_versions import (  # noqa: E402
 )
 from app.storage import Storage  # noqa: E402
 from app.utils import load_config  # noqa: E402
+from app.runtime_guard import config_paper_authority_mode  # noqa: E402
 
 REQUIRED_CI_JOBS = frozenset({"offline-tests"})
 RELEASE_FORMULA_VERSIONS = {
@@ -459,12 +460,10 @@ def build_report(*, run_tests: bool, check_remote: bool, repository: str | None 
         "auto_execution_enabled": config.get("auto_execution_enabled"),
         "auto_execution_mode": config.get("auto_execution_mode"),
         "live_capability": (config.get("execution_capabilities") or {}).get("live_execution_enabled"),
+        "paper_authority_mode": config_paper_authority_mode(config),
     }
     paper_only = (
-        paper_identity["mode"] == "paper"
-        and paper_identity["live_enabled"] is False
-        and paper_identity["auto_execution_enabled"] is False
-        and paper_identity["auto_execution_mode"] == "manual_only"
+        paper_identity["paper_authority_mode"] in {"manual_only", "autonomous_paper"}
         and paper_identity["live_capability"] is False
     )
     with tempfile.TemporaryDirectory(prefix="plutus-release-schema-") as temporary:
