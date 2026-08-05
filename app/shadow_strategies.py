@@ -135,6 +135,155 @@ def _features(bars: pd.DataFrame) -> dict[str, float] | None:
     return values if all(math.isfinite(v) for v in values.values()) else None
 
 
+def evaluate_promoted_signal(
+    symbol: str,
+    bars: pd.DataFrame,
+    *,
+    peer_bars: Mapping[str, pd.DataFrame] | None = None,
+    fallback_evaluator: Any | None = None,
+    has_position: bool = False,
+    has_open_order: bool = False,
+    market_open: bool = True,
+    maximum_volatility_20d: float = 0.50,
+    position_drawdown_pct: float = 0.0,
+) -> Any:
+    """Evaluate the five reviewed equity strategies for paper execution.
+
+    The calculations are the same deterministic feature definitions used by
+    the shadow engine.  This function only returns a signal; proposal, sizing,
+    profitability, authority, reservation, and broker controls remain in the
+    normal service path.
+    """
+
+    from .strategy_rule_based import Signal, evaluate_symbol
+
+    fallback = fallback_evaluator or evaluate_symbol
+
+    if has_position:
+        # Existing position exits remain owned by the canonical position and
+        # emergency management path.  The promoted strategies add entry
+        # discovery without changing protective-exit semantics.
+        return fallback(
+            symbol,
+            bars,
+            has_position=True,
+            has_open_order=has_open_order,
+            market_open=market_open,
+            maximum_volatility_20d=maximum_volatility_20d,
+            position_drawdown_pct=position_drawdown_pct,
+        )
+
+    current_symbol = str(symbol).upper()
+    feature_rows: dict[str, dict[str, float]] = {}
+    source = dict(peer_bars or {})
+    source.setdefault(current_symbol, bars)
+    for raw_symbol, raw_bars in source.items():
+        features = _features(raw_bars)
+        if features is not None:
+            feature_rows[str(raw_symbol).upper()] = features
+    current = feature_rows.get(current_symbol)
+    if current is None:
+        return fallback(
+            symbol,
+            bars,
+            has_position=False,
+            has_open_order=has_open_order,
+            market_open=market_open,
+            maximum_volatility_20d=maximum_volatility_20d,
+        )
+
+    momentum_order = sorted(
+        feature_rows,
+        key=lambda item: feature_rows[item]["return_120d"],
+        reverse=True,
+    )
+    momentum_rank = {item: index + 1 for index, item in enumerate(momentum_order)}
+    sector_symbols = sorted(set(feature_rows) & SECTOR_ETFS)
+    sector_order = sorted(
+        sector_symbols,
+        key=lambda item: (
+            feature_rows[item]["return_60d"],
+            feature_rows[item]["return_20d"],
+        ),
+        reverse=True,
+    )
+    sector_rank = {item: index + 1 for index, item in enumerate(sector_order)}
+
+    definitions: list[tuple[str, bool, float]] = [
+        (
+            "cross_sectional_momentum",
+            momentum_rank[current_symbol] <= max(1, math.ceil(len(feature_rows) * 0.20)),
+            current["return_120d"] * 100.0,
+        ),
+        (
+            "time_series_trend",
+            current["close"] > current["ma_50"] > current["ma_200"]
+            and current["return_120d"] > 0,
+            current["return_120d"] * 100.0,
+        ),
+        (
+            "pullback_uptrend",
+            current["close"] > current["ma_200"]
+            and current["ma_50"] > current["ma_200"]
+            and -0.08 <= current["drawdown_20d_high"] <= -0.02,
+            -current["drawdown_20d_high"] * 100.0,
+        ),
+        (
+            "breakout_continuation",
+            current["close"] > current["prior_20d_high"]
+            and current["return_60d"] > 0
+            and current["volume_ratio_20d"] >= 1.0,
+            current["return_60d"] * 100.0 + current["volume_ratio_20d"],
+        ),
+    ]
+    if current_symbol in sector_rank:
+        definitions.append(
+            (
+                "etf_sector_rotation",
+                sector_rank[current_symbol] <= min(3, len(sector_rank)),
+                current["return_60d"] * 100.0,
+            )
+        )
+
+    volatility = current["volatility_20d"]
+    if volatility > maximum_volatility_20d:
+        return Signal(
+            "HOLD",
+            None,
+            symbol,
+            "extreme volatility; blocked",
+            0.0,
+            {**current, "volatility_20": volatility},
+        )
+    active = [item for item in definitions if item[1]]
+    if not active:
+        return fallback(
+            symbol,
+            bars,
+            has_position=False,
+            has_open_order=has_open_order,
+            market_open=market_open,
+            maximum_volatility_20d=maximum_volatility_20d,
+        )
+    active.sort(key=lambda item: (-item[2], item[0]))
+    sleeve, _, score = active[0]
+    version = STRATEGY_VERSIONS[sleeve]
+    confidence = 0.70
+    if volatility > 0.35:
+        confidence *= 0.70
+    elif volatility >= 0.25:
+        confidence *= 0.85
+    indicators = {**current, "volatility_20": volatility, "promoted_strategy": sleeve}
+    reason = f"{sleeve} setup passed; volatility {volatility:.3f}"
+    if has_open_order:
+        reason += "; existing order blocks duplicate entry"
+    if not market_open:
+        reason += "; market closed"
+    action = "ENTRY" if market_open and not has_open_order else "HOLD"
+    side = "buy" if action == "ENTRY" else None
+    return Signal(action, side, symbol, reason, confidence, indicators, strategy_version=version)
+
+
 class ShadowStrategyEngine:
     """Pure research writer: intentionally has no proposal/risk/approval/broker interfaces."""
 

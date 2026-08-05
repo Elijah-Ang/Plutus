@@ -257,7 +257,7 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
             failures.append("pullback_policy_invalid")
         if not (ZERO < decimals["minimum_stop_distance_pct"] <= decimals["maximum_stop_distance_pct"] <= Decimal("0.25")):
             failures.append("strategy_stop_policy_invalid")
-        if decimals["target_reward_r_multiple"] < Decimal("1.5"):
+        if decimals["target_reward_r_multiple"] < Decimal("1.25"):
             failures.append("strategy_reward_multiple_below_floor")
     if failures:
         raise CryptoStrategyError("invalid crypto strategy policy: " + ", ".join(sorted(set(failures))))

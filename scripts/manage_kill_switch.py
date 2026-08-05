@@ -19,6 +19,7 @@ from app.utils import (  # noqa: E402
     load_config,
     set_kill_switch,
 )
+from app.runtime_guard import paper_authority_mode  # noqa: E402
 
 
 RESUME_CONFIRMATION = "CONFIRM PAPER RESUME"
@@ -35,12 +36,12 @@ def _require_paper_manual_runtime(manifest: dict) -> None:
     config = load_config()
     if (
         manifest.get("mode") != "paper"
-        or manifest.get("manual_approval_only") is not True
+        or paper_authority_mode(manifest) is None
         or manifest.get("live_capability") is not False
         or config.get("mode") != "paper"
         or config.get("live_enabled") is not False
     ):
-        raise RuntimeError("kill-switch management requires paper/manual-only authority")
+        raise RuntimeError("kill-switch management requires bounded paper authority")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,7 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         "release_id": str(manifest.get("release_id") or ""),
         "release_commit": str(manifest.get("release_commit") or ""),
         "paper_only": True,
-        "manual_approval_only": True,
+        "paper_authority_mode": paper_authority_mode(manifest),
+        "manual_approval_only": manifest.get("manual_approval_only") is True,
     }
     print(json.dumps(result, sort_keys=True))
     return 0

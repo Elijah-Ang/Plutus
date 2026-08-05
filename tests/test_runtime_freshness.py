@@ -428,7 +428,7 @@ def test_runtime_pointer_and_manifest_authority_fail_closed(tmp_path) -> None:
         _manifest(manual_approval_only=False),
     )
     report = _evaluate(paths)
-    assert "manual approval" in report["components"]["runtime_authority"]["error"]
+    assert "paper authority" in report["components"]["runtime_authority"]["error"]
 
 
 def test_runtime_pointer_release_directory_must_match_manifest_id(tmp_path) -> None:

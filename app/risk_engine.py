@@ -61,6 +61,18 @@ class RiskEngine:
         checks: list[RiskCheck] = []
         is_entry = str(proposal.get("action", "entry")) in {"entry", "add"}
         is_add = str(proposal.get("action", "entry")) == "add" or bool(proposal.get("is_add", False))
+        autonomous_mode = (
+            self.config.get("mode") == "paper"
+            and self.config.get("live_enabled") is False
+            and self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+        )
+        telegram_required = context.get("telegram_required")
+        if telegram_required is None:
+            telegram_required = not (
+                autonomous_mode
+                and str(proposal.get("approval_source_type") or "") == "autonomous_system"
+            )
 
         def check(name: str, passed: bool, reason: str) -> None:
             item = RiskCheck(name, bool(passed), reason)
@@ -74,13 +86,21 @@ class RiskEngine:
         check("internet", context.get("internet_available") is True, "internet must be available")
         check("database", context.get("database_writable") is True, "database must be writable")
         check("broker", context.get("broker_available") is True, "broker must be reachable")
-        check("telegram", not is_entry or context.get("telegram_available") is True, "Telegram must be configured for entry execution")
+        check("telegram", not is_entry or telegram_required is False or context.get("telegram_available") is True, "Telegram must be configured for manual entry execution")
         check("market_open", context.get("market_open") is True, "market must be open")
         check("live_execution_capability", mode == "paper" and self.config.get("live_enabled") is False, "live execution is disabled")
         if final and context.get("autonomous_entry_requested") is True and is_entry:
-            check("autonomous_entry_capability", False, "ordinary autonomous entries are disabled")
+            check(
+                "autonomous_entry_capability",
+                autonomous_mode and (self.config.get("execution_capabilities", {}) or {}).get("autonomous_entries_enabled") is True,
+                "ordinary autonomous entries require the explicit autonomous paper capability",
+            )
         if final and context.get("autonomous_exit_requested") is True and not is_entry:
-            check("autonomous_exit_capability", False, "ordinary autonomous exits are disabled")
+            check(
+                "autonomous_exit_capability",
+                autonomous_mode and (self.config.get("execution_capabilities", {}) or {}).get("autonomous_exits_enabled") is True,
+                "ordinary autonomous exits require the explicit autonomous paper capability",
+            )
 
         price = proposal.get("latest_price")
         check("valid_price", isinstance(price, (int, float)) and price > 0, "latest price must be positive")
@@ -431,8 +451,8 @@ class RiskEngine:
             "current strategy execution registry authorization required",
         )
         if is_entry and proposal.get("phase4_mode") == "exploration":
-            check("phase4_exploration_manual_approval", not final or context.get("approval_valid") is True,
-                  "Phase 4 exploration requires explicit manual approval")
+            check("phase4_exploration_authority", not final or context.get("approval_valid") is True,
+                  "Phase 4 exploration requires a valid durable paper authority")
             check("phase4_exploration_score_sizing", proposal.get("score_multiplier", 1.0) == 1.0,
                   "Phase 4 exploration cannot use score-based sizing")
         if is_entry and (proposal.get("phase4_mode") == "probe" or proposal.get("strategy_state") == "PROBE"):
@@ -442,13 +462,18 @@ class RiskEngine:
             check("phase4_probe_policy_version", proposal.get("strategy_policy_version") == STRATEGY_POLICY_VERSION, "PROBE requires the current strategy policy version")
             check("phase4_probe_entry_only", not is_add and str(proposal.get("action", "entry")) == "entry", "PROBE permits new entries only; adds are blocked")
             score = proposal.get("score")
-            check("phase4_probe_setup_score", isinstance(score, (int, float)) and float(score) >= float(phase4.get("probe_min_setup_score", 85)), "PROBE setup trade score must be at least 85")
+            check("phase4_probe_setup_score", isinstance(score, (int, float)) and float(score) >= float(phase4.get("probe_min_setup_score", 72)), "PROBE setup trade score is below the configured minimum")
             check("phase4_probe_score_sizing", proposal.get("score_multiplier", 1.0) == 1.0, "PROBE cannot use score-based sizing")
-            check("phase4_probe_manual_only", phase4.get("require_manual_approval") is True and self.config.get("auto_execution_enabled", False) is False, "PROBE requires manual Telegram approval and cannot execute autonomously")
-            check("phase4_probe_manual_approval", not final or context.get("approval_valid") is True, "PROBE requires explicit manual Telegram approval")
-            check("phase4_probe_active_count", isinstance(context.get("probe_projected_count"), int) and int(context["probe_projected_count"]) <= int(phase4.get("probe_max_active_count", 1)), "PROBE active position or reserved-intent limit")
-            check("phase4_probe_heat", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_stop_risk"), (int, float)) and float(context["probe_projected_stop_risk"]) <= float(equity) * float(phase4.get("probe_portfolio_heat_pct", 0.10)) / 100.0 + 1e-9, "PROBE portfolio heat cap")
-            check("phase4_probe_gross", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_gross_notional"), (int, float)) and float(context["probe_projected_gross_notional"]) <= float(equity) * float(phase4.get("probe_gross_exposure_pct", 2.5)) / 100.0 + 1e-9, "PROBE gross exposure cap")
+            check(
+                "phase4_probe_authority_mode",
+                (not autonomous_mode and phase4.get("require_manual_approval") is True)
+                or (autonomous_mode and phase4.get("require_manual_approval") is False),
+                "PROBE authority mode must match the configured paper execution path",
+            )
+            check("phase4_probe_approval", not final or context.get("approval_valid") is True, "PROBE requires a valid durable paper authority")
+            check("phase4_probe_active_count", isinstance(context.get("probe_projected_count"), int) and int(context["probe_projected_count"]) <= int(phase4.get("probe_max_active_count", 3)), "PROBE active position or reserved-intent limit")
+            check("phase4_probe_heat", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_stop_risk"), (int, float)) and float(context["probe_projected_stop_risk"]) <= float(equity) * float(phase4.get("probe_portfolio_heat_pct", 0.25)) / 100.0 + 1e-9, "PROBE portfolio heat cap")
+            check("phase4_probe_gross", isinstance(equity, (int, float)) and float(equity) > 0 and isinstance(context.get("probe_projected_gross_notional"), (int, float)) and float(context["probe_projected_gross_notional"]) <= float(equity) * float(phase4.get("probe_gross_exposure_pct", 7.5)) / 100.0 + 1e-9, "PROBE gross exposure cap")
             adv = proposal.get("average_dollar_volume")
             minimum_adv = float((self.config.get("phase3", {}).get("risk_profile", {}) or {}).get("minimum_average_dollar_volume", 10_000_000.0))
             check("phase4_probe_liquidity", isinstance(adv, (int, float)) and float(adv) >= minimum_adv, "PROBE requires the existing Phase 3 liquidity floor")

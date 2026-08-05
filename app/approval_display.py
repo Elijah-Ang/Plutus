@@ -50,8 +50,15 @@ def display_envelope(
         proposal.get("approval_source_type") or payload.get("approval_source_type")
         or ("emergency" if emergency_triggered else "proposal")
     )
-    execution_path = "protective_paper_exit" if source_type == "emergency" else str(
-        proposal.get("execution_path") or payload.get("execution_path") or "manual_paper_order"
+    default_execution_path = (
+        "protective_paper_exit"
+        if source_type == "emergency"
+        else "autonomous_paper_order"
+        if source_type == "autonomous_system"
+        else "manual_paper_order"
+    )
+    execution_path = default_execution_path if source_type == "emergency" else str(
+        proposal.get("execution_path") or payload.get("execution_path") or default_execution_path
     )
     request_basis = proposal.get("request_basis") or payload.get("request_basis")
     if request_basis not in {"quantity", "notional"}:
@@ -327,7 +334,13 @@ def validate_consumed_display_authority(
         effective_source = "proposal"
     if approved_source != effective_source or str(approval["approval_source_type"] or "") != approved_source:
         raise RuntimeError("execution source does not match the approved path")
-    expected_path = "protective_paper_exit" if approved_source == "emergency" else "manual_paper_order"
+    expected_path = (
+        "protective_paper_exit"
+        if approved_source == "emergency"
+        else "autonomous_paper_order"
+        if approved_source == "autonomous_system"
+        else "manual_paper_order"
+    )
     if str(envelope.get("execution_path") or "") != expected_path or str(approval["execution_path"] or "") != expected_path:
         raise RuntimeError("execution path does not match the displayed authority")
     if approved_source != "emergency" and any(

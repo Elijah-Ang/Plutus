@@ -35,7 +35,10 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ASSET_CLASSES = frozenset({"equity", "etf", "crypto"})
 EXECUTION_LANES = frozenset({"operational_paper", "research_only", "supervised_paper"})
 ACTIONS = frozenset({"entry", "add", "rotation_entry"})
-SOURCE_TYPES = frozenset({"candidate_profitability_decision"})
+SOURCE_TYPES = frozenset({
+    "candidate_profitability_decision",
+    "candidate_cold_start_discovery",
+})
 CRYPTO_EXPLORATION_ALLOWED_REJECTION_REASONS = frozenset(
     {
         "crypto_profitability_minimum_samples_not_met",
@@ -214,6 +217,26 @@ def _hash(value: Any, name: str) -> str:
     if not SHA256.fullmatch(result):
         raise CrossAssetAllocationError(f"{name} must be a SHA-256 digest")
     return result
+
+
+def cold_start_source_fingerprint(
+    *,
+    source_id: str,
+    strategy_version: str,
+    symbol: str,
+    config_hash: str,
+) -> str:
+    """Fingerprint the explicitly bounded pre-profitability crypto sleeve."""
+
+    return _fingerprint(
+        {
+            "source_type": "candidate_cold_start_discovery",
+            "source_id": str(source_id),
+            "strategy_version": str(strategy_version),
+            "symbol": str(symbol).upper(),
+            "config_hash": str(config_hash).lower(),
+        }
+    )
 
 
 def _decimal(
@@ -437,9 +460,12 @@ class CrossAssetCandidate:
         source_type = _required_text(self.source_type, "source_type")
         if source_type not in SOURCE_TYPES:
             raise CrossAssetAllocationError("source_type is unsupported")
-        if asset_class == "crypto" and source_type != "candidate_profitability_decision":
+        if asset_class == "crypto" and source_type not in {
+            "candidate_profitability_decision",
+            "candidate_cold_start_discovery",
+        }:
             raise CrossAssetAllocationError(
-                "crypto candidates require a persisted profitability decision"
+                "crypto candidates require a persisted profitability or bounded cold-start authority"
             )
         canonical = {
             "candidate_id": _required_text(self.candidate_id, "candidate_id"),
@@ -824,11 +850,11 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
     if (
         config.get("mode") != "paper"
         or config.get("live_enabled") is not False
-        or config.get("auto_execution_enabled") is not False
-        or config.get("auto_execution_mode") != "manual_only"
+        or config.get("auto_execution_enabled") not in {True, False}
+        or config.get("auto_execution_mode") not in {"manual_only", "autonomous_paper"}
     ):
         raise CrossAssetAllocationError(
-            "cross-asset allocation requires paper/manual-only capability controls"
+            "cross-asset allocation requires explicit paper authority controls"
         )
     crypto = config.get("crypto") or {}
     crypto_research = (
@@ -842,8 +868,10 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         and crypto.get("paper_trading_enabled") is True
         and crypto.get("proposals_enabled") is True
         and (crypto.get("supervised_paper_lane") or {}).get("enabled") is True
-        and (crypto.get("supervised_paper_lane") or {}).get("manual_approval_required") is True
-        and (crypto.get("supervised_paper_lane") or {}).get("autonomous_execution") is False
+        and (
+            (crypto.get("supervised_paper_lane") or {}).get("manual_approval_required") is True
+            or (crypto.get("supervised_paper_lane") or {}).get("autonomous_execution") is True
+        )
         and (crypto.get("supervised_paper_lane") or {}).get("live_enabled") is False
     )
     if not (crypto_research or crypto_supervised):
@@ -876,12 +904,12 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         "maximum_symbol_exposure_pct": (Decimal("0.01"), Decimal("6")),
         "maximum_cluster_exposure_pct": (Decimal("0.01"), Decimal("15")),
         "maximum_equity_exposure_pct": (Decimal("0.01"), Decimal("50")),
-        "maximum_crypto_exposure_pct": (Decimal("0.01"), Decimal("1")),
+        "maximum_crypto_exposure_pct": (Decimal("0.01"), Decimal("5")),
         "maximum_strategy_stop_heat_pct": (Decimal("0.01"), Decimal("0.6125")),
         "maximum_exploration_stop_heat_pct": (Decimal("0.01"), Decimal("0.10")),
-        "maximum_crypto_stop_heat_pct": (Decimal("0.01"), Decimal("0.05")),
+        "maximum_crypto_stop_heat_pct": (Decimal("0.01"), Decimal("0.20")),
         "maximum_equity_trade_stop_risk_pct": (Decimal("0.01"), Decimal("0.35")),
-        "maximum_crypto_trade_stop_risk_pct": (Decimal("0.001"), Decimal("0.01")),
+        "maximum_crypto_trade_stop_risk_pct": (Decimal("0.001"), Decimal("0.05")),
         "maximum_equity_annualized_volatility": (Decimal("0.01"), Decimal("0.45")),
         "maximum_crypto_annualized_volatility": (Decimal("0.01"), Decimal("1.50")),
         "minimum_cash_reserve_pct": (Decimal("20"), HUNDRED),
@@ -1425,7 +1453,8 @@ def optimize_cross_asset_allocation(
                 "binding_constraints": list(binding),
                 "rejection_reasons": sorted(set(reasons)),
                 "order_authority": False,
-                "manual_approval_required": row["asset_class"] == "crypto" and row["execution_lane"] == "supervised_paper",
+                "manual_approval_required": row["asset_class"] == "crypto" and row["execution_lane"] == "supervised_paper" and (config.get("crypto") or {}).get("supervised_paper_lane", {}).get("manual_approval_required") is True,
+                "autonomous_execution": row["asset_class"] == "crypto" and row["execution_lane"] == "supervised_paper" and (config.get("crypto") or {}).get("supervised_paper_lane", {}).get("autonomous_execution") is True,
             }
         )
 
@@ -1625,8 +1654,67 @@ class CrossAssetAllocationStore:
         current_hash = _hash(self.config.get("effective_config_hash"), "effective_config_hash")
         allocation_policy = _policy(self.config)
         for candidate in candidates:
+            if candidate.source_type == "candidate_cold_start_discovery":
+                if candidate.asset_class != "crypto":
+                    raise CrossAssetAllocationError(
+                        "cold-start discovery authority is reserved for crypto"
+                    )
+                from .crypto_strategies import CryptoStrategyStore
+
+                strategy = CryptoStrategyStore(self.storage).load_verified(
+                    candidate.source_id,
+                    self.config,
+                )
+                if (
+                    strategy.id != candidate.source_id
+                    or str(strategy.selected_strategy) != str(candidate.strategy_version)
+                    or str(strategy.symbol).upper() != str(candidate.symbol).upper()
+                    or str(strategy.lifecycle) != "PAPER_ACTIVE"
+                    or candidate.source_fingerprint
+                    != cold_start_source_fingerprint(
+                        source_id=strategy.id,
+                        strategy_version=strategy.selected_strategy,
+                        symbol=strategy.symbol,
+                        config_hash=current_hash,
+                    )
+                ):
+                    raise CrossAssetAllocationError(
+                        "crypto cold-start strategy authority is not current"
+                    )
+                policy = (self.config.get("crypto") or {}).get("profitability_policy") or {}
+                if policy.get("cold_start_enabled") is not True:
+                    raise CrossAssetAllocationError("crypto cold-start authority is disabled")
+                try:
+                    count = int(
+                        self.storage.fetch_all(
+                            """SELECT COUNT(*) AS count
+                               FROM crypto_profitability_observations
+                               WHERE evidence_type='actual' AND status='completed'"""
+                        )[0]["count"]
+                    )
+                    rows = self.storage.fetch_all(
+                        """SELECT net_pnl,net_return
+                           FROM crypto_profitability_observations
+                           WHERE evidence_type='actual' AND status='completed'"""
+                    )
+                    accumulated = ZERO
+                    for row in rows:
+                        raw = row.get("net_pnl") if row.get("net_pnl") not in (None, "") else row.get("net_return")
+                        accumulated += _decimal(raw, "crypto cold-start accumulated evidence")
+                    maximum = int(policy.get("cold_start_trade_count"))
+                except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                    raise CrossAssetAllocationError(
+                        "crypto cold-start evidence is unavailable"
+                    ) from exc
+                if count >= maximum or accumulated < ZERO:
+                    raise CrossAssetAllocationError(
+                        "crypto cold-start evidence no longer authorizes discovery"
+                    )
+                continue
             if candidate.source_type != "candidate_profitability_decision":
-                raise CrossAssetAllocationError("candidate source type is not a persisted profitability decision")
+                raise CrossAssetAllocationError(
+                    "candidate source type is not a supported crypto/equity authority"
+                )
             if candidate.asset_class == "crypto":
                 decision = crypto_store.load_verified(candidate.source_id)
                 identity_valid = (

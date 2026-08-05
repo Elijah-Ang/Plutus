@@ -23,6 +23,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from app.run_lock import LockInspection, inspect_lock  # noqa: E402
+from app.runtime_guard import paper_authority_mode  # noqa: E402
 
 
 DEFAULT_STATE_ROOT = Path.home() / "Library" / "Application Support" / "TradingAgent"
@@ -181,8 +182,8 @@ def _load_runtime_authority(runtime_link: Path) -> tuple[Path, dict[str, Any]]:
         raise FreshnessError("release manifest commit is malformed")
     if manifest.get("mode") != "paper":
         raise FreshnessError("active release is not paper-only")
-    if manifest.get("manual_approval_only") is not True:
-        raise FreshnessError("active release does not require manual approval")
+    if paper_authority_mode(manifest) is None:
+        raise FreshnessError("active release paper authority is missing or unbounded")
     if manifest.get("live_capability") is not False:
         raise FreshnessError("active release permits live capability")
     if manifest.get("tests_verified") is not True:

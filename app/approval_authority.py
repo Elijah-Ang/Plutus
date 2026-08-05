@@ -1,4 +1,4 @@
-"""Canonical immutable terms bound to a durable manual approval."""
+"""Canonical immutable terms bound to a durable paper authority."""
 
 from __future__ import annotations
 

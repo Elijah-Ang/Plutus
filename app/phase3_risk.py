@@ -18,7 +18,14 @@ from .utils import iso_now, json_dumps
 
 PHASE3_SCHEMA_VERSION = "phase3_adaptive_operational_paper_risk_v2"
 PROFILE_VERSION = "adaptive_operational_paper_risk_v2"
-AVAILABLE_STRATEGY_IMPLEMENTATIONS = {"rule_based_v2_evaluator": "rule_based_evaluator_v1"}
+AVAILABLE_STRATEGY_IMPLEMENTATIONS = {
+    "rule_based_v2_evaluator": "rule_based_evaluator_v1",
+    "pullback_uptrend_evaluator": "equity_multi_strategy_evaluator_v1",
+    "breakout_continuation_evaluator": "equity_multi_strategy_evaluator_v1",
+    "time_series_trend_evaluator": "equity_multi_strategy_evaluator_v1",
+    "cross_sectional_momentum_evaluator": "equity_multi_strategy_evaluator_v1",
+    "etf_sector_rotation_evaluator": "equity_multi_strategy_evaluator_v1",
+}
 
 
 @dataclass(frozen=True)

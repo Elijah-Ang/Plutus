@@ -341,9 +341,10 @@ def test_telegram_proposal_formats_expiry_and_volatility():
     assert "Decision time: 20 minutes" in msg_low
     assert f"Expires: {expiry_sgt}" in msg_low
 
-def test_auto_execution_disabled_by_default(temp_storage):
+def test_autonomous_paper_execution_is_enabled_by_default(temp_storage):
     config = load_config()
-    assert config.get("auto_execution_enabled") is False
+    assert config.get("auto_execution_enabled") is True
+    assert config.get("auto_execution_mode") == "autonomous_paper"
     
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
@@ -356,7 +357,7 @@ def test_auto_execution_disabled_by_default(temp_storage):
         "classification": "Strong",
         "reason": "Test"
     }
-    assert service._should_auto_execute(proposal) is False
+    assert service._should_auto_execute(proposal) is True
 
 def test_live_auto_execution_hard_blocked(temp_storage):
     config = load_config()

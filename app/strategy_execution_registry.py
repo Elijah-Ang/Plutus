@@ -330,8 +330,11 @@ def _registry_config_from_raw_inputs(raw_inputs: Mapping[str, Any]) -> dict[str,
         "mode": raw_inputs.get("runtime_mode"),
         "live_enabled": raw_inputs.get("live_enabled"),
         "auto_execution_enabled": raw_inputs.get("auto_execution_enabled"),
+        "auto_execution_mode": raw_inputs.get("auto_execution_mode"),
         "execution_capabilities": {
-            "live_execution_enabled": raw_inputs.get("live_execution_capability")
+            "live_execution_enabled": raw_inputs.get("live_execution_capability"),
+            "autonomous_entries_enabled": raw_inputs.get("autonomous_entries_capability"),
+            "autonomous_exits_enabled": raw_inputs.get("autonomous_exits_capability"),
         },
         "strategy_execution_registry": dict(registry),
     }
@@ -591,8 +594,19 @@ class StrategyExecutionRegistry:
         capabilities = self.config.get("execution_capabilities", {})
         if not isinstance(capabilities, Mapping) or capabilities.get("live_execution_enabled") is not False:
             reasons.append("live_execution_capability_not_disabled")
-        if self.config.get("auto_execution_enabled", False) is not False:
-            reasons.append("autonomous_execution_not_disabled")
+        auto_enabled = self.config.get("auto_execution_enabled", False)
+        auto_mode = self.config.get("auto_execution_mode", "manual_only")
+        if not (
+            (auto_enabled is False and auto_mode == "manual_only")
+            or (auto_enabled is True and auto_mode == "autonomous_paper")
+        ):
+            reasons.append("paper_authority_mode_invalid")
+        capabilities = self.config.get("execution_capabilities", {}) or {}
+        if auto_enabled is True and (
+            capabilities.get("autonomous_entries_enabled") is not True
+            or capabilities.get("autonomous_exits_enabled") is not True
+        ):
+            reasons.append("autonomous_paper_capabilities_missing")
         configuration_version = self.config.get("configuration_schema_version")
         required_configuration_version = self.registry.get("required_configuration_version")
         if not configuration_version:
@@ -657,8 +671,19 @@ class StrategyExecutionRegistry:
             "runtime_mode": self.config.get("mode"),
             "live_enabled": self.config.get("live_enabled"),
             "auto_execution_enabled": self.config.get("auto_execution_enabled", False),
+            "auto_execution_mode": self.config.get("auto_execution_mode", "manual_only"),
             "live_execution_capability": (
                 self.config.get("execution_capabilities", {}).get("live_execution_enabled")
+                if isinstance(self.config.get("execution_capabilities"), Mapping)
+                else None
+            ),
+            "autonomous_entries_capability": (
+                self.config.get("execution_capabilities", {}).get("autonomous_entries_enabled")
+                if isinstance(self.config.get("execution_capabilities"), Mapping)
+                else None
+            ),
+            "autonomous_exits_capability": (
+                self.config.get("execution_capabilities", {}).get("autonomous_exits_enabled")
                 if isinstance(self.config.get("execution_capabilities"), Mapping)
                 else None
             ),
@@ -722,7 +747,11 @@ class StrategyExecutionRegistry:
             reasons.append("paper_execution_eligibility_missing")
         if entry.get("live_eligible") is not False:
             reasons.append("live_execution_eligibility_forbidden")
-        if entry.get("human_authorized") is not True:
+        autonomous_paper = (
+            self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+        )
+        if entry.get("human_authorized") is not True and not autonomous_paper:
             reasons.append("human_authorization_missing")
         if entry.get("config_authorized") is not True:
             reasons.append("configuration_authorization_missing")

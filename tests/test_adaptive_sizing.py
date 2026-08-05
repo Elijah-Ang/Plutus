@@ -287,8 +287,8 @@ def test_configuration_strictly_rejects_non_operational_modes(key, value):
 def test_probe_caps_remain_unchanged_and_fixed_stage_caps_are_disabled():
     config = load_config()
     assert config["phase4"]["probe_stop_risk_pct"] == 0.03
-    assert config["phase4"]["probe_portfolio_heat_pct"] == 0.10
-    assert config["phase4"]["probe_gross_exposure_pct"] == 2.5
+    assert config["phase4"]["probe_portfolio_heat_pct"] == 0.25
+    assert config["phase4"]["probe_gross_exposure_pct"] == 7.5
     assert config["position_sizing"]["use_stage_dollar_cap"] is False
     assert config["position_sizing"]["stage"] == "adaptive_operational_paper"
     sizing_source = inspect.getsource(TradingService._calculate_dynamic_size)

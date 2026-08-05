@@ -123,7 +123,12 @@ def _risk_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     cfg = config.get("crypto") or {}
     policy = cfg.get("risk_policy") or {}
     failures: list[str] = []
-    lane_enabled = (cfg.get("supervised_paper_lane") or {}).get("enabled") is True
+    lane = cfg.get("supervised_paper_lane") or {}
+    lane_enabled = lane.get("enabled") is True
+    lane_manual = lane.get("manual_approval_required") is True
+    lane_autonomous = lane.get("autonomous_execution") is True
+    if (lane_manual, lane_autonomous) not in {(True, False), (False, True)}:
+        failures.append("crypto_paper_lane_authority_mode_invalid")
     if policy.get("mode") not in {"research_only", "supervised_paper"}:
         failures.append("risk_policy_mode_invalid")
     if policy.get("mode") == "supervised_paper" and not lane_enabled:
@@ -175,13 +180,12 @@ def _risk_policy(config: Mapping[str, Any]) -> dict[str, Any]:
             integers[name] = value
         except (TypeError, ValueError):
             failures.append(f"invalid_{name}")
-    required_true = (
-        "require_cash_funded", "require_verified_loss_evidence",
-        "block_on_any_open_crypto_order",
-    )
+    required_true = ("require_cash_funded", "require_verified_loss_evidence")
     for name in required_true:
         if policy.get(name) is not True:
             failures.append(f"{name}_must_be_true")
+    if policy.get("block_on_any_open_crypto_order") not in {True, False}:
+        failures.append("block_on_any_open_crypto_order_must_be_boolean")
     if str(policy.get("loss_session_timezone") or "") != "UTC":
         failures.append("loss_session_timezone_must_be_utc")
     clusters = policy.get("correlation_clusters") or {}
@@ -217,6 +221,17 @@ def _risk_policy(config: Mapping[str, Any]) -> dict[str, Any]:
             < decimals.get("volatility_halt_annualized", ZERO)
         ):
             failures.append("crypto_volatility_thresholds_are_invalid")
+        hard_ceilings = {
+            "maximum_total_portfolio_gross_exposure_pct_equity": Decimal("50"),
+            "maximum_gross_exposure_pct_equity": Decimal("5"),
+            "maximum_symbol_exposure_pct_equity": Decimal("3"),
+            "maximum_cluster_exposure_pct_equity": Decimal("5"),
+            "maximum_stop_risk_per_trade_pct_equity": Decimal("0.05"),
+            "maximum_stop_heat_pct_equity": Decimal("0.20"),
+        }
+        for name, ceiling in hard_ceilings.items():
+            if decimals.get(name, ZERO) > ceiling:
+                failures.append(f"{name}_exceeds_code_ceiling")
     if failures:
         raise CryptoRiskError("invalid crypto risk policy: " + ", ".join(sorted(set(failures))))
     return {**policy, **decimals, **integers}
@@ -783,6 +798,33 @@ def _aggregate(
     symbol_active_buy_intent_count = len(
         [item for item in (durable.get("intents") or ()) if item.get("symbol") == symbol and item.get("side") == "buy"]
     )
+    # Broker snapshots and durable crypto intents can describe the same
+    # unresolved order.  Count stable identities once, while retaining the
+    # symbol set so the one-order-per-symbol rule cannot be bypassed by a
+    # duplicate broker/durable representation.
+    active_crypto_order_keys: set[str] = set()
+    active_crypto_order_symbols: dict[str, str] = {}
+    for index, order in enumerate(orders):
+        if not order.get("is_crypto"):
+            continue
+        key = str(order.get("client_order_id") or order.get("broker_order_id") or f"broker:{index}")
+        order_symbol = str(order.get("symbol") or "")
+        active_crypto_order_keys.add(key)
+        active_crypto_order_symbols[key] = order_symbol
+    for index, intent in enumerate(durable.get("intents") or ()):
+        if intent.get("asset_class") != "crypto":
+            continue
+        key = str(intent.get("client_order_id") or f"intent:{intent.get('intent_id') or index}")
+        active_crypto_order_keys.add(key)
+        active_crypto_order_symbols.setdefault(key, str(intent.get("symbol") or ""))
+    active_crypto_symbols = {
+        active_crypto_order_symbols[key]
+        for key in active_crypto_order_keys
+        if active_crypto_order_symbols.get(key)
+    }
+    symbol_active_crypto_order_count = sum(
+        1 for key in active_crypto_order_keys if active_crypto_order_symbols.get(key) == symbol
+    )
     return {
         "all_position_gross": all_gross,
         "crypto_position_gross": crypto_gross,
@@ -795,10 +837,13 @@ def _aggregate(
         "pending_symbol_sell_quantity": pending_sell,
         "pending_crypto_stop_risk": pending_stop_risk,
         "crypto_position_count": len([item for item in crypto_positions if _decimal(item["quantity"], "position quantity") > ZERO]),
-        "open_crypto_order_count": len([item for item in orders if item.get("is_crypto")]),
+        "open_crypto_order_count": len(active_crypto_order_keys),
         "active_crypto_intent_count": len(durable.get("intents") or ()),
         "symbol_open_buy_order_count": symbol_open_buy_count,
         "symbol_active_buy_intent_count": symbol_active_buy_intent_count,
+        "active_crypto_order_count": len(active_crypto_order_keys),
+        "active_crypto_symbol_count": len(active_crypto_symbols),
+        "symbol_active_crypto_order_count": symbol_active_crypto_order_count,
     }
 
 
@@ -914,9 +959,13 @@ def _derive(
             profitable_winner = False
         if not profitable_winner:
             hard_notional = ZERO
-    if side == "buy" and policy.get("block_on_any_open_crypto_order") is True and int(aggregate["open_crypto_order_count"]) > 0:
+    maximum_active_orders = int(policy.get("maximum_positions", 2))
+    if side == "buy" and (
+        int(aggregate["active_crypto_order_count"]) >= maximum_active_orders
+        or int(aggregate["symbol_active_crypto_order_count"]) > 0
+    ):
         hard_notional = ZERO
-    if side == "buy" and int(aggregate["active_crypto_intent_count"]) > 0:
+    if side == "sell" and int(aggregate["symbol_active_crypto_order_count"]) > 0:
         hard_notional = ZERO
     stop_capacities = {
         "per_trade_stop_risk": equity * policy["maximum_stop_risk_per_trade_pct_equity"] / PERCENT * throttle,
@@ -933,8 +982,8 @@ def _derive(
         {"name": "weekly_crypto_loss", "passed": side == "sell" or weekly_crypto < equity * policy["weekly_crypto_loss_halt_pct_equity"] / PERCENT, "reason": "weekly crypto loss halts risk increases but not a validated reduction"},
         {"name": "drawdown", "passed": side == "sell" or drawdown < policy["drawdown_halt_pct_equity"], "reason": "account drawdown halts risk increases but not a validated reduction"},
         {"name": "volatility", "passed": side == "sell" or volatility_value < policy["volatility_halt_annualized"], "reason": "extreme crypto volatility halts risk increases but not a validated reduction"},
-        {"name": "open_crypto_orders", "passed": (int(aggregate["open_crypto_order_count"]) == 0 if side == "buy" else int(aggregate["symbol_open_buy_order_count"]) == 0), "reason": "crypto order conflicts must be absent; pending SELL quantity is reserved exactly"},
-        {"name": "durable_crypto_intents", "passed": (int(aggregate["active_crypto_intent_count"]) == 0 if side == "buy" else int(aggregate["symbol_active_buy_intent_count"]) == 0), "reason": "crypto durable-intent conflicts must be absent"},
+        {"name": "open_crypto_orders", "passed": (int(aggregate["active_crypto_order_count"]) < maximum_active_orders and int(aggregate["symbol_active_crypto_order_count"]) == 0 if side == "buy" else int(aggregate["symbol_active_crypto_order_count"]) == 0), "reason": "crypto capacity permits at most two unresolved orders, with no duplicate symbol"},
+        {"name": "durable_crypto_intents", "passed": (int(aggregate["active_crypto_intent_count"]) < maximum_active_orders and int(aggregate["symbol_active_crypto_order_count"]) == 0 if side == "buy" else int(aggregate["symbol_active_crypto_order_count"]) == 0), "reason": "crypto durable intent capacity permits at most two unresolved orders, with no duplicate symbol"},
         {"name": "maximum_positions", "passed": side == "sell" or symbol_has_position or int(aggregate["crypto_position_count"]) < int(policy["maximum_positions"]), "reason": "crypto maximum-position ceiling"},
         {"name": "entry_position_state", "passed": side != "buy" or action != "entry" or not symbol_has_position, "reason": "crypto entry requires no existing same-symbol position"},
         {"name": "add_position_state", "passed": side != "buy" or action != "add" or symbol_has_position, "reason": "crypto ADD requires an existing same-symbol position"},
@@ -1227,7 +1276,7 @@ class CryptoRiskStore:
                 [
                     {"name": "snapshot_authoritative", "passed": authoritative, "reason": "all broker, durable, loss and volatility evidence must be authoritative"},
                     {"name": "canonical_sizing", "passed": sizing.eligible and sizing.authoritative, "reason": "canonical Decimal sizing must pass every precision and capacity check"},
-                    {"name": "manual_paper_authority_boundary", "passed": (
+                    {"name": "paper_authority_boundary", "passed": (
                         ((config.get("crypto") or {}).get("mode") == "research_only"
                          and (config.get("crypto") or {}).get("paper_trading_enabled") is False
                          and (config.get("crypto") or {}).get("proposals_enabled") is False
@@ -1236,10 +1285,12 @@ class CryptoRiskStore:
                             and (config.get("crypto") or {}).get("paper_trading_enabled") is True
                             and (config.get("crypto") or {}).get("proposals_enabled") is True
                             and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("enabled") is True
-                            and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("manual_approval_required") is True
-                            and ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("autonomous_execution") is False
+                            and (((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("manual_approval_required") is True
+                                 or ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("autonomous_execution") is True)
+                            and (((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("manual_approval_required") is not
+                                 ((config.get("crypto") or {}).get("supervised_paper_lane") or {}).get("autonomous_execution"))
                             and (config.get("crypto") or {}).get("live_enabled") is False)
-                    ), "reason": "crypto authority must be research-only or explicitly supervised paper with manual approval"},
+                    ), "reason": "crypto authority must be research-only or exactly one supervised paper authority mode"},
                 ]
             )
             reasons = sorted(

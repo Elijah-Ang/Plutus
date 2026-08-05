@@ -17,7 +17,7 @@ owner-only external switch at
 not modify the release or unload launchd. Resume only after diagnosing the
 cause and reviewing audit logs, using
 `"$HOME/TradingAgentRuntime/scripts/start_agent.sh" "CONFIRM PAPER RESUME"`.
-The resume helper revalidates paper/manual-only release authority and does not
+The resume helper revalidates bounded paper release authority and does not
 load or restart jobs. Telegram `/resume CONFIRM PAPER RESUME` uses the same
 external switch and cannot resume live mode. On an unknown order status, do not
 rerun execution: inspect Alpaca by client order ID and reconcile manually.
@@ -40,7 +40,7 @@ After the listener has polled and one scanner cycle has completed, run:
 Use `./scripts/check_runtime_freshness.sh --json` for retained deployment evidence. The command uses the immutable release's Python 3.13.9 interpreter and fails closed unless:
 
 - `$HOME/TradingAgentRuntime` is an owner-controlled symlink to a release directory whose name and manifest ID agree;
-- the manifest binds paper-only, manual-only, live-disabled controls, successful artifact tests, exact CI, configuration, schema/formula, Git tree, and tracked-source authority;
+- the manifest binds paper-only, bounded (`manual_only` or `autonomous_paper`), live-disabled controls, successful artifact tests, exact CI, configuration, schema/formula, Git tree, and tracked-source authority;
 - the scanner's owner-only identity matches the release and is recent, and its database heartbeat is `healthy` or safely `blocked`, recent, and bound to the same run and commit;
 - the listener's owner-only identity matches the release and has a live PID, its `healthy` poll heartbeat is recent and bound to the same run and commit, and its active lock binds the same PID, release root, and commit;
 - the production SQLite database opens read-only and passes a bounded `PRAGMA quick_check(1)`.
@@ -136,7 +136,7 @@ See [CONFIGURATION_AND_SIZING.md](CONFIGURATION_AND_SIZING.md) for the formula a
 
 ## Approval, exit, and recovery workflow
 
-Every order requires a current manual approval. `YES ALL` means “validate every candidate independently,” not “execute the batch blindly.” A submitted BUY supersedes only an equivalent or mutually exclusive proposal; unrelated BUYs remain pending until their own approval-time account, position, order, reservation, Phase 3, sleeve, exposure, registry, expiry, quote, and exit-first checks complete.
+Manual-mode orders require a current manual approval. Autonomous paper-mode orders bind a deterministic system authorization instead. `YES ALL` means “validate every candidate independently,” not “execute the batch blindly.” A submitted BUY supersedes only an equivalent or mutually exclusive proposal; unrelated BUYs remain pending until their own account, position, order, reservation, Phase 3, sleeve, exposure, registry, expiry, quote, and exit-first checks complete.
 
 SELL validation is directional. A lower refreshed price does not by itself block an ordinary, partial-profit, trailing-stop, profit-protection, time-stop, emergency, or rotation exit. The system still requires an open market, fresh quote, a current held long position, quantity no greater than holdings, no conflicting SELL, an unexpired proposal, and a bounded paper SELL mechanism. Manual approval and no-shorting remain mandatory.
 

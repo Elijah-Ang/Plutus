@@ -9,7 +9,13 @@ from dotenv import load_dotenv
 
 from .broker_alpaca import AlpacaBroker
 from .logging_config import configure_logging
-from .preflight import run_core_preflight, run_research_preflight, run_trading_preflight
+from .preflight import (
+    run_core_preflight,
+    run_crypto_research_preflight,
+    run_equity_research_preflight,
+    run_research_preflight,  # noqa: F401 - retained as a compatibility hook for callers/tests
+    run_trading_preflight,
+)
 from .storage import Storage
 import sys
 import traceback
@@ -105,15 +111,31 @@ def run_once(config_path: str | Path | None = None) -> int:
             logger.warning("Broker initialization unavailable: %s", type(exc).__name__)
         service = TradingService(config, storage, broker, run_id)
         service.cleanup_stale_research_runs()
-        research_result = run_research_preflight(
+        equity_research_result = run_equity_research_preflight(
             config,
             storage,
-            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="research_preflight", config_hash=config.get("effective_config_hash")),
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="equity_research_preflight", config_hash=config.get("effective_config_hash")),
+        )
+        crypto_research_result = run_crypto_research_preflight(
+            config,
+            storage,
+            broker,
+            recorder=lambda c: storage.record_check(run_id, c.name, c.passed, c.reason, stage="crypto_research_preflight", config_hash=config.get("effective_config_hash")),
         )
         crypto_results = []
-        if not research_result.passed:
-            skipped_reasons = [c.name for c in research_result.checks if not c.passed]
-            storage.audit(run_id, "research_only_preflight_blocked", {"reasons": skipped_reasons})
+        set_crypto_preflight = getattr(service, "set_crypto_research_preflight", None)
+        if callable(set_crypto_preflight):
+            set_crypto_preflight(crypto_research_result.passed)
+        if not equity_research_result.passed:
+            skipped_reasons = [c.name for c in equity_research_result.checks if not c.passed]
+            storage.audit(run_id, "equity_research_preflight_blocked", {"reasons": skipped_reasons})
+        if not crypto_research_result.passed:
+            skipped_reasons = [c.name for c in crypto_research_result.checks if not c.passed]
+            storage.audit(run_id, "crypto_research_preflight_blocked", {"reasons": skipped_reasons})
+        elif (config.get("crypto") or {}).get("enabled", False):
+            # This evidence is independent of Dynamic Universe/EODHD and is
+            # deliberately collected before the equity branch is evaluated.
+            crypto_results = service.run_crypto_research_due()
 
         trading_result = run_trading_preflight(
             config,
@@ -126,16 +148,10 @@ def run_once(config_path: str | Path | None = None) -> int:
 
         research_results = []
         if trading_result.passed:
-            if research_result.passed:
-                # Collect continuous crypto evidence after the trading branch
-                # is known. TradingService carries this exact result set into
-                # scan(), where it is compared with current equity candidates
-                # before any manual crypto proposal can be materialized.
-                crypto_results = service.run_crypto_research_due()
             service.run_cycle(run_dynamic_universe=False)
             if not crypto_results:
                 crypto_results = list(getattr(service, "_last_crypto_research_results", []) or [])
-            if research_result.passed:
+            if equity_research_result.passed:
                 runtime_cfg = config.get("runtime_orchestration") or config.get("dynamic_universe", {}).get("runtime_orchestration", {})
                 research_results = service.run_dynamic_universe_research_only(
                     timeout_seconds=int(runtime_cfg.get("market_open_research_timeout_seconds", 60)),
@@ -151,7 +167,9 @@ def run_once(config_path: str | Path | None = None) -> int:
                 "preflight_split_evaluated",
                 {
                     "core_preflight_passed": core_result.passed,
-                    "research_preflight_passed": research_result.passed,
+                    "equity_research_preflight_passed": equity_research_result.passed,
+                    "crypto_research_preflight_passed": crypto_research_result.passed,
+                    "research_preflight_passed": equity_research_result.passed,
                     "trading_preflight_passed": True,
                     "research_ran": any(r.get("status") == "completed" for r in research_results),
                     "research_status": research_status,
@@ -167,17 +185,23 @@ def run_once(config_path: str | Path | None = None) -> int:
             storage.finish_run(run_id, "completed", "bounded paper cycle complete")
             return 0
 
-        if research_result.passed:
+        if crypto_results:
             # Crypto remains continuous when equities are closed or a trading
-            # preflight blocks the equity branch. Finalize the same evidence
-            # set here so deferred risk-increasing proposals are not stranded.
-            crypto_results = service.run_crypto_research_due()
-            if crypto_results:
-                finalize_crypto = getattr(service, "finalize_crypto_research_cycle", None)
-                if callable(finalize_crypto):
-                    finalize_crypto()
+            # preflight blocks the equity branch, regardless of the equity
+            # research/provider result. Finalize the same evidence set here so
+            # deferred risk-increasing proposals are not stranded.
+            finalize_crypto = getattr(service, "finalize_crypto_research_cycle", None)
+            if callable(finalize_crypto):
+                finalize_crypto()
 
-        if research_result.passed:
+        # The shared equity digest is intentionally suppressed while stocks
+        # are closed, but the independent crypto lane still reports on its
+        # own 30-minute cadence.
+        check_digest = getattr(service, "check_and_send_digest", None)
+        if callable(check_digest):
+            check_digest()
+
+        if equity_research_result.passed:
             research_results = service.run_dynamic_universe_research_only(label="market_closed_dynamic_universe_research")
         research_ran = any(r.get("status") == "completed" for r in research_results)
         research_status = "not_due"
@@ -192,7 +216,9 @@ def run_once(config_path: str | Path | None = None) -> int:
             catchup_required = False
         split_detail = {
             "core_preflight_passed": core_result.passed,
-            "research_preflight_passed": research_result.passed,
+            "equity_research_preflight_passed": equity_research_result.passed,
+            "crypto_research_preflight_passed": crypto_research_result.passed,
+            "research_preflight_passed": equity_research_result.passed,
             "trading_preflight_passed": trading_result.passed,
             "research_ran": research_ran,
             "research_status": research_status,

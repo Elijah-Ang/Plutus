@@ -321,7 +321,7 @@ def test_strategy_order_and_fingerprint_are_deterministic_and_replayable() -> No
     [
         (("mode",), "live", "runtime_mode_not_paper"),
         (("live_enabled",), True, "live_execution_not_disabled"),
-        (("auto_execution_enabled",), True, "autonomous_execution_not_disabled"),
+        (('auto_execution_enabled',), True, "paper_authority_mode_invalid"),
         (("execution_capabilities", "live_execution_enabled"), True, "live_execution_capability_not_disabled"),
         (("strategy_execution_registry", "mode"), "paper_and_live", "registry_not_paper_only"),
     ],

@@ -71,8 +71,8 @@ def evaluate_symbol(symbol: str, bars: pd.DataFrame, has_position: bool = False,
         volatility_ok = False
         vol_reason = "extreme volatility; blocked"
     elif vol_20 > 0.35:
-        volatility_ok = False
-        vol_reason = "high volatility; watch only"
+        volatility_ok = True
+        vol_reason = "high volatility; reduced confidence"
     elif vol_20 >= 0.25:
         volatility_ok = True
         vol_reason = "volatility elevated; reduced confidence"

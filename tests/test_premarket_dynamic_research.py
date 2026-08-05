@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from app.power import PowerStatus
-from app.preflight import PreflightCheck, PreflightResult, run_core_preflight, run_preflight, run_research_preflight, run_trading_preflight
+from app.preflight import (
+    PreflightCheck,
+    PreflightResult,
+    run_core_preflight,
+    run_crypto_research_preflight,
+    run_equity_research_preflight,
+    run_preflight,
+    run_research_preflight,
+    run_trading_preflight,
+)
 
 
 class FakeStorage:
@@ -122,6 +131,14 @@ def _ok_core(*args, **kwargs):
 
 def _ok_research(*args, **kwargs):
     return PreflightResult(True, (PreflightCheck("research_internet", True, "ok"),))
+
+
+def _ok_crypto_research(*args, **kwargs):
+    return PreflightResult(True, (PreflightCheck("crypto_research_internet", True, "ok"),))
+
+
+def _failed_equity_provider(*args, **kwargs):
+    return PreflightResult(False, (PreflightCheck("research_provider_key", False, "EODHD key missing"),))
 
 
 def _closed_trading(*args, **kwargs):
@@ -332,6 +349,33 @@ def test_market_open_runs_trading_without_duplicate_dynamic_universe(monkeypatch
     assert FakeStorage.last_instance.finished[0] == "completed"
 
 
+def test_eodhd_equity_preflight_failure_does_not_block_crypto_lane(monkeypatch):
+    from app import main
+
+    FakeService.instances = []
+    config = _config([])
+    config["dynamic_universe"]["enabled"] = True
+    monkeypatch.setattr(main, "load_config", lambda config_path=None: config)
+    monkeypatch.setattr(main, "Storage", FakeStorage)
+    monkeypatch.setattr(main, "AlpacaBroker", lambda config: OpenBroker())
+    monkeypatch.setattr(main, "TradingService", FakeService)
+    monkeypatch.setattr(main, "run_core_preflight", _ok_core)
+    monkeypatch.setattr(main, "run_equity_research_preflight", _failed_equity_provider)
+    monkeypatch.setattr(main, "run_crypto_research_preflight", _ok_crypto_research)
+    monkeypatch.setattr(main, "run_trading_preflight", _open_trading)
+    monkeypatch.setattr(main, "configure_logging", lambda: type("L", (), {"warning": lambda *a, **k: None, "info": lambda *a, **k: None, "exception": lambda *a, **k: None})())
+
+    assert main.run_once() == 0
+
+    service = FakeService.instances[0]
+    assert service.crypto_calls == 1
+    assert service.run_cycle_called is True
+    assert service.research_calls == []
+    detail = [e[1] for e in FakeStorage.last_instance.audit_events if e[0] == "preflight_split_evaluated"][-1]
+    assert detail["equity_research_preflight_passed"] is False
+    assert detail["crypto_research_preflight_passed"] is True
+
+
 def test_market_open_research_timeout_does_not_block_cycle_completion(monkeypatch):
     from app import main
 
@@ -381,6 +425,23 @@ def test_research_only_market_closed_can_run_without_ac_when_config_allows(monke
     assert any(c.name == "research_power" and c.passed and "warning-only" in c.reason for c in result.checks)
     assert all(c.name != "broker" for c in result.checks)
     assert all(c.name != "market_open" for c in result.checks)
+
+
+def test_eodhd_failure_is_scoped_to_equity_research_preflight(monkeypatch):
+    config = _config()
+    config["dynamic_universe"]["enabled"] = True
+    config["dynamic_universe"]["provider"] = "eodhd"
+    monkeypatch.setattr("app.preflight.get_power_status", lambda: PowerStatus(True, "test", "AC power connected", 100.0))
+    monkeypatch.setattr("app.preflight.internet_available", lambda: True)
+    monkeypatch.setattr("app.preflight.secret_present", lambda name: False)
+
+    equity = run_equity_research_preflight(config, FakeStorage())
+    crypto = run_crypto_research_preflight(config, FakeStorage(), ClosedBroker())
+
+    assert equity.passed is False
+    assert any(c.name == "research_provider_key" and not c.passed for c in equity.checks)
+    assert crypto.passed is True
+    assert all("eodhd" not in c.name.lower() for c in crypto.checks)
 
 
 def test_trading_path_still_requires_ac_power_and_market_open(monkeypatch):

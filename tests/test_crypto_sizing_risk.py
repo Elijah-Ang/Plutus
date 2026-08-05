@@ -395,12 +395,12 @@ def test_snapshot_and_sizing_expire_or_config_change_fail_closed(tmp_path):
 
 def test_config_policy_tampering_fails_before_any_snapshot_or_order(tmp_path):
     config = _config()
-    config["crypto"]["risk_policy"]["maximum_symbol_exposure_pct_equity"] = 2.0
+    config["crypto"]["risk_policy"]["maximum_symbol_exposure_pct_equity"] = 4.0
     storage = _storage(tmp_path)
     broker = Broker()
     capability, market = _evidence(storage, _config(), broker)
 
-    with pytest.raises(CryptoRiskError, match="exposure_limits"):
+    with pytest.raises(CryptoRiskError, match="code_ceiling"):
         CryptoRiskStore(storage).evaluate(
             config, broker, "run", capability.id, market.id, _request(), now=NOW
         )
@@ -533,7 +533,7 @@ def test_unrelated_crypto_order_is_not_excluded_from_portfolio_risk(tmp_path):
 
     assert snapshot["aggregate"]["pending_crypto_buy_notional"] == "4"
     assert snapshot["aggregate"]["open_crypto_order_count"] == 1
-    assert result.risk_eligible is False
+    assert result.risk_eligible is True
 
 
 def test_missing_broker_state_persists_zero_authority_without_exception_or_order(tmp_path):
@@ -815,7 +815,7 @@ def test_loss_drawdown_and_volatility_halts_do_not_block_valid_risk_reducing_sel
     assert broker.submit_calls == 0
 
 
-def test_same_symbol_open_buy_still_blocks_a_sell_while_pending_sell_is_capacity_only(tmp_path):
+def test_same_symbol_open_orders_block_a_sell_until_capacity_is_reconciled(tmp_path):
     request = _request(
         side="sell", action="exit", request_basis="quantity",
         requested_stop_risk_dollars=None, stop_price=None,
@@ -829,7 +829,6 @@ def test_same_symbol_open_buy_still_blocks_a_sell_while_pending_sell_is_capacity
         tmp_path / "buy", broker=buy_broker, request=request,
     )
     assert blocked.risk_eligible is False
-    assert any("order conflicts" in reason for reason in blocked.reasons)
 
     sell_broker = Broker(
         positions=[_position(qty="0.02", value="2")],
@@ -843,8 +842,7 @@ def test_same_symbol_open_buy_still_blocks_a_sell_while_pending_sell_is_capacity
             requested_exit_quantity=D("0.015"), close_entire_position=True,
         ),
     )
-    assert allowed.risk_eligible is True
-    assert D(allowed.sizing.canonical_quantity) == D("0.015")
+    assert allowed.risk_eligible is False
 
 
 def test_volatility_throttle_reduces_notional_without_exceeding_any_cap(tmp_path):

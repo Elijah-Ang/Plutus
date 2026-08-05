@@ -266,8 +266,16 @@ class AdaptiveSizingEngine:
             raise ValueError("adaptive sizing formula or schema version mismatch")
         if self.config.get("mode") != "paper" or self.config.get("live_enabled") is not False:
             raise ValueError("operational adaptive sizing requires paper-only mode")
-        if self.config.get("auto_execution_enabled") is not False or self.config.get("auto_execution_mode") != "manual_only":
-            raise ValueError("operational adaptive sizing requires manual approval")
+        autonomous_paper = (
+            self.config.get("auto_execution_enabled") is True
+            and self.config.get("auto_execution_mode") == "autonomous_paper"
+        )
+        manual_paper = (
+            self.config.get("auto_execution_enabled") is False
+            and self.config.get("auto_execution_mode") == "manual_only"
+        )
+        if not (manual_paper or autonomous_paper):
+            raise ValueError("operational adaptive sizing requires an explicit paper authority mode")
 
     def evaluate(self, inputs: Mapping[str, Any]) -> AdaptiveSizingDecision | None:
         raw = dict(inputs)

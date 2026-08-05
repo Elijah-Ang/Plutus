@@ -153,15 +153,20 @@ from pathlib import Path
 from app.formula_versions import REQUIRED_SCHEMA_VERSIONS
 from scripts.check_release_eligibility import RELEASE_FORMULA_VERSIONS
 from app.utils import load_config
-from app.runtime_guard import REQUIRED_SCHEMA_VERSION
+from app.runtime_guard import REQUIRED_SCHEMA_VERSION, config_paper_authority_mode
 tests=json.load(open("artifact-test-results.json",encoding="utf-8"))
 if tests.get("tests_verified") is not True: raise SystemExit("artifact tests are not verified")
 config=load_config()
+authority_mode=config_paper_authority_mode(config)
+if authority_mode is None: raise SystemExit("configuration has no bounded paper authority")
 manifest={
   "release_id":os.environ["RELEASE_ID"],"release_commit":os.environ["COMMIT"],
   "schema_version":REQUIRED_SCHEMA_VERSION,"required_schema_versions":sorted(REQUIRED_SCHEMA_VERSIONS),
   "formula_versions":RELEASE_FORMULA_VERSIONS,"configuration_hash":config.get("effective_config_hash"),
-  "mode":"paper","manual_approval_only":True,"live_capability":False,
+  "mode":"paper","paper_authority_mode":authority_mode,
+  "manual_approval_only":authority_mode == "manual_only",
+  "autonomous_execution_enabled":authority_mode == "autonomous_paper",
+  "live_capability":False,
   "authority_model":"exact_current_main_or_verified_immutable_release_rollback",
   "release_authority":json.loads(os.environ["AUTHORITY_EVIDENCE"]),
   "ci":{"workflow_name":os.environ["CI_WORKFLOW"],"run_id":int(os.environ["CI_RUN_ID"]),"head_sha":os.environ["COMMIT"]},

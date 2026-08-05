@@ -325,9 +325,9 @@ class AlpacaBroker(BrokerInterface):
 
         This method is intentionally separate from ``submit_order`` so a
         crypto pair can never fall through the equity DAY-order adapter.  The
-        lane gate and caller must already have proved a current manual approval
-        and paper identity; this adapter still rechecks the hard paper boundary
-        before constructing an SDK request.
+        lane gate and caller must already have proved the current paper
+        authority and paper identity; this adapter still rechecks the hard
+        paper boundary before constructing an SDK request.
         """
 
         if self.mode != "paper":

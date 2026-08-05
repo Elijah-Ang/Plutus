@@ -2,11 +2,10 @@
 
 This stage adds independently verifiable BTC/USD and ETH/USD strategy
 decisions and an immutable crypto proposal-preview record. The installed
-configuration remains `research_only`; the non-approvable preview path is
-unchanged. A separately reviewed opt-in is now available through
-`crypto.supervised_paper_lane`, which uses the isolated
-`CryptoPaperLaneStore` ledger for manual, paper-only limit orders. It never
-uses the equity adapter.
+configuration remains research-first; the non-approvable preview path is
+unchanged. The separately reviewed `crypto.supervised_paper_lane` uses the
+isolated `CryptoPaperLaneStore` ledger for bounded manual or autonomous,
+paper-only limit orders. It never uses the equity adapter.
 
 ## Official Alpaca contract
 
@@ -120,12 +119,11 @@ evidence cannot change between display construction and preview persistence.
 ## Supervised paper stage
 
 `app/crypto_paper_lane.py` adds the separate authority chain: immutable
-Telegram display, reply-target binding, one-use approval, final fresh
-broker/risk revalidation, durable intent and reservation, a crypto-specific
-limit/GTC-or-IOC adapter, idempotent client identity, deterministic
-pre-submission recovery, fills, fees and FIFO lot accounting. The lane is opt-in only;
-the installed values keep `enabled=false` and `execution_enabled=false`.
-It remains paper-only, manual-only, long-only, cash-funded, and unable to retry
-an ambiguous submission automatically. See
+display binding, one-use manual or deterministic autonomous authority, final
+fresh broker/risk revalidation, durable intent and reservation, a
+crypto-specific limit/GTC-or-IOC adapter, idempotent client identity,
+deterministic pre-submission recovery, fills, fees and FIFO lot accounting.
+It remains paper-only, long-only, cash-funded, and unable to retry an
+ambiguous submission automatically. See
 [`CRYPTO_SUPERVISED_PAPER_LANE.md`](CRYPTO_SUPERVISED_PAPER_LANE.md) for the
 exact controls and migration boundary.

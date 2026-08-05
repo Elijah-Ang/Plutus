@@ -163,6 +163,11 @@ class PromotionBroker:
 def dynamic_config() -> dict[str, Any]:
     cfg = load_config()
     cfg["mode"] = "paper"
+    # These scanner fixtures patch the canonical/manual evaluator. Keep their
+    # authority explicit so production autonomous-paper discovery does not
+    # change which evaluator the fixture is exercising.
+    cfg["auto_execution_enabled"] = False
+    cfg["auto_execution_mode"] = "manual_only"
     cfg["dynamic_universe"]["max_research_symbols_per_run"] = 20
     cfg["dynamic_universe"]["raw_sources"]["existing_static_watchlist"] = False
     cfg["dynamic_universe"]["raw_sources"]["eodhd_exchange_symbols"] = False
@@ -818,19 +823,25 @@ def test_compact_counts_use_static_total_and_held_static_separately(temp_storage
     service.notify_premarket_dynamic_universe_status([result], "market_closed", now=datetime(2026, 6, 27, 12, 21, tzinfo=UTC))
 
     msg = service.telegram.messages[-1]
-    assert "Observation total: 7" in msg
+    assert "Observation total: 2" in msg
     assert "Dynamic paper-tradable: 1" in msg
-    assert "Static paper-tradable: 4" in msg
+    assert "Static paper-tradable: 38" in msg
     assert "Held positions: 3 total (2 static, 1 dynamic)." in msg
     assert "Held static positions:" not in msg
     assert "Global research-only observation: 1" in msg
     assert "Static paper-tradable: 2" not in msg
     rows = temp_storage.fetch_all("SELECT detail FROM audit_events WHERE event_type='dynamic_universe_market_closed_status_snapshot' ORDER BY created_at DESC LIMIT 1")
     snapshot = json.loads(rows[0]["detail"])["snapshot"]
-    assert snapshot["observation_symbols"] == ["2800.HK", "AMAT", "XLE", "XLF", "XLK", "XLV", "XLY"]
+    assert snapshot["observation_symbols"] == ["2800.HK", "AMAT"]
     assert snapshot["global_research_only_symbols"] == ["2800.HK"]
     assert snapshot["dynamic_paper_tradable_symbols"] == ["SMH"]
-    assert snapshot["static_paper_tradable_symbols"] == ["DIA", "IWM", "QQQ", "SPY"]
+    assert snapshot["static_paper_tradable_symbols"] == [
+        "AAPL", "AMZN", "AVGO", "COST", "DIA", "GLD", "GOOGL", "HD",
+        "IWM", "JNJ", "JPM", "LLY", "MA", "META", "MSFT", "NVDA",
+        "PG", "QQQ", "SPY", "TLT", "TSLA", "UNH", "V", "VOO", "VTI",
+        "WMT", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE",
+        "XLU", "XLV", "XLY", "XOM",
+    ]
     assert snapshot["held_symbols"] == ["DIA", "IWM", "SMH"]
     assert snapshot["held_static_symbols"] == ["DIA", "IWM"]
     assert snapshot["held_dynamic_symbols"] == ["SMH"]

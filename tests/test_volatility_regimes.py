@@ -23,6 +23,8 @@ def test_volatility_score_grading(temp_storage):
     # >45%: 0/15
     # missing/invalid: 0/15
     config = load_config()
+    config["auto_execution_enabled"] = False
+    config["auto_execution_mode"] = "manual_only"
     broker = MockBroker()
     service = TradingService(config, temp_storage, broker, "test_run_id")
     service.telegram = MockTelegramBot()
@@ -93,6 +95,8 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     # 35%–45%: watch-only, no proposal generated
     # >45%: extreme blocked, no proposal generated
     config = load_config()
+    config["auto_execution_enabled"] = False
+    config["auto_execution_mode"] = "manual_only"
     config["phase3"]["enabled"] = False
     config["phase3"]["active"] = False
     config["phase4"]["enabled"] = False
@@ -156,13 +160,13 @@ def test_volatility_regime_eligibility_and_size_adjustments(temp_storage):
     assert memory["volatility_regime"] == "elevated"
     assert memory["paper_size_adjustment"] == 0.5
 
-    # Case C: 40% (high volatility) -> watch-only, no proposal
+    # Case C: 40% (high volatility) -> eligible score regime, no proposal
     run_scan_with_vol(0.40)
     props = temp_storage.fetch_all("SELECT * FROM trade_proposals WHERE symbol='SPY'")
     assert len(props) == 0
     memory = temp_storage.fetch_all("SELECT * FROM market_memory WHERE symbol='SPY'")[0]
     assert memory["volatility_regime"] == "high"
-    assert memory["volatility_gate_result"] == "watch only"
+    assert memory["volatility_gate_result"] == "eligible"
     assert memory["proposal_generated"] == 0
 
     # Case D: 50% (extreme volatility) -> blocked, no proposal

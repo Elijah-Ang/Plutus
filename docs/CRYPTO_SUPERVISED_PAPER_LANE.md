@@ -26,8 +26,10 @@ The lane is long-only spot crypto: BUY entry/add orders may use a quantity or
 notional basis, while risk-reducing SELL exit/reduce orders must use an exact
 quantity and are checked against current holdings immediately before I/O.  It
 permits only limit orders with Alpaca's documented `gtc` or `ioc` time-in-force
-values and caps risk-increasing orders at USD 5,000.  Live trading, margin,
-shorting, autonomous execution and equity-adapter fall-through are rejected.
+values and caps risk-increasing orders at USD 5,000. Live trading, margin,
+shorting and equity-adapter fall-through are rejected. The selected authority
+is either one-use human approval or a deterministic system authorization in
+`autonomous_paper` mode; both paths perform the same final checks.
 
 `retryable_pre_submission` means the adapter was unavailable or rejected the
 request before broker invocation.  Once `broker_invocation_occurred=1`, a

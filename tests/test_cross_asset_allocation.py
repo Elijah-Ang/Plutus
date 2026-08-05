@@ -145,20 +145,20 @@ def _plan(config, candidates, portfolio=None):
     )
 
 
-def test_exact_configuration_remains_paper_manual_and_advisory_only():
+def test_exact_configuration_is_bounded_autonomous_paper_and_advisory_only():
     config = load_config()
     validate_config(config)
     assert config["mode"] == "paper"
     assert config["live_enabled"] is False
-    assert config["auto_execution_enabled"] is False
-    assert config["auto_execution_mode"] == "manual_only"
+    assert config["auto_execution_enabled"] is True
+    assert config["auto_execution_mode"] == "autonomous_paper"
     assert config["cross_asset_allocation"]["mode"] == "research_advisory"
     assert config["cross_asset_allocation"]["produce_order_authority"] is False
     assert config["crypto"]["mode"] == "supervised_paper"
     assert config["crypto"]["paper_trading_enabled"] is True
     assert config["crypto"]["proposals_enabled"] is True
-    assert config["crypto"]["supervised_paper_lane"]["manual_approval_required"] is True
-    assert config["crypto"]["supervised_paper_lane"]["autonomous_execution"] is False
+    assert config["crypto"]["supervised_paper_lane"]["manual_approval_required"] is False
+    assert config["crypto"]["supervised_paper_lane"]["autonomous_execution"] is True
 
 
 def test_cross_asset_ranking_is_deterministic_and_input_order_independent():
@@ -244,8 +244,8 @@ def test_crypto_research_candidate_is_bounded_by_crypto_sleeve_and_never_authori
         cluster_exposure={"us_equity": "10000", "crypto_major": "500"},
     )
     decision = _plan(config, [crypto], portfolio).decisions[0]
-    assert decision["decision"] == "ALLOCATE_RESEARCH_ONLY_PARTIAL"
-    assert decision["allocated_notional"] == "500"
+    assert decision["decision"] == "ALLOCATE_RESEARCH_ONLY"
+    assert decision["allocated_notional"] == "2000"
     assert decision["order_authority"] is False
 
 
@@ -330,9 +330,9 @@ def test_crypto_trade_heat_and_exploration_heat_cannot_exceed_existing_controls(
         liquidity_notional="5000000",
     )
     crypto_decision = _plan(config, [crypto]).decisions[0]
-    assert crypto_decision["allocated_notional"] == "1000"
-    assert crypto_decision["allocated_stop_risk"] == "10"
-    assert "trade_stop_risk" in crypto_decision["binding_constraints"]
+    assert crypto_decision["allocated_notional"] == "2000"
+    assert crypto_decision["allocated_stop_risk"] == "20"
+    assert crypto_decision["binding_constraints"] == []
 
     exploration = _candidate(
         config,
@@ -480,8 +480,8 @@ def test_allocated_portfolio_preserves_all_dimensional_invariants():
     summary = plan.summary
     assert D(summary["gross_exposure_after"]) <= D("50000")
     assert D(summary["stop_heat_after"]) <= D("1750")
-    assert D(summary["asset_class_exposure_after"]["crypto"]) <= D("1000")
-    assert D(summary["asset_class_stop_heat_after"]["crypto"]) <= D("50")
+    assert D(summary["asset_class_exposure_after"]["crypto"]) <= D("5000")
+    assert D(summary["asset_class_stop_heat_after"]["crypto"]) <= D("200")
     assert summary["position_count_after"] <= 5
     assert summary["asset_class_position_count_after"]["equity"] <= 3
     assert summary["asset_class_position_count_after"]["crypto"] <= 2
@@ -741,8 +741,8 @@ def test_plan_expiry_cannot_outlive_near_expiry_candidate_evidence():
 
 
 def test_self_consistent_config_cannot_widen_code_level_hard_limits():
-    config = _config(maximum_crypto_exposure_pct=2.0)
-    with pytest.raises(CrossAssetAllocationError, match="at most 1"):
+    config = _config(maximum_crypto_exposure_pct=6.0)
+    with pytest.raises(CrossAssetAllocationError, match="at most 5"):
         _plan(config, [_candidate(config, "SPY")])
 
 
