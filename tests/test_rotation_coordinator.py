@@ -128,7 +128,9 @@ def coordinator(tmp_path):
                 "strategy_version": "rule_based_v2",
                 "risk_unit": "stop_risk_dollars",
                 "remaining_risk": 25.0,
+                "remaining_risk_decimal": "25",
                 "remaining_notional": 500.0,
+                "remaining_notional_decimal": "500",
             }},
             "raw_replay_inputs": {
                 "as_of": evaluated_at,

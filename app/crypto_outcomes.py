@@ -653,7 +653,22 @@ class CryptoOutcomeObservation:
 
     @property
     def available(self) -> bool:
-        return self.status == "completed" and self.net_return is not None
+        return (
+            self.status == "completed"
+            and self.setup.quantity is not None
+            and self.setup.quantity > 0
+            and self.exit_timestamp is not None
+            and self.exit_price is not None
+            and self.holding_hours is not None
+            and self.gross_return is not None
+            and self.net_return is not None
+            and self.gross_pnl is not None
+            and self.net_pnl is not None
+            and self.risk_amount is not None
+            and self.risk_amount > 0
+            and self.gross_r_multiple is not None
+            and self.net_r_multiple is not None
+        )
 
     def to_record(self) -> dict[str, Any]:
         """Return the database-shaped record with exact Decimal text."""
@@ -1065,6 +1080,8 @@ def build_actual_observation(
     status = str(_pick(payload, "status", required=False) or "completed").strip().lower()
     if status != "completed":
         raise ValueError("actual observations require a completed closed lifecycle")
+    if setup.quantity is None or setup.quantity <= 0:
+        raise ValueError("actual observations require a positive setup quantity")
     outcome_class = str(_pick(payload, "outcome_class", "result_class", required=False) or "actual_closed").strip().lower()
     exit_price = _positive_decimal(_pick(payload, "exit_price", "actual_exit_price"), "exit_price")
     exit_timestamp = _parse_utc(_pick(payload, "exit_timestamp", "actual_exit_timestamp"), "exit_timestamp")
@@ -1073,11 +1090,13 @@ def build_actual_observation(
         raise ValueError("holding_hours cannot be negative")
     gross_return = _as_decimal(_pick(payload, "gross_return"), "gross_return")
     net_return = _as_decimal(_pick(payload, "net_return"), "net_return")
-    gross_pnl = _pick(payload, "gross_pnl", required=False)
-    net_pnl = _pick(payload, "net_pnl", required=False)
-    risk_amount = _pick(payload, "risk_amount", required=False)
-    gross_r = _pick(payload, "gross_r_multiple", required=False)
-    net_r = _pick(payload, "net_r_multiple", required=False)
+    gross_pnl = _as_decimal(_pick(payload, "gross_pnl"), "gross_pnl")
+    net_pnl = _as_decimal(_pick(payload, "net_pnl"), "net_pnl")
+    risk_amount = _as_decimal(_pick(payload, "risk_amount"), "risk_amount")
+    gross_r = _as_decimal(_pick(payload, "gross_r_multiple"), "gross_r_multiple")
+    net_r = _as_decimal(_pick(payload, "net_r_multiple"), "net_r_multiple")
+    if risk_amount <= 0:
+        raise ValueError("actual observations require a positive risk_amount")
     input_evidence = _pick(payload, "input_evidence", required=False)
     if input_evidence is None:
         actual_payload: dict[str, Any] = {
@@ -1096,8 +1115,7 @@ def build_actual_observation(
             ("gross_r_multiple", gross_r, "gross_r_multiple"),
             ("net_r_multiple", net_r, "net_r_multiple"),
         ):
-            if value is not None:
-                actual_payload[key] = canonical_decimal_text(value, field)
+            actual_payload[key] = canonical_decimal_text(value, field)
         input_evidence = {"actual_payload": actual_payload, "lineage": json.loads(validation.canonical_lineage_json or "{}")}
     if not isinstance(input_evidence, Mapping):
         raise TypeError("input_evidence must be a mapping when supplied")
@@ -1121,11 +1139,11 @@ def build_actual_observation(
         holding_hours=holding_hours,
         gross_return=gross_return,
         net_return=net_return,
-        gross_pnl=None if gross_pnl is None else _as_decimal(gross_pnl, "gross_pnl"),
-        net_pnl=None if net_pnl is None else _as_decimal(net_pnl, "net_pnl"),
-        risk_amount=None if risk_amount is None else _as_decimal(risk_amount, "risk_amount"),
-        gross_r_multiple=None if gross_r is None else _as_decimal(gross_r, "gross_r_multiple"),
-        net_r_multiple=None if net_r is None else _as_decimal(net_r, "net_r_multiple"),
+        gross_pnl=gross_pnl,
+        net_pnl=net_pnl,
+        risk_amount=risk_amount,
+        gross_r_multiple=gross_r,
+        net_r_multiple=net_r,
         actual_lineage_json=validation.canonical_lineage_json,
         input_evidence_json=evidence_json,
     )
@@ -1450,28 +1468,75 @@ def derive_aggregate_metrics(
             if selected_type is None or row_type == selected_type:
                 rows.append(row)
 
-    completed: list[tuple[Decimal, Decimal | None]] = []
+    completed: list[tuple[Decimal, Decimal]] = []
     unavailable_count = 0
     holding_values: list[Decimal] = []
     gross_values: list[Decimal] = []
     net_pnl_values: list[Decimal] = []
     for observation in rows:
         status = observation.status if isinstance(observation, CryptoOutcomeObservation) else str(observation.get("status") or "")
-        net_value = observation.net_return if isinstance(observation, CryptoOutcomeObservation) else observation.get("net_return")
-        if status != "completed" or net_value is None:
+        if status != "completed":
             unavailable_count += 1
             continue
-        net_return = _as_decimal(net_value, "net_return")
-        holding_value = observation.holding_hours if isinstance(observation, CryptoOutcomeObservation) else observation.get("holding_hours")
-        gross_value = observation.gross_return if isinstance(observation, CryptoOutcomeObservation) else observation.get("gross_return")
-        pnl_value = observation.net_pnl if isinstance(observation, CryptoOutcomeObservation) else observation.get("net_pnl")
-        if holding_value is not None:
-            holding_values.append(_as_decimal(holding_value, "holding_hours"))
-        if gross_value is not None:
-            gross_values.append(_as_decimal(gross_value, "gross_return"))
-        if pnl_value is not None:
-            net_pnl_values.append(_as_decimal(pnl_value, "net_pnl"))
-        completed.append((net_return, holding_values[-1] if holding_value is not None else None))
+        if isinstance(observation, CryptoOutcomeObservation):
+            values = {
+                "quantity": observation.setup.quantity,
+                "exit_timestamp": observation.exit_timestamp,
+                "exit_price": observation.exit_price,
+                "holding_hours": observation.holding_hours,
+                "gross_return": observation.gross_return,
+                "net_return": observation.net_return,
+                "gross_pnl": observation.gross_pnl,
+                "net_pnl": observation.net_pnl,
+                "risk_amount": observation.risk_amount,
+                "gross_r_multiple": observation.gross_r_multiple,
+                "net_r_multiple": observation.net_r_multiple,
+            }
+        else:
+            setup_value = observation.get("setup")
+            quantity_value = observation.get("quantity")
+            if quantity_value is None and isinstance(setup_value, Mapping):
+                quantity_value = setup_value.get("quantity")
+            values = {
+                "quantity": quantity_value,
+                "exit_timestamp": observation.get("exit_timestamp"),
+                "exit_price": observation.get("exit_price"),
+                "holding_hours": observation.get("holding_hours"),
+                "gross_return": observation.get("gross_return"),
+                "net_return": observation.get("net_return"),
+                "gross_pnl": observation.get("gross_pnl"),
+                "net_pnl": observation.get("net_pnl"),
+                "risk_amount": observation.get("risk_amount"),
+                "gross_r_multiple": observation.get("gross_r_multiple"),
+                "net_r_multiple": observation.get("net_r_multiple"),
+            }
+        if any(values[name] in (None, "") for name in values):
+            unavailable_count += 1
+            continue
+        try:
+            quantity = _as_decimal(values["quantity"], "quantity")
+            exit_price = _as_decimal(values["exit_price"], "exit_price")
+            holding_value = _as_decimal(values["holding_hours"], "holding_hours")
+            gross_value = _as_decimal(values["gross_return"], "gross_return")
+            net_return = _as_decimal(values["net_return"], "net_return")
+            gross_pnl = _as_decimal(values["gross_pnl"], "gross_pnl")
+            pnl_value = _as_decimal(values["net_pnl"], "net_pnl")
+            risk_amount = _as_decimal(values["risk_amount"], "risk_amount")
+            _as_decimal(values["gross_r_multiple"], "gross_r_multiple")
+            _as_decimal(values["net_r_multiple"], "net_r_multiple")
+        except (TypeError, ValueError):
+            unavailable_count += 1
+            continue
+        if quantity <= 0 or exit_price <= 0 or holding_value < 0 or risk_amount <= 0:
+            unavailable_count += 1
+            continue
+        holding_values.append(holding_value)
+        gross_values.append(gross_value)
+        net_pnl_values.append(pnl_value)
+        # Keep this local value validated even though the aggregate currently
+        # exposes only net P&L; incomplete gross economics remain unavailable.
+        _ = gross_pnl
+        completed.append((net_return, holding_value))
 
     sample_count = len(completed)
     wins = sum(1 for net_return, _ in completed if net_return > 0)

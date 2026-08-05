@@ -230,6 +230,40 @@ def test_migration_backfills_real_as_reconstructed_and_is_idempotent(tmp_path):
     assert migration_count == 1
 
 
+def test_migration_backfills_performance_outcome_entry_evidence(tmp_path):
+    storage = _database(tmp_path)
+    storage.execute(
+        """INSERT INTO performance_outcomes(
+             id,setup_id,run_id,symbol,actual_or_shadow,status,
+             entry_price,entry_qty,entry_notional,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "legacy-performance-outcome", "legacy-performance-setup", "run-lab",
+            "BTC/USD", "shadow", "pending_forward_returns",
+            100.0, 0.05, 5.0,
+            "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+        ),
+    )
+
+    with storage.connect() as conn:
+        apply_fixed_point_accounting_schema(conn)
+        first = dict(conn.execute(
+            "SELECT * FROM performance_outcomes WHERE id='legacy-performance-outcome'"
+        ).fetchone())
+        apply_fixed_point_accounting_schema(conn)
+        second = dict(conn.execute(
+            "SELECT * FROM performance_outcomes WHERE id='legacy-performance-outcome'"
+        ).fetchone())
+
+    assert first == second
+    assert first["entry_price_decimal"] == "100"
+    assert first["entry_qty_decimal"] == "0.05"
+    assert first["entry_notional_decimal"] == "5"
+    assert first["decimal_provenance"] == RECONSTRUCTED_REAL_PROVENANCE
+    assert first["decimal_accounting_version"] == FIXED_POINT_ACCOUNTING_VERSION
+    assert not any(fixed_point_integrity_report(storage).values())
+
+
 def test_integrity_detects_canonical_tampering_and_real_projection_tampering(tmp_path):
     storage = _database(tmp_path)
     identifier = LotLedger(storage).record_manual_adjustment(

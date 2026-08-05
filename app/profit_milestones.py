@@ -10,13 +10,31 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from .formula_versions import PLUTUS_AUDIT_SCHEMA_VERSION
 from .utils import iso_now, json_dumps
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    ZERO,
+    decimal_text,
+    require_exact_decimal,
+)
 
 
 TAKE_PROFIT_PROGRESS_FORMULA_VERSION = "take_profit_fill_progress_v1"
+
+
+def _milestone_decimal(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite decimal") from exc
+    if not result.is_finite() or result < minimum:
+        raise ValueError(f"{label} must be finite and non-negative")
+    return result
 
 
 def apply_profit_milestone_schema(conn: Any, *, record_migration: bool = True) -> None:
@@ -27,6 +45,8 @@ def apply_profit_milestone_schema(conn: Any, *, record_migration: bool = True) -
              target_quantity REAL NOT NULL CHECK(target_quantity>0),
              cumulative_filled_quantity REAL NOT NULL DEFAULT 0 CHECK(cumulative_filled_quantity>=0),
              completed_fraction REAL NOT NULL DEFAULT 0 CHECK(completed_fraction>=0 AND completed_fraction<=1),
+             target_quantity_decimal TEXT,cumulative_filled_quantity_decimal TEXT,completed_fraction_decimal TEXT,
+             decimal_provenance TEXT,decimal_accounting_version TEXT,
              status TEXT NOT NULL CHECK(status IN ('pending_fill','partially_filled','filled')),
              formula_version TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,
              UNIQUE(position_lifecycle_id,take_profit_level))"""
@@ -37,6 +57,8 @@ def apply_profit_milestone_schema(conn: Any, *, record_migration: bool = True) -
              order_intent_id TEXT NOT NULL UNIQUE,requested_quantity REAL NOT NULL CHECK(requested_quantity>0),
              cumulative_filled_quantity REAL NOT NULL DEFAULT 0 CHECK(cumulative_filled_quantity>=0),
              completed_fraction REAL NOT NULL DEFAULT 0 CHECK(completed_fraction>=0 AND completed_fraction<=1),
+             requested_quantity_decimal TEXT,cumulative_filled_quantity_decimal TEXT,completed_fraction_decimal TEXT,
+             decimal_provenance TEXT,decimal_accounting_version TEXT,
              status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
              UNIQUE(milestone_id,proposal_id,order_intent_id))"""
     )
@@ -47,12 +69,35 @@ def apply_profit_milestone_schema(conn: Any, *, record_migration: bool = True) -
              delta_quantity REAL NOT NULL CHECK(delta_quantity>=0),
              cumulative_intent_quantity REAL NOT NULL CHECK(cumulative_intent_quantity>=0),
              fill_price REAL NOT NULL CHECK(fill_price>=0),occurred_at TEXT NOT NULL,
-             applied_at TEXT NOT NULL,payload TEXT NOT NULL)"""
+             applied_at TEXT NOT NULL,payload TEXT NOT NULL,
+             delta_quantity_decimal TEXT,cumulative_intent_quantity_decimal TEXT,fill_price_decimal TEXT,
+             decimal_provenance TEXT,decimal_accounting_version TEXT)"""
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_take_profit_progress_lifecycle "
         "ON take_profit_milestones(position_lifecycle_id,take_profit_level,status)"
     )
+    for table, columns in {
+        "take_profit_milestones": {
+            "target_quantity_decimal": "TEXT", "cumulative_filled_quantity_decimal": "TEXT",
+            "completed_fraction_decimal": "TEXT", "decimal_provenance": "TEXT",
+            "decimal_accounting_version": "TEXT",
+        },
+        "take_profit_milestone_actions": {
+            "requested_quantity_decimal": "TEXT", "cumulative_filled_quantity_decimal": "TEXT",
+            "completed_fraction_decimal": "TEXT", "decimal_provenance": "TEXT",
+            "decimal_accounting_version": "TEXT",
+        },
+        "take_profit_milestone_fill_links": {
+            "delta_quantity_decimal": "TEXT", "cumulative_intent_quantity_decimal": "TEXT",
+            "fill_price_decimal": "TEXT", "decimal_provenance": "TEXT",
+            "decimal_accounting_version": "TEXT",
+        },
+    }.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns.items():
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
     if record_migration:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at,detail) VALUES(?,?,?)",
@@ -95,8 +140,12 @@ def bind_take_profit_intent_in_transaction(
     lifecycle_id = str(intent.get("position_lifecycle_id") or proposal.get("position_lifecycle_id") or "")
     proposal_id = str(intent.get("proposal_id") or proposal.get("id") or proposal.get("proposal_id") or "")
     symbol = str(intent.get("symbol") or proposal.get("symbol") or "").upper()
-    requested = float(intent.get("requested_quantity") or 0.0)
-    if not lifecycle_id or not proposal_id or not symbol or not math.isfinite(requested) or requested <= 0:
+    requested_decimal = require_exact_decimal(
+        intent, "requested_quantity_decimal", minimum=ZERO
+    )
+    assert requested_decimal is not None
+    requested = float(requested_decimal)
+    if not lifecycle_id or not proposal_id or not symbol or requested_decimal <= ZERO:
         raise RuntimeError("take-profit intent requires lifecycle, proposal, symbol, and positive quantity")
     active = conn.execute(
         "SELECT id FROM position_lifecycles WHERE id=? AND symbol=? AND state='active'",
@@ -114,8 +163,10 @@ def bind_take_profit_intent_in_transaction(
         conn.execute(
             """INSERT INTO take_profit_milestones(
                  id,position_lifecycle_id,symbol,take_profit_level,target_quantity,
-                 cumulative_filled_quantity,completed_fraction,status,formula_version,created_at,updated_at)
-               VALUES(?,?,?,?,?,0,0,'pending_fill',?,?,?)""",
+                 cumulative_filled_quantity,completed_fraction,status,formula_version,created_at,updated_at,
+                 target_quantity_decimal,cumulative_filled_quantity_decimal,completed_fraction_decimal,
+                 decimal_provenance,decimal_accounting_version)
+               VALUES(?,?,?,?,?,0,0,'pending_fill',?,?,?,?,?,?,?,?)""",
             (
                 milestone_id,
                 lifecycle_id,
@@ -125,17 +176,26 @@ def bind_take_profit_intent_in_transaction(
                 TAKE_PROFIT_PROGRESS_FORMULA_VERSION,
                 timestamp,
                 timestamp,
+                decimal_text(requested_decimal),
+                "0",
+                "0",
+                EXACT_DECIMAL_PROVENANCE,
+                FIXED_POINT_ACCOUNTING_VERSION,
             ),
         )
     else:
         milestone_id = str(row["id"])
         if str(row["status"]) == "filled":
             raise RuntimeError("take-profit milestone is already fully filled")
-        remaining = max(
-            0.0,
-            float(row["target_quantity"]) - float(row["cumulative_filled_quantity"] or 0.0),
+        target_quantity_decimal = require_exact_decimal(
+            row, "target_quantity_decimal", minimum=ZERO
         )
-        if requested > remaining + 1e-9:
+        cumulative_filled_decimal = require_exact_decimal(
+            row, "cumulative_filled_quantity_decimal", minimum=ZERO
+        )
+        assert target_quantity_decimal is not None and cumulative_filled_decimal is not None
+        remaining = max(ZERO, target_quantity_decimal - cumulative_filled_decimal)
+        if requested_decimal > remaining:
             raise RuntimeError("take-profit intent exceeds the unfilled milestone quantity")
     action = conn.execute(
         "SELECT * FROM take_profit_milestone_actions WHERE order_intent_id=?",
@@ -146,9 +206,13 @@ def bind_take_profit_intent_in_transaction(
         conn.execute(
             """INSERT INTO take_profit_milestone_actions(
                  id,milestone_id,proposal_id,order_intent_id,requested_quantity,
-                 cumulative_filled_quantity,completed_fraction,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,0,0,'submitted_zero_fill',?,?)""",
-            (action_id, milestone_id, proposal_id, intent["id"], requested, timestamp, timestamp),
+                 cumulative_filled_quantity,completed_fraction,status,created_at,updated_at,
+                 requested_quantity_decimal,cumulative_filled_quantity_decimal,completed_fraction_decimal,
+                 decimal_provenance,decimal_accounting_version)
+               VALUES(?,?,?,?,?,0,0,'submitted_zero_fill',?,?,?,?,?,?,?)""",
+            (action_id, milestone_id, proposal_id, intent["id"], requested, timestamp, timestamp,
+             decimal_text(requested_decimal), "0", "0", EXACT_DECIMAL_PROVENANCE,
+             FIXED_POINT_ACCOUNTING_VERSION),
         )
     else:
         action_id = str(action["id"])
@@ -166,12 +230,16 @@ def apply_take_profit_terminal_state_in_transaction(
 ) -> None:
     """Persist a terminal order outcome without advancing milestone quantity."""
     action = conn.execute(
-        "SELECT id,cumulative_filled_quantity FROM take_profit_milestone_actions WHERE order_intent_id=?",
+        "SELECT id,cumulative_filled_quantity_decimal FROM take_profit_milestone_actions WHERE order_intent_id=?",
         (order_intent_id,),
     ).fetchone()
     if action is None:
         return
-    filled = float(action["cumulative_filled_quantity"] or 0.0)
+    filled_decimal = require_exact_decimal(
+        action, "cumulative_filled_quantity_decimal", minimum=ZERO
+    )
+    assert filled_decimal is not None
+    filled = float(filled_decimal)
     action_status = (
         f"partially_filled_{terminal_state}" if filled > 0
         else f"{terminal_state}_zero_fill"
@@ -194,11 +262,17 @@ def apply_take_profit_fill_in_transaction(
     occurred_at: str,
     now: str,
 ) -> None:
-    if str(intent.get("side") or "").lower() != "sell" or delta_quantity <= 0:
+    if str(intent.get("side") or "").lower() != "sell":
+        return
+    delta_decimal = _milestone_decimal(delta_quantity, "take-profit delta quantity")
+    cumulative_decimal = _milestone_decimal(cumulative_quantity, "take-profit cumulative quantity")
+    fill_price_decimal = _milestone_decimal(fill_price, "take-profit fill price")
+    if delta_decimal <= ZERO:
         return
     action = conn.execute(
         """SELECT a.*,m.position_lifecycle_id,m.symbol,m.take_profit_level,m.target_quantity,
-                  m.cumulative_filled_quantity AS milestone_filled,m.status AS milestone_status
+                  m.target_quantity_decimal,m.cumulative_filled_quantity_decimal AS milestone_filled_decimal,
+                  m.status AS milestone_status
            FROM take_profit_milestone_actions a
            JOIN take_profit_milestones m ON m.id=a.milestone_id
            WHERE a.order_intent_id=?""",
@@ -209,37 +283,60 @@ def apply_take_profit_fill_in_transaction(
     inserted = conn.execute(
         """INSERT OR IGNORE INTO take_profit_milestone_fill_links(
              id,milestone_id,action_id,broker_fill_event_id,broker_event_key,delta_quantity,
-             cumulative_intent_quantity,fill_price,occurred_at,applied_at,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+             cumulative_intent_quantity,fill_price,occurred_at,applied_at,payload,
+             delta_quantity_decimal,cumulative_intent_quantity_decimal,fill_price_decimal,
+             decimal_provenance,decimal_accounting_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             str(uuid.uuid4()), action["milestone_id"], action["id"], fill_event_id,
-            broker_event_key, delta_quantity, cumulative_quantity, fill_price,
+            broker_event_key, float(delta_decimal), float(cumulative_decimal), float(fill_price_decimal),
             occurred_at, now, json_dumps({"fill_authoritative": True}),
+            decimal_text(delta_decimal), decimal_text(cumulative_decimal), decimal_text(fill_price_decimal),
+            EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
         ),
     )
     if inserted.rowcount != 1:
         return
-    action_filled = min(float(action["requested_quantity"]), float(action["cumulative_filled_quantity"] or 0) + delta_quantity)
-    action_fraction = min(1.0, action_filled / float(action["requested_quantity"]))
+    requested_decimal = require_exact_decimal(action, "requested_quantity_decimal", minimum=ZERO)
+    previous_action_decimal = require_exact_decimal(
+        action, "cumulative_filled_quantity_decimal", minimum=ZERO
+    )
+    target_quantity_decimal = require_exact_decimal(
+        action, "target_quantity_decimal", minimum=ZERO
+    )
+    previous_milestone_decimal = require_exact_decimal(
+        action, "milestone_filled_decimal", minimum=ZERO
+    )
+    assert requested_decimal is not None and previous_action_decimal is not None
+    assert target_quantity_decimal is not None and previous_milestone_decimal is not None
+    action_filled_decimal = min(requested_decimal, previous_action_decimal + delta_decimal)
+    action_fraction_decimal = min(Decimal("1"), action_filled_decimal / requested_decimal)
     conn.execute(
         """UPDATE take_profit_milestone_actions SET cumulative_filled_quantity=?,completed_fraction=?,
-             status=?,updated_at=? WHERE id=?""",
+             status=?,updated_at=?,cumulative_filled_quantity_decimal=?,completed_fraction_decimal=?,
+             decimal_provenance=?,decimal_accounting_version=? WHERE id=?""",
         (
-            action_filled,
-            action_fraction,
-            "filled" if action_fraction >= 1.0 - 1e-12 else "partially_filled",
+            float(action_filled_decimal),
+            float(action_fraction_decimal),
+            "filled" if action_fraction_decimal >= Decimal("1") else "partially_filled",
             now,
+            decimal_text(action_filled_decimal), decimal_text(action_fraction_decimal),
+            EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
             action["id"],
         ),
     )
-    milestone_filled = min(float(action["target_quantity"]), float(action["milestone_filled"] or 0) + delta_quantity)
-    milestone_fraction = min(1.0, milestone_filled / float(action["target_quantity"]))
-    milestone_status = "filled" if milestone_fraction >= 1.0 - 1e-12 else "partially_filled"
+    milestone_filled_decimal = min(target_quantity_decimal, previous_milestone_decimal + delta_decimal)
+    milestone_fraction_decimal = min(Decimal("1"), milestone_filled_decimal / target_quantity_decimal)
+    milestone_status = "filled" if milestone_fraction_decimal >= Decimal("1") else "partially_filled"
     conn.execute(
         """UPDATE take_profit_milestones SET cumulative_filled_quantity=?,completed_fraction=?,
-             status=?,updated_at=?,completed_at=CASE WHEN ?='filled' THEN COALESCE(completed_at,?) ELSE completed_at END
+             status=?,updated_at=?,completed_at=CASE WHEN ?='filled' THEN COALESCE(completed_at,?) ELSE completed_at END,
+             cumulative_filled_quantity_decimal=?,completed_fraction_decimal=?,
+             decimal_provenance=?,decimal_accounting_version=?
            WHERE id=?""",
-        (milestone_filled, milestone_fraction, milestone_status, now, milestone_status, now, action["milestone_id"]),
+        (float(milestone_filled_decimal), float(milestone_fraction_decimal), milestone_status, now, milestone_status, now,
+         decimal_text(milestone_filled_decimal), decimal_text(milestone_fraction_decimal),
+         EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, action["milestone_id"]),
     )
     level = int(action["take_profit_level"])
     conn.execute(
@@ -258,13 +355,16 @@ def remaining_take_profit_quantity(
     take_profit_level: int,
 ) -> float | None:
     rows = storage.fetch_all(
-        """SELECT target_quantity,cumulative_filled_quantity FROM take_profit_milestones
+        """SELECT target_quantity_decimal,cumulative_filled_quantity_decimal FROM take_profit_milestones
            WHERE position_lifecycle_id=? AND take_profit_level=?""",
         (position_lifecycle_id, take_profit_level),
     )
     if not rows:
         return None
-    return max(0.0, float(rows[0]["target_quantity"]) - float(rows[0]["cumulative_filled_quantity"] or 0.0))
+    target = require_exact_decimal(rows[0], "target_quantity_decimal", minimum=ZERO)
+    filled = require_exact_decimal(rows[0], "cumulative_filled_quantity_decimal", minimum=ZERO)
+    assert target is not None and filled is not None
+    return float(max(ZERO, target - filled))
 
 
 __all__ = [

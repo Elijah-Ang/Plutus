@@ -15,6 +15,7 @@ from .formula_versions import (
     PHASE4_ALLOCATOR_VERSION,
     PHASE4_SCHEMA_VERSION,
 )
+from .fixed_point_accounting import ZERO, require_exact_decimal
 from .strategy_execution_registry import (
     REGISTRY_FORMULA_VERSION,
     StrategyRegistryIntegrityError,
@@ -357,6 +358,22 @@ class Phase4AllocationStore:
                     raise AllocationAuthorityError(
                         "allocation sleeve capacity is not finite and nonnegative"
                     )
+                if require_executable:
+                    try:
+                        require_exact_decimal(
+                            raw_sleeve,
+                            "remaining_risk_decimal",
+                            minimum=ZERO,
+                        )
+                        require_exact_decimal(
+                            raw_sleeve,
+                            "remaining_notional_decimal",
+                            minimum=ZERO,
+                        )
+                    except ValueError as exc:
+                        raise AllocationAuthorityError(
+                            "executable allocation sleeve exact capacity is unavailable"
+                        ) from exc
         if registry_binding_exact and authorized != tuple(
             verified_registry.evaluation.authorized_versions
         ):
@@ -420,14 +437,23 @@ class Phase4AllocationStore:
 def allocation_authority_integrity_report(storage: Any) -> dict[str, int]:
     """Count replay failures without mutating or repairing persisted authority."""
     rows = storage.fetch_all(
-        "SELECT id FROM phase4_allocation_decisions WHERE formula_version=?",
+        "SELECT id, decision FROM phase4_allocation_decisions WHERE formula_version=?",
         (PHASE4_ALLOCATION_VERSION,),
     )
     invalid = 0
     store = Phase4AllocationStore(storage)
     for row in rows:
         try:
-            store.load_verified(str(row["id"]))
+            # Preserve-cash decisions are intentionally non-executable.  They
+            # still need replayable allocation/configuration authority, but
+            # must not be rejected merely because they cannot authorize a
+            # broker-bound allocation.  Require the stronger exact registry
+            # authority only for decisions that can authorize execution.
+            decision = str(row.get("decision") or "")
+            store.load_verified(
+                str(row["id"]),
+                require_executable=decision.startswith("ALLOCATE"),
+            )
         except (AllocationAuthorityError, sqlite3.Error):
             invalid += 1
     return {"invalid_phase4_allocation_authority": invalid}

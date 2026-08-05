@@ -5,6 +5,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -15,6 +16,12 @@ from .formula_versions import (
     FINAL_HARDENING_SCHEMA_VERSION,
     REQUIRED_SCHEMA_VERSIONS,
     RISK_DECISION_VERSION,
+)
+from .fixed_point_accounting import (
+    EXACT_DECIMAL_PROVENANCE,
+    FIXED_POINT_ACCOUNTING_VERSION,
+    decimal_text,
+    require_exact_decimal,
 )
 
 
@@ -84,7 +91,7 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "control_state": "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT, source TEXT, raw_command_redacted TEXT, telegram_update_id INTEGER, telegram_message_id INTEGER, telegram_message_timestamp INTEGER, processed_at TEXT",
     "trade_setups": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, side TEXT, action TEXT, setup_key TEXT, is_active INTEGER, price REAL, score REAL, asset_score REAL, volatility_regime TEXT, trend_state TEXT, gpt_status TEXT, proposal_eligible INTEGER, proposal_sent INTEGER, block_reason TEXT",
     "shadow_trades": "id TEXT PRIMARY KEY, run_id TEXT, setup_id TEXT, symbol TEXT, side TEXT, would_have_entry_price REAL, would_have_entry_time TEXT, would_have_notional REAL, would_have_shares REAL, would_have_stop_price REAL, would_have_stop_distance_pct REAL, reason_not_executed TEXT, score REAL, volatility_regime TEXT, gpt_confidence TEXT, gpt_caution TEXT, setup_key TEXT, portfolio_state_json TEXT, sleep_mode_active INTEGER, cooldown_state TEXT, selected_actual_trade_this_cycle INTEGER",
-    "trade_outcomes": "id TEXT PRIMARY KEY, trade_id TEXT, actual_or_shadow TEXT, symbol TEXT, entry_time TEXT, entry_price REAL, outcome_status TEXT, forward_return_1d REAL, forward_return_5d REAL, forward_return_20d REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, stop_hit INTEGER, target_reached INTEGER, add_on_improved INTEGER, beat_shadow_alternatives INTEGER, updated_at TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, shadow_trade_id TEXT, risk_budget_decision_id TEXT, position_sizing_decision_id TEXT, approval_id TEXT, approval_batch_action_id TEXT, quantity REAL, notional REAL, score REAL, asset_score REAL, trade_score REAL, setup_reason TEXT, source TEXT",
+    "trade_outcomes": "id TEXT PRIMARY KEY, trade_id TEXT, actual_or_shadow TEXT, symbol TEXT, entry_time TEXT, entry_price REAL, outcome_status TEXT, forward_return_1d REAL, forward_return_5d REAL, forward_return_20d REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, stop_hit INTEGER, target_reached INTEGER, add_on_improved INTEGER, beat_shadow_alternatives INTEGER, updated_at TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, shadow_trade_id TEXT, risk_budget_decision_id TEXT, position_sizing_decision_id TEXT, approval_id TEXT, approval_batch_action_id TEXT, quantity REAL, notional REAL, score REAL, asset_score REAL, trade_score REAL, setup_reason TEXT, source TEXT, entry_price_decimal TEXT, quantity_decimal TEXT, notional_decimal TEXT, decimal_provenance TEXT, decimal_accounting_version TEXT",
     "position_sizing_decisions": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, timestamp TEXT, portfolio_equity REAL, risk_budget REAL, stop_distance_dollars REAL, risk_based_shares REAL, score_adjusted_notional REAL, vol_adjusted_notional REAL, final_notional REAL, suggested_shares REAL, base_notional REAL, score_multiplier REAL, volatility_multiplier REAL, stop_model_used TEXT, initial_stop_price REAL, initial_risk_per_share REAL, initial_risk_pct REAL, initial_risk_dollars REAL, stop_source TEXT, entry_price_for_r REAL, risk_model_version TEXT, r_multiple_unavailable_reason TEXT, batch_id TEXT, candidate_id TEXT, proposal_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT",
     "portfolio_exposure_snapshots": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, total_exposure_pct REAL, total_exposure_dollars REAL, single_symbol_exposure_json TEXT, cluster_exposure_json TEXT",
     "candidate_rankings": "id TEXT PRIMARY KEY, run_id TEXT, timestamp TEXT, symbol TEXT, true_score_rank INTEGER, final_candidate_rank INTEGER, setup_quality_score REAL, portfolio_fit_score REAL, diversification_score REAL, sizing_score REAL, reason_selected TEXT, reason_not_selected TEXT",
@@ -122,9 +129,9 @@ TABLE_DEFINITIONS: dict[str, str] = {
     "llm_explanation_usage": "id TEXT PRIMARY KEY, run_id TEXT, enabled INTEGER DEFAULT 0, attempted_calls INTEGER DEFAULT 0, successful_calls INTEGER DEFAULT 0, failed_calls INTEGER DEFAULT 0, discarded_invalid INTEGER DEFAULT 0, conflicts_ignored INTEGER DEFAULT 0, total_estimated_cost REAL DEFAULT 0, status TEXT, created_at TEXT, detail TEXT",
     "dynamic_universe_stage_reviews": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, current_tier TEXT, review_type TEXT, decision TEXT, reason TEXT, score REAL, data_confidence TEXT, observation_since TEXT, observation_cycles INTEGER, market_open_refreshes INTEGER, latest_price REAL, price_freshness TEXT, eod_available INTEGER DEFAULT 0, intraday_available INTEGER DEFAULT 0, trend_summary TEXT, intraday_summary TEXT, liquidity_summary TEXT, volatility_summary TEXT, relative_strength_spy TEXT, relative_strength_qqq TEXT, cluster TEXT, cluster_exposure_blocker TEXT, promotion_requirements_met TEXT, promotion_requirements_missing TEXT, demotion_risk_reasons TEXT, demotion_guard_active INTEGER DEFAULT 0, current_stage_reason TEXT, next_stage_blocker TEXT, tradable_status TEXT, proposal_allowed_status TEXT, proposal_block_reason TEXT, last_promotion_review_at TEXT, last_demotion_review_at TEXT, next_promotion_review_at TEXT, next_demotion_review_at TEXT, created_at TEXT, payload TEXT, promotion_freshness_path TEXT, promotion_confidence_adjustment TEXT, promotion_data_limitations TEXT, proposal_block_reason_after_promotion TEXT, fallback_used TEXT, next_review_time TEXT, alpaca_quote_freshness TEXT, alpaca_tradability_result TEXT, intraday_freshness TEXT, eod_freshness TEXT",
     "dynamic_universe_performance": "id TEXT PRIMARY KEY, run_id TEXT, symbol TEXT, tier TEXT, metric TEXT, value REAL, created_at TEXT, payload TEXT",
-    "performance_setups": "id TEXT PRIMARY KEY, timestamp TEXT, run_id TEXT, symbol TEXT, asset_class TEXT, tier TEXT, setup_type TEXT, action_decision TEXT, proposed INTEGER DEFAULT 0, proposal_id TEXT, batch_id TEXT, not_proposed_reason TEXT, score REAL, score_components TEXT, signal_state TEXT, entry_signal INTEGER DEFAULT 0, exit_signal INTEGER DEFAULT 0, add_signal INTEGER DEFAULT 0, current_price REAL, price_timestamp TEXT, data_freshness TEXT, trend_metrics TEXT, volatility_metrics TEXT, liquidity_metrics TEXT, relative_strength_metrics TEXT, portfolio_exposure TEXT, cluster_exposure TEXT, risk_budget TEXT, proposed_notional REAL, hypothetical_notional REAL, actual_approved_notional REAL, final_submitted_notional REAL, order_id TEXT, broker_order_id TEXT, fill_id TEXT, order_status TEXT, fill_price REAL, fill_qty REAL, created_at TEXT, updated_at TEXT",
+    "performance_setups": "id TEXT PRIMARY KEY, timestamp TEXT, run_id TEXT, symbol TEXT, asset_class TEXT, tier TEXT, setup_type TEXT, action_decision TEXT, proposed INTEGER DEFAULT 0, proposal_id TEXT, batch_id TEXT, not_proposed_reason TEXT, score REAL, score_components TEXT, signal_state TEXT, entry_signal INTEGER DEFAULT 0, exit_signal INTEGER DEFAULT 0, add_signal INTEGER DEFAULT 0, current_price REAL, price_timestamp TEXT, data_freshness TEXT, trend_metrics TEXT, volatility_metrics TEXT, liquidity_metrics TEXT, relative_strength_metrics TEXT, portfolio_exposure TEXT, cluster_exposure TEXT, risk_budget TEXT, proposed_notional REAL, hypothetical_notional REAL, actual_approved_notional REAL, final_submitted_notional REAL, order_id TEXT, broker_order_id TEXT, fill_id TEXT, order_status TEXT, fill_price REAL, fill_qty REAL, created_at TEXT, updated_at TEXT, fill_price_decimal TEXT, fill_qty_decimal TEXT, decimal_provenance TEXT, decimal_accounting_version TEXT",
     "performance_blockers": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, blocker TEXT, reason TEXT, severity TEXT, created_at TEXT",
-    "performance_outcomes": "id TEXT PRIMARY KEY, setup_id TEXT UNIQUE, run_id TEXT, symbol TEXT, proposal_id TEXT, batch_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, actual_or_shadow TEXT, entry_time TEXT, entry_price REAL, entry_notional REAL, entry_qty REAL, status TEXT, actual_proposal_execution_helped INTEGER, add_to_winner_improved_position INTEGER, exit_signal_avoided_loss INTEGER, created_at TEXT, updated_at TEXT",
+    "performance_outcomes": "id TEXT PRIMARY KEY, setup_id TEXT UNIQUE, run_id TEXT, symbol TEXT, proposal_id TEXT, batch_id TEXT, order_id TEXT, broker_order_id TEXT, fill_id TEXT, actual_or_shadow TEXT, entry_time TEXT, entry_price REAL, entry_notional REAL, entry_qty REAL, status TEXT, actual_proposal_execution_helped INTEGER, add_to_winner_improved_position INTEGER, exit_signal_avoided_loss INTEGER, created_at TEXT, updated_at TEXT, entry_price_decimal TEXT, entry_qty_decimal TEXT, entry_notional_decimal TEXT, decimal_provenance TEXT, decimal_accounting_version TEXT",
     "performance_forward_returns": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, horizon_days INTEGER, due_at TEXT, eligible_to_update INTEGER DEFAULT 0, updated_at TEXT, forward_return REAL, max_favorable_excursion REAL, max_adverse_excursion REAL, hypothetical_stop_hit INTEGER, hypothetical_target_hit INTEGER, status TEXT, reason TEXT",
     "performance_counterfactuals": "id TEXT PRIMARY KEY, setup_id TEXT, run_id TEXT, symbol TEXT, counterfactual_type TEXT, would_enter INTEGER DEFAULT 0, would_add INTEGER DEFAULT 0, would_exit INTEGER DEFAULT 0, hypothetical_entry_price REAL, hypothetical_notional REAL, reason TEXT, comparison_status TEXT, created_at TEXT, updated_at TEXT",
     "crypto_research_runs": "id TEXT PRIMARY KEY, run_id TEXT, status TEXT, started_at TEXT, ended_at TEXT, symbols TEXT, provider TEXT, error TEXT, capability_snapshot_id TEXT, capability_snapshot_fingerprint TEXT, capability_authoritative INTEGER, payload TEXT",
@@ -225,6 +232,19 @@ RUNTIME_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     },
     "telegram_updates": {
         "message_timestamp": "INTEGER",
+    },
+    "trade_outcomes": {
+        "entry_price_decimal": "TEXT", "quantity_decimal": "TEXT", "notional_decimal": "TEXT",
+        "decimal_provenance": "TEXT", "decimal_accounting_version": "TEXT",
+    },
+    "performance_setups": {
+        "fill_price_decimal": "TEXT", "fill_qty_decimal": "TEXT",
+        "decimal_provenance": "TEXT", "decimal_accounting_version": "TEXT",
+    },
+    "performance_outcomes": {
+        "entry_price_decimal": "TEXT", "entry_qty_decimal": "TEXT",
+        "entry_notional_decimal": "TEXT", "decimal_provenance": "TEXT",
+        "decimal_accounting_version": "TEXT",
     },
 }
 
@@ -383,8 +403,8 @@ class Storage:
             from .crypto_proposals import apply_crypto_proposal_schema
             from .crypto_paper_lane import apply_crypto_paper_lane_schema
             from .cross_asset_allocation import apply_cross_asset_allocation_schema
-            from .performance_lab import apply_performance_lab_classification_schema
             from .fixed_point_accounting import apply_fixed_point_accounting_schema
+            from .performance_lab import apply_performance_lab_classification_schema
             from .crypto_outcomes import apply_crypto_outcomes_schema
             from .crypto_profitability import apply_crypto_profitability_schema
             apply_p1_execution_schema(conn)
@@ -418,8 +438,8 @@ class Storage:
             apply_crypto_proposal_schema(conn)
             apply_crypto_paper_lane_schema(conn)
             apply_cross_asset_allocation_schema(conn)
-            apply_performance_lab_classification_schema(conn)
             apply_fixed_point_accounting_schema(conn)
+            apply_performance_lab_classification_schema(conn)
             apply_crypto_outcomes_schema(conn)
             apply_crypto_profitability_schema(conn)
             _ensure_columns(conn, RUNTIME_ADDITIVE_COLUMNS)
@@ -509,10 +529,10 @@ class Storage:
                 apply_crypto_paper_lane_schema(conn, record_migration=False)
                 from .cross_asset_allocation import apply_cross_asset_allocation_schema
                 apply_cross_asset_allocation_schema(conn, record_migration=False)
-                from .performance_lab import apply_performance_lab_classification_schema
-                apply_performance_lab_classification_schema(conn, record_migration=False)
                 from .fixed_point_accounting import apply_fixed_point_accounting_schema
                 apply_fixed_point_accounting_schema(conn, record_migration=False)
+                from .performance_lab import apply_performance_lab_classification_schema
+                apply_performance_lab_classification_schema(conn, record_migration=False)
                 from .crypto_outcomes import apply_crypto_outcomes_schema
                 apply_crypto_outcomes_schema(conn, record_migration=False)
                 from .crypto_profitability import apply_crypto_profitability_schema
@@ -1166,6 +1186,63 @@ class Storage:
             )
         return run_id
 
+    def recover_stale_runs(self, current_run_id: str, mode: str) -> list[str]:
+        """Close process sessions left running by a process restart.
+
+        The corresponding runtime lock is acquired before this method is
+        called, so any older session in the same mode still marked ``running``
+        no longer has process authority. Keep the recovery explicit and
+        auditable without touching orders, intents, fills, or any other trading
+        ledger state.
+        """
+        if mode not in {"paper", "listener"}:
+            raise ValueError(f"unsupported runtime session mode: {mode}")
+        now = iso_now()
+        recovered: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT id, started_at FROM runs
+                   WHERE mode=? AND status='running' AND id<>?
+                   ORDER BY started_at""",
+                (mode, current_run_id),
+            ).fetchall()
+            for row in rows:
+                detail = json_dumps(
+                    {
+                        "mode": mode,
+                        "reason": "runtime_restart_after_previous_process_lost_authority",
+                        "recovered_by_run_id": current_run_id,
+                        "started_at": row["started_at"],
+                        "trading_ledger_unchanged": True,
+                    }
+                )
+                updated = conn.execute(
+                    """UPDATE runs
+                       SET ended_at=?, status='stale_recovered', detail=?
+                       WHERE id=? AND mode=? AND status='running'""",
+                    (now, detail, row["id"], mode),
+                )
+                if updated.rowcount != 1:
+                    continue
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event_type,actor,detail,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (row["id"], "runtime_run_recovered_after_restart", "system", detail, now),
+                )
+                conn.execute(
+                    """INSERT INTO audit_events(run_id,event_type,actor,detail,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (
+                        current_run_id,
+                        "stale_runtime_run_recovered",
+                        "system",
+                        json_dumps({"stale_run_id": row["id"], "detail": detail}),
+                        now,
+                    ),
+                )
+                recovered.append(str(row["id"]))
+        return recovered
+
     def finish_run(self, run_id: str, status: str, detail: str = "") -> None:
         self.execute("UPDATE runs SET ended_at=?, status=?, detail=? WHERE id=?", (iso_now(), status, detail, run_id))
         rows = self.fetch_all("SELECT mode FROM runs WHERE id=?", (run_id,))
@@ -1393,7 +1470,8 @@ class Storage:
     def upsert_actual_trade_outcome_for_order(self, order_id: str, source: str = "ranked_batch_approval") -> str | None:
         rows = self.fetch_all(
             """
-            SELECT o.*, f.id AS fill_id, f.qty AS fill_qty, f.price AS fill_price, f.filled_at,
+            SELECT o.*, f.id AS fill_id,
+                   f.qty_decimal AS fill_qty_decimal, f.price_decimal AS fill_price_decimal, f.filled_at,
                    p.run_id AS proposal_run_id, p.payload AS proposal_payload, p.created_at AS proposal_created_at,
                    p.selection_reason, p.current_price,
                    c.id AS candidate_id, c.batch_id,
@@ -1431,11 +1509,21 @@ class Storage:
             except Exception:
                 payload = {}
         entry_time = str(row.get("filled_at") or row.get("updated_at") or row.get("created_at") or iso_now())
-        entry_price = row.get("fill_price") or payload.get("latest_price") or row.get("current_price")
-        quantity = row.get("fill_qty") or row.get("qty")
-        notional = row.get("notional")
-        if notional is None and quantity is not None and entry_price is not None:
-            notional = float(quantity) * float(entry_price)
+        if row.get("fill_id") is None:
+            return None
+        entry_price_decimal = require_exact_decimal(
+            row, "fill_price_decimal", minimum=Decimal("0")
+        )
+        quantity_decimal = require_exact_decimal(
+            row, "fill_qty_decimal", minimum=Decimal("0")
+        )
+        assert entry_price_decimal is not None and quantity_decimal is not None
+        if entry_price_decimal <= 0 or quantity_decimal <= 0:
+            return None
+        notional_decimal = quantity_decimal * entry_price_decimal
+        entry_price = float(entry_price_decimal)
+        quantity = float(quantity_decimal)
+        notional = float(notional_decimal)
         existing = self.fetch_all("SELECT id FROM trade_outcomes WHERE actual_or_shadow='actual' AND order_id=?", (order_id,))
         outcome_id = existing[0]["id"] if existing else str(uuid.uuid4())
         values = (
@@ -1478,8 +1566,9 @@ class Storage:
                 batch_id, candidate_id, proposal_id, order_id, broker_order_id, fill_id,
                 shadow_trade_id, risk_budget_decision_id, position_sizing_decision_id,
                 approval_id, approval_batch_action_id, quantity, notional, score, asset_score,
-                trade_score, setup_reason, source
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                trade_score, setup_reason, source,entry_price_decimal,quantity_decimal,notional_decimal,
+                decimal_provenance,decimal_accounting_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 trade_id=excluded.trade_id,
                 entry_time=excluded.entry_time,
@@ -1503,9 +1592,16 @@ class Storage:
                 asset_score=excluded.asset_score,
                 trade_score=excluded.trade_score,
                 setup_reason=excluded.setup_reason,
-                source=excluded.source
+                source=excluded.source,
+                entry_price_decimal=excluded.entry_price_decimal,
+                quantity_decimal=excluded.quantity_decimal,
+                notional_decimal=excluded.notional_decimal,
+                decimal_provenance=excluded.decimal_provenance,
+                decimal_accounting_version=excluded.decimal_accounting_version
             """,
-            values,
+            (*values, decimal_text(entry_price_decimal), decimal_text(quantity_decimal),
+             decimal_text(notional_decimal), EXACT_DECIMAL_PROVENANCE,
+             FIXED_POINT_ACCOUNTING_VERSION),
         )
         if row.get("shadow_trade_id"):
             self.execute(

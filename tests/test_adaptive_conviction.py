@@ -180,5 +180,6 @@ def test_operational_sizing_formula_does_not_reference_adaptive_conviction():
     assert "AdaptiveConviction" not in final_validation_source
     assert "_record_adaptive_conviction" in final_validation_source
     assert "approved_notional" in final_validation_source
+    assert "approved_notional_ceiling_decimal" in final_validation_source
     assert "displayed_quantity" in final_validation_source
     assert "final_adaptive" in final_validation_source

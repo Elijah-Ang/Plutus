@@ -17,6 +17,13 @@ from .crypto_risk import CryptoRiskError, CryptoRiskStore
 from .crypto_sizing import CryptoSizingRequest
 from .crypto_outcomes import CryptoCostModel, calculate_shadow_outcome, persist_observation
 from .cross_asset_allocation import cold_start_source_fingerprint
+from .crypto_profitability import CryptoProfitabilityStore
+from .cross_asset_allocation import (
+    _policy as cross_asset_policy,
+    build_crypto_exploration_evidence,
+)
+from .fixed_point_accounting import RECONSTRUCTED_REAL_PROVENANCE
+from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .storage import Storage
 from .utils import json_dumps
 
@@ -441,6 +448,7 @@ class CryptoResearchEngine:
 
         current = (now or datetime.now(UTC)).astimezone(UTC)
         by_source: dict[str, Any] = {}
+        by_candidate: dict[str, Any] = {}
         for raw in allocation_decisions or ():
             if not isinstance(raw, dict):
                 continue
@@ -458,11 +466,21 @@ class CryptoResearchEngine:
             source_id = str(raw.get("source_id") or "").strip()
             if source_id:
                 by_source[source_id] = raw
+            candidate_id = str(raw.get("candidate_id") or "").strip()
+            if candidate_id:
+                by_candidate[candidate_id] = raw
 
         proposal_ids: list[str] = []
         for result in results:
             source_id = str(result.strategy_decision_id or "").strip()
             allocation = by_source.get(source_id)
+            if allocation is None:
+                for action in ("entry", "add"):
+                    allocation = by_candidate.get(
+                        f"crypto:{result.symbol}:{source_id}:{action}"
+                    )
+                    if allocation is not None:
+                        break
             if allocation is None or not result.strategy_signal_eligible:
                 continue
             if not result.capability_snapshot_id or not result.market_evidence_id:
@@ -501,6 +519,7 @@ class CryptoResearchEngine:
                 ):
                     continue
                 allocation_source_type = str(allocation.get("source_type") or "")
+                profitability = None
                 if allocation_source_type == "candidate_cold_start_discovery":
                     expected_source_fingerprint = cold_start_source_fingerprint(
                         source_id=str(strategy.id),
@@ -508,22 +527,49 @@ class CryptoResearchEngine:
                         symbol=str(strategy.symbol),
                         config_hash=str(self.config.get("effective_config_hash") or ""),
                     )
+                    source_valid = (
+                        str(allocation.get("source_fingerprint") or "")
+                        == expected_source_fingerprint
+                    )
                 elif allocation_source_type == "candidate_profitability_decision":
-                    from .crypto_profitability import CryptoProfitabilityStore
-
-                    source_authority = CryptoProfitabilityStore(self.storage).load_verified(
+                    profitability = CryptoProfitabilityStore(self.storage).load_verified(
                         str(allocation.get("source_id") or "")
                     )
-                    expected_source_fingerprint = source_authority.decision_fingerprint
+                    source_valid = (
+                        str(allocation.get("source_fingerprint") or "")
+                        == profitability.decision_fingerprint
+                        and profitability.strategy_decision_id == strategy.id
+                        and profitability.config_hash
+                        == str(self.config.get("effective_config_hash") or "")
+                    )
                 else:
-                    expected_source_fingerprint = ""
-                if str(allocation.get("source_fingerprint") or "") != expected_source_fingerprint:
+                    source_valid = False
+                if not source_valid:
                     self.storage.audit(
                         self.run_id,
                         "crypto_deferred_proposal_failed_closed",
-                        {"symbol": result.symbol, "error": "allocation_source_fingerprint_mismatch"},
+                        {
+                            "symbol": result.symbol,
+                            "error": "allocation_source_fingerprint_mismatch",
+                        },
                     )
                     continue
+                if allocation.get("exploration_eligible") is True:
+                    if profitability is None:
+                        continue
+                    expected_exploration = build_crypto_exploration_evidence(
+                        profitability, cross_asset_policy(self.config)
+                    )
+                    if json_dumps(dict(allocation.get("exploration_evidence") or {})) != json_dumps(expected_exploration):
+                        self.storage.audit(
+                            self.run_id,
+                            "crypto_deferred_proposal_failed_closed",
+                            {
+                                "symbol": result.symbol,
+                                "error": "exploration_evidence_mismatch",
+                            },
+                        )
+                        continue
                 requested = Decimal(str(allocation["requested_notional"]))
                 allocated = Decimal(str(allocation["allocated_notional"]))
                 if (
@@ -693,7 +739,7 @@ class CryptoResearchEngine:
             if bid <= Decimal("0"):
                 continue
             basis_rows = self.storage.fetch_all(
-                "SELECT remaining_quantity,unit_cost FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
+                "SELECT remaining_quantity,unit_cost,opened_at FROM crypto_paper_lots WHERE symbol=? AND remaining_quantity<>'0' ORDER BY opened_at,id",
                 (symbol,),
             )
             basis_quantity = sum((_crypto_decimal(row["remaining_quantity"], "crypto lot quantity") for row in basis_rows), Decimal("0"))
@@ -724,8 +770,19 @@ class CryptoResearchEngine:
                 stop_price = max(stop_price, _crypto_decimal(previous["stop_price"], "crypto persisted stop"))
             target_r = _crypto_decimal(strategy_cfg.get("target_reward_r_multiple"), "crypto target reward")
             profit_target = average_entry + (average_entry - stop_price) * target_r
-            created_at = previous["created_at"] if previous else now.isoformat()
-            created_dt = _parse_dt(created_at)
+            try:
+                lot_opened_at = _oldest_crypto_lot_opened_at(basis_rows)
+            except ValueError:
+                self.storage.audit(
+                    self.run_id,
+                    "crypto_position_management_blocked",
+                    {"symbol": symbol, "reason": "crypto_lot_opened_at_missing_or_invalid"},
+                )
+                continue
+            # Position age is anchored to the oldest verified open lot, never
+            # to the timestamp of a management row created by the scanner.
+            created_at = lot_opened_at.isoformat()
+            created_dt = lot_opened_at
             time_stop_cfg = management_cfg.get("time_stop") or {}
             hold_days = _crypto_decimal(time_stop_cfg.get("min_hold_days_before_time_stop") or "3", "crypto time stop days")
             time_stop_at = created_dt + timedelta(seconds=int(hold_days * Decimal("86400")))
@@ -822,7 +879,7 @@ class CryptoResearchEngine:
                    time_stop_at=excluded.time_stop_at,thesis_fingerprint=excluded.thesis_fingerprint,
                    last_action=COALESCE(excluded.last_action,crypto_paper_position_management.last_action),
                    last_proposal_id=COALESCE(excluded.last_proposal_id,crypto_paper_position_management.last_proposal_id),
-                   updated_at=excluded.updated_at""",
+                   updated_at=excluded.updated_at,created_at=excluded.created_at""",
                 (
                     str(uuid.uuid4()), symbol, _decimal_text(quantity), _decimal_text(average_entry), _decimal_text(peak),
                     _decimal_text(stop_price), _decimal_text(profit_target), time_stop_at.isoformat(), thesis_fingerprint,
@@ -1152,6 +1209,13 @@ class CryptoResearchEngine:
                 target = row["target_price"]
                 if entry in (None, "") or stop in (None, "") or target in (None, ""):
                     continue
+                entry_decimal = _crypto_decimal(entry, "crypto shadow entry price")
+                shadow_notional = _crypto_decimal(
+                    sizing.get("maximum_order_notional_usd"),
+                    "crypto shadow sizing notional",
+                )
+                if entry_decimal <= Decimal("0") or shadow_notional <= Decimal("0"):
+                    raise ValueError("crypto shadow sizing basis must be positive")
                 setup = {
                     "symbol": symbol,
                     "strategy_decision_id": str(row["id"]),
@@ -1163,6 +1227,12 @@ class CryptoResearchEngine:
                     "horizon_hours": horizon_hours,
                     "cost_model": cost_model.to_payload(),
                     "side": "long",
+                    # Forward shadow outcomes use the configured paper order
+                    # notional as a deterministic hypothetical sizing basis.
+                    # This is not execution authority; it ensures P&L and
+                    # risk-multiple evidence is available for profitability
+                    # ranking instead of silently remaining quantity-less.
+                    "quantity": _decimal_text(shadow_notional / entry_decimal),
                 }
                 observation = calculate_shadow_outcome(
                     setup,
@@ -1268,6 +1338,39 @@ class CryptoResearchEngine:
         mode = _crypto_mode(self.config)
         candidate = _build_candidate_metadata(result, self.config, now)
         blockers = self._crypto_blockers(result, candidate, now)
+        # ``performance_outcomes`` keeps REAL compatibility projections for
+        # older reporting consumers, but its Decimal sidecars are still
+        # required whenever those projections are populated.  This research
+        # row is hypothetical evidence reconstructed from provider/config
+        # values, not a broker fill, so the provenance must say so explicitly.
+        shadow_entry_price_decimal = None
+        shadow_entry_notional_decimal = None
+        shadow_entry_quantity_decimal = None
+        try:
+            if result.price is not None:
+                shadow_entry_price_decimal = _crypto_decimal(
+                    result.price, "crypto Performance Lab shadow entry price"
+                )
+            if candidate.get("position_size") is not None:
+                shadow_entry_notional_decimal = _crypto_decimal(
+                    candidate.get("position_size"),
+                    "crypto Performance Lab shadow entry notional",
+                )
+            if (
+                shadow_entry_price_decimal is not None
+                and shadow_entry_price_decimal > Decimal("0")
+                and shadow_entry_notional_decimal is not None
+            ):
+                shadow_entry_quantity_decimal = (
+                    shadow_entry_notional_decimal / shadow_entry_price_decimal
+                )
+        except ValueError:
+            # Preserve the existing descriptive row and let the read-only
+            # integrity report expose malformed source evidence; never invent
+            # a Decimal sidecar for an invalid research value.
+            shadow_entry_price_decimal = None
+            shadow_entry_notional_decimal = None
+            shadow_entry_quantity_decimal = None
         proposed = 0
         action_decision = "paper_watch" if mode == "paper_watch" else ("paper_proposal" if mode == "paper_proposal" else "research_only")
         self.storage.execute(
@@ -1314,13 +1417,29 @@ class CryptoResearchEngine:
         self.storage.execute(
             """
             INSERT INTO performance_outcomes(
-                id,setup_id,run_id,symbol,actual_or_shadow,entry_time,entry_price,entry_notional,status,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                id,setup_id,run_id,symbol,actual_or_shadow,entry_time,entry_price,entry_notional,entry_qty,status,
+                created_at,updated_at,entry_price_decimal,entry_qty_decimal,entry_notional_decimal,
+                decimal_provenance,decimal_accounting_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 str(uuid.uuid4()), setup_id, self.run_id, result.symbol, "shadow", now.isoformat(), result.price,
-                candidate.get("position_size"), "pending_forward_returns",
-                now.isoformat(), now.isoformat(),
+                candidate.get("position_size"),
+                None
+                if shadow_entry_quantity_decimal is None
+                else float(shadow_entry_quantity_decimal),
+                "pending_forward_returns", now.isoformat(), now.isoformat(),
+                None
+                if shadow_entry_price_decimal is None
+                else _decimal_text(shadow_entry_price_decimal),
+                None
+                if shadow_entry_quantity_decimal is None
+                else _decimal_text(shadow_entry_quantity_decimal),
+                None
+                if shadow_entry_notional_decimal is None
+                else _decimal_text(shadow_entry_notional_decimal),
+                RECONSTRUCTED_REAL_PROVENANCE,
+                FIXED_POINT_ACCOUNTING_VERSION,
             ),
         )
         for horizon in (1, 5, 20):
@@ -1701,6 +1820,22 @@ def _parse_dt(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _oldest_crypto_lot_opened_at(rows: list[Mapping[str, Any]]) -> datetime | None:
+    """Return the oldest opened_at, failing closed on any active-lot defect."""
+
+    opened_at: datetime | None = None
+    for row in rows:
+        raw_opened_at = row.get("opened_at")
+        if raw_opened_at in (None, ""):
+            raise ValueError("active crypto lot opened_at is missing")
+        try:
+            parsed = _parse_dt(str(raw_opened_at))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("active crypto lot opened_at is invalid") from exc
+        opened_at = parsed if opened_at is None else min(opened_at, parsed)
+    return opened_at
 
 
 def _crypto_decimal(value: Any, label: str) -> Decimal:

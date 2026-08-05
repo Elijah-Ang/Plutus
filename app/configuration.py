@@ -268,7 +268,12 @@ STRICT_NESTED_KEYS = {
         "cold_start_prior_correlation", "cold_start_notional_tiers",
         "severe_loss_threshold", "minimum_mean_net_return",
         "require_verified_correlation", "correlation_snapshot_max_age_seconds",
-        "outcome_horizon_hours",
+        "outcome_horizon_hours", "exploration_policy",
+    },
+    "crypto.profitability_policy.exploration_policy": {
+        "enabled", "maximum_completed_samples", "maximum_notional_usd",
+        "prior_win_probability", "prior_uncertainty", "expected_holding_hours",
+        "correlation_bound",
     },
     "crypto.profitability_policy.cold_start_notional_tiers": {
         "first_trade_count", "first_notional_usd", "second_trade_count",
@@ -1213,6 +1218,74 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         crypto_profitability.get("require_verified_correlation") is True,
         "crypto profitability must require verified correlation evidence",
     )
+    exploration_policy = crypto_profitability.get("exploration_policy") or {}
+    if exploration_policy.get("enabled") is True:
+        require(
+            crypto_mode == "supervised_paper",
+            "crypto exploration requires supervised_paper mode",
+        )
+        require(
+            isinstance(exploration_policy.get("maximum_completed_samples"), int)
+            and not isinstance(exploration_policy.get("maximum_completed_samples"), bool),
+            "crypto exploration maximum_completed_samples must be an integer",
+        )
+        _bounded(
+            exploration_policy.get("maximum_completed_samples"),
+            "crypto.profitability_policy.exploration_policy.maximum_completed_samples",
+            errors,
+            1,
+            5,
+        )
+        _bounded(
+            exploration_policy.get("maximum_notional_usd"),
+            "crypto.profitability_policy.exploration_policy.maximum_notional_usd",
+            errors,
+            5,
+            500,
+        )
+        prior_probability = _bounded(
+            exploration_policy.get("prior_win_probability"),
+            "crypto.profitability_policy.exploration_policy.prior_win_probability",
+            errors,
+            0.50,
+            0.90,
+        )
+        prior_uncertainty = _bounded(
+            exploration_policy.get("prior_uncertainty"),
+            "crypto.profitability_policy.exploration_policy.prior_uncertainty",
+            errors,
+            0,
+            0.25,
+        )
+        if prior_probability is not None and prior_uncertainty is not None:
+            require(
+                prior_probability - prior_uncertainty > 0,
+                "crypto exploration prior must retain a positive conservative probability",
+            )
+        _bounded(
+            exploration_policy.get("expected_holding_hours"),
+            "crypto.profitability_policy.exploration_policy.expected_holding_hours",
+            errors,
+            1,
+            720,
+        )
+        correlation_bound = _bounded(
+            exploration_policy.get("correlation_bound"),
+            "crypto.profitability_policy.exploration_policy.correlation_bound",
+            errors,
+            1,
+            1,
+        )
+        require(
+            correlation_bound == 1,
+            "crypto exploration correlation_bound must be the conservative bound 1",
+        )
+    else:
+        require(
+            exploration_policy.get("enabled") is False
+            or exploration_policy.get("enabled") is None,
+            "crypto exploration policy enabled must be true, false, or omitted",
+        )
 
     crypto_proposal = crypto.get("proposal_policy") or {}
     require(crypto_proposal.get("mode") == "research_only_preview",

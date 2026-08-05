@@ -6,6 +6,7 @@ import math
 import statistics
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -25,6 +26,7 @@ from .strategy_execution_registry import (
     StrategyRegistryStore,
 )
 from .strategy_rule_based import STRATEGY_VERSION
+from .fixed_point_accounting import decimal_text
 from .utils import iso_now, json_dumps
 
 
@@ -38,6 +40,23 @@ COVARIANCE_VERSION = "ledoit_wolf_style_shrinkage_v1"
 STRATEGIES = (STRATEGY_VERSION, *tuple(sorted(STRATEGY_VERSIONS.values())))
 SUPPORTED_RISK_UNITS = frozenset({"stop_risk_dollars", "pct_equity"})
 RISK_CONVERSION_FORMULA_VERSION = "risk_unit_to_stop_risk_dollars_v1"
+ZERO = Decimal("0")
+
+
+def _risk_decimal(value: Any, label: str, *, minimum: Decimal = ZERO) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{label} is missing")
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not a valid decimal") from exc
+    if not result.is_finite() or result < minimum:
+        raise ValueError(f"{label} must be finite and non-negative")
+    return result
+
+
+def _risk_quantize(value: Decimal, precision: int) -> Decimal:
+    return value.quantize(Decimal("1").scaleb(-precision), rounding=ROUND_HALF_EVEN)
 
 
 def normalize_risk_to_dollars(
@@ -50,10 +69,16 @@ def normalize_risk_to_dollars(
     allow_zero: bool = False,
     max_equity_age_seconds: float = 300.0,
 ) -> dict[str, Any]:
-    """Validate a dimensional risk amount and return canonical stop-risk dollars."""
+    """Validate a dimensional risk amount and return canonical stop-risk dollars.
+
+    Risk budgets are authority inputs, not presentation metrics.  Keep their
+    canonical representation as decimal text through the conversion and only
+    expose floats as compatibility projections for the existing allocator
+    payloads.
+    """
     try:
-        value = float(risk_value)
-        equity = float(conversion_equity)
+        value = _risk_decimal(risk_value, "risk value")
+        equity = _risk_decimal(conversion_equity, "conversion equity")
         evaluated = datetime.fromisoformat(str(evaluation_time).replace("Z", "+00:00"))
         equity_at = datetime.fromisoformat(str(conversion_equity_as_of).replace("Z", "+00:00"))
     except (TypeError, ValueError, OverflowError) as exc:
@@ -63,22 +88,25 @@ def normalize_risk_to_dollars(
     unit = str(risk_unit or "")
     if unit not in SUPPORTED_RISK_UNITS:
         raise ValueError("risk unit is missing or unsupported")
-    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+    if value < ZERO or (value == ZERO and not allow_zero):
         raise ValueError("risk value must be finite and positive")
-    if not math.isfinite(equity) or equity <= 0:
+    if equity <= ZERO:
         raise ValueError("authoritative conversion equity is missing or invalid")
     age = (evaluated - equity_at).total_seconds()
     if age < -5.0 or age > max_equity_age_seconds:
         raise ValueError("authoritative conversion equity is stale")
-    dollars = value if unit == "stop_risk_dollars" else equity * value / 100.0
-    if not math.isfinite(dollars) or dollars < 0 or (dollars == 0 and not allow_zero):
+    dollars = value if unit == "stop_risk_dollars" else equity * value / Decimal("100")
+    if dollars < ZERO or (dollars == ZERO and not allow_zero):
         raise ValueError("canonical stop-risk dollars are invalid")
     return {
-        "risk_value": dollars,
+        "risk_value": float(dollars),
+        "risk_value_decimal": decimal_text(dollars),
         "risk_unit": "stop_risk_dollars",
-        "source_risk_value": value,
+        "source_risk_value": float(value),
+        "source_risk_value_decimal": decimal_text(value),
         "source_risk_unit": unit,
-        "conversion_equity": equity,
+        "conversion_equity": float(equity),
+        "conversion_equity_decimal": decimal_text(equity),
         "conversion_equity_as_of": equity_at.isoformat(),
         "evaluation_time": evaluated.isoformat(),
         "formula_version": RISK_CONVERSION_FORMULA_VERSION,
@@ -146,8 +174,15 @@ def candidate_allocation_rank(inputs: Mapping[str, Any]) -> dict[str, float]:
         conversion_equity_as_of=str(inputs.get("conversion_equity_as_of") or ""),
         evaluation_time=str(inputs.get("evaluation_time") or ""),
     )
-    authoritative_equity = float(canonical_risk["conversion_equity"])
-    risk_consumption = unit(float(canonical_risk["risk_value"]) / authoritative_equity, scale=0.0035)
+    authoritative_equity = _risk_decimal(
+        canonical_risk["conversion_equity_decimal"], "canonical conversion equity"
+    )
+    canonical_risk_value = _risk_decimal(
+        canonical_risk["risk_value_decimal"], "canonical risk value"
+    )
+    risk_consumption = unit(
+        float(canonical_risk_value / authoritative_equity), scale=0.0035
+    )
     stop_quality = unit(inputs.get("stop_quality"), scale=100.0, default=0.50)
     reward_to_risk = unit(inputs.get("reward_to_risk"), scale=3.0, default=0.50)
     risk_efficiency = statistics.fmean((1.0 - 0.50 * risk_consumption, stop_quality, reward_to_risk))
@@ -208,8 +243,11 @@ def allocate_candidates_to_sleeves(
     for strategy, raw_sleeve in sorted(sleeves.items(), key=lambda item: str(item[0])):
         sleeve = dict(raw_sleeve)
         unit = str(sleeve.get("risk_unit") or "")
+        remaining_risk_input = sleeve.get("remaining_risk_decimal")
+        if remaining_risk_input is None:
+            remaining_risk_input = sleeve.get("remaining_risk")
         normalized = normalize_risk_to_dollars(
-            sleeve.get("remaining_risk"), unit,
+            remaining_risk_input, unit,
             conversion_equity=conversion_equity,
             conversion_equity_as_of=conversion_equity_as_of,
             evaluation_time=evaluation_time,
@@ -218,15 +256,36 @@ def allocate_candidates_to_sleeves(
         normalized_sleeves[str(strategy)] = {
             **sleeve,
             **normalized,
-            "remaining_risk": round(float(normalized["risk_value"]), precision),
-            "risk_value": round(float(normalized["risk_value"]), precision),
+            "remaining_risk_decimal": decimal_text(
+                _risk_quantize(
+                    _risk_decimal(normalized["risk_value_decimal"], "sleeve risk"),
+                    precision,
+                )
+            ),
+            "remaining_risk": float(
+                _risk_quantize(
+                    _risk_decimal(normalized["risk_value_decimal"], "sleeve risk"),
+                    precision,
+                )
+            ),
+            "risk_value": float(
+                _risk_quantize(
+                    _risk_decimal(normalized["risk_value_decimal"], "sleeve risk"),
+                    precision,
+                )
+            ),
             "risk_unit": "stop_risk_dollars",
         }
-    sleeve_capacity = round(
-        sum(float(sleeve["remaining_risk"]) for sleeve in normalized_sleeves.values()),
+    sleeve_capacity_decimal = _risk_quantize(
+        sum(
+            (_risk_decimal(sleeve["remaining_risk_decimal"], "sleeve remaining risk")
+             for sleeve in normalized_sleeves.values()),
+            ZERO,
+        ),
         precision,
     )
-    global_source = sleeve_capacity if global_available_risk is None else global_available_risk
+    sleeve_capacity = float(sleeve_capacity_decimal)
+    global_source = sleeve_capacity_decimal if global_available_risk is None else global_available_risk
     global_normalized = normalize_risk_to_dollars(
         global_source, global_risk_unit,
         conversion_equity=conversion_equity,
@@ -234,8 +293,15 @@ def allocate_candidates_to_sleeves(
         evaluation_time=evaluation_time,
         allow_zero=True,
     )
-    requested_global = float(global_normalized["risk_value"])
-    global_remaining = round(min(sleeve_capacity, requested_global or 0.0), precision)
+    requested_global_decimal = _risk_quantize(
+        _risk_decimal(global_normalized["risk_value_decimal"], "global risk budget"),
+        precision,
+    )
+    requested_global = float(requested_global_decimal)
+    global_remaining_decimal = _risk_quantize(
+        min(sleeve_capacity_decimal, requested_global_decimal), precision
+    )
+    global_remaining = float(global_remaining_decimal)
 
     ranked: list[tuple[float, str, dict[str, Any], dict[str, float]]] = []
     exits: list[tuple[str, dict[str, Any]]] = []
@@ -249,11 +315,18 @@ def allocate_candidates_to_sleeves(
             exits.append((identity, candidate))
             continue
         try:
-            candidate_risk_value = candidate.get("stop_risk_dollars")
+            candidate_risk_value = candidate.get("stop_risk_dollars_decimal")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("stop_risk_dollars")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("risk_value_decimal")
             if candidate_risk_value is None:
                 candidate_risk_value = candidate.get("risk_value")
             candidate_risk_unit = candidate.get("risk_unit")
-            if candidate_risk_unit is None and candidate.get("stop_risk_dollars") is not None:
+            if candidate_risk_unit is None and (
+                candidate.get("stop_risk_dollars") is not None
+                or candidate.get("stop_risk_dollars_decimal") is not None
+            ):
                 candidate_risk_unit = "stop_risk_dollars"
             rank = candidate_allocation_rank({
                 **candidate,
@@ -279,9 +352,12 @@ def allocate_candidates_to_sleeves(
             "action": str(candidate.get("action") or "exit").lower(),
             "decision": "EXIT_BYPASS",
             "requested_risk": 0.0,
+            "requested_risk_decimal": "0",
             "risk_value": 0.0,
+            "risk_value_decimal": "0",
             "risk_unit": "stop_risk_dollars",
             "allocated_risk": 0.0,
+            "allocated_risk_decimal": "0",
             "ranking_score": None,
             "reason": "exits do not compete for entry risk sleeves",
         })
@@ -291,22 +367,31 @@ def allocate_candidates_to_sleeves(
             "strategy_version": str(candidate.get("strategy_version") or ""),
             "symbol": str(candidate.get("symbol") or ""),
             "action": str(candidate.get("action") or "entry").lower(),
-            "decision": "REJECT", "requested_risk": None, "allocated_risk": 0.0,
-            "risk_value": 0.0, "risk_unit": "stop_risk_dollars", "ranking_score": None,
+            "decision": "REJECT", "requested_risk": None, "requested_risk_decimal": None,
+            "allocated_risk": 0.0, "allocated_risk_decimal": "0",
+            "risk_value": 0.0, "risk_value_decimal": "0",
+            "risk_unit": "stop_risk_dollars", "ranking_score": None,
             "rank_components": None, "reason": f"invalid or stale risk conversion evidence: {reason}",
         })
 
-    allocated_by_strategy = {strategy: 0.0 for strategy in normalized_sleeves}
+    allocated_by_strategy_decimal = {strategy: ZERO for strategy in normalized_sleeves}
     for _negative_score, identity, candidate, rank in ranked:
         strategy = str(candidate.get("strategy_version") or "")
-        requested = None
+        requested_decimal: Decimal | None = None
         requested_conversion: dict[str, Any] | None = None
         try:
-            candidate_risk_value = candidate.get("stop_risk_dollars")
+            candidate_risk_value = candidate.get("stop_risk_dollars_decimal")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("stop_risk_dollars")
+            if candidate_risk_value is None:
+                candidate_risk_value = candidate.get("risk_value_decimal")
             if candidate_risk_value is None:
                 candidate_risk_value = candidate.get("risk_value")
             candidate_risk_unit = candidate.get("risk_unit")
-            if candidate_risk_unit is None and candidate.get("stop_risk_dollars") is not None:
+            if candidate_risk_unit is None and (
+                candidate.get("stop_risk_dollars") is not None
+                or candidate.get("stop_risk_dollars_decimal") is not None
+            ):
                 candidate_risk_unit = "stop_risk_dollars"
             requested_conversion = normalize_risk_to_dollars(
                 candidate_risk_value, str(candidate_risk_unit or ""),
@@ -314,48 +399,76 @@ def allocate_candidates_to_sleeves(
                 conversion_equity_as_of=conversion_equity_as_of,
                 evaluation_time=evaluation_time,
             )
-            requested = float(requested_conversion["risk_value"])
+            requested_decimal = _risk_quantize(
+                _risk_decimal(requested_conversion["risk_value_decimal"], "requested candidate risk"),
+                precision,
+            )
         except ValueError:
-            requested = None
+            requested_decimal = None
         sleeve = normalized_sleeves.get(strategy)
         reason = "allocated within strategy sleeve and global risk budget"
-        allocated = 0.0
+        allocated_decimal = ZERO
         decision = "REJECT"
         if sleeve is None:
             reason = "strategy has no authorized risk sleeve"
-        elif requested is None or requested <= 0.0:
+        elif requested_decimal is None or requested_decimal <= ZERO:
             reason = "positive finite requested stop risk is required"
-        elif sleeve["remaining_risk"] <= 0.0:
+        elif _risk_decimal(sleeve["remaining_risk_decimal"], "sleeve remaining risk") <= ZERO:
             reason = "strategy sleeve is exhausted"
-        elif global_remaining <= 0.0:
+        elif global_remaining_decimal <= ZERO:
             reason = "global Phase 3 available risk is exhausted"
         else:
-            allocated = round(
-                min(float(requested), float(sleeve["remaining_risk"]), global_remaining),
+            allocated_decimal = _risk_quantize(
+                min(
+                    requested_decimal,
+                    _risk_decimal(sleeve["remaining_risk_decimal"], "sleeve remaining risk"),
+                    global_remaining_decimal,
+                ),
                 precision,
             )
-            minimum = 0.0
+            minimum_decimal = ZERO
             if candidate.get("minimum_risk_value") is not None or candidate.get("minimum_risk_unit") is not None:
                 try:
-                    minimum = float(normalize_risk_to_dollars(
-                        candidate.get("minimum_risk_value"), str(candidate.get("minimum_risk_unit") or ""),
+                    minimum_value = candidate.get("minimum_risk_value_decimal")
+                    if minimum_value is None:
+                        minimum_value = candidate.get("minimum_risk_value")
+                    minimum_decimal = _risk_decimal(normalize_risk_to_dollars(
+                        minimum_value, str(candidate.get("minimum_risk_unit") or ""),
                         conversion_equity=conversion_equity,
                         conversion_equity_as_of=conversion_equity_as_of,
                         evaluation_time=evaluation_time,
-                    )["risk_value"])
+                    )["risk_value_decimal"], "candidate minimum risk")
                 except ValueError:
-                    allocated = 0.0
+                    allocated_decimal = ZERO
                     reason = "candidate minimum risk unit or value is invalid"
-            if allocated + 10 ** (-(precision + 1)) < minimum:
-                allocated = 0.0
+            epsilon = Decimal("1").scaleb(-(precision + 1))
+            if allocated_decimal + epsilon < minimum_decimal:
+                allocated_decimal = ZERO
                 reason = "remaining capacity is below the candidate minimum stop risk"
-            elif allocated > 0.0:
-                decision = "ALLOCATE" if allocated >= float(requested) - 10 ** (-precision) else "ALLOCATE_PARTIAL"
+            elif allocated_decimal > ZERO:
+                decision = (
+                    "ALLOCATE"
+                    if allocated_decimal + Decimal("1").scaleb(-precision) >= requested_decimal
+                    else "ALLOCATE_PARTIAL"
+                )
                 if decision == "ALLOCATE_PARTIAL":
                     reason = "candidate was reduced to remaining sleeve or global risk capacity"
-                sleeve["remaining_risk"] = round(float(sleeve["remaining_risk"]) - allocated, precision)
-                global_remaining = round(global_remaining - allocated, precision)
-                allocated_by_strategy[strategy] = round(allocated_by_strategy[strategy] + allocated, precision)
+                remaining_decimal = _risk_quantize(
+                    _risk_decimal(sleeve["remaining_risk_decimal"], "sleeve remaining risk")
+                    - allocated_decimal,
+                    precision,
+                )
+                global_remaining_decimal = _risk_quantize(
+                    global_remaining_decimal - allocated_decimal, precision
+                )
+                sleeve["remaining_risk_decimal"] = decimal_text(remaining_decimal)
+                sleeve["remaining_risk"] = float(remaining_decimal)
+                allocated_by_strategy_decimal[strategy] = _risk_quantize(
+                    allocated_by_strategy_decimal[strategy] + allocated_decimal,
+                    precision,
+                )
+        allocated = float(allocated_decimal)
+        requested = None if requested_decimal is None else float(requested_decimal)
         decisions.append({
             "candidate_id": identity,
             "strategy_version": strategy,
@@ -363,8 +476,11 @@ def allocate_candidates_to_sleeves(
             "action": str(candidate.get("action") or "entry").lower(),
             "decision": decision,
             "requested_risk": requested,
+            "requested_risk_decimal": None if requested_decimal is None else decimal_text(requested_decimal),
             "allocated_risk": allocated,
+            "allocated_risk_decimal": decimal_text(allocated_decimal),
             "risk_value": allocated,
+            "risk_value_decimal": decimal_text(allocated_decimal),
             "risk_unit": "stop_risk_dollars",
             "risk_conversion": requested_conversion,
             "candidate_stop_risk": requested,
@@ -373,8 +489,15 @@ def allocate_candidates_to_sleeves(
             "reason": reason,
         })
 
-    allocated_total = round(sum(allocated_by_strategy.values()), precision)
-    starting_global = round(global_remaining + allocated_total, precision)
+    allocated_total_decimal = _risk_quantize(
+        sum(allocated_by_strategy_decimal.values(), ZERO), precision
+    )
+    starting_global_decimal = _risk_quantize(
+        global_remaining_decimal + allocated_total_decimal, precision
+    )
+    allocated_total = float(allocated_total_decimal)
+    starting_global = float(starting_global_decimal)
+    global_remaining = float(global_remaining_decimal)
     replay_inputs = {
         "candidates": [dict(candidate) for candidate in candidates],
         "sleeves": {strategy: dict(sleeve) for strategy, sleeve in sorted(sleeves.items())},
@@ -388,14 +511,28 @@ def allocate_candidates_to_sleeves(
     }
     return {
         "decisions": decisions,
-        "allocated_by_strategy": allocated_by_strategy,
+        "allocated_by_strategy": {
+            strategy: float(value)
+            for strategy, value in allocated_by_strategy_decimal.items()
+        },
+        "allocated_by_strategy_decimal": {
+            strategy: decimal_text(value)
+            for strategy, value in allocated_by_strategy_decimal.items()
+        },
         "allocated_risk": allocated_total,
+        "allocated_risk_decimal": decimal_text(allocated_total_decimal),
         "global_budget": starting_global,
+        "global_budget_decimal": decimal_text(starting_global_decimal),
         "risk_value": allocated_total,
+        "risk_value_decimal": decimal_text(allocated_total_decimal),
         "risk_unit": "stop_risk_dollars",
         "global_remaining_risk": global_remaining,
+        "global_remaining_risk_decimal": decimal_text(global_remaining_decimal),
         "sleeves_after": normalized_sleeves,
         "reconciliation_residual": round(starting_global - allocated_total - global_remaining, precision),
+        "reconciliation_residual_decimal": decimal_text(
+            starting_global_decimal - allocated_total_decimal - global_remaining_decimal
+        ),
         "raw_replay_inputs": replay_inputs,
         "fingerprint": _fingerprint({"inputs": replay_inputs, "decisions": decisions}),
     }
@@ -785,28 +922,52 @@ class AdaptiveAllocator:
         snapshot: Mapping[str, Any],
         drawdown_pct: float,
         phase3_profile: Any,
-    ) -> tuple[float, str, dict[str, Any]]:
-        explicit = _finite_nonnegative(snapshot.get("phase3_available_risk"))
-        explicit_pct = _finite_nonnegative(snapshot.get("phase3_available_risk_pct"))
-        if explicit is not None:
-            return explicit, str(snapshot.get("phase3_available_risk_unit") or ""), {"source": "phase3_available_risk"}
-        if explicit_pct is not None:
-            return explicit_pct, "pct_equity", {"source": "phase3_available_risk_pct"}
-        maximum = float(getattr(phase3_profile, "max_portfolio_heat_pct", 0.0) or 0.0)
-        heat = _finite_nonnegative(snapshot.get("heat_before_pct"), 0.0) or 0.0
-        halt = float(getattr(phase3_profile, "drawdown_halt_pct", 6.0) or 6.0)
-        multiplier = 0.0 if drawdown_pct >= halt else 0.50 if drawdown_pct >= 4.0 else 0.75 if drawdown_pct >= 2.0 else 1.0
+    ) -> tuple[Any, str, dict[str, Any]]:
+        explicit_decimal = snapshot.get("phase3_available_risk_decimal")
+        explicit_value = explicit_decimal if explicit_decimal is not None else snapshot.get("phase3_available_risk")
+        if explicit_value is not None:
+            explicit = _risk_decimal(explicit_value, "Phase 3 available risk")
+            return decimal_text(explicit), str(snapshot.get("phase3_available_risk_unit") or ""), {
+                "source": "phase3_available_risk",
+                "risk_value_decimal": decimal_text(explicit),
+            }
+        explicit_pct_decimal = snapshot.get("phase3_available_risk_pct_decimal")
+        explicit_pct_value = explicit_pct_decimal if explicit_pct_decimal is not None else snapshot.get("phase3_available_risk_pct")
+        if explicit_pct_value is not None:
+            explicit_pct = _risk_decimal(explicit_pct_value, "Phase 3 available risk percentage")
+            return decimal_text(explicit_pct), "pct_equity", {
+                "source": "phase3_available_risk_pct",
+                "risk_value_decimal": decimal_text(explicit_pct),
+            }
+        maximum = _risk_decimal(
+            getattr(phase3_profile, "max_portfolio_heat_pct", "0") if phase3_profile is not None else "0",
+            "maximum Phase 3 portfolio heat percentage",
+        )
+        heat_value = snapshot.get("heat_before_pct_decimal")
+        heat_raw = heat_value if heat_value is not None else snapshot.get("heat_before_pct", "0")
+        heat = _risk_decimal(heat_raw, "Phase 3 heat before percentage")
+        halt = _risk_decimal(
+            getattr(phase3_profile, "drawdown_halt_pct", "6") if phase3_profile is not None else "6",
+            "Phase 3 drawdown halt percentage",
+        )
+        drawdown = _risk_decimal(drawdown_pct, "drawdown percentage")
+        multiplier = (
+            ZERO if drawdown >= halt
+            else Decimal("0.50") if drawdown >= Decimal("4")
+            else Decimal("0.75") if drawdown >= Decimal("2")
+            else Decimal("1")
+        )
         # This is the total risk capacity to divide into strategy targets.
         # Current held/reserved consumption is subtracted exactly once inside
         # _build_sleeves. Returning a remaining envelope here and subtracting
         # strategy consumption again would double count existing heat.
         capacity = maximum * multiplier
-        return capacity, "pct_equity", {
+        return decimal_text(capacity), "pct_equity", {
             "source": "phase3_total_heat_capacity_fallback",
-            "max_portfolio_heat_pct": maximum,
-            "heat_before_pct": heat,
-            "drawdown_multiplier": multiplier,
-            "global_remaining_after_consumption_pct": max(0.0, capacity - heat),
+            "max_portfolio_heat_pct": decimal_text(maximum),
+            "heat_before_pct": decimal_text(heat),
+            "drawdown_multiplier": decimal_text(multiplier),
+            "global_remaining_after_consumption_pct": decimal_text(max(ZERO, capacity - heat)),
         }
 
     def _build_sleeves(
@@ -817,114 +978,200 @@ class AdaptiveAllocator:
         exploration: Mapping[str, float],
         probe: Mapping[str, float],
         snapshot: Mapping[str, Any],
-        available_risk: float,
+        available_risk: Any,
         risk_unit: str,
         *,
         precision: int = 8,
-    ) -> tuple[dict[str, dict[str, Any]], float, float]:
+    ) -> tuple[dict[str, dict[str, Any]], Decimal, Decimal]:
         equity = _finite_nonnegative(snapshot.get("portfolio_equity"))
+        equity_decimal = (
+            _risk_decimal(snapshot.get("portfolio_equity"), "portfolio equity")
+            if equity is not None
+            else None
+        )
+        available_decimal = _risk_decimal(available_risk, "available Phase 4 risk")
+        if risk_unit == "pct_equity":
+            if equity_decimal is None or equity_decimal <= ZERO:
+                raise ValueError("percentage risk allocation requires positive equity")
+            available_decimal = equity_decimal * available_decimal / Decimal("100")
 
-        def pct_cap(value: float) -> float:
+        def pct_cap(value: Any) -> Decimal:
+            value_decimal = _risk_decimal(value, "strategy risk cap")
             if risk_unit == "pct_equity":
-                return value
-            return equity * value / 100.0 if equity is not None else 0.0
+                return value_decimal
+            return (
+                equity_decimal * value_decimal / Decimal("100")
+                if equity_decimal is not None
+                else ZERO
+            )
 
-        desired: dict[str, float] = {}
-        caps: dict[str, float] = {}
+        desired: dict[str, Decimal] = {}
+        caps: dict[str, Decimal] = {}
         for strategy in sorted(authorized):
             state = states[strategy]
             if state == "PROBE":
-                caps[strategy] = pct_cap(float(probe.get(strategy, 0.0)))
+                caps[strategy] = pct_cap(probe.get(strategy, 0.0))
                 desired[strategy] = caps[strategy]
             elif state == "EXPLORATION":
-                caps[strategy] = pct_cap(float(exploration.get(strategy, 0.0)))
+                caps[strategy] = pct_cap(exploration.get(strategy, 0.0))
                 desired[strategy] = caps[strategy]
             elif state in {"ACTIVE", "THROTTLED"}:
-                caps[strategy] = available_risk * (
-                    float(self.cfg.get("max_strategy_weight", 0.35))
-                    if state == "ACTIVE" else float(self.cfg.get("throttled_max_strategy_weight", float(self.cfg.get("max_strategy_weight", 0.35)) * 0.5))
+                max_weight = _risk_decimal(
+                    self.cfg.get("max_strategy_weight", 0.35),
+                    "maximum strategy weight",
                 )
-                desired[strategy] = min(caps[strategy], available_risk * max(0.0, float(weights.get(strategy, 0.0))))
+                throttled_weight = _risk_decimal(
+                    self.cfg.get("throttled_max_strategy_weight", max_weight * Decimal("0.5")),
+                    "throttled strategy weight",
+                )
+                state_weight = max_weight if state == "ACTIVE" else throttled_weight
+                caps[strategy] = available_decimal * state_weight
+                desired[strategy] = min(
+                    caps[strategy],
+                    available_decimal * max(
+                        ZERO, _risk_decimal(weights.get(strategy, 0.0), "strategy weight")
+                    ),
+                )
             else:
-                caps[strategy] = desired[strategy] = 0.0
-        desired_total = sum(desired.values())
-        scale = min(1.0, available_risk / desired_total) if desired_total > 0 else 0.0
-        allocated = {strategy: round(value * scale, precision) for strategy, value in desired.items()}
-        allocated_total = round(sum(allocated.values()), precision)
-        budget = round(available_risk, precision)
+                caps[strategy] = desired[strategy] = ZERO
+        desired_total = sum(desired.values(), ZERO)
+        scale = min(Decimal("1"), available_decimal / desired_total) if desired_total > ZERO else ZERO
+        allocated = {
+            strategy: _risk_quantize(value * scale, precision)
+            for strategy, value in desired.items()
+        }
+        allocated_total = _risk_quantize(sum(allocated.values(), ZERO), precision)
+        budget = _risk_quantize(available_decimal, precision)
         if allocated_total > budget and allocated:
             last = sorted(allocated)[-1]
-            allocated[last] = round(max(0.0, allocated[last] - (allocated_total - budget)), precision)
-            allocated_total = round(sum(allocated.values()), precision)
-        unallocated = round(max(0.0, budget - allocated_total), precision)
-        residual = round(budget - allocated_total - unallocated, precision)
-        consumption: dict[str, float] = {strategy: 0.0 for strategy in authorized}
+            allocated[last] = _risk_quantize(
+                max(ZERO, allocated[last] - (allocated_total - budget)), precision
+            )
+            allocated_total = _risk_quantize(sum(allocated.values(), ZERO), precision)
+        unallocated_decimal = _risk_quantize(max(ZERO, budget - allocated_total), precision)
+        residual_decimal = _risk_quantize(
+            budget - allocated_total - unallocated_decimal, precision
+        )
+        consumption: dict[str, Decimal] = {strategy: ZERO for strategy in authorized}
         consumption_unit = str(snapshot.get("strategy_risk_unit") or "")
 
-        def canonical_consumption(value: Any) -> float:
-            return float(normalize_risk_to_dollars(
+        def canonical_consumption(value: Any) -> Decimal:
+            return _risk_decimal(normalize_risk_to_dollars(
                 value,
                 consumption_unit,
                 conversion_equity=snapshot.get("portfolio_equity"),
                 conversion_equity_as_of=str(snapshot.get("equity_as_of") or snapshot.get("as_of") or ""),
                 evaluation_time=str(snapshot.get("as_of") or ""),
                 allow_zero=True,
-            )["risk_value"])
+            )["risk_value_decimal"], "strategy consumed risk")
 
-        total_map = snapshot.get("strategy_risk_by_strategy")
+        total_map_decimal = snapshot.get("strategy_risk_by_strategy_decimal")
+        total_map = (
+            total_map_decimal
+            if isinstance(total_map_decimal, Mapping) and total_map_decimal
+            else snapshot.get("strategy_risk_by_strategy")
+        )
         if isinstance(total_map, Mapping) and total_map:
             for strategy in consumption:
-                consumption[strategy] = canonical_consumption(total_map.get(strategy, 0.0))
+                consumption[strategy] = (
+                    _risk_decimal(total_map.get(strategy, 0.0), "strategy consumed risk")
+                    if total_map is total_map_decimal
+                    else canonical_consumption(total_map.get(strategy, 0.0))
+                )
         else:
             for key in ("held_risk_by_strategy", "pending_risk_by_strategy", "reserved_risk_by_strategy"):
-                values = snapshot.get(key, {})
+                values_decimal = snapshot.get(f"{key}_decimal")
+                values = values_decimal if isinstance(values_decimal, Mapping) else snapshot.get(key, {})
                 if isinstance(values, Mapping) and values:
                     for strategy in consumption:
-                        consumption[strategy] += canonical_consumption(values.get(strategy, 0.0))
+                        consumption[strategy] += (
+                            _risk_decimal(values.get(strategy, 0.0), "strategy consumed risk")
+                            if values is values_decimal
+                            else canonical_consumption(values.get(strategy, 0.0))
+                        )
         sleeves: dict[str, dict[str, Any]] = {}
-        notional_consumption = snapshot.get("strategy_notional_by_strategy", {})
-        gross_capacity = 0.0
-        if equity is not None:
+        notional_consumption_decimal = snapshot.get("strategy_notional_by_strategy_decimal")
+        notional_consumption = (
+            notional_consumption_decimal
+            if isinstance(notional_consumption_decimal, Mapping)
+            else snapshot.get("strategy_notional_by_strategy", {})
+        )
+        gross_capacity_decimal = ZERO
+        if equity_decimal is not None:
             try:
-                gross_capacity = equity * float(snapshot.get("phase3_gross_exposure_capacity_pct") or 0.0) / 100.0
-            except (TypeError, ValueError):
-                gross_capacity = 0.0
+                gross_capacity_decimal = equity_decimal * _risk_decimal(
+                    snapshot.get("phase3_gross_exposure_capacity_pct") or 0.0,
+                    "Phase 3 gross exposure capacity percentage",
+                ) / Decimal("100")
+            except ValueError:
+                gross_capacity_decimal = ZERO
         for strategy in sorted(authorized):
             assigned = allocated[strategy]
-            consumed = round(consumption[strategy], precision)
-            target_share = round(assigned / budget, precision) if budget else 0.0
-            assigned_notional = round(gross_capacity * target_share, precision)
-            consumed_notional = round(
-                _finite_nonnegative(
-                    notional_consumption.get(strategy) if isinstance(notional_consumption, Mapping) else 0.0,
-                    0.0,
-                ) or 0.0,
-                precision,
+            consumed = _risk_quantize(consumption[strategy], precision)
+            target_share_decimal = _risk_quantize(assigned / budget, precision) if budget > ZERO else ZERO
+            assigned_notional = _risk_quantize(gross_capacity_decimal * target_share_decimal, precision)
+            raw_consumed_notional = (
+                notional_consumption.get(strategy, 0.0)
+                if isinstance(notional_consumption, Mapping)
+                else 0.0
             )
-            remaining = round(max(0.0, assigned - consumed), precision)
-            overconsumed = round(max(0.0, consumed - assigned), precision)
+            consumed_notional = _risk_quantize(
+                _risk_decimal(raw_consumed_notional, "strategy consumed notional"), precision
+            )
+            remaining = _risk_quantize(max(ZERO, assigned - consumed), precision)
+            overconsumed = _risk_quantize(max(ZERO, consumed - assigned), precision)
+            reconciliation_residual = _risk_quantize(
+                assigned + overconsumed - consumed - remaining, precision
+            )
+            remaining_notional = _risk_quantize(
+                max(ZERO, assigned_notional - consumed_notional), precision
+            )
+            overconsumed_notional = _risk_quantize(
+                max(ZERO, consumed_notional - assigned_notional), precision
+            )
             sleeves[strategy] = {
                 "strategy_version": strategy,
                 "state": states[strategy],
                 "risk_unit": risk_unit,
-                "risk_value": assigned,
+                "risk_value": float(assigned),
+                "risk_value_decimal": decimal_text(assigned),
                 "conversion_equity": equity,
+                "conversion_equity_decimal": None if equity_decimal is None else decimal_text(equity_decimal),
                 "conversion_equity_as_of": snapshot.get("equity_as_of") or snapshot.get("as_of"),
                 "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
-                "target_weight": target_share,
-                "state_cap_risk": round(caps[strategy], precision),
-                "allocated_risk": assigned,
-                "consumed_risk": consumed,
-                "remaining_risk": remaining,
-                "overconsumed_risk": overconsumed,
-                "risk_reconciliation_residual": round(assigned + overconsumed - consumed - remaining, precision),
-                "allocated_notional": assigned_notional,
-                "consumed_notional": consumed_notional,
-                "remaining_notional": round(max(0.0, assigned_notional - consumed_notional), precision),
-                "overconsumed_notional": round(max(0.0, consumed_notional - assigned_notional), precision),
+                "target_weight": float(target_share_decimal),
+                "state_cap_risk": float(caps[strategy]),
+                "state_cap_risk_decimal": decimal_text(caps[strategy]),
+                "allocated_risk": float(assigned),
+                "allocated_risk_decimal": decimal_text(assigned),
+                "consumed_risk": float(consumed),
+                "consumed_risk_decimal": decimal_text(consumed),
+                "remaining_risk": float(remaining),
+                "remaining_risk_decimal": decimal_text(remaining),
+                "overconsumed_risk": float(overconsumed),
+                "overconsumed_risk_decimal": decimal_text(overconsumed),
+                "risk_reconciliation_residual": float(reconciliation_residual),
+                "risk_reconciliation_residual_decimal": decimal_text(reconciliation_residual),
+                "allocated_notional": float(assigned_notional),
+                "allocated_notional_decimal": decimal_text(assigned_notional),
+                "consumed_notional": float(consumed_notional),
+                "consumed_notional_decimal": decimal_text(consumed_notional),
+                "remaining_notional": float(remaining_notional),
+                "remaining_notional_decimal": decimal_text(remaining_notional),
+                "overconsumed_notional": float(overconsumed_notional),
+                "overconsumed_notional_decimal": decimal_text(overconsumed_notional),
             }
-        sleeve_residual = round(sum(abs(float(row["risk_reconciliation_residual"])) for row in sleeves.values()), precision)
-        return sleeves, unallocated, round(residual + sleeve_residual, precision)
+        sleeve_residual = _risk_quantize(
+            sum(
+                (_risk_decimal(row["risk_reconciliation_residual_decimal"], "sleeve residual").copy_abs()
+                 for row in sleeves.values()),
+                ZERO,
+            ),
+            precision,
+        )
+        return sleeves, unallocated_decimal, _risk_quantize(
+            residual_decimal + sleeve_residual, precision
+        )
 
     def run(
         self,
@@ -1185,10 +1432,12 @@ class AdaptiveAllocator:
         available_risk = float(conversion["risk_value"])
         risk_unit = "stop_risk_dollars"
         available_risk_inputs = {**available_risk_inputs, "conversion": conversion}
-        sleeves, unallocated_available_risk, reconciliation_residual = self._build_sleeves(
+        sleeves, unallocated_available_risk_decimal, reconciliation_residual_decimal = self._build_sleeves(
             authorized_order, operational_states, allocation_weights, exploration_weights, probe_weights,
-            snapshot, available_risk, risk_unit,
+            snapshot, conversion["risk_value_decimal"], risk_unit,
         )
+        unallocated_available_risk = float(unallocated_available_risk_decimal)
+        reconciliation_residual = float(reconciliation_residual_decimal)
         if weights_vector.sum() > 0:
             decision, reason, allocation_class = "ALLOCATE_ADAPTIVELY", "qualified strategies sized below fractional Kelly and Phase 3 risk", "adaptive"
         elif probe_weights:
@@ -1263,7 +1512,8 @@ class AdaptiveAllocator:
             "probe_stop_risk_pct": probe_per_strategy, "probe_portfolio_heat_pct": probe_heat_cap,
             "probe_gross_exposure_pct": float(self.cfg.get("probe_gross_exposure_pct", 2.5)),
             "probe_max_active_count": int(self.cfg.get("probe_max_active_count", 1)),
-            "phase3_available_risk": available_risk, "phase3_available_risk_unit": risk_unit,
+            "phase3_available_risk": available_risk, "phase3_available_risk_decimal": conversion["risk_value_decimal"],
+            "phase3_available_risk_unit": risk_unit,
             "phase3_source_risk_value": source_available_risk,
             "phase3_source_risk_unit": source_risk_unit,
             "conversion_equity": conversion["conversion_equity"],
@@ -1292,11 +1542,14 @@ class AdaptiveAllocator:
             "strategy_policies": strategy_policies, "allocation_class": allocation_class,
             "unallocated_risk_pct": unallocated_risk_pct, "phase3_available_risk": available_risk,
             "phase3_available_risk_unit": risk_unit, "strategy_sleeves": sleeves,
-            "risk_value": available_risk, "risk_unit": risk_unit,
+            "risk_value": available_risk, "risk_value_decimal": conversion["risk_value_decimal"], "risk_unit": risk_unit,
             "conversion_equity": conversion["conversion_equity"],
             "conversion_equity_as_of": conversion["conversion_equity_as_of"],
             "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
-            "unallocated_available_risk": unallocated_available_risk, "risk_reconciliation_residual": reconciliation_residual,
+            "unallocated_available_risk": unallocated_available_risk,
+            "unallocated_available_risk_decimal": decimal_text(unallocated_available_risk_decimal),
+            "risk_reconciliation_residual": reconciliation_residual,
+            "risk_reconciliation_residual_decimal": decimal_text(reconciliation_residual_decimal),
             "risk_reconciliation": {
                 "capacity": available_risk,
                 "allocated_targets": round(sum(float(row["allocated_risk"]) for row in sleeves.values()), 8),
@@ -1373,12 +1626,16 @@ class AdaptiveAllocator:
             "formula_version": PHASE4_ALLOCATION_VERSION, "strategy_policy_map": strategy_policies,
             "strategy_policy_version": payload.get("strategy_policy_version"), "policy_authoritative": policy_authoritative,
             "covariance": covariance_payload, "strategy_sleeves": sleeves, "phase3_available_risk": available_risk,
+            "phase3_available_risk_decimal": conversion["risk_value_decimal"],
             "phase3_available_risk_unit": risk_unit, "unallocated_available_risk": unallocated_available_risk,
-            "risk_value": available_risk, "risk_unit": risk_unit,
+            "unallocated_available_risk_decimal": decimal_text(unallocated_available_risk_decimal),
+            "risk_value": available_risk, "risk_value_decimal": conversion["risk_value_decimal"], "risk_unit": risk_unit,
             "conversion_equity": conversion["conversion_equity"],
             "conversion_equity_as_of": conversion["conversion_equity_as_of"],
             "risk_formula_version": RISK_CONVERSION_FORMULA_VERSION,
-            "risk_reconciliation_residual": reconciliation_residual, "raw_replay_inputs": raw_replay_inputs,
+            "risk_reconciliation_residual": reconciliation_residual,
+            "risk_reconciliation_residual_decimal": decimal_text(reconciliation_residual_decimal),
+            "raw_replay_inputs": raw_replay_inputs,
             "evidence_fingerprint": fingerprint,
         }
 

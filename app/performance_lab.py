@@ -6,22 +6,34 @@ evidence.  Only a durable fill may promote an opportunity to ``actual_fill``.
 
 from __future__ import annotations
 
-import math
 import sqlite3
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .formula_versions import PERFORMANCE_LAB_CLASSIFICATION_SCHEMA_VERSION
+from .fixed_point_accounting import EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION, decimal_text
 from .utils import iso_now
+
+
+def _exact_positive(value: Any) -> Decimal | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() and result > 0 else None
 
 
 PERFORMANCE_EVIDENCE_CTE_SQL = """WITH ranked_performance_execution AS (
     SELECT o.proposal_id,o.id order_id,o.broker_order_id,o.status order_status,
-           o.notional submitted_notional,f.id fill_id,f.price fill_price,
-           f.qty fill_qty,f.qty*f.price filled_notional,
+           o.notional submitted_notional,f.id fill_id,f.price_decimal fill_price,
+           f.qty_decimal fill_qty,NULL AS filled_notional,
            ROW_NUMBER() OVER (
              PARTITION BY o.proposal_id
              ORDER BY CASE
-                        WHEN f.id IS NOT NULL AND f.qty>0 AND f.price>0 THEN 0
+                        WHEN f.id IS NOT NULL AND f.qty_decimal IS NOT NULL
+                             AND f.price_decimal IS NOT NULL THEN 0
                         WHEN f.id IS NOT NULL THEN 1
                         ELSE 2
                       END,
@@ -33,11 +45,7 @@ PERFORMANCE_EVIDENCE_CTE_SQL = """WITH ranked_performance_execution AS (
 
 
 def _positive_finite(value: Any) -> bool:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(number) and number > 0
+    return _exact_positive(value) is not None
 
 
 def classify_performance_outcome(
@@ -118,7 +126,8 @@ def apply_performance_lab_classification_schema(
                              WHERE a.proposal_id=ps.proposal_id AND a.authorized=1)
                         approval_exists,
                       e.order_status,e.order_id,e.broker_order_id,
-                      e.fill_id,e.fill_price,e.fill_qty,e.filled_notional
+                      e.fill_id,e.fill_price,e.fill_qty,e.filled_notional,
+                      e.submitted_notional,po.entry_notional
                FROM performance_setups ps
                JOIN performance_outcomes po ON po.setup_id=ps.id
                JOIN trade_proposals p ON p.id=ps.proposal_id
@@ -129,21 +138,37 @@ def apply_performance_lab_classification_schema(
         ).fetchall()
         affected_runs: set[str] = set()
         for row in rows:
+            fill_price_decimal = _exact_positive(row[8])
+            fill_qty_decimal = _exact_positive(row[9])
+            filled_notional_decimal = (
+                None
+                if fill_price_decimal is None or fill_qty_decimal is None
+                else fill_price_decimal * fill_qty_decimal
+            )
             classification = classify_performance_outcome(
                 proposal_status=row[2],
                 authorized_approval=bool(row[3]),
                 order_status=row[4],
                 fill_id=row[7],
-                fill_price=row[8],
-                fill_qty=row[9],
+                fill_price=fill_price_decimal,
+                fill_qty=fill_qty_decimal,
             )
             valid_fill = classification == "actual_fill"
+            performance_entry_notional_decimal = filled_notional_decimal
+            if not valid_fill:
+                performance_entry_notional_decimal = (
+                    _exact_positive(row[11]) or _exact_positive(row[12])
+                )
             conn.execute(
                 """UPDATE performance_setups
                    SET order_id=COALESCE(?,order_id),
                        broker_order_id=COALESCE(?,broker_order_id),
                        fill_id=COALESCE(?,fill_id),fill_price=COALESCE(?,fill_price),
-                       fill_qty=COALESCE(?,fill_qty),updated_at=?
+                       fill_qty=COALESCE(?,fill_qty),updated_at=?,
+                       fill_price_decimal=COALESCE(?,fill_price_decimal),
+                       fill_qty_decimal=COALESCE(?,fill_qty_decimal),
+                       decimal_provenance=COALESCE(?,decimal_provenance),
+                       decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                    WHERE id=? AND (
                      (? IS NOT NULL AND COALESCE(order_id,'')<>?)
                      OR (? IS NOT NULL AND COALESCE(broker_order_id,'')<>?)
@@ -151,17 +176,35 @@ def apply_performance_lab_classification_schema(
                      OR (? IS NOT NULL AND (
                        COALESCE(fill_price,0)<>? OR COALESCE(fill_qty,0)<>?
                      ))
+                     OR (?=1 AND (
+                       COALESCE(fill_price_decimal,'')<>?
+                       OR COALESCE(fill_qty_decimal,'')<>?
+                       OR COALESCE(decimal_provenance,'')<>?
+                       OR COALESCE(decimal_accounting_version,'')<>?
+                     ))
                    )""",
                 (
                     row[5], row[6],
                     str(row[7]) if valid_fill else None,
-                    row[8] if valid_fill else None,
-                    row[9] if valid_fill else None,
-                    iso_now(), row[0],
+                    float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    iso_now(),
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
+                    row[0],
                     row[5], row[5],
                     row[6], row[6],
                     row[7] if valid_fill else None, row[7],
-                    row[7] if valid_fill else None, row[8], row[9],
+                    row[7] if valid_fill else None,
+                    float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    1 if valid_fill else 0,
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else "",
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else "",
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else "",
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else "",
                 ),
             )
             conn.execute(
@@ -170,7 +213,11 @@ def apply_performance_lab_classification_schema(
                        broker_order_id=COALESCE(?,broker_order_id),
                        fill_id=COALESCE(?,fill_id),entry_price=COALESCE(?,entry_price),
                        entry_qty=COALESCE(?,entry_qty),entry_notional=COALESCE(?,entry_notional),
-                       updated_at=?
+                       updated_at=?,entry_price_decimal=COALESCE(?,entry_price_decimal),
+                       entry_qty_decimal=COALESCE(?,entry_qty_decimal),
+                       entry_notional_decimal=COALESCE(?,entry_notional_decimal),
+                       decimal_provenance=COALESCE(?,decimal_provenance),
+                       decimal_accounting_version=COALESCE(?,decimal_accounting_version)
                    WHERE setup_id=? AND (
                      COALESCE(actual_or_shadow,'')<>?
                      OR (? IS NOT NULL AND COALESCE(order_id,'')<>?)
@@ -180,23 +227,61 @@ def apply_performance_lab_classification_schema(
                        COALESCE(entry_price,0)<>? OR COALESCE(entry_qty,0)<>?
                        OR COALESCE(entry_notional,0)<>?
                      ))
+                     OR (?=1 AND (
+                       COALESCE(entry_price_decimal,'')<>?
+                       OR COALESCE(entry_qty_decimal,'')<>?
+                       OR COALESCE(entry_notional_decimal,'')<>?
+                       OR COALESCE(decimal_provenance,'')<>?
+                       OR COALESCE(decimal_accounting_version,'')<>?
+                     ))
+                     OR (? IS NOT NULL AND COALESCE(entry_notional_decimal,'')<>?)
+                     OR (? IS NOT NULL AND COALESCE(entry_notional,0)<>?)
                    )""",
                 (
                     classification,
                     row[5],
                     row[6],
                     str(row[7]) if valid_fill else None,
-                    row[8] if valid_fill else None,
-                    row[9] if valid_fill else None,
-                    row[10] if valid_fill else None,
+                    float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                     iso_now(),
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else None,
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else None,
                     row[0],
                     classification,
                     row[5], row[5],
                     row[6], row[6],
                     row[7] if valid_fill else None, row[7],
                     row[7] if valid_fill else None,
-                    row[8], row[9], row[10],
+                    float(fill_price_decimal) if valid_fill and fill_price_decimal is not None else None,
+                    float(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else None,
+                    float(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else None,
+                    1 if valid_fill else 0,
+                    decimal_text(fill_price_decimal) if valid_fill and fill_price_decimal is not None else "",
+                    decimal_text(fill_qty_decimal) if valid_fill and fill_qty_decimal is not None else "",
+                    decimal_text(filled_notional_decimal) if valid_fill and filled_notional_decimal is not None else "",
+                    EXACT_DECIMAL_PROVENANCE if valid_fill else "",
+                    FIXED_POINT_ACCOUNTING_VERSION if valid_fill else "",
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
+                    decimal_text(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else "",
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
+                    float(performance_entry_notional_decimal)
+                    if performance_entry_notional_decimal is not None
+                    else None,
                 ),
             )
             if row[1]:

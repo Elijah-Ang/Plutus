@@ -12,6 +12,7 @@ import math
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .formula_versions import (
@@ -21,6 +22,12 @@ from .formula_versions import (
     EVIDENCE_VERSION,
 )
 from .utils import iso_now, json_dumps
+
+
+def _decimal_text(value: float) -> str:
+    """Serialize a conviction projection without introducing new float math."""
+
+    return format(Decimal(str(value)).normalize(), "f")
 
 
 DEPLOYMENT_MODES: dict[str, dict[str, float]] = {
@@ -113,10 +120,13 @@ class AdaptiveConvictionDecision:
             "deployment_mode": self.deployment_mode,
             "opportunity_class": self.opportunity_class,
             "recommended_stop_risk_pct": self.recommended_stop_risk_pct,
+            "recommended_stop_risk_pct_decimal": _decimal_text(self.recommended_stop_risk_pct),
             "operational_stop_risk_pct": self.operational_stop_risk_pct,
             "per_trade_ceiling_pct": self.per_trade_ceiling_pct,
             "portfolio_heat_target_pct": self.portfolio_heat_target_pct,
+            "portfolio_heat_target_pct_decimal": _decimal_text(self.portfolio_heat_target_pct),
             "gross_exposure_target_pct": self.gross_exposure_target_pct,
+            "gross_exposure_target_pct_decimal": _decimal_text(self.gross_exposure_target_pct),
             "binding_cap": self.binding_cap,
             "position_target": self.position_target,
             "confidence": self.confidence,

@@ -16,6 +16,7 @@ import pandas as pd
 from .strategy_rule_based import STRATEGY_VERSION, completed_daily_bars, evaluate_symbol
 from .utils import json_dumps
 from .formula_versions import EVIDENCE_VERSION
+from .fixed_point_accounting import ZERO, require_exact_decimal
 
 
 PHASE1_SCHEMA_VERSION = "phase1_evidence_validation_v1"
@@ -724,12 +725,21 @@ def import_legacy_opportunities(
     proposed-but-unfilled, blocked, shadow, observation-only, and generic
     hypothetical records can never collapse into one result population.
     """
+    # This is an explicit compatibility migration boundary.  Historical
+    # Performance Lab rows may have been inserted before canonical sidecars
+    # existed; reconstruct those sidecars once, then classify only from the
+    # resulting exact evidence below.
+    from .fixed_point_accounting import apply_fixed_point_accounting_schema
+
+    with storage.connect() as conn:
+        apply_fixed_point_accounting_schema(conn, record_migration=False)
+
     opportunities: list[Opportunity] = []
     linked_execution_keys: set[tuple[str, str]] = set()
     setups = storage.fetch_all(
         """SELECT ps.*, po.actual_or_shadow, po.entry_time, po.entry_price,
-                  df.id AS durable_fill_id,df.price AS durable_fill_price,
-                  df.qty AS durable_fill_qty,eo.id AS durable_order_id,
+                  df.id AS durable_fill_id,df.price_decimal AS durable_fill_price_decimal,
+                  df.qty_decimal AS durable_fill_qty_decimal,eo.id AS durable_order_id,
                   GROUP_CONCAT(pb.blocker, '|') AS blockers
            FROM performance_setups ps
            LEFT JOIN performance_outcomes po ON po.setup_id=ps.id
@@ -747,11 +757,23 @@ def import_legacy_opportunities(
         if not observed_at:
             continue
         tier = str(row.get("tier") or "unknown")
+        try:
+            durable_fill_price = require_exact_decimal(
+                row, "durable_fill_price_decimal", minimum=ZERO
+            )
+            durable_fill_qty = require_exact_decimal(
+                row, "durable_fill_qty_decimal", minimum=ZERO
+            )
+        except ValueError:
+            durable_fill_price = None
+            durable_fill_qty = None
         if (
             row.get("durable_fill_id") is not None
             and row.get("durable_order_id") is not None
-            and float(row.get("durable_fill_price") or 0) > 0
-            and float(row.get("durable_fill_qty") or 0) > 0
+            and durable_fill_price is not None
+            and durable_fill_qty is not None
+            and durable_fill_price > ZERO
+            and durable_fill_qty > ZERO
         ):
             execution_type = "actual_fill"
         elif int(row.get("proposed") or 0):
@@ -766,7 +788,7 @@ def import_legacy_opportunities(
             execution_type = "hypothetical"
         signal = _safe_json(row.get("signal_state"))
         score_components = _safe_json(row.get("score_components"))
-        entry_price = row.get("durable_fill_price") if execution_type == "actual_fill" else row.get("entry_price") or row.get("current_price")
+        entry_price = durable_fill_price if execution_type == "actual_fill" else row.get("entry_price") or row.get("current_price")
         source_id = str(row["id"])
         opportunity = Opportunity(
             id=hashlib.sha256(f"performance_setups|{source_id}".encode()).hexdigest()[:32],
@@ -814,14 +836,18 @@ def import_legacy_opportunities(
     # cycles import only their newly captured Performance Lab rows; actual fill
     # linkage is synchronized there without rescanning all historical trades.
     trades = storage.fetch_all("SELECT * FROM trade_outcomes") if run_id is None else []
-    durable_fills = {
-        str(row["id"]): row
-        for row in storage.fetch_all(
-            """SELECT f.id,f.order_id,f.qty,f.price,o.proposal_id
-               FROM fills f JOIN orders o ON o.id=f.order_id
-               WHERE f.qty>0 AND f.price>0"""
-        )
-    }
+    durable_fills: dict[str, dict[str, Any]] = {}
+    for row in storage.fetch_all(
+        """SELECT f.id,f.order_id,f.qty_decimal,f.price_decimal,o.proposal_id
+           FROM fills f JOIN orders o ON o.id=f.order_id"""
+    ):
+        try:
+            quantity = require_exact_decimal(row, "qty_decimal", minimum=ZERO)
+            price = require_exact_decimal(row, "price_decimal", minimum=ZERO)
+        except ValueError:
+            continue
+        if quantity is not None and price is not None and quantity > ZERO and price > ZERO:
+            durable_fills[str(row["id"])] = row
     existing_sources = {(o.source_table, o.source_id) for o in opportunities}
     for row in trades:
         source_id = str(row["id"])

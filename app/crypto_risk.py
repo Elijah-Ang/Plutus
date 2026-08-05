@@ -33,6 +33,7 @@ from .formula_versions import (
     CRYPTO_RISK_SCHEMA_VERSION,
     CRYPTO_SIZING_FORMULA_VERSION,
 )
+from .fixed_point_accounting import require_exact_decimal
 from .utils import iso_now, json_dumps
 
 
@@ -642,7 +643,7 @@ def _durable_evidence(
         """SELECT i.id,i.symbol,i.side,i.state,i.client_order_id,i.requested_quantity,
                   i.filled_quantity,i.requested_notional,i.reserved_notional,
                   i.reserved_stop_risk,r.id reservation_id,r.state reservation_state,
-                  r.active_notional,r.active_stop_risk
+                  r.active_notional_decimal,r.active_stop_risk_decimal
            FROM order_intents i
            LEFT JOIN risk_reservations r ON r.intent_id=i.id
            WHERE i.state IN ('created','reserved','retryable_pre_submission','submitting',
@@ -660,8 +661,18 @@ def _durable_evidence(
             failures.append(f"active_crypto_intent_missing_active_reservation:{row['id']}")
         quantity = _decimal(row["requested_quantity"] or ZERO, "durable intent quantity", minimum=ZERO)
         filled = _decimal(row["filled_quantity"] or ZERO, "durable intent filled quantity", minimum=ZERO)
-        active_notional = _decimal(row["active_notional"] or ZERO, "durable reservation notional", minimum=ZERO)
-        active_stop = _decimal(row["active_stop_risk"] or ZERO, "durable reservation stop risk", minimum=ZERO)
+        try:
+            active_notional = require_exact_decimal(
+                row, "active_notional_decimal", minimum=ZERO
+            )
+            active_stop = require_exact_decimal(
+                row, "active_stop_risk_decimal", minimum=ZERO
+            )
+            assert active_notional is not None and active_stop is not None
+        except ValueError:
+            failures.append(f"crypto_durable_reservation_exact_evidence_missing:{row['id']}")
+            active_notional = ZERO
+            active_stop = ZERO
         if state in AMBIGUOUS_INTENT_STATES:
             failures.append(f"ambiguous_crypto_intent_requires_reconciliation:{row['id']}")
         intents.append(

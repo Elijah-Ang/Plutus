@@ -16,7 +16,7 @@ from .fixed_point_accounting import (
     decimal_text,
     decimal_value,
     legacy_float,
-    row_decimal,
+    require_exact_decimal,
 )
 from .formula_versions import FIXED_POINT_ACCOUNTING_VERSION
 from .utils import iso_now
@@ -471,15 +471,14 @@ class LotLedger:
             (moment.isoformat(),),
         )
         if any(
-            row.get("realized_pl_decimal") is None and row.get("realized_pl") is None
+            row.get("realized_pl_decimal") in (None, "")
             for row in rows
         ) or any(str(row.get("confidence")) not in KNOWN_CONFIDENCE for row in rows):
             return None, "partially_reconstructed"
         confidence = "reconstructed" if str(status.get("confidence")) == "reconstructed" or any(str(row.get("confidence")) == "reconstructed" for row in rows) else "verified"
         return sum(
             (
-                row_decimal(row, "realized_pl_decimal", "realized_pl")
-                or ZERO
+                require_exact_decimal(row, "realized_pl_decimal") or ZERO
                 for row in rows
             ),
             ZERO,
@@ -506,15 +505,14 @@ class LotLedger:
             confidence = status_confidence if status_confidence in ALL_CONFIDENCE else "unavailable"
             return None, confidence
         if any(
-            row.get("realized_pl_decimal") is None and row.get("realized_pl") is None
+            row.get("realized_pl_decimal") in (None, "")
             for row in rows
         ) or any(c not in KNOWN_CONFIDENCE for c in row_confidences):
             return None, "partially_reconstructed"
         confidence = "reconstructed" if status_confidence == "reconstructed" or "reconstructed" in row_confidences else "verified"
         return sum(
             (
-                row_decimal(row, "realized_pl_decimal", "realized_pl")
-                or ZERO
+                require_exact_decimal(row, "realized_pl_decimal") or ZERO
                 for row in rows
             ),
             ZERO,

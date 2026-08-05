@@ -208,6 +208,7 @@ def test_actual_evidence_requires_verified_fill_link_and_closed_lifecycle() -> N
             "gross_pnl": "20",
             "net_pnl": "20",
             "risk_amount": "10",
+            "gross_r_multiple": "2",
             "net_r_multiple": "2",
         },
         lineage=lineage,
@@ -258,6 +259,31 @@ def test_aggregate_metrics_exclude_unavailable_and_require_explicit_prior_snapsh
     assert with_explicit_evidence["win_probability_posterior"] == Decimal("0.5")
     assert with_explicit_evidence["correlation"] == Decimal("0.25")
     assert with_explicit_evidence["posterior_uncertainty"] is not None
+
+
+def test_incomplete_completed_economic_row_is_unavailable_not_a_sample() -> None:
+    complete = {
+        "status": "completed",
+        "quantity": "2",
+        "exit_timestamp": "2026-01-01T01:00:00Z",
+        "exit_price": "110",
+        "holding_hours": "1",
+        "gross_return": "0.1",
+        "net_return": "0.1",
+        "gross_pnl": "20",
+        "net_pnl": "20",
+        "risk_amount": "10",
+        "gross_r_multiple": "2",
+        "net_r_multiple": "2",
+        "evidence_type": "actual",
+    }
+    incomplete = {**complete, "net_pnl": None}
+    metrics = derive_aggregate_metrics(
+        [complete, incomplete], severe_loss_threshold="-0.05"
+    )
+    assert metrics["sample_count"] == 1
+    assert metrics["unavailable_count"] == 1
+    assert metrics["total_net_pnl"] == Decimal("20")
 
 
 def test_float_financial_input_is_rejected() -> None:

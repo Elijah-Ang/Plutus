@@ -782,6 +782,7 @@ def load_verified_crypto_sizing(storage: Any, decision_id: str, config: Mapping[
         stop_price=request_payload.get("stop_price"),
         requested_exit_quantity=request_payload.get("requested_exit_quantity"),
         close_entire_position=request_payload.get("close_entire_position") is True,
+        requested_notional_cap=request_payload.get("requested_notional_cap"),
     )
     authority_payload = payload["risk_authority"]
     authority = CryptoSizingAuthority(

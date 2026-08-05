@@ -18,7 +18,7 @@ from app.crypto_proposals import (
     CryptoProposalStore,
     format_crypto_proposal_preview,
 )
-from app.crypto_research import CryptoResearchEngine
+from app.crypto_research import CryptoResearchEngine, _oldest_crypto_lot_opened_at
 from app.cross_asset_runtime import CrossAssetRuntimeCoordinator
 from app.crypto_risk import CryptoRiskError, CryptoRiskStore
 from app.crypto_sizing import CryptoSizingRequest
@@ -155,7 +155,24 @@ def _storage(tmp_path):
 
 
 def _config():
-    return deepcopy(load_config())
+    config = deepcopy(load_config())
+    # The production config activates this in a separate reviewed commit; the
+    # research/allocator fixtures opt in explicitly so the cold-start path is
+    # tested without changing the default fixture boundary.
+    config["auto_execution_enabled"] = False
+    config["auto_execution_mode"] = "manual_only"
+    config["execution_capabilities"].update(
+        {"autonomous_entries_enabled": False, "autonomous_exits_enabled": False}
+    )
+    config["phase3"]["require_manual_approval"] = True
+    config["phase4"]["require_manual_approval"] = True
+    config["winner_expansion"]["require_manual_approval"] = True
+    config["trend_management"]["require_manual_approval_for_sells"] = True
+    config["crypto"]["supervised_paper_lane"]["manual_approval_required"] = True
+    config["crypto"]["supervised_paper_lane"]["autonomous_execution"] = False
+    config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
+    config["effective_config_hash"] = effective_config_hash(config)
+    return config
 
 
 def _market(storage, config, broker, *, research_run="research"):
@@ -270,7 +287,52 @@ def test_hourly_crypto_research_persists_strategy_decision_without_proposal(tmp_
     assert broker.submit_calls == 0
 
 
-def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp_path, monkeypatch):
+def test_shadow_outcome_persists_quantity_and_r_multiple_from_configured_paper_notional(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    _, _, decision = _strategy(storage, config, Broker())
+    engine = CryptoResearchEngine(config, storage, run_id="shadow-quantity")
+    horizon = int(config["crypto"]["profitability_policy"]["outcome_horizon_hours"])
+    bars = [
+        {
+            "timestamp": (NOW + timedelta(hours=index)).isoformat(),
+            "high": "101",
+            "low": "99",
+            "close": "100",
+        }
+        for index in range(1, horizon + 1)
+    ]
+
+    engine._settle_crypto_shadow_outcomes(
+        "BTC/USD", bars, now=NOW + timedelta(hours=horizon),
+        exclude_strategy_decision_id=None,
+    )
+
+    row = storage.fetch_all(
+        """SELECT quantity,net_pnl,net_r_multiple
+           FROM crypto_profitability_observations WHERE strategy_decision_id=?""",
+        (decision.id,),
+    )[0]
+    assert D(row["quantity"]) > 0
+    assert row["net_pnl"] is not None
+    assert row["net_r_multiple"] is not None
+
+
+def test_crypto_position_age_uses_oldest_verified_lot_not_management_row_time():
+    with pytest.raises(ValueError, match="opened_at"):
+        _oldest_crypto_lot_opened_at([
+            {"opened_at": "2026-07-10T04:00:00+00:00"},
+            {"opened_at": "2026-07-15T04:00:00+00:00"},
+            {"opened_at": "not-a-timestamp"},
+        ])
+    opened = _oldest_crypto_lot_opened_at([
+        {"opened_at": "2026-07-10T04:00:00+00:00"},
+        {"opened_at": "2026-07-15T04:00:00+00:00"},
+    ])
+    assert opened == datetime(2026, 7, 10, 4, tzinfo=UTC)
+
+
+def test_deferred_crypto_research_enters_bounded_exploration_before_full_validation(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
     config = _config()
     monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
@@ -307,20 +369,28 @@ def test_deferred_crypto_research_is_compared_before_any_supervised_proposal(tmp
         now=NOW,
     )
     assert plan.execution_authorized is False
-    assert plan.summary["candidate_count"] == 0
-    assert plan.decisions == ()
-    assert not storage.fetch_all(
-        "SELECT event_type FROM audit_events WHERE event_type='crypto_profitability_candidate_excluded'"
+    assert plan.summary["candidate_count"] == 1
+    assert plan.summary["allocated_candidate_count"] == 0
+    assert plan.decisions[0]["decision"] == "REJECT"
+    assert "nonpositive_expected_net_profit" in plan.decisions[0]["rejection_reasons"]
+    assert (
+        plan.decisions[0]["manual_approval_required"] is True
+        or plan.decisions[0]["autonomous_execution"] is True
+    )
+    assert plan.decisions[0]["order_authority"] is False
+    assert storage.fetch_all(
+        "SELECT event_type FROM audit_events WHERE event_type='crypto_exploration_candidate_authorized'"
     )
     assert storage.fetch_all("SELECT COUNT(*) n FROM cross_asset_allocation_plans")[0]["n"] == 1
 
-    assert engine.create_deferred_supervised_entry_proposals(
+    proposal_ids = engine.create_deferred_supervised_entry_proposals(
         results, plan.decisions, now=NOW
-    ) == []
+    )
+    assert proposal_ids == []
     assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_proposals")[0]["n"] == 0
 
 
-def test_crypto_profitability_gate_blocks_unvalidated_research(tmp_path, monkeypatch):
+def test_crypto_profitability_gate_labels_unvalidated_research_as_exploration(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
     config = _config()
     # The synthetic rising series needs a wider target to make the
@@ -358,14 +428,19 @@ def test_crypto_profitability_gate_blocks_unvalidated_research(tmp_path, monkeyp
         now=NOW,
     )
     assert plan.execution_authorized is False
-    assert plan.summary["allocated_candidate_count"] == 0
-    assert plan.decisions == ()
+    assert plan.summary["allocated_candidate_count"] == 1
+    assert plan.decisions[0]["decision"] == "ALLOCATE_SUPERVISED_PAPER_ADVISORY"
+    assert (
+        plan.decisions[0]["manual_approval_required"] is True
+        or plan.decisions[0]["autonomous_execution"] is True
+    )
+    assert plan.decisions[0]["order_authority"] is False
 
     proposal_ids = engine.create_deferred_supervised_entry_proposals(
         results, plan.decisions, now=NOW
     )
-    assert proposal_ids == []
-    assert storage.fetch_all("SELECT id FROM crypto_paper_proposals") == []
+    assert len(proposal_ids) == 1
+    assert storage.fetch_all("SELECT COUNT(*) n FROM crypto_paper_proposals")[0]["n"] == 1
     assert broker.submit_calls == 0
 
 
@@ -415,7 +490,12 @@ def test_cross_asset_runtime_accepts_alpaca_account_status_enum(tmp_path, monkey
         now=NOW,
     )
 
-    assert plan.summary["candidate_count"] == 0
+    assert plan.summary["candidate_count"] == 1
+    assert plan.decisions[0]["strategy_version"] == results[0].selected_strategy
+    assert (
+        plan.decisions[0]["manual_approval_required"] is True
+        or plan.decisions[0]["autonomous_execution"] is True
+    )
 
 
 def test_hourly_research_preserves_wide_market_strategy_as_blocked_evidence(tmp_path):

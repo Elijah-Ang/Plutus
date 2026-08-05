@@ -40,6 +40,7 @@ from .profitability_validation import (
 from .utils import iso_now, json_dumps
 from .shadow_strategies import STRATEGY_VERSIONS
 from .strategy_rule_based import STRATEGY_VERSION
+from .fixed_point_accounting import ZERO, require_exact_decimal
 
 
 PRIMARY_HORIZON_SESSIONS = 20
@@ -998,7 +999,7 @@ class StrategyPerformanceEngine:
     def _execution_rows(self, strategy_version: str) -> list[dict[str, Any]]:
         try:
             rows = self.storage.fetch_all(
-                """SELECT oi.id,oi.state,oi.requested_quantity,oi.filled_quantity,
+                """SELECT oi.id,oi.state,oi.requested_quantity_decimal,oi.filled_quantity_decimal,
                           oi.implementation_shortfall_bps intent_shortfall,
                           o.implementation_shortfall_bps order_shortfall
                    FROM order_intents oi LEFT JOIN orders o ON o.id=oi.id
@@ -1011,8 +1012,14 @@ class StrategyPerformanceEngine:
         result = []
         for row in rows:
             state = str(row.get("state") or "").lower()
-            submitted = state in submitted_states or float(row.get("filled_quantity") or 0) > 0
-            result.append({"submitted": submitted, "filled": float(row.get("filled_quantity") or 0) > 0 or state in {"filled", "partially_filled"}, "implementation_shortfall_bps": row.get("order_shortfall") if row.get("order_shortfall") is not None else row.get("intent_shortfall")})
+            try:
+                filled_quantity = require_exact_decimal(
+                    row, "filled_quantity_decimal", minimum=ZERO
+                ) or ZERO
+            except ValueError:
+                filled_quantity = ZERO
+            submitted = state in submitted_states or filled_quantity > ZERO
+            result.append({"submitted": submitted, "filled": filled_quantity > ZERO or state in {"filled", "partially_filled"}, "implementation_shortfall_bps": row.get("order_shortfall") if row.get("order_shortfall") is not None else row.get("intent_shortfall")})
         return result
 
     def _strategy_versions(self) -> list[str]:
