@@ -72,6 +72,24 @@ def _decimal(value: Any, label: str, *, positive: bool = False) -> Decimal:
     return number
 
 
+def _bounded_decimal(
+    value: Any,
+    label: str,
+    *,
+    minimum: Decimal,
+    maximum: Decimal,
+) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise CrossAssetRuntimeError(f"{label} is missing")
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CrossAssetRuntimeError(f"{label} is invalid") from exc
+    if not number.is_finite() or number < minimum or number > maximum:
+        raise CrossAssetRuntimeError(f"{label} is outside its safe range")
+    return number
+
+
 def _text(value: Decimal) -> str:
     return "0" if value == ZERO else format(value.normalize(), "f")
 
@@ -705,7 +723,6 @@ class CrossAssetRuntimeCoordinator:
         max_crypto_exposure = equity * _decimal(allocation_cfg.get("maximum_crypto_exposure_pct"), "cross asset crypto exposure") / HUNDRED
         cold_start = self._crypto_cold_start_authority()
         allocation_policy = cross_asset_policy(self.config)
-        exploration_enabled = allocation_policy.get("crypto_exploration_enabled") is True
         for research in results:
             if not getattr(research, "strategy_signal_eligible", False):
                 continue
@@ -755,26 +772,22 @@ class CrossAssetRuntimeCoordinator:
                 use_cold_start = (
                     cold_start is not None
                     and not profitability.eligible
-                    and not exploration_enabled
                 )
                 if use_cold_start:
-                    prior_probability = _decimal(
+                    prior_probability = _bounded_decimal(
                         profitability_cfg.get("cold_start_prior_win_probability"),
                         "crypto cold-start prior win probability",
-                        minimum=ZERO,
-                        maximum=ONE,
+                        minimum=ZERO, maximum=ONE,
                     )
-                    prior_uncertainty = _decimal(
+                    prior_uncertainty = _bounded_decimal(
                         profitability_cfg.get("cold_start_prior_uncertainty"),
                         "crypto cold-start prior uncertainty",
-                        minimum=ZERO,
-                        maximum=ONE,
+                        minimum=ZERO, maximum=ONE,
                     )
-                    prior_correlation = _decimal(
+                    prior_correlation = _bounded_decimal(
                         profitability_cfg.get("cold_start_prior_correlation"),
                         "crypto cold-start prior correlation",
-                        minimum=Decimal("-1"),
-                        maximum=ONE,
+                        minimum=Decimal("-1"), maximum=ONE,
                     )
                     probability = prior_probability
                     uncertainty = prior_uncertainty
@@ -965,7 +978,7 @@ class CrossAssetRuntimeCoordinator:
                     cluster="crypto_major", strategy_version=str(strategy.selected_strategy),
                     strategy_state=(
                         "EXPLORATION"
-                        if exploration_eligible
+                        if exploration_eligible or use_cold_start
                         else ("ACTIVE" if strategy.lifecycle == "PAPER_ACTIVE" else "RESEARCH_ONLY")
                     ),
                     action=action, execution_lane="supervised_paper", evidence_as_of=market.captured_at,

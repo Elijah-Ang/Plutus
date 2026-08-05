@@ -13,6 +13,8 @@ from app.approval_workflow import (
     ApprovalWorkflowState,
     ApprovalWorkflowStore,
 )
+from app.autonomous_authority import authorize_proposal
+from app.service import TradingService
 from app.execution import DurableExecutionStore, Executor
 from app.risk_engine import RiskDecision
 from app.storage import Storage
@@ -232,6 +234,53 @@ def test_crash_before_intent_is_recovered_exactly_once(tmp_path):
     assert storage.fetch_all(
         "SELECT COUNT(*) n FROM audit_events WHERE event_type='approval_workflow_recovery_claimed'"
     )[0]["n"] >= 1
+
+
+def test_autonomous_crash_before_intent_rebuilds_authority_instead_of_manual_review(tmp_path):
+    storage = _storage(tmp_path)
+    proposal = _proposal(status="pending")
+    proposal.update({
+        "approval_source_type": "autonomous_system",
+        "execution_path": "autonomous_paper_order",
+        "autonomous_entry_requested": True,
+        "autonomous_exit_requested": False,
+    })
+    now = datetime.now(UTC)
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,symbol,side,notional,status,created_at,expires_at,strategy_version,
+             payload)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            proposal["id"], proposal["symbol"], proposal["side"], proposal["notional"],
+            "pending", now.isoformat(), proposal["expires_at"], "rule_based_v2",
+            json.dumps(proposal),
+        ),
+    )
+    authority = authorize_proposal(storage, proposal["id"], run_id="autonomous-run")
+    workflow_store = ApprovalWorkflowStore(storage)
+    workflow = workflow_store.get_by_approval(authority["approval_id"])
+    workflow_store.transition(workflow["id"], ApprovalWorkflowState.VALIDATING)
+
+    service = TradingService.__new__(TradingService)
+    service.storage = storage
+    service.config = {"effective_config_hash": "a" * 64}
+    service.broker = None
+    service.run_id = "restart-run"
+    detail = service._recover_local_workflows()
+
+    recovered = workflow_store.get(workflow["id"])
+    assert recovered["state"] == ApprovalWorkflowState.APPROVED_PENDING_INTENT.value
+    assert recovered["state"] != ApprovalWorkflowState.MANUAL_REVIEW.value
+    assert detail["approvals_without_intents"] == 0
+    assert storage.fetch_all("SELECT COUNT(*) n FROM order_intents")[0]["n"] == 0
+
+    # Once the broker client is available, the next recovery pass creates the
+    # intent under the same autonomous source lane instead of downgrading it.
+    service.broker = object()
+    service._recover_local_workflows()
+    intent = storage.fetch_all("SELECT source_type FROM order_intents")[0]
+    assert intent["source_type"] == "autonomous_system"
 
 
 def test_crash_after_intent_commit_links_existing_intent(tmp_path):

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.configuration import effective_config_hash, validate_config
+from app.configuration import ConfigurationError, effective_config_hash, validate_config
 from app.cross_asset_allocation import (
     CrossAssetAllocationError,
     CrossAssetAllocationStore,
@@ -822,6 +822,7 @@ def test_version_constants_are_bound_to_configuration():
 
 def test_crypto_exploration_is_explicit_bounded_and_never_replaces_profitability_evidence():
     config = deepcopy(load_config())
+    config["crypto"]["profitability_policy"]["cold_start_enabled"] = False
     config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
     config["effective_config_hash"] = effective_config_hash(config)
     policy = cross_asset_policy(config)
@@ -858,6 +859,7 @@ def test_crypto_exploration_is_explicit_bounded_and_never_replaces_profitability
             ),
             policy,
         )
+
     with pytest.raises(CrossAssetAllocationError, match="budget is exhausted"):
         build_crypto_exploration_evidence(
             SimpleNamespace(**{**base, "sample_count": 3}), policy
@@ -866,3 +868,22 @@ def test_crypto_exploration_is_explicit_bounded_and_never_replaces_profitability
         build_crypto_exploration_evidence(
             SimpleNamespace(**{**base, "walk_forward_status": "failed"}), policy
         )
+
+
+def test_staged_crypto_cold_start_takes_precedence_over_legacy_exploration():
+    config = deepcopy(load_config())
+    config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
+    config["effective_config_hash"] = effective_config_hash(config)
+
+    policy = cross_asset_policy(config)
+
+    assert policy["crypto_exploration_enabled"] is False
+
+
+def test_configuration_rejects_conflicting_crypto_discovery_policies():
+    config = deepcopy(load_config())
+    config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
+    config["effective_config_hash"] = effective_config_hash(config)
+
+    with pytest.raises(ConfigurationError, match="legacy crypto exploration"):
+        validate_config(config)

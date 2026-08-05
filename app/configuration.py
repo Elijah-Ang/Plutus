@@ -1219,6 +1219,11 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         "crypto profitability must require verified correlation evidence",
     )
     exploration_policy = crypto_profitability.get("exploration_policy") or {}
+    if crypto_profitability.get("cold_start_enabled") is True:
+        require(
+            exploration_policy.get("enabled") is not True,
+            "legacy crypto exploration cannot be enabled while staged cold-start discovery is active",
+        )
     if exploration_policy.get("enabled") is True:
         require(
             crypto_mode == "supervised_paper",

@@ -170,6 +170,15 @@ def _config():
     config["trend_management"]["require_manual_approval_for_sells"] = True
     config["crypto"]["supervised_paper_lane"]["manual_approval_required"] = True
     config["crypto"]["supervised_paper_lane"]["autonomous_execution"] = False
+    config["effective_config_hash"] = effective_config_hash(config)
+    return config
+
+
+def _legacy_exploration_config():
+    config = _config()
+    # These fixtures exercise the legacy bounded-discovery compatibility path;
+    # production uses the staged 20-trade cold-start authority instead.
+    config["crypto"]["profitability_policy"]["cold_start_enabled"] = False
     config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
     config["effective_config_hash"] = effective_config_hash(config)
     return config
@@ -334,7 +343,7 @@ def test_crypto_position_age_uses_oldest_verified_lot_not_management_row_time():
 
 def test_deferred_crypto_research_enters_bounded_exploration_before_full_validation(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
-    config = _config()
+    config = _legacy_exploration_config()
     monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
     monkeypatch.setattr(
         "app.cross_asset_runtime.get_power_status",
@@ -392,7 +401,7 @@ def test_deferred_crypto_research_enters_bounded_exploration_before_full_validat
 
 def test_crypto_profitability_gate_labels_unvalidated_research_as_exploration(tmp_path, monkeypatch):
     storage = _storage(tmp_path)
-    config = _config()
+    config = _legacy_exploration_config()
     # The synthetic rising series needs a wider target to make the
     # cost-adjusted candidate positive under the production fee/slippage tier.
     config["crypto"]["strategy_policy"]["target_reward_r_multiple"] = 8
@@ -451,6 +460,10 @@ def test_cross_asset_runtime_accepts_alpaca_account_status_enum(tmp_path, monkey
 
     storage = _storage(tmp_path)
     config = _config()
+    # Both flags are present here to prove the staged authority wins over the
+    # legacy three-trial compatibility policy at runtime.
+    config["crypto"]["profitability_policy"]["exploration_policy"]["enabled"] = True
+    config["effective_config_hash"] = effective_config_hash(config)
     monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
     monkeypatch.setattr(
         "app.cross_asset_runtime.get_power_status",
@@ -492,6 +505,7 @@ def test_cross_asset_runtime_accepts_alpaca_account_status_enum(tmp_path, monkey
 
     assert plan.summary["candidate_count"] == 1
     assert plan.decisions[0]["strategy_version"] == results[0].selected_strategy
+    assert plan.decisions[0]["source_type"] == "candidate_cold_start_discovery"
     assert (
         plan.decisions[0]["manual_approval_required"] is True
         or plan.decisions[0]["autonomous_execution"] is True
