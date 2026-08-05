@@ -646,7 +646,20 @@ class ApprovalWorkflowStore:
                         )
                         counts["blocked"] += 1
                     else:
-                        self.ensure_intent(workflow_id, proposal, run_id=run_id)
+                        # Preserve the immutable authority lane when a crash
+                        # happened before intent creation. In particular,
+                        # autonomous paper recovery must not be downgraded to
+                        # the ordinary/manual source type, or the later final
+                        # execution snapshot would reject the restart.
+                        recovery_source_type = str(
+                            proposal.get("approval_source_type") or "proposal"
+                        )
+                        self.ensure_intent(
+                            workflow_id,
+                            proposal,
+                            run_id=run_id,
+                            source_type=recovery_source_type,
+                        )
                         counts["intent_created"] += 1
                         self.transition(
                             workflow_id,

@@ -63,7 +63,22 @@ def _crypto_exploration_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     crypto = config.get("crypto") or {}
-    raw = (crypto.get("profitability_policy") or {}).get("exploration_policy") or {}
+    profitability = crypto.get("profitability_policy") or {}
+    # The staged cold-start sleeve is the current crypto discovery authority.
+    # Keep the legacy three-trial policy available for explicitly isolated
+    # compatibility configurations, but never let it mask the 20-trade plan
+    # when both settings are present in an unvalidated caller configuration.
+    if profitability.get("cold_start_enabled") is True:
+        return {
+            "enabled": False,
+            "maximum_completed_samples": 0,
+            "maximum_notional_usd": "0",
+            "prior_win_probability": "0",
+            "prior_uncertainty": "0",
+            "expected_holding_hours": "0",
+            "correlation_bound": "1",
+        }
+    raw = profitability.get("exploration_policy") or {}
     if not isinstance(raw, Mapping) or raw.get("enabled") is not True:
         return {
             "enabled": False,
@@ -883,6 +898,14 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         raise CrossAssetAllocationError(
             "crypto paper exploration requires the supervised-paper capability"
         )
+    profitability = crypto.get("profitability_policy") or {}
+    cold_start_enabled = profitability.get("cold_start_enabled") is True
+    cold_start_tiers = profitability.get("cold_start_notional_tiers") or {}
+    cold_start_maximum_notional = _trusted_decimal(
+        cold_start_tiers.get("final_notional_usd", 0),
+        "crypto.profitability_policy.cold_start_notional_tiers.final_notional_usd",
+        minimum=ZERO,
+    )
     raw = config.get("cross_asset_allocation") or {}
     if raw.get("enabled") is not True or raw.get("mode") != "research_advisory":
         raise CrossAssetAllocationError("cross-asset allocation policy is not enabled")
@@ -948,6 +971,10 @@ def _policy(config: Mapping[str, Any]) -> dict[str, Any]:
         )
     policy.update(
         {
+            "crypto_cold_start_enabled": cold_start_enabled,
+            "crypto_cold_start_maximum_notional_usd": _text(
+                cold_start_maximum_notional
+            ),
             "crypto_exploration_enabled": bool(exploration["enabled"]),
             "crypto_exploration_maximum_completed_samples": int(
                 exploration["maximum_completed_samples"]
@@ -1189,10 +1216,27 @@ def optimize_cross_asset_allocation(
     scored: list[tuple[Decimal, str, dict[str, Any], dict[str, str], tuple[str, ...]]] = []
     for row in candidate_rows:
         reasons: list[str] = []
+        cold_start_candidate = row["source_type"] == "candidate_cold_start_discovery"
         if not row["source_authoritative"]:
             reasons.append("source_not_authoritative")
-        if not row["profitability_eligible"] and not row["exploration_eligible"]:
+        if (
+            not row["profitability_eligible"]
+            and not row["exploration_eligible"]
+            and not cold_start_candidate
+        ):
             reasons.append("profitability_ineligible")
+        if cold_start_candidate:
+            if (
+                row["asset_class"] != "crypto"
+                or row["execution_lane"] != "supervised_paper"
+                or row["strategy_state"] != "EXPLORATION"
+                or not policy["crypto_cold_start_enabled"]
+            ):
+                reasons.append("cold_start_authority_invalid")
+            if Decimal(row["proposed_notional"]) > Decimal(
+                policy["crypto_cold_start_maximum_notional_usd"]
+            ):
+                reasons.append("cold_start_notional_exceeds_policy")
         if row["exploration_eligible"]:
             if (
                 row["asset_class"] != "crypto"
@@ -1684,6 +1728,8 @@ class CrossAssetAllocationStore:
                 policy = (self.config.get("crypto") or {}).get("profitability_policy") or {}
                 if policy.get("cold_start_enabled") is not True:
                     raise CrossAssetAllocationError("crypto cold-start authority is disabled")
+                if candidate.execution_lane != "supervised_paper" or candidate.strategy_state.upper() != "EXPLORATION":
+                    raise CrossAssetAllocationError("crypto cold-start candidate state is invalid")
                 try:
                     count = int(
                         self.storage.fetch_all(
@@ -1702,6 +1748,25 @@ class CrossAssetAllocationStore:
                         raw = row.get("net_pnl") if row.get("net_pnl") not in (None, "") else row.get("net_return")
                         accumulated += _decimal(raw, "crypto cold-start accumulated evidence")
                     maximum = int(policy.get("cold_start_trade_count"))
+                    tiers = policy.get("cold_start_notional_tiers") or {}
+                    if count < int(tiers["first_trade_count"]):
+                        notional_cap = _trusted_decimal(
+                            tiers["first_notional_usd"],
+                            "crypto cold-start first notional cap",
+                            minimum=ZERO,
+                        )
+                    elif count < int(tiers["second_trade_count"]):
+                        notional_cap = _trusted_decimal(
+                            tiers["second_notional_usd"],
+                            "crypto cold-start second notional cap",
+                            minimum=ZERO,
+                        )
+                    else:
+                        notional_cap = _trusted_decimal(
+                            tiers["final_notional_usd"],
+                            "crypto cold-start final notional cap",
+                            minimum=ZERO,
+                        )
                 except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
                     raise CrossAssetAllocationError(
                         "crypto cold-start evidence is unavailable"
@@ -1709,6 +1774,10 @@ class CrossAssetAllocationStore:
                 if count >= maximum or accumulated < ZERO:
                     raise CrossAssetAllocationError(
                         "crypto cold-start evidence no longer authorizes discovery"
+                    )
+                if _decimal(candidate.proposed_notional, "crypto cold-start proposed notional") > notional_cap:
+                    raise CrossAssetAllocationError(
+                        "crypto cold-start proposed notional exceeds the current staged cap"
                     )
                 continue
             if candidate.source_type != "candidate_profitability_decision":

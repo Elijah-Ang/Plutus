@@ -699,6 +699,80 @@ def test_service_recovery_blocks_expired_rotation_before_intent_and_releases_res
     )[0]["state"] == "released"
 
 
+def test_autonomous_rotation_uses_durable_system_approval_and_leg_authority(coordinator):
+    storage, manager = coordinator
+    group = _create(coordinator)
+    step = manager.steps(group["id"])[0]
+    now = datetime.now(UTC)
+    proposal = {
+        "id": "exit-proposal", "proposal_id": "exit-proposal", "symbol": "OLD",
+        "side": "sell", "action": "exit", "status": "pending", "qty": 10.0,
+        "notional": 1000.0, "latest_price": 100.0, "trading_mode": "paper",
+        "relationship_type": "rotation_exit", "relationship_group_id": group["id"],
+        "rotation_group_id": group["id"], "rotation_step_id": step["id"],
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+    }
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,run_id,symbol,side,status,notional,created_at,expires_at,relationship_type,
+             rotation_group_id,rotation_step_id,payload)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "exit-proposal", "run", "OLD", "sell", "pending", 1000.0,
+            now.isoformat(), proposal["expires_at"], "rotation_exit", group["id"],
+            step["id"], json.dumps(proposal),
+        ),
+    )
+    entry_proposal = {
+        "id": "entry-proposal", "proposal_id": "entry-proposal", "symbol": "NEW",
+        "side": "buy", "action": "entry", "status": "pending", "qty": 5.0,
+        "notional": 500.0, "latest_price": 100.0, "stop_price": 95.0,
+        "stop_risk_dollars": 25.0, "trading_mode": "paper",
+        "relationship_type": "rotation_entry", "relationship_group_id": group["id"],
+        "rotation_group_id": group["id"],
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+    }
+    entry = manager.entries(group["id"])[0]
+    storage.execute(
+        """INSERT INTO trade_proposals(
+             id,run_id,symbol,side,status,notional,created_at,expires_at,relationship_type,
+             rotation_group_id,rotation_step_id,payload)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "entry-proposal", "run", "NEW", "buy", "pending", 500.0,
+            now.isoformat(), entry_proposal["expires_at"], "rotation_entry", group["id"],
+            entry["id"], json.dumps(entry_proposal),
+        ),
+    )
+
+    service = TradingService.__new__(TradingService)
+    service.storage = storage
+    service.config = {
+        "effective_config_hash": CONFIG_HASH,
+        "mode": "paper",
+        "live_enabled": False,
+        "auto_execution_enabled": True,
+        "auto_execution_mode": "autonomous_paper",
+    }
+    service.run_id = "autonomous-rotation-run"
+    service._authorize_autonomous_rotation_group(group["id"])
+
+    approved_group = manager.get_group(group["id"])
+    group_approval = storage.fetch_all(
+        "SELECT * FROM rotation_group_approvals WHERE group_id=?", (group["id"],)
+    )[0]
+    leg_display = storage.fetch_all(
+        "SELECT displayed_envelope_json FROM proposal_display_envelopes WHERE proposal_id=?",
+        ("exit-proposal",),
+    )[0]
+
+    assert approved_group["state"] == RotationState.APPROVED_EXIT_PENDING.value
+    assert group_approval["sender_id"] == "plutus:autonomous"
+    assert group_approval["approval_id"] == f"autonomous-rotation-approval:{group['id']}"
+    assert group_approval["status"] == "active"
+    assert json.loads(leg_display["displayed_envelope_json"])["approval_source_type"] == "autonomous_system"
+
+
 def test_final_execution_boundary_rechecks_rotation_expiry(coordinator):
     storage, manager = coordinator
     group = _create(coordinator)

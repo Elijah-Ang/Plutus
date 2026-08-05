@@ -17,7 +17,11 @@ from zoneinfo import ZoneInfo
 from .ai_review import AIReviewer, deterministic_review
 from .adaptive_conviction import AdaptiveConvictionEngine
 from .adaptive_sizing import AdaptiveSizingEngine
-from .autonomous_authority import authorize_proposal as authorize_autonomous_proposal
+from .autonomous_authority import (
+    AUTONOMOUS_RAW_MESSAGE,
+    AUTONOMOUS_SENDER_ID,
+    authorize_proposal as authorize_autonomous_proposal,
+)
 from .capabilities import AUTO_EXECUTION_SUPPORTED, require_protective_paper_exit_support
 from .crypto_research import CryptoResearchEngine, crypto_quiet_hours_active, format_crypto_digest
 
@@ -356,6 +360,22 @@ class TradingService:
                 # approval.  Generic recovery must neither submit it nor turn
                 # the grouped approval into an unrecoverable manual-review row.
                 return "retry", None, "rotation coordinator owns grouped recovery"
+            authority_rows = self.storage.fetch_all(
+                "SELECT approval_source_type,execution_path FROM approvals WHERE id=?",
+                (workflow["approval_id"],),
+            )
+            authority = authority_rows[0] if authority_rows else {}
+            if (
+                str(authority.get("approval_source_type") or "") == "autonomous_system"
+                and str(authority.get("execution_path") or "") == "autonomous_paper_order"
+                and str(proposal.get("approval_source_type") or "") == "autonomous_system"
+                and str(proposal.get("execution_path") or "") == "autonomous_paper_order"
+            ):
+                # The durable autonomous authority already exists. Rebuild a
+                # fresh paper intent and let the normal recovery submitter run
+                # the current broker/account/quote/risk checks; do not strand
+                # a deterministic pre-submission crash in manual review.
+                return "approved", proposal, "autonomous paper authority will rebuild final checks after restart"
             # A crash before final validation lacks a fresh broker/account proof.
             # Surface it explicitly instead of silently reviving or stranding it.
             return "manual_review", None, "fresh final broker validation cannot be reconstructed automatically"
@@ -3797,6 +3817,104 @@ class TradingService:
             )
         return group
 
+    def _bind_autonomous_rotation_proposal(self, proposal_id: str, group_id: str) -> None:
+        """Bind one rotation leg to the durable autonomous paper authority."""
+
+        rows = self.storage.fetch_all(
+            "SELECT * FROM trade_proposals WHERE id=?", (proposal_id,)
+        )
+        if len(rows) != 1:
+            raise RuntimeError("autonomous rotation leg proposal is unavailable")
+        row = dict(rows[0])
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        side = str(row.get("side") or payload.get("side") or "").lower()
+        if side not in {"buy", "sell"}:
+            raise RuntimeError("autonomous rotation leg side is invalid")
+        if int(row.get("emergency_exit_triggered") or payload.get("emergency_exit_triggered") or 0) == 1:
+            raise RuntimeError("emergency exits cannot be grouped as autonomous rotations")
+
+        existing_displays = self.storage.fetch_all(
+            """SELECT displayed_envelope_json FROM proposal_display_envelopes
+               WHERE proposal_id=? ORDER BY proposal_version DESC LIMIT 1""",
+            (proposal_id,),
+        )
+        if existing_displays:
+            try:
+                envelope = json.loads(existing_displays[0]["displayed_envelope_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("autonomous rotation leg display authority is invalid") from exc
+            if str(envelope.get("approval_source_type") or "") != "autonomous_system":
+                raise RuntimeError("rotation leg was already displayed under manual authority")
+
+        payload.update({
+            "approval_source_type": "autonomous_system",
+            "execution_path": "autonomous_paper_order",
+            "autonomous_entry_requested": side == "buy",
+            "autonomous_exit_requested": side == "sell",
+            "rotation_group_id": group_id,
+        })
+        self.storage.execute(
+            """UPDATE trade_proposals
+               SET payload=?
+               WHERE id=? AND status IN ('pending','approved')""",
+            (
+                json_dumps(payload),
+                proposal_id,
+            ),
+        )
+        if not existing_displays:
+            record_display(
+                self.storage,
+                proposal_id,
+                f"autonomous-rotation:{group_id}",
+                context_type="rotation",
+                context_id=group_id,
+            )
+
+    def _authorize_autonomous_rotation_group(self, group_id: str) -> dict[str, Any]:
+        """Approve a pending rotation with a durable system identity."""
+
+        from .rotation_coordinator import RotationState
+
+        coordinator = RotationCoordinator(
+            self.storage, config_hash=self.config.get("effective_config_hash")
+        )
+        group = coordinator.get_group(group_id)
+        if RotationState(group["state"]) != RotationState.PENDING_GROUP_APPROVAL:
+            return group
+
+        for leg in coordinator.steps(group_id) + coordinator.entries(group_id):
+            proposal_id = str(leg.get("proposal_id") or "")
+            if proposal_id:
+                self._bind_autonomous_rotation_proposal(proposal_id, group_id)
+
+        display_id = f"autonomous-rotation:{group_id}"
+        coordinator.record_group_display(group_id, display_id)
+        approval_id = f"autonomous-rotation-approval:{group_id}"
+        approved = coordinator.approve(
+            group_id,
+            approval_id=approval_id,
+            sender_id=AUTONOMOUS_SENDER_ID,
+            command=f"{AUTONOMOUS_RAW_MESSAGE} ROTATION {group_id}",
+            reply_to_message_id=display_id,
+        )
+        self.storage.audit(
+            self.run_id,
+            "autonomous_rotation_group_authorized",
+            {
+                "group_id": group_id,
+                "approval_id": approval_id,
+                "sender_id": AUTONOMOUS_SENDER_ID,
+                "sequence": "exit_submission_then_fill_reconciliation_then_entry_revalidation",
+            },
+        )
+        return approved
+
     def _format_rotation_group_message(self, group: dict[str, Any]) -> str:
         from .rotation_coordinator import RotationCoordinator
 
@@ -4238,6 +4356,17 @@ class TradingService:
         for action in coordinator.recovery_actions():
             group = coordinator.get_group(action["group_id"])
             state = RotationState(group["state"])
+            if state == RotationState.PENDING_GROUP_APPROVAL and self._autonomous_paper_enabled():
+                try:
+                    group = self._authorize_autonomous_rotation_group(group["id"])
+                    state = RotationState(group["state"])
+                except Exception as exc:
+                    self.storage.audit(
+                        self.run_id,
+                        "autonomous_rotation_recovery_blocked",
+                        {"group_id": group["id"], "error_type": type(exc).__name__},
+                    )
+                    continue
             if state == RotationState.APPROVED_EXIT_PENDING:
                 approvals = self.storage.fetch_all(
                     """SELECT * FROM rotation_group_approvals WHERE group_id=?
@@ -8381,7 +8510,6 @@ class TradingService:
                 (self.config.get("rotation", {}) or {}).get("enabled")
                 and exit_candidates_exist
                 and buy_candidates
-                and not self._autonomous_paper_enabled()
             )
 
             # Sort profile_results: EXITS first, then BUYS, then HOLDS
@@ -9489,14 +9617,14 @@ class TradingService:
 
                 self.storage.execute("INSERT INTO ai_reviews(run_id,proposal_id,summary,risks,caution_level,payload,created_at) VALUES(?,?,?,?,?,?,?)", (self.run_id, proposal_id, review["summary"], json_dumps(review["risks"]), review["caution_level"], json_dumps(review), iso_now()))
 
-                if self._autonomous_paper_enabled() and proposal.get("status", "pending") == "pending":
-                    self._execute_autonomous_proposal(proposal)
-                elif rotation_candidate_available and is_buy and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
+                if rotation_candidate_available and is_buy and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
                     # The grouped message is the sole approval surface for the
                     # displayed contingent BUY.
                     pass
                 elif rotation_candidate_available and is_exit and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1:
                     rotation_exit_proposals.append(proposal)
+                elif self._autonomous_paper_enabled() and proposal.get("status", "pending") == "pending":
+                    self._execute_autonomous_proposal(proposal)
                 elif batch_mode_enabled and proposal.get("status", "pending") == "pending" and emergency_exit_triggered != 1 and (is_buy or is_exit):
                     batch_proposals.append(proposal)
                 else:
@@ -9515,44 +9643,63 @@ class TradingService:
                     rotation_group = self._create_rotation_group(
                         rotation_exit_proposals, rotation_candidates, now
                     )
-                    rotation_result = self.telegram.send_message(self._format_rotation_group_message(rotation_group))
-                    if rotation_result and isinstance(rotation_result, dict) and "message_id" in rotation_result:
-                        rotation_message_id = str(rotation_result["message_id"])
-                        rotation_group_id = str(rotation_group.get("id") or rotation_group.get("group_id") or "")
-                        RotationCoordinator(
-                            self.storage,
-                            config_hash=self.config.get("effective_config_hash"),
-                        ).record_group_display(rotation_group_id, rotation_message_id)
-                        for displayed_proposal in rotation_exit_proposals:
-                            record_display(
-                                self.storage, displayed_proposal["id"], rotation_message_id,
-                                context_type="rotation", context_id=rotation_group_id,
-                            )
-                        for candidate in rotation_candidates:
-                            displayed_proposal = candidate.get("performance_proposal_payload") or {}
-                            if displayed_proposal.get("id"):
+                    rotation_group_id = str(rotation_group.get("id") or rotation_group.get("group_id") or "")
+                    if self._autonomous_paper_enabled():
+                        # The system approval is durable and deterministic; the
+                        # coordinator still owns exit-first submission,
+                        # authoritative fill reconciliation, capacity rebuild,
+                        # and contingent-entry revalidation.
+                        self._authorize_autonomous_rotation_group(rotation_group_id)
+                        self._advance_rotation_workflows()
+                    else:
+                        rotation_result = self.telegram.send_message(self._format_rotation_group_message(rotation_group))
+                        if rotation_result and isinstance(rotation_result, dict) and "message_id" in rotation_result:
+                            rotation_message_id = str(rotation_result["message_id"])
+                            RotationCoordinator(
+                                self.storage,
+                                config_hash=self.config.get("effective_config_hash"),
+                            ).record_group_display(rotation_group_id, rotation_message_id)
+                            for displayed_proposal in rotation_exit_proposals:
                                 record_display(
                                     self.storage, displayed_proposal["id"], rotation_message_id,
                                     context_type="rotation", context_id=rotation_group_id,
                                 )
+                            for candidate in rotation_candidates:
+                                displayed_proposal = candidate.get("performance_proposal_payload") or {}
+                                if displayed_proposal.get("id"):
+                                    record_display(
+                                        self.storage, displayed_proposal["id"], rotation_message_id,
+                                        context_type="rotation", context_id=rotation_group_id,
+                                    )
                 except Exception as exc:
                     self.storage.audit(self.run_id, "rotation_group_creation_blocked", {
                         "error_type": type(exc).__name__, "exit_proposal_count": len(rotation_exit_proposals),
                         "contingent_candidate_count": len(buy_candidates), "exit_safety_preserved": True,
                     })
-                    # A rotation feature failure must never suppress a genuine
-                    # reduce-risk proposal.
-                    for exit_proposal in rotation_exit_proposals:
-                        res_tg = self.telegram.send_message(format_proposal_message(exit_proposal, self.config))
-                        if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                            record_display(self.storage, exit_proposal["id"], str(res_tg["message_id"]))
-                    for candidate in rotation_candidates:
-                        buy_proposal = candidate.get("performance_proposal_payload") or {}
-                        if not buy_proposal:
-                            continue
-                        res_tg = self.telegram.send_message(format_proposal_message(buy_proposal, self.config))
-                        if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
-                            record_display(self.storage, buy_proposal["id"], str(res_tg["message_id"]))
+                    if self._autonomous_paper_enabled():
+                        # Never turn an autonomous rotation failure into a
+                        # hidden manual approval surface or bypass exit-first
+                        # sequencing. The next recovery cycle can retry the
+                        # durable group path after the cause is resolved.
+                        self.storage.audit(
+                            self.run_id,
+                            "autonomous_rotation_blocked_without_manual_fallback",
+                            {"error_type": type(exc).__name__},
+                        )
+                    else:
+                        # A rotation feature failure must never suppress a
+                        # genuine reduce-risk proposal in manual mode.
+                        for exit_proposal in rotation_exit_proposals:
+                            res_tg = self.telegram.send_message(format_proposal_message(exit_proposal, self.config))
+                            if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                                record_display(self.storage, exit_proposal["id"], str(res_tg["message_id"]))
+                        for candidate in rotation_candidates:
+                            buy_proposal = candidate.get("performance_proposal_payload") or {}
+                            if not buy_proposal:
+                                continue
+                            res_tg = self.telegram.send_message(format_proposal_message(buy_proposal, self.config))
+                            if res_tg and isinstance(res_tg, dict) and "message_id" in res_tg:
+                                record_display(self.storage, buy_proposal["id"], str(res_tg["message_id"]))
             if batch_mode_enabled and batch_proposals:
                 self._send_ranked_batch_if_needed(batch_proposals, buy_candidates, risk_snapshot)
 
