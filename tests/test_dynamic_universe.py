@@ -163,6 +163,11 @@ class PromotionBroker:
 def dynamic_config() -> dict[str, Any]:
     cfg = load_config()
     cfg["mode"] = "paper"
+    # These scanner fixtures patch the canonical/manual evaluator. Keep their
+    # authority explicit so production autonomous-paper discovery does not
+    # change which evaluator the fixture is exercising.
+    cfg["auto_execution_enabled"] = False
+    cfg["auto_execution_mode"] = "manual_only"
     cfg["dynamic_universe"]["max_research_symbols_per_run"] = 20
     cfg["dynamic_universe"]["raw_sources"]["existing_static_watchlist"] = False
     cfg["dynamic_universe"]["raw_sources"]["eodhd_exchange_symbols"] = False
