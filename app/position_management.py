@@ -104,6 +104,7 @@ class PositionManagementEngine:
         normal_exit_signal: bool = False,
         volatility_regime: str = "normal",
         has_open_order: bool = False,
+        allow_risk_increasing_actions: bool = True,
         position_age_days: float | None = None,
         position_age_cycles: int | None = None,
         now: datetime | None = None,
@@ -174,7 +175,8 @@ class PositionManagementEngine:
         pullback = self._healthy_pullback_decision(
             symbol, current_price, avg_entry_price, quantity, unrealized_pct, highest,
             max_profit_pct, pullback_pct, giveback, current_r, trailing_stop, atr, atr_pct,
-            ma50, ma200, trade_score, score_improvement, emergency_exit_score, volatility_regime, has_open_order,
+            ma50, ma200, trade_score, score_improvement, emergency_exit_score, volatility_regime,
+            has_open_order, allow_risk_increasing_actions,
         )
         if pullback:
             return pullback
@@ -304,7 +306,7 @@ class PositionManagementEngine:
             position_age_days=position_age_days, position_age_cycles=position_age_cycles, exit_review_needed=True,
         )
 
-    def _healthy_pullback_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, giveback: float | None, current_r: float | None, trailing_stop: float | None, atr: float | None, atr_pct: float | None, ma50: float | None, ma200: float | None, trade_score: float, score_improvement: float, emergency_exit_score: float | None, volatility_regime: str, has_open_order: bool) -> PositionManagementDecision | None:
+    def _healthy_pullback_decision(self, symbol: str, current_price: float, avg_entry_price: float, quantity: float, unrealized_pct: float, highest: float, max_profit_pct: float, pullback_pct: float | None, giveback: float | None, current_r: float | None, trailing_stop: float | None, atr: float | None, atr_pct: float | None, ma50: float | None, ma200: float | None, trade_score: float, score_improvement: float, emergency_exit_score: float | None, volatility_regime: str, has_open_order: bool, allow_risk_increasing_actions: bool = True) -> PositionManagementDecision | None:
         cfg = _nested(self.config, "healthy_pullback_add")
         if not cfg.get("enabled", True):
             return None
@@ -342,6 +344,8 @@ class PositionManagementEngine:
             blockers.append("trailing stop breached")
         if has_open_order:
             blockers.append("open order already exists for symbol")
+        if not allow_risk_increasing_actions:
+            blockers.append("external position add requires verified entry and stop provenance")
 
         classification = self._classify_dip_trap(unrealized_pct, current_price, avg_entry_price, ma50, ma200, giveback, trailing_stop, emergency_exit_score, volatility_regime)
         if blockers:

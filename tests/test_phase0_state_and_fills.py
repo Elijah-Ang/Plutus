@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import json
 
 import pytest
@@ -9,6 +10,7 @@ from app.approval_workflow import ApprovalWorkflowState, ApprovalWorkflowStore
 from app.execution import DurableExecutionStore, Executor
 from app.order_state import ALLOWED_TRANSITIONS, InvalidOrderTransition, OrderState, validate_transition
 from app.position_lifecycle import PositionLifecycleManager
+from app.reconciliation import BrokerReconciler
 from app.risk_engine import RiskDecision
 from app.service import TradingService
 from app.storage import Storage
@@ -264,6 +266,115 @@ def test_new_broker_position_backfills_prospective_intent_and_lot_lifecycle(tmp_
     lifecycle = PositionLifecycleManager(storage).reconcile([SimpleNamespace(symbol="SPY", qty="10", avg_entry_price="50")])["SPY"]
     assert storage.fetch_all("SELECT position_lifecycle_id FROM order_intents")[0]["position_lifecycle_id"] == lifecycle
     assert storage.fetch_all("SELECT DISTINCT position_lifecycle_id FROM position_lots")[0]["position_lifecycle_id"] == lifecycle
+
+
+def test_external_equity_position_is_absorbed_idempotently_with_explicit_provenance(tmp_path):
+    storage = _db(tmp_path)
+    manager = PositionLifecycleManager(storage)
+    position = SimpleNamespace(
+        symbol="AAPL", qty="3.5", avg_entry_price="180.25", asset_class="us_equity"
+    )
+
+    lifecycle = manager.reconcile(
+        [position], absorb_external_equities=True, run_id="external-run"
+    )["AAPL"]
+    manager.reconcile(
+        [position], absorb_external_equities=True, run_id="external-run-2"
+    )
+
+    lifecycle_row = storage.fetch_all(
+        "SELECT source,current_quantity_decimal FROM position_lifecycles WHERE id=?",
+        (lifecycle,),
+    )[0]
+    lot_rows = storage.fetch_all(
+        """SELECT source,confidence,position_lifecycle_id,
+                  original_quantity_decimal,remaining_quantity_decimal,
+                  unit_cost_decimal,initial_risk_dollars_decimal
+           FROM position_lots WHERE symbol='AAPL'"""
+    )
+    assert lifecycle_row == {
+        "source": "external_broker_reconciliation",
+        "current_quantity_decimal": "3.5",
+    }
+    assert lot_rows == [{
+        "source": "external_broker_reconciliation",
+        "confidence": "reconstructed",
+        "position_lifecycle_id": lifecycle,
+        "original_quantity_decimal": "3.5",
+        "remaining_quantity_decimal": "3.5",
+        "unit_cost_decimal": "180.25",
+        "initial_risk_dollars_decimal": None,
+    }]
+    assert manager.is_external_position("AAPL") is True
+    assert storage.fetch_all(
+        "SELECT COUNT(*) n FROM audit_events WHERE event_type='external_equity_position_absorbed'"
+    )[0]["n"] == 1
+
+
+def test_external_equity_absorption_tracks_only_quantity_deltas_and_reductions(tmp_path):
+    storage = _db(tmp_path)
+    manager = PositionLifecycleManager(storage)
+
+    manager.reconcile(
+        [SimpleNamespace(symbol="MSFT", qty="10", avg_entry_price="400")],
+        absorb_external_equities=True,
+        run_id="external-1",
+    )
+    manager.reconcile(
+        [SimpleNamespace(symbol="MSFT", qty="12", avg_entry_price="400")],
+        absorb_external_equities=True,
+        run_id="external-2",
+    )
+    assert storage.fetch_all(
+        "SELECT COUNT(*) n FROM position_lots WHERE symbol='MSFT'"
+    )[0]["n"] == 2
+    assert sum(
+        Decimal(row["remaining_quantity_decimal"])
+        for row in storage.fetch_all(
+            "SELECT remaining_quantity_decimal FROM position_lots WHERE symbol='MSFT'"
+        )
+    ) == Decimal("12")
+
+    manager.reconcile(
+        [SimpleNamespace(symbol="MSFT", qty="8", avg_entry_price="400")],
+        absorb_external_equities=True,
+        run_id="external-3",
+    )
+    assert sum(
+        Decimal(row["remaining_quantity_decimal"])
+        for row in storage.fetch_all(
+            "SELECT remaining_quantity_decimal FROM position_lots WHERE symbol='MSFT'"
+        )
+    ) == Decimal("8")
+    assert [
+        Decimal(row["remaining_quantity_decimal"])
+        for row in storage.fetch_all(
+            "SELECT remaining_quantity_decimal FROM position_lots WHERE symbol='MSFT' ORDER BY opened_at,id"
+        )
+    ] == [Decimal("6"), Decimal("2")]
+
+
+def test_broker_reconciliation_absorbs_external_equity_before_account_snapshot(tmp_path):
+    storage = _db(tmp_path)
+
+    class Broker:
+        def get_account(self):
+            return SimpleNamespace(equity="1000", cash="700", settled_cash="700")
+
+        def get_positions(self):
+            return [SimpleNamespace(
+                symbol="NVDA", qty="2", avg_entry_price="120",
+                market_value="250", unrealized_pl="10", asset_class="us_equity",
+            )]
+
+    BrokerReconciler(Broker(), storage, "broker-run").reconcile()
+    assert storage.fetch_all(
+        "SELECT source,confidence,remaining_quantity_decimal FROM position_lots WHERE symbol='NVDA'"
+    ) == [{
+        "source": "external_broker_reconciliation",
+        "confidence": "reconstructed",
+        "remaining_quantity_decimal": "2",
+    }]
 
 
 def test_opening_quantity_grows_with_original_entry_but_excludes_later_add(tmp_path):

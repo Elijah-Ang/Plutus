@@ -84,7 +84,7 @@ cross_asset_allocation:
   enabled: true
   mode: research_advisory
   produce_order_authority: false
-  formula_version: cross_asset_normalized_constrained_allocator_v3_external_crypto_reconciliation
+  formula_version: cross_asset_normalized_constrained_allocator_v4_external_position_reconciliation
   schema_version: cross_asset_research_allocation_plans_v2_bounded_exploration
   candidate_ttl_seconds: 300
   portfolio_snapshot_ttl_seconds: 300
@@ -447,7 +447,7 @@ formula_versions:
   crypto_proposal: crypto_research_proposal_authority_v2_net_cost_target
   crypto_paper_execution: crypto_supervised_paper_execution_v1_paper_authority_limit_orders
   crypto_paper_execution_schema: crypto_supervised_paper_execution_schema_v3_fingerprinted_lifecycle
-  cross_asset_allocation: cross_asset_normalized_constrained_allocator_v3_external_crypto_reconciliation
+  cross_asset_allocation: cross_asset_normalized_constrained_allocator_v4_external_position_reconciliation
   adaptive_conviction: adaptive_conviction_formula_v2_operational_paper
   adaptive_sizing: adaptive_sizing_formula_v2_operational_paper
   phase4_allocation: phase4_multi_strategy_allocation_v7_stop_risk_dollars

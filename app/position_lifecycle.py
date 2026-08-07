@@ -15,6 +15,10 @@ from .utils import iso_now, json_dumps
 
 
 ZERO = Decimal("0")
+EXTERNAL_POSITION_LOT_SOURCE = "external_broker_reconciliation"
+EXTERNAL_POSITION_STRATEGY_VERSION = "external_unmanaged"
+EXTERNAL_POSITION_FORMULA_VERSION = "external_position_reconciliation_v1"
+EXTERNAL_POSITION_LOT_SOURCES = frozenset({EXTERNAL_POSITION_LOT_SOURCE, "manual_adjustment"})
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -27,18 +31,30 @@ class PositionLifecycleManager:
     def __init__(self, storage: Any) -> None:
         self.storage = storage
 
-    def reconcile(self, positions: list[Any], source: str = "broker_reconciliation") -> dict[str, str]:
+    def reconcile(
+        self,
+        positions: list[Any],
+        source: str = "broker_reconciliation",
+        *,
+        absorb_external_equities: bool = False,
+        run_id: str | None = None,
+    ) -> dict[str, str]:
         now = iso_now()
         current: dict[str, dict[str, Any]] = {}
         for position in positions:
             symbol = str(_value(position, "symbol", "")).upper()
             quantity = _decimal_or_none(_value(position, "qty", 0)) or ZERO
             if symbol and abs(quantity) > ZERO:
+                raw_asset_class = str(
+                    _value(position, "asset_class", _value(position, "class", "equity"))
+                    or "equity"
+                ).lower()
                 current[symbol] = {
                     "quantity": quantity,
                     "side": "long" if quantity > ZERO else "short",
                     "broker_position_id": str(_value(position, "asset_id", "") or _value(position, "id", "") or "") or None,
                     "average_entry_price": _decimal_or_none(_value(position, "avg_entry_price")),
+                    "asset_class": "crypto" if "crypto" in raw_asset_class else "equity",
                 }
 
         def refresh_opening_quantity(conn: Any, lifecycle: Any) -> None:
@@ -239,10 +255,307 @@ class PositionLifecycleManager:
                     ).fetchone()
                     if created:
                         refresh_opening_quantity(conn, created)
+            if absorb_external_equities:
+                self._absorb_external_equities_in_transaction(
+                    conn,
+                    current=current,
+                    now=now,
+                    run_id=run_id,
+                )
         return {
             row["symbol"]: row["id"]
             for row in self.storage.fetch_all("SELECT symbol,id FROM position_lifecycles WHERE state='active'")
         }
+
+    def _absorb_external_equities_in_transaction(
+        self,
+        conn: Any,
+        *,
+        current: dict[str, dict[str, Any]],
+        now: str,
+        run_id: str | None,
+    ) -> None:
+        """Import broker-held equity shares that have no local entry fill.
+
+        The broker quantity is authoritative for the current holding, but it
+        is not historical trade evidence.  External shares therefore enter the
+        prospective FIFO ledger as reconstructed/unavailable lots with no
+        invented stop risk.  Quantity increases create only the delta; broker
+        reductions consume only external lots.  A reduction that would require
+        rewriting a Plutus-originated lot remains blocked for reconciliation.
+        """
+
+        def audit(event_type: str, detail: dict[str, Any]) -> None:
+            conn.execute(
+                "INSERT INTO audit_events(run_id,event_type,actor,detail,created_at) VALUES(?,?,?,?,?)",
+                (run_id, event_type, "position_lifecycle", json_dumps(detail), now),
+            )
+
+        def exact_remaining(row: Any) -> Decimal | None:
+            raw = dict(row)
+            try:
+                return require_exact_decimal(
+                    raw, "remaining_quantity_decimal", minimum=ZERO
+                )
+            except (TypeError, ValueError):
+                # A closed legacy lot is harmless.  An open lot without exact
+                # evidence is not eligible for automatic absorption.
+                legacy = _decimal_or_none(raw.get("remaining_quantity"))
+                if legacy is not None and legacy <= ZERO:
+                    return ZERO
+                return None
+
+        def local_entry_evidence(lifecycle_id: str, symbol: str) -> bool:
+            rows = conn.execute(
+                """SELECT filled_quantity_decimal,filled_quantity
+                   FROM order_intents
+                   WHERE position_lifecycle_id=? AND symbol=?
+                     AND lower(side)='buy' AND lower(intended_action)='entry'""",
+                (lifecycle_id, symbol),
+            ).fetchall()
+            for raw in rows:
+                try:
+                    filled = require_exact_decimal(
+                        dict(raw), "filled_quantity_decimal", minimum=ZERO
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if filled is not None and filled > ZERO:
+                    return True
+            return False
+
+        def reduce_external_lots(
+            symbol: str,
+            lots: list[tuple[Any, Decimal]],
+            quantity: Decimal,
+        ) -> Decimal:
+            remaining = quantity
+            for raw, lot_remaining in lots:
+                if remaining <= ZERO:
+                    break
+                consumed = min(remaining, lot_remaining)
+                after = lot_remaining - consumed
+                conn.execute(
+                    """UPDATE position_lots
+                       SET remaining_quantity=?,remaining_quantity_decimal=?,
+                           closed_at=?,updated_at=? WHERE id=?""",
+                    (
+                        legacy_float(after), decimal_text(after),
+                        now if after == ZERO else None, now, raw["id"],
+                    ),
+                )
+                remaining -= consumed
+            return remaining
+
+        def add_external_lot(
+            *,
+            symbol: str,
+            lifecycle_id: str,
+            quantity: Decimal,
+            average_entry_price: Decimal | None,
+        ) -> None:
+            if quantity <= ZERO:
+                return
+            unit_cost = average_entry_price if average_entry_price and average_entry_price > ZERO else ZERO
+            confidence = "reconstructed" if unit_cost > ZERO else "unavailable"
+            lot_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO position_lots(
+                       id,symbol,position_lifecycle_id,source_fill_event_key,opened_at,
+                       original_quantity,remaining_quantity,unit_cost,fees_allocated,
+                       source,provenance,confidence,created_at,updated_at,
+                       strategy_version,entry_proposal_id,entry_intent_id,entry_regime,
+                       entry_score,initial_risk_dollars,config_hash,evidence_version,
+                       formula_version,original_quantity_decimal,remaining_quantity_decimal,
+                       unit_cost_decimal,fees_allocated_decimal,initial_risk_dollars_decimal,
+                       decimal_provenance,decimal_accounting_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    lot_id, symbol, lifecycle_id,
+                    f"external-position:{lifecycle_id}:{lot_id}", now,
+                    legacy_float(quantity), legacy_float(quantity), legacy_float(unit_cost), 0.0,
+                    EXTERNAL_POSITION_LOT_SOURCE,
+                    "broker_position_observed_without_local_entry_fill",
+                    confidence, now, now,
+                    EXTERNAL_POSITION_STRATEGY_VERSION, None, None, None, None, None, None,
+                    "external_broker_position_snapshot_v1", EXTERNAL_POSITION_FORMULA_VERSION,
+                    decimal_text(quantity), decimal_text(quantity), decimal_text(unit_cost),
+                    "0", None, EXACT_DECIMAL_PROVENANCE, FIXED_POINT_ACCOUNTING_VERSION,
+                ),
+            )
+            audit(
+                "external_equity_position_absorbed",
+                {
+                    "symbol": symbol,
+                    "position_lifecycle_id": lifecycle_id,
+                    "quantity": decimal_text(quantity),
+                    "unit_cost": decimal_text(unit_cost) if unit_cost > ZERO else None,
+                    "accounting_confidence": confidence,
+                    "risk_management": "risk_reducing_exits_allowed_adds_require_verified_entry_stop",
+                },
+            )
+
+        lot_symbols = {
+            str(row["symbol"]).upper()
+            for row in conn.execute(
+                """SELECT DISTINCT symbol FROM position_lots
+                   WHERE source IN (?,?) AND COALESCE(remaining_quantity_decimal,'0')<>'0'""",
+                tuple(EXTERNAL_POSITION_LOT_SOURCES),
+            ).fetchall()
+        }
+        symbols = {
+            symbol for symbol, item in current.items()
+            if item.get("asset_class") == "equity" and item.get("quantity", ZERO) > ZERO
+        }
+        symbols.update(lot_symbols)
+
+        for symbol in sorted(symbols):
+            observed = current.get(symbol)
+            if observed is not None and observed.get("asset_class") != "equity":
+                continue
+            lifecycle_row = conn.execute(
+                "SELECT * FROM position_lifecycles WHERE symbol=? AND state='active'",
+                (symbol,),
+            ).fetchone()
+            lifecycle_id = str(lifecycle_row["id"]) if lifecycle_row else None
+
+            all_rows = conn.execute(
+                "SELECT * FROM position_lots WHERE symbol=? ORDER BY opened_at,id",
+                (symbol,),
+            ).fetchall()
+            external_lots: list[tuple[Any, Decimal]] = []
+            local_total = ZERO
+            malformed_open_lot = False
+            for raw in all_rows:
+                remaining = exact_remaining(raw)
+                if remaining is None:
+                    malformed_open_lot = True
+                    continue
+                if remaining <= ZERO:
+                    continue
+                if str(raw["source"] or "") in EXTERNAL_POSITION_LOT_SOURCES:
+                    external_lots.append((raw, remaining))
+                else:
+                    local_total += remaining
+
+            if malformed_open_lot:
+                audit(
+                    "external_equity_position_absorption_blocked",
+                    {
+                        "symbol": symbol,
+                        "reason": "open_lot_lacks_exact_quantity_evidence",
+                        "current_quantity": decimal_text(observed["quantity"]) if observed else None,
+                    },
+                )
+                continue
+
+            has_local_entry = bool(
+                lifecycle_id and local_entry_evidence(lifecycle_id, symbol)
+            )
+            external_total = sum((quantity for _, quantity in external_lots), ZERO)
+            observed_quantity = (
+                observed["quantity"] if observed is not None and observed["quantity"] > ZERO else ZERO
+            )
+
+            # A local entry fill with no corresponding local lot is a ledger
+            # integrity problem, not an external position.  Do not hide it by
+            # turning the entire holding into a reconstructed lot.
+            if has_local_entry and local_total == ZERO and external_total == ZERO and observed_quantity > ZERO:
+                audit(
+                    "external_equity_position_absorption_blocked",
+                    {
+                        "symbol": symbol,
+                        "reason": "local_entry_fill_exists_but_fifo_lot_is_missing",
+                        "current_quantity": decimal_text(observed_quantity),
+                    },
+                )
+                continue
+
+            # A non-external open lot without linked local entry provenance is
+            # ambiguous.  Preserve the old fail-closed behavior rather than
+            # relabeling potentially corrupt accounting as user-originated.
+            if not has_local_entry and local_total > ZERO:
+                audit(
+                    "external_equity_position_absorption_blocked",
+                    {
+                        "symbol": symbol,
+                        "reason": "unclassified_open_fifo_lot_without_local_entry_provenance",
+                        "current_quantity": decimal_text(observed_quantity),
+                        "local_lot_quantity": decimal_text(local_total),
+                    },
+                )
+                continue
+
+            target_external = max(ZERO, observed_quantity - local_total)
+            if target_external < external_total:
+                unreconciled = reduce_external_lots(
+                    symbol, external_lots, external_total - target_external
+                )
+                if unreconciled > ZERO:
+                    audit(
+                        "external_equity_position_absorption_blocked",
+                        {
+                            "symbol": symbol,
+                            "reason": "external_quantity_reduction_exceeds_absorbed_lots",
+                            "unreconciled_quantity": decimal_text(unreconciled),
+                        },
+                    )
+                else:
+                    audit(
+                        "external_equity_position_quantity_reconciled",
+                        {
+                            "symbol": symbol,
+                            "previous_external_quantity": decimal_text(external_total),
+                            "current_external_quantity": decimal_text(target_external),
+                            "basis": "broker_current_position_snapshot",
+                            "realized_pnl": "not_recorded_external_reduction",
+                        },
+                    )
+            elif target_external > external_total:
+                if not lifecycle_id:
+                    audit(
+                        "external_equity_position_absorption_blocked",
+                        {
+                            "symbol": symbol,
+                            "reason": "active_lifecycle_missing",
+                            "quantity_to_absorb": decimal_text(target_external - external_total),
+                        },
+                    )
+                    continue
+                add_external_lot(
+                    symbol=symbol,
+                    lifecycle_id=lifecycle_id,
+                    quantity=target_external - external_total,
+                    average_entry_price=(
+                        observed.get("average_entry_price") if observed else None
+                    ),
+                )
+
+            if lifecycle_id and not has_local_entry and local_total == ZERO:
+                conn.execute(
+                    "UPDATE position_lifecycles SET source=?,updated_at=? WHERE id=?",
+                    (EXTERNAL_POSITION_LOT_SOURCE, now, lifecycle_id),
+                )
+
+    def is_external_position(self, symbol: str) -> bool:
+        """Return whether an active holding contains externally sourced shares."""
+
+        rows = self.storage.fetch_all(
+            """SELECT source,remaining_quantity,remaining_quantity_decimal
+               FROM position_lots
+               WHERE symbol=? AND source IN (?,?)""",
+            (symbol.upper(), *tuple(EXTERNAL_POSITION_LOT_SOURCES)),
+        )
+        for row in rows:
+            try:
+                remaining = require_exact_decimal(
+                    row, "remaining_quantity_decimal", minimum=ZERO
+                )
+            except (TypeError, ValueError):
+                remaining = _decimal_or_none(row.get("remaining_quantity"))
+            if remaining is not None and remaining > ZERO:
+                return True
+        return False
 
     def active_id(self, symbol: str) -> str | None:
         rows = self.storage.fetch_all(

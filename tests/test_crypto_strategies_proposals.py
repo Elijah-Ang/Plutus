@@ -561,7 +561,7 @@ def test_cross_asset_runtime_reconciles_external_crypto_position_conservatively(
     )
 
 
-def test_cross_asset_runtime_keeps_untracked_equity_fail_closed(tmp_path):
+def test_cross_asset_runtime_reconciles_untracked_equity_conservatively(tmp_path):
     storage = _storage(tmp_path)
     config = _config()
     broker = Broker(
@@ -573,8 +573,14 @@ def test_cross_asset_runtime_keeps_untracked_equity_fail_closed(tmp_path):
         storage, config, broker, run_id="untracked-equity-run"
     )
     held = coordinator._held_positions(broker.get_positions())
-    with pytest.raises(CrossAssetRuntimeError, match="no authoritative FIFO lot evidence"):
-        coordinator._authoritative_position_stop_heat(held)
+    total, by_asset, by_strategy = coordinator._authoritative_position_stop_heat(held)
+    assert total == D("500")
+    assert by_asset == {"equity": D("500"), "crypto": D("0")}
+    assert by_strategy["external_unmanaged"] == D("500")
+    assert storage.fetch_all(
+        "SELECT event_type FROM audit_events "
+        "WHERE event_type='external_equity_position_reconciled'"
+    )
 
 
 def test_hourly_research_preserves_wide_market_strategy_as_blocked_evidence(tmp_path):

@@ -308,7 +308,7 @@ class CrossAssetRuntimeCoordinator:
         self,
         held: Mapping[str, Mapping[str, Any]],
     ) -> tuple[Decimal, dict[str, Decimal], dict[str, Decimal]]:
-        """Return open stop risk from FIFO evidence or a bounded crypto fallback.
+        """Return open stop risk from FIFO evidence or bounded external fallback.
 
         Market value is exposure, not stop risk.  A position is therefore not
         allowed into the advisory allocator unless its broker quantity
@@ -317,13 +317,12 @@ class CrossAssetRuntimeCoordinator:
         fraction of its original stop-risk budget; this is conservative after
         a partial fill or reduction and never reconstructs risk from floats.
 
-        A long spot-crypto position may have been placed outside Plutus before
-        the FIFO ledger existed.  Crypto risk already treats an unprotected
-        holding's full market value as its conservative downside.  Apply that
-        same explicit model here, record the observation, and keep the
-        position visible to cross-asset exposure constraints.  This is not a
-        reconstructed cost basis and it never grants crypto order authority.
-        Equity positions still require their exact FIFO stop-risk evidence.
+        A position may have been placed outside Plutus before the FIFO ledger
+        existed.  For both supported crypto and equity holdings, the full
+        current market value is the conservative downside until protective-risk
+        history is verified.  This is not a reconstructed cost basis and it
+        never grants order authority; risk-reducing position management remains
+        a separate, explicitly permitted path.
         """
 
         total = ZERO
@@ -335,16 +334,18 @@ class CrossAssetRuntimeCoordinator:
                 (symbol,),
             )
             if not rows:
-                if item["asset_class"] == "crypto":
+                if item["asset_class"] in {"crypto", "equity"}:
                     conservative_risk = item["market_value"]
-                    by_asset["crypto"] += conservative_risk
+                    asset = str(item["asset_class"])
+                    by_asset[asset] += conservative_risk
                     by_strategy["external_unmanaged"] = (
                         by_strategy.get("external_unmanaged", ZERO)
                         + conservative_risk
                     )
+                    event_type = f"external_{asset}_position_reconciled"
                     self.storage.audit(
                         self.run_id,
-                        "external_crypto_position_reconciled",
+                        event_type,
                         {
                             "symbol": symbol,
                             "quantity": _text(item["quantity"]),
@@ -352,6 +353,7 @@ class CrossAssetRuntimeCoordinator:
                             "risk_model": "full_market_value_until_fifo_reconciled",
                             "accounting_confidence": "unavailable",
                             "reason": "broker_position_not_in_local_fifo_ledger",
+                            "management_policy": "risk_reducing_exits_allowed_adds_require_verified_entry_stop",
                         },
                     )
                     total += conservative_risk
@@ -361,7 +363,7 @@ class CrossAssetRuntimeCoordinator:
                 )
             remaining_total = ZERO
             symbol_risk = ZERO
-            unknown_crypto_risk = False
+            unknown_external_risk = False
             for raw in rows:
                 row = dict(raw)
                 legacy_remaining = row.get("remaining_quantity")
@@ -396,8 +398,13 @@ class CrossAssetRuntimeCoordinator:
                 remaining_total += remaining
                 risk_raw = row.get("initial_risk_dollars_decimal")
                 if risk_raw in (None, ""):
-                    if item["asset_class"] == "crypto":
-                        unknown_crypto_risk = True
+                    external_source = str(row.get("source") or "") in {
+                        "external_broker_reconciliation", "manual_adjustment",
+                    }
+                    if item["asset_class"] == "crypto" or (
+                        item["asset_class"] == "equity" and external_source
+                    ):
+                        unknown_external_risk = True
                         continue
                     raise CrossAssetRuntimeError(
                         f"position {symbol} open FIFO lot lacks exact stop-risk evidence"
@@ -419,11 +426,11 @@ class CrossAssetRuntimeCoordinator:
                     f"position {symbol} quantity does not reconcile to exact FIFO lots"
                 )
             asset = str(item["asset_class"])
-            if unknown_crypto_risk:
+            if unknown_external_risk:
                 # Do not substitute a zero or an invented stop.  The full
                 # current value is the conservative downside for an external
-                # crypto holding until its actual protective-risk history is
-                # imported and verified.
+                # holding until its actual protective-risk history is imported
+                # and verified.
                 prior_risk = symbol_risk
                 symbol_risk = max(symbol_risk, item["market_value"])
                 external_increment = symbol_risk - prior_risk
@@ -432,16 +439,18 @@ class CrossAssetRuntimeCoordinator:
                         by_strategy.get("external_unmanaged", ZERO)
                         + external_increment
                     )
+                    asset = str(item["asset_class"])
                     self.storage.audit(
                         self.run_id,
-                        "external_crypto_position_reconciled",
+                        f"external_{asset}_position_reconciled",
                         {
                             "symbol": symbol,
                             "quantity": _text(item["quantity"]),
                             "market_value": _text(item["market_value"]),
                             "risk_model": "full_market_value_until_fifo_reconciled",
                             "accounting_confidence": "unavailable",
-                            "reason": "open_crypto_lot_lacks_stop_risk_evidence",
+                            "reason": "open_external_lot_lacks_stop_risk_evidence",
+                            "management_policy": "risk_reducing_exits_allowed_adds_require_verified_entry_stop",
                         },
                     )
             by_asset[asset] += symbol_risk
