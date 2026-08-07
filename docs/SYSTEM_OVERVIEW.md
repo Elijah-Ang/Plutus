@@ -479,6 +479,7 @@ The system is configured with two separate scheduled jobs:
 - **How to Uninstall**: Run `"$HOME/TradingAgentRuntime/scripts/uninstall_launchd.sh"`.
 - **Manual Scan/Listener**: Unsupported in production; use only the controlled immutable launchd paths.
 - **Reconciliation**: Each passing cycle reads existing Alpaca order/account/position state and reconciles SQLite before scanning. Reconciliation has no submission or retry operation.
+- **External crypto reconciliation**: Supported spot-crypto positions that were placed outside Plutus are canonicalized across broker/API symbol formats. When local FIFO history is absent, cross-asset allocation records the holding as `external_unmanaged` and reserves its full market value as conservative downside until exact history is supplied; no cost basis is invented and no crypto order authority is granted.
 - **Lock Recovery**: `run_once.sh` records PID and epoch time. Active/recent locks are preserved; only a dead owner older than the grace period is atomically recovered and audited.
 - **Runtime isolation**: Production launchd never executes a mutable source checkout; it uses the immutable runtime pointer and external Application Support state.
 

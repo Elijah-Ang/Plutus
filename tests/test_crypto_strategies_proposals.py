@@ -19,7 +19,7 @@ from app.crypto_proposals import (
     format_crypto_proposal_preview,
 )
 from app.crypto_research import CryptoResearchEngine, _oldest_crypto_lot_opened_at
-from app.cross_asset_runtime import CrossAssetRuntimeCoordinator
+from app.cross_asset_runtime import CrossAssetRuntimeCoordinator, CrossAssetRuntimeError
 from app.crypto_risk import CryptoRiskError, CryptoRiskStore
 from app.crypto_sizing import CryptoSizingRequest
 from app.crypto_strategies import CryptoStrategyError, CryptoStrategyStore, SUPPORTED_STRATEGIES
@@ -510,6 +510,71 @@ def test_cross_asset_runtime_accepts_alpaca_account_status_enum(tmp_path, monkey
         plan.decisions[0]["manual_approval_required"] is True
         or plan.decisions[0]["autonomous_execution"] is True
     )
+
+
+def test_cross_asset_runtime_reconciles_external_crypto_position_conservatively(
+    tmp_path, monkeypatch
+):
+    storage = _storage(tmp_path)
+    config = _config()
+    broker = Broker(
+        positions=[
+            SimpleNamespace(
+                # Alpaca may omit the slash on the broker position even though
+                # Plutus's configured/API identity is BTC/USD.
+                symbol="BTCUSD",
+                qty="0.076031156",
+                market_value="4890.210059",
+                avg_entry_price="64315.174",
+            )
+        ]
+    )
+    monkeypatch.setattr("app.cross_asset_runtime.internet_available", lambda: True)
+    monkeypatch.setattr(
+        "app.cross_asset_runtime.get_power_status",
+        lambda: SimpleNamespace(connected=True),
+    )
+
+    coordinator = CrossAssetRuntimeCoordinator(
+        storage, config, broker, run_id="external-position-run"
+    )
+    held = coordinator._held_positions(broker.get_positions())
+    assert set(held) == {"BTC/USD"}
+
+    snapshot = coordinator._portfolio_snapshot(
+        broker.get_account(), broker.get_positions(), [], held, NOW
+    )
+    assert snapshot.asset_class_position_count == {"equity": 0, "crypto": 1}
+    assert snapshot.asset_class_stop_heat["crypto"] == "4890.210059"
+    assert snapshot.strategy_stop_heat["external_unmanaged"] == "4890.210059"
+    plan = coordinator.create_plan(
+        positions=broker.get_positions(),
+        orders=[],
+        account=broker.get_account(),
+        now=NOW,
+    )
+    assert plan.execution_authorized is False
+    assert plan.summary["candidate_count"] == 0
+    assert storage.fetch_all(
+        "SELECT event_type FROM audit_events "
+        "WHERE event_type='external_crypto_position_reconciled'"
+    )
+
+
+def test_cross_asset_runtime_keeps_untracked_equity_fail_closed(tmp_path):
+    storage = _storage(tmp_path)
+    config = _config()
+    broker = Broker(
+        positions=[
+            SimpleNamespace(symbol="SPY", qty="1", market_value="500")
+        ]
+    )
+    coordinator = CrossAssetRuntimeCoordinator(
+        storage, config, broker, run_id="untracked-equity-run"
+    )
+    held = coordinator._held_positions(broker.get_positions())
+    with pytest.raises(CrossAssetRuntimeError, match="no authoritative FIFO lot evidence"):
+        coordinator._authoritative_position_stop_heat(held)
 
 
 def test_hourly_research_preserves_wide_market_strategy_as_blocked_evidence(tmp_path):
