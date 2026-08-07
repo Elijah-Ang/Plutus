@@ -397,7 +397,11 @@ class BrokerReconciler:
         except Exception as exc:
             self.storage.audit(self.run_id, "account_reconciliation_unknown", {"error_type": type(exc).__name__})
             return
-        PositionLifecycleManager(self.storage).reconcile(positions)
+        PositionLifecycleManager(self.storage).reconcile(
+            positions,
+            absorb_external_equities=True,
+            run_id=self.run_id,
+        )
         unrealized_values = [_value(position, "unrealized_pl") for position in positions]
         try:
             unrealized = (

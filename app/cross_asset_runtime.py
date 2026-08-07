@@ -114,6 +114,25 @@ def _symbol(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "/")
 
 
+def _canonical_crypto_symbol(value: Any, configured_symbols: set[str]) -> str:
+    """Bind broker pair spellings such as ``BTCUSD`` to configured symbols.
+
+    Alpaca can return spot-crypto positions without the slash used by the
+    Assets and market-data APIs.  Symbol identity is an authority boundary:
+    treating those spellings as different positions can make an existing
+    holding look like a new entry.  Only configured pairs are canonicalized;
+    unknown symbols retain their normalized broker spelling and remain
+    subject to the usual crypto safety gates.
+    """
+
+    normalized = _symbol(value)
+    compact = normalized.replace("/", "")
+    for configured in configured_symbols:
+        if compact == configured.replace("/", ""):
+            return configured
+    return normalized
+
+
 class CrossAssetRuntimeCoordinator:
     """Build and persist one current advisory allocation plan."""
 
@@ -178,7 +197,9 @@ class CrossAssetRuntimeCoordinator:
         crypto_symbols = self._crypto_symbols()
         held: dict[str, dict[str, Any]] = {}
         for index, position in enumerate(positions):
-            symbol = _symbol(_raw(position, "symbol"))
+            symbol = _canonical_crypto_symbol(
+                _raw(position, "symbol"), crypto_symbols
+            )
             if not symbol:
                 raise CrossAssetRuntimeError(f"broker position {index} has no symbol")
             quantity = _decimal(_raw(position, "qty", "quantity"), f"position {symbol} quantity")
@@ -287,7 +308,7 @@ class CrossAssetRuntimeCoordinator:
         self,
         held: Mapping[str, Mapping[str, Any]],
     ) -> tuple[Decimal, dict[str, Decimal], dict[str, Decimal]]:
-        """Return open stop risk from the exact FIFO lot ledger.
+        """Return open stop risk from FIFO evidence or bounded external fallback.
 
         Market value is exposure, not stop risk.  A position is therefore not
         allowed into the advisory allocator unless its broker quantity
@@ -295,6 +316,13 @@ class CrossAssetRuntimeCoordinator:
         risk.  The remaining fraction of each lot retains the corresponding
         fraction of its original stop-risk budget; this is conservative after
         a partial fill or reduction and never reconstructs risk from floats.
+
+        A position may have been placed outside Plutus before the FIFO ledger
+        existed.  For both supported crypto and equity holdings, the full
+        current market value is the conservative downside until protective-risk
+        history is verified.  This is not a reconstructed cost basis and it
+        never grants order authority; risk-reducing position management remains
+        a separate, explicitly permitted path.
         """
 
         total = ZERO
@@ -306,11 +334,36 @@ class CrossAssetRuntimeCoordinator:
                 (symbol,),
             )
             if not rows:
+                if item["asset_class"] in {"crypto", "equity"}:
+                    conservative_risk = item["market_value"]
+                    asset = str(item["asset_class"])
+                    by_asset[asset] += conservative_risk
+                    by_strategy["external_unmanaged"] = (
+                        by_strategy.get("external_unmanaged", ZERO)
+                        + conservative_risk
+                    )
+                    event_type = f"external_{asset}_position_reconciled"
+                    self.storage.audit(
+                        self.run_id,
+                        event_type,
+                        {
+                            "symbol": symbol,
+                            "quantity": _text(item["quantity"]),
+                            "market_value": _text(item["market_value"]),
+                            "risk_model": "full_market_value_until_fifo_reconciled",
+                            "accounting_confidence": "unavailable",
+                            "reason": "broker_position_not_in_local_fifo_ledger",
+                            "management_policy": "risk_reducing_exits_allowed_adds_require_verified_entry_stop",
+                        },
+                    )
+                    total += conservative_risk
+                    continue
                 raise CrossAssetRuntimeError(
                     f"position {symbol} has no authoritative FIFO lot evidence"
                 )
             remaining_total = ZERO
             symbol_risk = ZERO
+            unknown_external_risk = False
             for raw in rows:
                 row = dict(raw)
                 legacy_remaining = row.get("remaining_quantity")
@@ -342,8 +395,17 @@ class CrossAssetRuntimeCoordinator:
                     )
                 if remaining == ZERO:
                     continue
+                remaining_total += remaining
                 risk_raw = row.get("initial_risk_dollars_decimal")
                 if risk_raw in (None, ""):
+                    external_source = str(row.get("source") or "") in {
+                        "external_broker_reconciliation", "manual_adjustment",
+                    }
+                    if item["asset_class"] == "crypto" or (
+                        item["asset_class"] == "equity" and external_source
+                    ):
+                        unknown_external_risk = True
+                        continue
                     raise CrossAssetRuntimeError(
                         f"position {symbol} open FIFO lot lacks exact stop-risk evidence"
                     )
@@ -352,7 +414,6 @@ class CrossAssetRuntimeCoordinator:
                     f"position {symbol} lot initial stop risk",
                 )
                 lot_risk = initial_risk * remaining / original
-                remaining_total += remaining
                 symbol_risk += lot_risk
                 strategy = str(
                     row.get("strategy_version")
@@ -365,6 +426,33 @@ class CrossAssetRuntimeCoordinator:
                     f"position {symbol} quantity does not reconcile to exact FIFO lots"
                 )
             asset = str(item["asset_class"])
+            if unknown_external_risk:
+                # Do not substitute a zero or an invented stop.  The full
+                # current value is the conservative downside for an external
+                # holding until its actual protective-risk history is imported
+                # and verified.
+                prior_risk = symbol_risk
+                symbol_risk = max(symbol_risk, item["market_value"])
+                external_increment = symbol_risk - prior_risk
+                if external_increment > ZERO:
+                    by_strategy["external_unmanaged"] = (
+                        by_strategy.get("external_unmanaged", ZERO)
+                        + external_increment
+                    )
+                    asset = str(item["asset_class"])
+                    self.storage.audit(
+                        self.run_id,
+                        f"external_{asset}_position_reconciled",
+                        {
+                            "symbol": symbol,
+                            "quantity": _text(item["quantity"]),
+                            "market_value": _text(item["market_value"]),
+                            "risk_model": "full_market_value_until_fifo_reconciled",
+                            "accounting_confidence": "unavailable",
+                            "reason": "open_external_lot_lacks_stop_risk_evidence",
+                            "management_policy": "risk_reducing_exits_allowed_adds_require_verified_entry_stop",
+                        },
+                    )
             by_asset[asset] += symbol_risk
             total += symbol_risk
         return total, by_asset, by_strategy

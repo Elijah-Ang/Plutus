@@ -55,6 +55,17 @@ The greedy allocation order is deterministic: descending normalized score, then 
 
 The authoritative portfolio snapshot must reconcile position counts, gross exposure by symbol/cluster/asset class, and stop heat by asset class/strategy. Missing or inconsistent totals fail closed. Candidate run identity, canonical symbol identity, held-position status, and entry-versus-add action must agree with that snapshot. The audited maxima are also enforced in code, so a different but internally self-consistent config hash cannot widen the paper/research limits.
 
+Positions can also originate outside Plutus. Broker pair spellings such as
+`BTCUSD` are canonicalized to the configured `BTC/USD` identity. External
+crypto and equity holdings are absorbed into the broker-reconciled lifecycle and
+prospective FIFO ledger with explicit reconstructed/unavailable provenance. If
+exact protective-risk history is absent, the snapshot records the holding as
+`external_unmanaged` and reserves its full current market value as conservative
+downside. This preserves portfolio exposure and prevents risk from being
+understated; it does not invent cost basis or protective stops. Plutus may
+manage risk-reducing exits on the holding, while risk-increasing adds remain
+blocked until the entry and stop history is verified.
+
 ## Durability and verification
 
 `cross_asset_allocation_plans` binds:

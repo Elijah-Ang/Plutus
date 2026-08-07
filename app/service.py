@@ -1350,6 +1350,11 @@ class TradingService:
             rows = self.storage.fetch_all("SELECT * FROM position_management_state WHERE symbol=?", (symbol.upper(),))
         return rows[0] if rows else None
 
+    def _is_external_position(self, symbol: str) -> bool:
+        """Whether the current holding contains broker-originated shares."""
+
+        return PositionLifecycleManager(self.storage).is_external_position(symbol)
+
     def _initial_risk_seed_for_position(self, symbol: str) -> dict[str, Any]:
         symbol = symbol.upper()
         lifecycle_id = PositionLifecycleManager(self.storage).active_id(symbol)
@@ -1381,6 +1386,10 @@ class TradingService:
         )
         if len(lifecycle_rows) != 1:
             return unavailable("r_multiple_unavailable_active_position_lifecycle_invalid")
+        if self._is_external_position(symbol):
+            return unavailable(
+                "r_multiple_unavailable_external_position_initial_stop_unverified"
+            )
         fill_rows = self.storage.fetch_all(
             """SELECT f.id AS entry_fill_id,
                       f.delta_quantity_decimal AS entry_delta_quantity_decimal,
@@ -2289,6 +2298,8 @@ class TradingService:
             ):
                 return "conflicting open sell order exists for symbol"
         elif proposal.get("action") == "add":
+            if self._is_external_position(symbol):
+                return "external position add requires verified entry and stop provenance"
             positions = self.broker.get_positions() if self.broker is not None else []
             pos = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
             if pos is None:
@@ -2332,6 +2343,8 @@ class TradingService:
         )
         if not symbol or not lifecycle_id:
             raise ValueError("active position lifecycle is required for winner expansion")
+        if self._is_external_position(symbol):
+            raise ValueError("external position add requires verified entry and stop provenance")
 
         runtime_state = self._authoritative_runtime_state(force=True)
         positions = list(runtime_state.get("positions") or [])
@@ -7520,6 +7533,7 @@ class TradingService:
 
                 pos_obj = next((p for p in positions if str(_value(p, "symbol", "")).upper() == symbol), None)
                 has_position = pos_obj is not None
+                external_position = has_position and self._is_external_position(symbol)
                 has_order = any(str(_value(o, "symbol", "")).upper() == symbol for o in orders)
 
                 position_drawdown_pct = 0.0
@@ -7704,7 +7718,13 @@ class TradingService:
                 add_score_improvement = 0.0
 
                 pyramiding_cfg = self.config.get("add_to_position", {})
-                if pyramiding_cfg.get("enabled", True) and has_position and signal.action != "EXIT" and not has_order:
+                if (
+                    pyramiding_cfg.get("enabled", True)
+                    and has_position
+                    and not external_position
+                    and signal.action != "EXIT"
+                    and not has_order
+                ):
                     # Run evaluate_symbol pretending we don't have a position to see if buy setup exists
                     buy_setup_signal = evaluate_symbol(
                         symbol,
@@ -7955,6 +7975,7 @@ class TradingService:
                         normal_exit_signal=normal_exit_signal,
                         volatility_regime=volatility_regime,
                         has_open_order=has_order,
+                        allow_risk_increasing_actions=not external_position,
                         position_age_days=position_age_days,
                         position_age_cycles=position_age_cycles,
                         now=now,

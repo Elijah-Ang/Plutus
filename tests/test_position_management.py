@@ -113,6 +113,36 @@ def test_position_state_calculations_and_r_multiple():
     assert round(decision.current_r_multiple, 2) == 2.0
 
 
+def test_external_position_blocks_risk_increasing_add_but_keeps_exit_path():
+    cfg = config()
+    cfg["position_management"]["profit_taking"]["enabled"] = False
+    cfg["position_management"]["profit_protection"]["enabled"] = False
+    cfg["position_management"]["trailing_stop"]["enabled"] = False
+
+    add = classify(
+        config=cfg,
+        current_price=104.0,
+        trade_score=95.0,
+        score_improvement=10.0,
+        allow_risk_increasing_actions=False,
+        initial_stop_price=None,
+    )
+    assert add.decision_type == "HOLD"
+    assert add.action == "hold"
+    assert "external position add requires verified entry and stop provenance" in add.blocking_reasons
+
+    exit_decision = classify(
+        config=cfg,
+        current_price=96.0,
+        trade_score=40.0,
+        allow_risk_increasing_actions=False,
+        initial_stop_price=None,
+        normal_exit_signal=True,
+    )
+    assert exit_decision.decision_type == "NORMAL_RISK_EXIT"
+    assert exit_decision.action == "sell"
+
+
 def test_drawdown_from_entry_computed_for_losing_position():
     cfg = config()
     cfg["position_management"]["profit_protection"]["enabled"] = False
